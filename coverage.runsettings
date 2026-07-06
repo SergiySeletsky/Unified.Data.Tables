@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Coverage settings for `dotnet test`. Emits an OpenCover-format report (coverage.opencover.xml)
+  that SonarQube Cloud imports via /d:sonar.cs.opencover.reportsPaths. The XPlat Code Coverage
+  collector ships with the coverlet.collector package referenced by the test project.
+-->
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <Format>opencover</Format>
+          <!-- Don't measure coverage of the test assembly or third-party code. -->
+          <Exclude>[*.Tests]*,[xunit.*]*</Exclude>
+          <ExcludeByAttribute>Obsolete,GeneratedCodeAttribute,CompilerGeneratedAttribute</ExcludeByAttribute>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>
