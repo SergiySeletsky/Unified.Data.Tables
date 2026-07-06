@@ -1,0 +1,64 @@
+name: Publish
+
+# Publishing is triggered by creating a GitHub Release (tag like v0.1.0), or run manually.
+# Uses NuGet.org Trusted Publishing (OIDC) — no long-lived API key required.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 1.2.3). Leave empty to use the .csproj version."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # required for NuGet Trusted Publishing (OIDC token exchange)
+
+jobs:
+  publish:
+    name: Build & publish to NuGet.org
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${{ github.event.release.tag_name || inputs.version }}"
+          VERSION="${VERSION#v}"   # strip a leading 'v' (v1.2.3 -> 1.2.3)
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: ${VERSION:-<.csproj default>}"
+
+      - name: Test
+        run: dotnet test Unified.Data.Tables.slnx -c Release
+
+      - name: Pack
+        shell: bash
+        run: |
+          if [ -n "${{ steps.version.outputs.value }}" ]; then
+            dotnet pack src/Unified.Data.Tables/Unified.Data.Tables.csproj -c Release -o artifacts -p:Version=${{ steps.version.outputs.value }}
+          else
+            dotnet pack src/Unified.Data.Tables/Unified.Data.Tables.csproj -c Release -o artifacts
+          fi
+
+      - name: NuGet login (OIDC trusted publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          # Your nuget.org username (profile name, NOT email). Stored as a repo secret.
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push to NuGet.org
+        run: >-
+          dotnet nuget push "artifacts/*.nupkg"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
