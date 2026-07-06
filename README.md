@@ -1,5 +1,14 @@
 # Unified.Data.Tables
 
+[![Build & Analyze](https://github.com/SergiySeletsky/Unified.Data.Tables/actions/workflows/sonarqube.yml/badge.svg)](https://github.com/SergiySeletsky/Unified.Data.Tables/actions/workflows/sonarqube.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=testasm_unified-data-tables&metric=alert_status)](https://sonarcloud.io/summary/overall?id=testasm_unified-data-tables)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=testasm_unified-data-tables&metric=coverage)](https://sonarcloud.io/summary/overall?id=testasm_unified-data-tables)
+[![Unified.Data.Tables on NuGet](https://img.shields.io/nuget/v/Unified.Data.Tables.svg?label=Unified.Data.Tables)](https://www.nuget.org/packages/Unified.Data.Tables)
+[![Unified.Data.Tables.Abstractions on NuGet](https://img.shields.io/nuget/v/Unified.Data.Tables.Abstractions.svg?label=Unified.Data.Tables.Abstractions)](https://www.nuget.org/packages/Unified.Data.Tables.Abstractions)
+[![Downloads](https://img.shields.io/nuget/dt/Unified.Data.Tables.svg)](https://www.nuget.org/packages/Unified.Data.Tables)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat)](https://github.com/SergiySeletsky/Unified.Data.Tables/compare)
+
 A small, reusable **Azure Table Storage** data layer for .NET: a generic `IStorage<T>` repository with
 in-memory caching, optimistic concurrency, builder-driven partial updates, role-gated properties, and a
 reflection-based object-graph serializer that transparently handles nested types and the 64&nbsp;KB
@@ -240,4 +249,4 @@ against a local **Azurite** emulator. The integration tests self-skip when Azuri
 
 ## License
 
-Copyright © Serhii Seletskyi. Add a `LICENSE` file (for example, MIT) before publishing to NuGet.
+Licensed under the [MIT License](LICENSE). Copyright © Serhii Seletskyi.

@@ -35,6 +35,17 @@
     <Copyright>Copyright © Serhii Seletskyi</Copyright>
     <NeutralLanguage>en-US</NeutralLanguage>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/SergiySeletsky/Unified.Data.Tables</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SergiySeletsky/Unified.Data.Tables</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Source Link / reproducible builds">
+    <!-- Embeds commit + source metadata so debuggers can step into the package. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
 </Project>
