@@ -1,0 +1,17 @@
+## .NET build output
+bin/
+obj/
+
+## NuGet packages produced locally
+*.nupkg
+*.snupkg
+artifacts/
+
+## IDE / user files
+.vs/
+*.user
+*.suo
+
+## Test results
+TestResults/
+[Cc]overage*/

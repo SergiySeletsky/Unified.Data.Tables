@@ -1,0 +1,39 @@
+<Project>
+
+  <!--
+    Self-contained build settings for the Unified.Data.Tables package. Living in this folder,
+    this file also stops MSBuild from walking further up the tree, so the package never
+    accidentally inherits settings from a host repository it happens to be nested under.
+  -->
+
+  <PropertyGroup Label="Language / hygiene">
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Analyzer baseline">
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!--
+      Suppressions carried over from the two source projects this package was merged from,
+      plus the globalization rules that the intentional id-normalization (ToLowerInvariant)
+      and invariant parsing would otherwise trip. 1591 = missing XML doc comment.
+    -->
+    <NoWarn>$(NoWarn);1591;CA1304;CA1305;CA1307;CA1308;CA1310;CA1311;CA1848;CA1873;CA1822;CA1805;CA1860;CA1707;CA1711;CA1716;CA1720;CA1068;CA1859;CA1050;CA1051;CA1862;CA1861;CA1806</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Package metadata">
+    <Authors>Serhii Seletskyi</Authors>
+    <Company>Serhii Seletskyi</Company>
+    <Copyright>Copyright © Serhii Seletskyi</Copyright>
+    <NeutralLanguage>en-US</NeutralLanguage>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+</Project>

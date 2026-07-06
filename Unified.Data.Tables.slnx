@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Unified.Data.Tables/Unified.Data.Tables.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Unified.Data.Tables.Tests/Unified.Data.Tables.Tests.csproj" />
+  </Folder>
+</Solution>
