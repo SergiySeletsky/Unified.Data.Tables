@@ -4,11 +4,11 @@ namespace Unified.Data.Tables;
 /// Decides whether the current caller may modify a property gated by
 /// <see cref="ProtectedPropertyAttribute"/>. Implement this in the host application (for example,
 /// wrapping the current <c>ClaimsPrincipal</c> and checking its roles) and register it in DI so
-/// <see cref="TableStorage{T}"/> can enforce protected properties without the package taking a
+/// <c>TableStorage&lt;T&gt;</c> can enforce protected properties without the package taking a
 /// dependency on any specific authentication stack.
 /// </summary>
 /// <remarks>
-/// When no implementation is registered, <see cref="TableStorage{T}"/> denies changes to protected
+/// When no implementation is registered, <c>TableStorage&lt;T&gt;</c> denies changes to protected
 /// properties on the whole-entity update path (a changed protected value throws
 /// <see cref="UnauthorizedAccessException"/>).
 /// </remarks>

@@ -36,6 +36,19 @@ copy-pasted into each one.
 dotnet add package Unified.Data.Tables
 ```
 
+This is shipped as two packages:
+
+| Package | Contents | Use it in |
+| --- | --- | --- |
+| **Unified.Data.Tables** | `TableStorage<T>`, the serializer, DI helpers (Azure dependencies) | server / host projects |
+| **Unified.Data.Tables.Abstractions** | `Entity`, `IStorage<T>`, `UpdateBuilder<T>`, `[ProtectedProperty]`, `IProtectedPropertyAuthorizer` — no Azure/hosting deps | shared/domain & Blazor WebAssembly projects |
+
+`Unified.Data.Tables` references the abstractions transitively, so most apps just install it. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone:
+
+```bash
+dotnet add package Unified.Data.Tables.Abstractions
+```
+
 Requires **.NET 10** and an Azure Storage account (or the local [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator).
 
 ---

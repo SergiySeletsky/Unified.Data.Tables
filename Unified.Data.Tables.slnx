@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Unified.Data.Tables.Abstractions/Unified.Data.Tables.Abstractions.csproj" />
     <Project Path="src/Unified.Data.Tables/Unified.Data.Tables.csproj" />
   </Folder>
   <Folder Name="/tests/">

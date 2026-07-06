@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>Unified.Data.Tables.Abstractions</PackageId>
+    <RootNamespace>Unified.Data.Tables</RootNamespace>
+    <AssemblyName>Unified.Data.Tables.Abstractions</AssemblyName>
+    <Description>Browser-safe abstractions for Unified.Data.Tables: the Entity/IEntity base, the generic IStorage&lt;T&gt; repository contract, the UpdateBuilder for partial updates, and [ProtectedProperty] + IProtectedPropertyAuthorizer. No Azure or hosting dependencies — safe to reference from shared/domain layers and Blazor WebAssembly projects.</Description>
+    <PackageTags>azure;table-storage;repository;abstractions;storage;nosql</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

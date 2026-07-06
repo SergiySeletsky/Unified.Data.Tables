@@ -5,17 +5,21 @@
     <PackageId>Unified.Data.Tables</PackageId>
     <RootNamespace>Unified.Data.Tables</RootNamespace>
     <AssemblyName>Unified.Data.Tables</AssemblyName>
-    <Version>0.1.0</Version>
-    <Description>Reusable Azure Table Storage abstraction: a generic IStorage&lt;T&gt; repository over Azure Tables with in-memory caching, optimistic concurrency (ETag), builder-driven partial (Merge) updates, role-gated protected properties, and a reflection-based object-graph serializer (nested types, JSON/GZip fallback, 64KB cell handling).</Description>
+    <Description>Azure Table Storage implementation for Unified.Data.Tables: TableStorage&lt;T&gt; (IStorage&lt;T&gt;) with in-memory caching, ETag optimistic concurrency, builder-driven partial (Merge) updates, role-gated protected properties, and a reflection-based object-graph serializer (nested types, JSON/GZip fallback, 64KB cell handling). Builds on Unified.Data.Tables.Abstractions.</Description>
     <PackageTags>azure;azure-table-storage;table-storage;repository;storage;serialization;nosql;cache</PackageTags>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Ship the repository README as the NuGet package landing page. -->
+    <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>

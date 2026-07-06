@@ -2,7 +2,7 @@ namespace Unified.Data.Tables;
 
 /// <summary>
 /// Generic persistence contract over a single Azure Table (one table per entity type
-/// <typeparamref name="T"/>). Implemented by <see cref="TableStorage{T}"/>.
+/// <typeparamref name="T"/>). Implemented by <c>TableStorage&lt;T&gt;</c> in the Unified.Data.Tables package.
 /// </summary>
 /// <typeparam name="T">The entity type; must derive from <see cref="Entity"/> and have a public parameterless constructor.</typeparam>
 public interface IStorage<T> where T : Entity, new()

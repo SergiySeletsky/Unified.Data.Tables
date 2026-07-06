@@ -45,9 +45,9 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ steps.version.outputs.value }}" ]; then
-            dotnet pack src/Unified.Data.Tables/Unified.Data.Tables.csproj -c Release -o artifacts -p:Version=${{ steps.version.outputs.value }}
+            dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts -p:Version=${{ steps.version.outputs.value }}
           else
-            dotnet pack src/Unified.Data.Tables/Unified.Data.Tables.csproj -c Release -o artifacts
+            dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts
           fi
 
       - name: NuGet login (OIDC trusted publishing)
