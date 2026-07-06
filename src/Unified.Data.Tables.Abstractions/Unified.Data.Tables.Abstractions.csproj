@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>netstandard2.0;net10.0</TargetFrameworks>
     <PackageId>Unified.Data.Tables.Abstractions</PackageId>
     <RootNamespace>Unified.Data.Tables</RootNamespace>
     <AssemblyName>Unified.Data.Tables.Abstractions</AssemblyName>
@@ -16,6 +16,11 @@
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- [Key]/[DataType] live in the shared framework on net10.0, but need this package on netstandard2.0. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.ComponentModel.Annotations" Version="5.0.0" />
   </ItemGroup>
 
 </Project>

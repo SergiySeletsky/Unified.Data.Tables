@@ -71,7 +71,7 @@ public abstract class Entity : IEntity, IEquatable<Entity>
     }
 
     /// <inheritdoc />
-    public override int GetHashCode() => Id.GetHashCode(StringComparison.Ordinal);
+    public override int GetHashCode() => StringComparer.Ordinal.GetHashCode(Id);
 
     private static bool IsTransient(Entity? obj) => obj != null && string.IsNullOrWhiteSpace(obj.Id);
 

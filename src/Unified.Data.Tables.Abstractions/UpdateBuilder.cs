@@ -15,19 +15,21 @@ public class UpdateBuilder<T>
     // bumped automatically on every Merge, and ETag is the row version. Letting callers patch these
     // via SetProperty would either silently corrupt the row's identity or be overridden anyway, so
     // we reject them up front.
-    private static readonly HashSet<string> ManagedPropertyNames = typeof(Entity)
-        .GetProperties()
-        .Select(p => p.Name)
-        .ToHashSet(StringComparer.Ordinal);
+    private static readonly HashSet<string> ManagedPropertyNames = new(
+        typeof(Entity)
+            .GetProperties()
+            .Select(p => p.Name),
+        StringComparer.Ordinal);
 
     // Properties decorated with [ProtectedProperty] are role-gated and must go through dedicated
     // endpoints, never through generic builder-based updates — unless the caller has already
     // verified authorisation and opted in via AllowProtected().
-    private static readonly HashSet<string> ProtectedPropertyNames = typeof(T)
-        .GetProperties()
-        .Where(p => p.GetCustomAttribute<ProtectedPropertyAttribute>() is not null)
-        .Select(p => p.Name)
-        .ToHashSet(StringComparer.Ordinal);
+    private static readonly HashSet<string> ProtectedPropertyNames = new(
+        typeof(T)
+            .GetProperties()
+            .Where(p => p.GetCustomAttribute<ProtectedPropertyAttribute>() is not null)
+            .Select(p => p.Name),
+        StringComparer.Ordinal);
 
     /// <summary>The set of column names to value mappings collected so far.</summary>
     public Dictionary<string, object> Updates { get; } = new();
