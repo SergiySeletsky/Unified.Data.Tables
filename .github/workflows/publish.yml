@@ -20,6 +20,7 @@ jobs:
   publish:
     name: Build & publish to NuGet.org
     runs-on: ubuntu-latest
+    environment: production   # must match the 'Environment' in the nuget.org trusted-publishing policy
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
