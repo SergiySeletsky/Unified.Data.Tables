@@ -116,27 +116,33 @@ public class EntityTests
     }
 
     [Fact]
-    public void Created_DefaultsToUtcNow()
+    public void CreatedAt_DefaultsToUtcNow()
     {
         var before = DateTimeOffset.UtcNow;
         var entity = new TestEntity();
         var after = DateTimeOffset.UtcNow;
-        Assert.InRange(entity.Created, before, after);
+        Assert.InRange(entity.CreatedAt, before, after);
     }
 
     [Fact]
-    public void Modified_DefaultsToUtcNow()
+    public void UpdatedAt_DefaultsToUtcNow()
     {
         var before = DateTimeOffset.UtcNow;
         var entity = new TestEntity();
         var after = DateTimeOffset.UtcNow;
-        Assert.InRange(entity.Modified, before, after);
+        Assert.InRange(entity.UpdatedAt, before, after);
     }
 
     [Fact]
     public void ETag_DefaultsToNull()
     {
         Assert.Null(new TestEntity().ETag);
+    }
+
+    [Fact]
+    public void Timestamp_DefaultsToNull()
+    {
+        Assert.Null(new TestEntity().Timestamp);
     }
 
     [Fact]

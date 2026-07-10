@@ -22,10 +22,54 @@ public class TableStorageTests
     }
 
     [Fact]
-    public void Constructor_CallsCreateIfNotExists()
+    public void Constructor_DoesNotTouchStorage()
     {
         using var h = new StorageHarness<TestEntity>();
-        h.Table.Received(1).CreateIfNotExists(Arg.Any<CancellationToken>());
+
+        // Table creation is lazy — construction (DI resolve) must not perform network I/O.
+        h.Table.DidNotReceive().CreateIfNotExists(Arg.Any<CancellationToken>());
+        _ = h.Table.DidNotReceive().CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task FirstOperation_CreatesTable_ExactlyOnce()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupAdd();
+
+        await h.Store.CreateAsync(new TestEntity { Id = "a|1" });
+        await h.Store.CreateAsync(new TestEntity { Id = "a|2" });
+
+        _ = h.Table.Received(1).CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task EnsureCreatedAsync_CreatesTableEagerly()
+    {
+        using var h = new StorageHarness<TestEntity>();
+
+        await h.Store.EnsureCreatedAsync();
+
+        _ = h.Table.Received(1).CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task TableInit_FailedAttempt_IsRetried_NotPoisoned()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        var calls = 0;
+        h.Table.CreateIfNotExistsAsync(Arg.Any<CancellationToken>())
+            .Returns(_ => calls++ == 0
+                ? Task.FromException<Response<Azure.Data.Tables.Models.TableItem>>(
+                    new RequestFailedException(503, "storage unavailable"))
+                : Task.FromResult<Response<Azure.Data.Tables.Models.TableItem>>(null!));
+        h.SetupAdd();
+
+        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.CreateAsync(new TestEntity { Id = "a|1" }));
+        var recovered = await h.Store.CreateAsync(new TestEntity { Id = "a|2" });
+
+        Assert.NotNull(recovered);
+        _ = h.Table.Received(2).CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
     }
 
     // ── CreateAsync ─────────────────────────────────────────────────────────
@@ -66,7 +110,7 @@ public class TableStorageTests
     }
 
     [Fact]
-    public async Task CreateAsync_SetsCreatedToUtcNow()
+    public async Task CreateAsync_SetsCreatedAtToUtcNow()
     {
         using var h = new StorageHarness<TestEntity>();
         h.SetupAdd();
@@ -75,7 +119,19 @@ public class TableStorageTests
         var result = await h.Store.CreateAsync(new TestEntity { Id = "id1", Name = "Test" });
         var after = DateTimeOffset.UtcNow;
 
-        Assert.InRange(result.Created, before, after);
+        Assert.InRange(result.CreatedAt, before, after);
+    }
+
+    [Fact]
+    public async Task CreateAsync_ResetsTimestamp_UntilNextRead()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupAdd();
+
+        var entity = new TestEntity { Id = "ts1", Name = "Test", Timestamp = DateTimeOffset.UtcNow };
+        var result = await h.Store.CreateAsync(entity);
+
+        Assert.Null(result.Timestamp);
     }
 
     [Fact]
@@ -245,6 +301,18 @@ public class TableStorageTests
         var result = await h.Store.OneAsync("part|row");
 
         Assert.Equal(new ETag("W/\"etag1\"").ToString(), result!.ETag);
+    }
+
+    [Fact]
+    public async Task OneAsync_PopulatesTimestampFromRow()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        var serviceTime = new DateTimeOffset(2026, 7, 10, 12, 0, 0, TimeSpan.Zero);
+        h.SetupGet("part", "row", Mocks.Row("part", "row", timestamp: serviceTime));
+
+        var result = await h.Store.OneAsync("part|row");
+
+        Assert.Equal(serviceTime, result!.Timestamp);
     }
 
     [Fact]
@@ -454,7 +522,7 @@ public class TableStorageTests
     }
 
     [Fact]
-    public async Task UpdateAsync_SetsModifiedToUtcNow()
+    public async Task UpdateAsync_SetsUpdatedAtToUtcNow()
     {
         using var h = new StorageHarness<TestEntity>();
         h.SetupUpdate();
@@ -463,7 +531,19 @@ public class TableStorageTests
         var result = await h.Store.UpdateAsync(new TestEntity { Id = "upd2", Name = "Updated" });
         var after = DateTimeOffset.UtcNow;
 
-        Assert.InRange(result.Modified, before, after);
+        Assert.InRange(result.UpdatedAt, before, after);
+    }
+
+    [Fact]
+    public async Task UpdateAsync_ResetsTimestamp_UntilNextRead()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpdate();
+
+        var entity = new TestEntity { Id = "upd-ts", Name = "x", Timestamp = DateTimeOffset.UtcNow };
+        var result = await h.Store.UpdateAsync(entity);
+
+        Assert.Null(result.Timestamp);
     }
 
     [Fact]
@@ -593,5 +673,393 @@ public class TableStorageTests
         h.Table.Received(3).QueryAsync<TableEntity>(
             Arg.Any<System.Linq.Expressions.Expression<Func<TableEntity, bool>>>(),
             Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    // ── UpsertAsync ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task UpsertAsync_CallsUpsertEntity_InReplaceMode()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpsert();
+
+        await h.Store.UpsertAsync(new TestEntity { Id = "p|r", Name = "x" });
+
+        await h.Table.Received(1).UpsertEntityAsync(
+            Arg.Any<TableEntity>(), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpsertAsync_PopulatesETagFromResponse()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpsert("W/\"upserted\"");
+
+        var result = await h.Store.UpsertAsync(new TestEntity { Id = "p|r", Name = "x" });
+
+        Assert.Equal(new ETag("W/\"upserted\"").ToString(), result.ETag);
+    }
+
+    [Fact]
+    public async Task UpsertAsync_PreservesCallerSuppliedCreatedAt()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpsert();
+        var created = new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        var result = await h.Store.UpsertAsync(new TestEntity { Id = "p|r", CreatedAt = created });
+
+        Assert.Equal(created, result.CreatedAt);
+    }
+
+    [Fact]
+    public async Task UpsertAsync_StampsUpdatedAt_AndResetsTimestamp()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpsert();
+
+        var before = DateTimeOffset.UtcNow;
+        var result = await h.Store.UpsertAsync(new TestEntity { Id = "p|r", Timestamp = DateTimeOffset.UtcNow });
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.InRange(result.UpdatedAt, before, after);
+        Assert.Null(result.Timestamp);
+    }
+
+    [Fact]
+    public async Task UpsertAsync_WithNullEntity_ThrowsArgumentNull()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        await Assert.ThrowsAsync<ArgumentNullException>(() => h.Store.UpsertAsync(null!));
+    }
+
+    [Fact]
+    public async Task UpsertAsync_CachesEntity_AndInvalidatesQueryCache()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryAll();
+        h.SetupUpsert();
+
+        await h.Store.QueryAsync();                                       // warm query cache
+        await h.Store.UpsertAsync(new TestEntity { Id = "up|1", Name = "x" });
+        var cached = await h.Store.OneAsync("up|1");                      // served from entity cache
+        await h.Store.QueryAsync();                                       // query cache invalidated → 2nd SDK call
+
+        Assert.NotNull(cached);
+        await h.Table.DidNotReceive().GetEntityIfExistsAsync<TableEntity>(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+        h.Table.Received(2).QueryAsync<TableEntity>(
+            Arg.Any<string>(), Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpsertAsync_ChangingProtectedProperty_WithoutAuthorizer_Throws()
+    {
+        using var h = new StorageHarness<ProtectedEntity>();   // no authorizer registered
+        var stored = new ProtectedEntity { Id = "all|e1", Name = "old", Salary = 100m }.ToTableEntity("all", "e1");
+        stored.ETag = new ETag("W/\"etag1\"");
+        h.SetupGet("all", "e1", stored);
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(
+            () => h.Store.UpsertAsync(new ProtectedEntity { Id = "all|e1", Name = "old", Salary = 200m }));
+    }
+
+    // ── UpdateAsync (explicit ConcurrencyMode) ──────────────────────────────
+
+    [Fact]
+    public async Task UpdateAsync_Strict_WithoutETag_ThrowsInvalidOperation()
+    {
+        using var h = new StorageHarness<TestEntity>();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" }, ConcurrencyMode.Strict));
+    }
+
+    [Fact]
+    public async Task UpdateAsync_Strict_UsesCallerETag()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpdate("W/\"new\"");
+
+        await h.Store.UpdateAsync(
+            new TestEntity { Id = "p|r", Name = "x", ETag = "W/\"mine\"" }, ConcurrencyMode.Strict);
+
+        await h.Table.Received(1).UpdateEntityAsync(
+            Arg.Any<TableEntity>(), new ETag("W/\"mine\""), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpdateAsync_Strict_412Propagates_WithoutRetry()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
+
+        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.UpdateAsync(
+            new TestEntity { Id = "p|r", Name = "x", ETag = "W/\"mine\"" }, ConcurrencyMode.Strict));
+
+        await h.Table.Received(1).UpdateEntityAsync(
+            Arg.Any<TableEntity>(), Arg.Any<ETag>(), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+        await h.Table.DidNotReceive().GetEntityIfExistsAsync<TableEntity>(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpdateAsync_LastWriterWins_UsesWildcardETag_EvenWhenEntityCarriesOne()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpdate();
+
+        await h.Store.UpdateAsync(
+            new TestEntity { Id = "p|r", Name = "x", ETag = "W/\"stale\"" }, ConcurrencyMode.LastWriterWins);
+
+        await h.Table.Received(1).UpdateEntityAsync(
+            Arg.Any<TableEntity>(), ETag.All, TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+    }
+
+    // ── QueryAsync(QueryOptions) / QueryStreamAsync ─────────────────────────
+
+    [Fact]
+    public async Task QueryOptions_RowKeyPrefix_WithoutPartition_Throws()
+    {
+        using var h = new StorageHarness<TestEntity>();
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => h.Store.QueryAsync(new QueryOptions { RowKeyPrefix = "msg_" }));
+    }
+
+    [Fact]
+    public async Task QueryOptions_NonPositiveTake_Throws()
+    {
+        using var h = new StorageHarness<TestEntity>();
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => h.Store.QueryAsync(new QueryOptions { Take = 0 }));
+    }
+
+    [Fact]
+    public async Task QueryOptions_Partition_BuildsEqualityFilter()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByFilter(Mocks.Row("vis-1", "r1"));
+
+        var results = await h.Store.QueryAsync(new QueryOptions { Partition = "vis-1" });
+
+        Assert.Single(results);
+        Assert.Equal("PartitionKey eq 'vis-1'", h.LastQueryFilter);
+    }
+
+    [Fact]
+    public async Task QueryOptions_RowKeyPrefix_BuildsRangeFilter()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByFilter();
+
+        await h.Store.QueryAsync(new QueryOptions { Partition = "vis-1", RowKeyPrefix = "msg_" });
+
+        // '_' + 1 = '`' — the canonical [prefix, next(prefix)) range.
+        Assert.Equal("PartitionKey eq 'vis-1' and RowKey ge 'msg_' and RowKey lt 'msg`'", h.LastQueryFilter);
+    }
+
+    [Fact]
+    public async Task QueryOptions_PrefixEndingInMaxChar_DropsUpperBound()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByFilter();
+
+        await h.Store.QueryAsync(new QueryOptions { Partition = "p", RowKeyPrefix = "a￿" });
+
+        Assert.Equal("PartitionKey eq 'p' and RowKey ge 'a￿' and RowKey lt 'b'", h.LastQueryFilter);
+    }
+
+    [Fact]
+    public async Task QueryOptions_Take_LimitsResults()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByFilter(Mocks.Row("p", "r1"), Mocks.Row("p", "r2"), Mocks.Row("p", "r3"));
+
+        var results = await h.Store.QueryAsync(new QueryOptions { Partition = "p", Take = 2 });
+
+        Assert.Equal(2, results.Count);
+    }
+
+    [Fact]
+    public async Task QueryOptions_IsNeverCached()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByFilter(Mocks.Row("p", "r1"));
+
+        await h.Store.QueryAsync(new QueryOptions { Partition = "p" });
+        await h.Store.QueryAsync(new QueryOptions { Partition = "p" });
+
+        h.Table.Received(2).QueryAsync<TableEntity>(
+            Arg.Any<string>(), Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task QueryStreamAsync_NullOptions_StreamsWholeTable_WithETagAndTimestamp()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        var serviceTime = new DateTimeOffset(2026, 7, 10, 8, 0, 0, TimeSpan.Zero);
+        h.SetupQueryByFilter(Mocks.Row("p", "r1", timestamp: serviceTime), Mocks.Row("p", "r2"));
+
+        var seen = new List<TestEntity>();
+        await foreach (var entity in h.Store.QueryStreamAsync())
+            seen.Add(entity);
+
+        Assert.Equal(2, seen.Count);
+        Assert.Null(h.LastQueryFilter);
+        Assert.Equal(new ETag("W/\"etag1\"").ToString(), seen[0].ETag);
+        Assert.Equal(serviceTime, seen[0].Timestamp);
+    }
+
+    // ── Batch writes ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task CreateBatchAsync_EmptyCollection_ReturnsZero_WithoutCalls()
+    {
+        using var h = new StorageHarness<TestEntity>();
+
+        var written = await h.Store.CreateBatchAsync([]);
+
+        Assert.Equal(0, written);
+        await h.Table.DidNotReceive().SubmitTransactionAsync(
+            Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpsertBatchAsync_ChunksAt100PerTransaction()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupTransaction();
+        var entities = Enumerable.Range(0, 150)
+            .Select(i => new TestEntity { Id = $"p|r{i:D3}", Value = i })
+            .ToList();
+
+        var written = await h.Store.UpsertBatchAsync(entities);
+
+        Assert.Equal(150, written);
+        await h.Table.Received(2).SubmitTransactionAsync(
+            Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpsertBatchAsync_GroupsByPartition_OneTransactionEach()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupTransaction();
+
+        await h.Store.UpsertBatchAsync(
+        [
+            new TestEntity { Id = "p1|a" },
+            new TestEntity { Id = "p2|a" },
+            new TestEntity { Id = "p1|b" },
+        ]);
+
+        await h.Table.Received(2).SubmitTransactionAsync(
+            Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task CreateBatchAsync_StampsTimestamps_AndNormalizesIds()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupTransaction();
+        var entity = new TestEntity { Id = "  P1 | A ", Timestamp = DateTimeOffset.UtcNow };
+
+        var before = DateTimeOffset.UtcNow;
+        await h.Store.CreateBatchAsync([entity]);
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.Equal("p1-|-a", entity.Id);
+        Assert.InRange(entity.CreatedAt, before, after);
+        Assert.InRange(entity.UpdatedAt, before, after);
+        Assert.Null(entity.Timestamp);
+    }
+
+    [Fact]
+    public async Task UpsertBatchAsync_ResetsETags_ToNull()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupTransaction();
+        var entity = new TestEntity { Id = "p|r", ETag = "W/\"stale\"" };
+
+        await h.Store.UpsertBatchAsync([entity]);
+
+        // Batch sub-responses aren't correlated back; a kept ETag would be a phantom-412 trap.
+        Assert.Null(entity.ETag);
+    }
+
+    [Fact]
+    public async Task UpsertBatchAsync_PartialFailure_StillInvalidatesCaches()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByPartition(Mocks.Row("p", "warm"));
+        await h.Store.QueryAsync("p");                                     // warm the partition query cache
+
+        var calls = 0;
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => calls++ == 0
+                ? Substitute.For<Response<IReadOnlyList<Response>>>()
+                : throw new RequestFailedException(503, "storage unavailable"));
+        var entities = Enumerable.Range(0, 150).Select(i => new TestEntity { Id = $"p|r{i:D3}" }).ToList();
+
+        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.UpsertBatchAsync(entities));
+        await h.Store.QueryAsync("p");                                     // must MISS — first chunk committed
+
+        h.Table.Received(2).QueryAsync<TableEntity>(
+            Arg.Any<System.Linq.Expressions.Expression<Func<TableEntity, bool>>>(),
+            Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task UpsertBatchAsync_EntityWithoutId_Throws()
+    {
+        using var h = new StorageHarness<TestEntity>();
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => h.Store.UpsertBatchAsync([new TestEntity { Id = " " }]));
+    }
+
+    [Fact]
+    public async Task UpsertBatchAsync_InvalidatesQueryCache_ForAffectedPartitions()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByPartition(Mocks.Row("p1", "r1"));
+        h.SetupTransaction();
+
+        await h.Store.QueryAsync("p1");                                    // warm
+        await h.Store.UpsertBatchAsync([new TestEntity { Id = "p1|new" }]);
+        await h.Store.QueryAsync("p1");                                    // must miss
+
+        h.Table.Received(2).QueryAsync<TableEntity>(
+            Arg.Any<System.Linq.Expressions.Expression<Func<TableEntity, bool>>>(),
+            Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    // ── CountAsync ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task CountAsync_CountsAllRows()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByFilter(Mocks.Row("p", "r1"), Mocks.Row("p", "r2"), Mocks.Row("q", "r3"));
+
+        var count = await h.Store.CountAsync();
+
+        Assert.Equal(3, count);
+        Assert.Null(h.LastQueryFilter);
+    }
+
+    [Fact]
+    public async Task CountAsync_WithPartition_FiltersByPartition()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByFilter(Mocks.Row("p", "r1"));
+
+        var count = await h.Store.CountAsync("p");
+
+        Assert.Equal(1, count);
+        Assert.Equal("PartitionKey eq 'p'", h.LastQueryFilter);
     }
 }

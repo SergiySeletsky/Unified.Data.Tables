@@ -36,14 +36,17 @@ public static class Mocks
         return AsyncPageable<TableEntity>.FromPages(new[] { page });
     }
 
-    public static TableEntity Row(string partitionKey, string rowKey, string name = "test", int value = 42)
+    public static TableEntity Row(string partitionKey, string rowKey, string name = "test", int value = 42,
+        DateTimeOffset? timestamp = null)
     {
         var te = new TableEntity(partitionKey, rowKey) { ETag = new ETag("W/\"etag1\"") };
         te["Name"] = name;
         te["Value"] = value;
         te["Id"] = partitionKey == rowKey ? partitionKey : $"{partitionKey}|{rowKey}";
-        te["Created"] = DateTimeOffset.UtcNow;
-        te["Modified"] = DateTimeOffset.UtcNow;
+        te["CreatedAt"] = DateTimeOffset.UtcNow;
+        te["UpdatedAt"] = DateTimeOffset.UtcNow;
+        if (timestamp is not null)
+            te.Timestamp = timestamp;
         return te;
     }
 }
@@ -59,13 +62,17 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
     public MemoryCache Cache { get; }
     public TableStorage<T> Store { get; }
 
-    public StorageHarness(IProtectedPropertyAuthorizer? authorizer = null)
+    public StorageHarness(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
     {
         Service = Substitute.For<TableServiceClient>();
         Table = Substitute.For<TableClient>();
         Service.GetTableClient(typeof(T).Name).Returns(Table);
+        // Table creation is lazy (first operation awaits it); an unmocked substitute would return
+        // a null Task and NRE on await, so every harness store gets a completed init by default.
+        Table.CreateIfNotExistsAsync(Arg.Any<CancellationToken>())
+             .Returns(Task.FromResult<Response<Azure.Data.Tables.Models.TableItem>>(null!));
         Cache = new MemoryCache(new MemoryCacheOptions());
-        Store = new TableStorage<T>(Service, Cache, NullLogger<TableStorage<T>>.Instance, authorizer);
+        Store = new TableStorage<T>(Service, Cache, NullLogger<TableStorage<T>>.Instance, authorizer, options);
     }
 
     public void Dispose() => Cache.Dispose();
@@ -78,6 +85,21 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
     public void SetupUpdate(string etag = "W/\"etag1\"") =>
         Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
              .Returns(Mocks.EtagResponse(etag));
+
+    public void SetupUpsert(string etag = "W/\"etag1\"") =>
+        Table.UpsertEntityAsync(Arg.Any<TableEntity>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+             .Returns(Mocks.EtagResponse(etag));
+
+    /// <summary>The OData filter string passed to the most recent string-filter QueryAsync call.</summary>
+    public string? LastQueryFilter { get; private set; }
+
+    /// <summary>
+    /// Mocks the string-filter QueryAsync overload (used by QueryOptions/stream/count paths and
+    /// the no-partition scan) and captures the filter each call passes.
+    /// </summary>
+    public void SetupQueryByFilter(params TableEntity[] entities) =>
+        Table.QueryAsync<TableEntity>(Arg.Do<string?>(f => LastQueryFilter = f), Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+             .Returns(Mocks.Pageable(entities));
 
     public void SetupDelete() =>
         Table.DeleteEntityAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<ETag>(), Arg.Any<CancellationToken>())

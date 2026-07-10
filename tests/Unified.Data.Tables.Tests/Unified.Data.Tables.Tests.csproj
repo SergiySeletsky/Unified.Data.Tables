@@ -31,6 +31,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Unified.Data.Tables\Unified.Data.Tables.csproj" />
+    <ProjectReference Include="..\..\src\Unified.Data.Tables.InMemory\Unified.Data.Tables.InMemory.csproj" />
   </ItemGroup>
 
   <ItemGroup>

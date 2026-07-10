@@ -10,9 +10,10 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat)](https://github.com/SergiySeletsky/Unified.Data.Tables/compare)
 
 A small, reusable **Azure Table Storage** data layer for .NET: a generic `IStorage<T>` repository with
-in-memory caching, optimistic concurrency, builder-driven partial updates, role-gated properties, and a
+configurable in-memory caching, optimistic concurrency, upserts and batch transactions, bounded
+prefix queries, builder-driven partial updates, role-gated properties, legacy-column aliases, and a
 reflection-based object-graph serializer that transparently handles nested types and the 64&nbsp;KB
-per-cell limit.
+per-cell limit — plus a semantically faithful in-memory backend for tests.
 
 It exists so the same battle-tested storage primitives can be shared across projects instead of being
 copy-pasted into each one.
@@ -21,21 +22,32 @@ copy-pasted into each one.
 
 ## Features
 
-- **Generic repository** — `IStorage<T>` over Azure Tables, one table per entity type (`typeof(T).Name`).
+- **Generic repository** — `IStorage<T>` over Azure Tables, one table per entity type (`typeof(T).Name`),
+  created lazily on first use (`EnsureCreatedAsync()` for fail-fast hosts).
 - **Reflection-based serializer** — flattens nested objects into `Parent_Child` columns, stores enums as
   strings and money-style `decimal`s as doubles, and falls back to JSON (then GZip) for collections and
   complex graphs. Oversized cells are compressed — and, as a last resort, truncated — so a single large
   property can never blow the 64&nbsp;KB limit and lose the whole row.
-- **In-memory caching** — reads are served from `IMemoryCache` (1&nbsp;hour sliding TTL); writes keep the
-  entity cache coherent and invalidate the relevant query caches automatically.
+- **Configurable caching** — reads are served from `IMemoryCache` per a registration-time `CachePolicy`
+  (`Sliding`, `Absolute`, or `Disabled` — per entity type or globally); writes keep the entity cache
+  coherent and invalidate the relevant query caches automatically.
 - **Optimistic concurrency (ETag)** — a caller-supplied `ETag` enforces strict concurrency (a conflict
-  surfaces as `RequestFailedException` 412 → map to 409); without one, a stale-cache conflict is retried once.
+  surfaces as `RequestFailedException` 412 → map to 409); explicit `ConcurrencyMode.Strict` /
+  `LastWriterWins` overloads make intent greppable.
+- **Upsert & batches** — `UpsertAsync` (single round-trip insert-or-replace), `CreateBatchAsync` /
+  `UpsertBatchAsync` (partition-grouped 100-row transactions), `CountAsync` (keys-only projection).
+- **Bounded queries** — `QueryAsync(QueryOptions)` and streaming `QueryStreamAsync` with partition scope,
+  canonical RowKey-prefix ranges, and `Take` — never cached, never a disguised full scan.
 - **Partial (Merge) updates** — `UpdateAsync(id, builder)` writes only the columns you declare, leaving the
   rest of the row untouched with no read required.
+- **Legacy column aliases** — `[ColumnAlias]` reads old column names (e.g. after a property rename) when
+  the canonical column is absent; writes stay canonical, so rows converge without a migration job.
 - **Protected properties** — mark a property `[ProtectedProperty("admin,...")]` and role-gate writes through
   a pluggable `IProtectedPropertyAuthorizer` (the package itself has **no** ASP.NET Core dependency).
-- **Batch partition delete** — `DeletePartitionAsync` removes a whole partition in 100-entity transactions.
-- **Composite id convention** — `Id` is `"{PartitionKey}|{RowKey}"`; row keys may themselves contain `|`.
+- **Faithful in-memory backend** — `Unified.Data.Tables.InMemory` round-trips rows through the REAL
+  serializer with 409/412/404 and ETag semantics, so tests exercise production behaviour.
+- **Composite id convention** — `Id` is `"{PartitionKey}|{RowKey}"` (shared helpers in `EntityId`); row keys
+  may themselves contain `|`.
 
 ---
 
@@ -45,18 +57,15 @@ copy-pasted into each one.
 dotnet add package Unified.Data.Tables
 ```
 
-This is shipped as two packages:
+This is shipped as three packages:
 
 | Package | Contents | Use it in |
 | --- | --- | --- |
-| **Unified.Data.Tables** | `TableStorage<T>`, the serializer, DI helpers (Azure dependencies) | server / host projects |
-| **Unified.Data.Tables.Abstractions** | `Entity`, `IStorage<T>`, `UpdateBuilder<T>`, `[ProtectedProperty]`, `IProtectedPropertyAuthorizer` — no Azure/hosting deps | shared/domain & Blazor WebAssembly projects |
+| **Unified.Data.Tables** | `TableStorage<T>`, the serializer, cache policies, DI helpers (Azure dependencies) | server / host projects |
+| **Unified.Data.Tables.Abstractions** | `Entity`, `IStorage<T>`, `QueryOptions`, `ConcurrencyMode`, `UpdateBuilder<T>`, `EntityId`, `[ColumnAlias]`, `[ProtectedProperty]` — no Azure/hosting deps | shared/domain & Blazor WebAssembly projects |
+| **Unified.Data.Tables.InMemory** | `InMemoryStorage<T>` — serializer-faithful in-memory `IStorage<T>` | test projects, dev/offline mode |
 
-`Unified.Data.Tables` references the abstractions transitively, so most apps just install it. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone:
-
-```bash
-dotnet add package Unified.Data.Tables.Abstractions
-```
+`Unified.Data.Tables` references the abstractions transitively, so most apps just install it. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone.
 
 Requires **.NET 10** and an Azure Storage account (or the local [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator).
 
@@ -66,8 +75,8 @@ Requires **.NET 10** and an Azure Storage account (or the local [Azurite](https:
 
 ### 1. Define an entity
 
-Derive from `Entity`. `Id` is the composite `"{PartitionKey}|{RowKey}"`; `Created`, `Modified` and `ETag`
-are managed for you.
+Derive from `Entity`. `Id` is the composite `"{PartitionKey}|{RowKey}"`; `CreatedAt`, `UpdatedAt`,
+`ETag` and the service-managed `Timestamp` are maintained for you.
 
 ```csharp
 using Unified.Data.Tables;
@@ -86,15 +95,31 @@ public sealed class Customer : Entity
 using Azure.Data.Tables;
 using Unified.Data.Tables;
 
-// Option A — build the TableServiceClient from a connection string:
+// Option A — from a connection string:
 builder.Services.AddUnifiedTableStorage(connectionString);
 
-// Option B — you already register a TableServiceClient yourself:
+// Option B — managed identity:
+builder.Services.AddUnifiedTableStorage(
+    new Uri("https://myaccount.table.core.windows.net"), new DefaultAzureCredential());
+
+// Option C — you already register a TableServiceClient yourself:
 builder.Services.AddSingleton(_ => new TableServiceClient(connectionString));
 builder.Services.AddUnifiedTableStorage();
+
+// Cache policy is a DEPLOYMENT concern — configure it per host:
+builder.Services.AddUnifiedTableStorage(connectionString, o =>
+{
+    o.Cache = CachePolicy.Absolute(TimeSpan.FromSeconds(30));   // bound cross-process staleness
+    o.CacheFor<ChatMessage>(CachePolicy.Disabled);              // huge partitions — don't cache
+});
 ```
 
-Both register `IMemoryCache` and the open-generic `IStorage<T>` → `TableStorage<T>` mapping as singletons.
+All overloads register `IMemoryCache`, the configured options, and the open-generic
+`IStorage<T>` → `TableStorage<T>` mapping as singletons.
+
+> **Sharing tables across processes?** A second process (worker, subprocess, sidecar) writing to the
+> same tables makes `Sliding` caching unbounded-stale in the readers. Use `CachePolicy.Disabled` in
+> secondary processes and `Absolute` with a short TTL in the primary.
 
 ### 3. Use it
 
@@ -102,6 +127,7 @@ Both register `IMemoryCache` and the open-generic `IStorage<T>` → `TableStorag
 public sealed class CustomerService(IStorage<Customer> storage)
 {
     public Task<Customer> Add(Customer c)          => storage.CreateAsync(c);
+    public Task<Customer> Save(Customer c)         => storage.UpsertAsync(c);
     public Task<Customer?> Get(string id)          => storage.OneAsync(id);
     public Task<bool> Exists(string id)            => storage.ExistsAsync(id);
     public Task<IEnumerable<Customer>> InRegion(string region) => storage.QueryAsync(region);
@@ -130,14 +156,40 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 
 | Method | Description |
 | --- | --- |
-| `CreateAsync(entity)` | Insert a new row; returns it with its populated `ETag`. |
+| `CreateAsync(entity)` | Insert a new row (409 when it exists); returns it with its populated `ETag`. |
+| `UpsertAsync(entity)` | Insert-or-replace in one round trip. Unconditional by design (last writer wins); preserves a caller-supplied `CreatedAt`. |
 | `OneAsync(id)` | Fetch one row by composite id, or `null`. |
 | `ExistsAsync(id)` | Whether a row exists (cache-aware). |
-| `QueryAsync(partition?)` | All rows, or just one partition when supplied. |
-| `UpdateAsync(entity)` | Full replace with ETag concurrency. |
+| `QueryAsync(partition?)` | All rows, or just one partition (the cached read path). |
+| `QueryAsync(options)` | Bounded query: partition + RowKey prefix + Take. Never cached. |
+| `QueryStreamAsync(options?)` | Streaming variant — never caches, never buffers. |
+| `UpdateAsync(entity)` | Full replace with adaptive (`Auto`) ETag concurrency. |
+| `UpdateAsync(entity, mode)` | Full replace with explicit `ConcurrencyMode`. |
 | `UpdateAsync(id, builder)` | Partial `Merge` — writes only the declared columns. |
-| `DeleteAsync(id)` | Delete one row. |
+| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction. |
+| `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking. |
+| `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
+| `DeleteAsync(id)` | Delete one row (idempotent). |
 | `DeletePartitionAsync(partition)` | Batch-delete a whole partition; returns the count. |
+
+### Bounded queries
+
+```csharp
+// Chat messages for one vision, bounded by RowKey prefix:
+var messages = await storage.QueryAsync(new QueryOptions
+{
+    Partition = visionId,
+    RowKeyPrefix = "msg_",
+    Take = 100,
+});
+
+// Stream a huge partition without buffering:
+await foreach (var run in storage.QueryStreamAsync(new QueryOptions { Partition = visionId }))
+    Process(run);
+```
+
+Results arrive in lexical (PartitionKey, RowKey) order — encode any other order into your RowKeys.
+`RowKeyPrefix` requires `Partition` (a cross-partition RowKey range would be a full table scan).
 
 ### Partial updates
 
@@ -160,12 +212,52 @@ c!.Balance += 100;
 await storage.UpdateAsync(c);   // 412 if the row changed since it was read
 ```
 
+Pick semantics explicitly when it matters:
+
+1. **Disjoint-field mutation** → `UpdateAsync(id, builder)` — Merge, race-safe by construction.
+2. **Read-modify-write of the whole object** → `UpdateAsync(entity)` — `Auto`: strict when the ETag
+   round-tripped, cached-ETag with one retry otherwise.
+3. **Deliberate overwrite** → `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` — explicit and
+   greppable. (Don't null the ETag to "turn off" concurrency; that silently selects the cached-ETag
+   path, which is neither strict nor last-writer-wins.)
+4. **Mandatory round-trip** → `UpdateAsync(entity, ConcurrencyMode.Strict)` — throws
+   `InvalidOperationException` when no ETag is present instead of degrading.
+
+`Entity.Timestamp` mirrors the service-managed last-write time: populated on every read, reset to
+`null` on writes (write responses don't carry it), never stored as a column. Unlike `UpdatedAt` it is
+bumped by ANY storage write — including migrations — and cannot be set by clients.
+
+---
+
+## Legacy column aliases
+
+Renamed a property (or adopted this package with pre-existing rows)? Declare the old column name and
+reads fall back to it whenever the canonical column is absent — writes always use the property name,
+so rows converge to the canonical schema as they are rewritten. No migration job.
+
+```csharp
+// Property you own:
+public sealed class Customer : Entity
+{
+    [ColumnAlias("FullName")]                       // rows written before the rename
+    public string Name { get; set; } = "";
+}
+
+// Inherited property (e.g. the Entity base timestamps, pre-0.3 names):
+[ColumnAlias(nameof(Entity.CreatedAt), "Created")]
+[ColumnAlias(nameof(Entity.UpdatedAt), "Modified")]
+public sealed class LegacyCustomer : Entity { }
+```
+
+The canonical column wins unconditionally when both exist. Aliases cover the `__Json`/`__GZip` cell
+variants and are validated eagerly (collisions and unknown targets throw on first use of the type).
+
 ---
 
 ## Protected properties
 
-Gate sensitive columns behind roles. Enforcement runs on the whole-entity update path and needs an
-`IProtectedPropertyAuthorizer`; if none is registered, changing a protected value is denied.
+Gate sensitive columns behind roles. Enforcement runs on the whole-entity update/upsert paths and
+needs an `IProtectedPropertyAuthorizer`; if none is registered, changing a protected value is denied.
 
 ```csharp
 public sealed class Employee : Entity
@@ -198,6 +290,9 @@ For the builder path, protected properties are rejected unless you opt in after 
 await storage.UpdateAsync(id, b => b.AllowProtected().SetProperty(x => x.Salary, 5000m));
 ```
 
+Batch writes bypass protected-property enforcement (per-row reads would defeat the batch) — treat
+them as trusted server-side paths.
+
 ---
 
 ## Serialization
@@ -216,12 +311,14 @@ Customer     back = row.FromTableEntity<Customer>();
 - **Legacy tolerance** — a stored date surfaced by the SDK as a `DateTime` or a `string` still
   deserializes into a `DateTimeOffset` (or `DateTime`) property without throwing.
 - Set `persistType: true` to embed the type name and use the late-bound `FromTableEntity()` overload.
+- `TableEntitySerializer.FlattenProperty` is public for alternative `IStorage<T>` implementations.
 
 ---
 
 ## Id convention
 
-`Entity.Id` is a composite string split on the **first** `|`:
+`Entity.Id` is a composite string split on the **first** `|` (helpers: `EntityId.Normalize`,
+`EntityId.Split`, `EntityId.Combine`):
 
 | `Id` | PartitionKey | RowKey |
 | --- | --- | --- |
@@ -231,6 +328,25 @@ Customer     back = row.FromTableEntity<Customer>();
 
 Ids are normalized on write (`trim → replace spaces with '-' → ToLowerInvariant`). `Id` is also stored as
 a data column, so the full composite id is preserved on read.
+
+---
+
+## Testing with Unified.Data.Tables.InMemory
+
+```csharp
+// In tests (or a dev/offline host):
+services.AddUnifiedInMemoryStorage();          // open-generic IStorage<> → InMemoryStorage<>
+
+var store = new InMemoryStorage<Customer>();   // or construct directly
+await store.CreateAsync(new Customer { Id = "eu|alice" });
+Assert.Equal(1, store.Count);                  // + Clear(), Snapshot() conveniences
+```
+
+The fake is deliberately faithful: rows round-trip through the REAL serializer (decimal-as-double,
+enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `CreateAsync` throws 409,
+updating a missing row throws 404, stale ETags throw 412 per `ConcurrencyMode`, deletes are idempotent,
+and results arrive in lexical key order — so a green test against the fake means the same code holds
+against Azure Tables.
 
 ---
 
