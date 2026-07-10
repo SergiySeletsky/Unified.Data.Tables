@@ -628,15 +628,16 @@ public class TableStorageTests
     }
 
     [Fact]
-    public async Task UpdateAsync_OnETagMismatch_WhenEntityDeleted_Throws()
+    public async Task UpdateAsync_OnETagMismatch_WhenEntityDeleted_ThrowsConflict()
     {
         using var h = new StorageHarness<TestEntity>();
         h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
             .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
         h.SetupGet("deleted", "key", entity: null);
 
-        await Assert.ThrowsAsync<RequestFailedException>(
+        var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(
             () => h.Store.UpdateAsync(new TestEntity { Id = "deleted|key", Name = "Gone" }));
+        Assert.IsType<RequestFailedException>(ex.InnerException);
     }
 
     [Fact]
@@ -646,10 +647,12 @@ public class TableStorageTests
         h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
             .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
 
-        await Assert.ThrowsAsync<RequestFailedException>(
+        var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(
             () => h.Store.UpdateAsync(new TestEntity { Id = "strict|key", Name = "x", ETag = "W/\"caller\"" }));
 
-        // Strict optimistic concurrency: the 412 surfaces, no re-fetch, no retry.
+        // Strict optimistic concurrency: the conflict surfaces, no re-fetch, no retry; the
+        // provider's 412 rides along as the inner exception.
+        Assert.Equal(412, Assert.IsType<RequestFailedException>(ex.InnerException).Status);
         await h.Table.Received(1).UpdateEntityAsync(
             Arg.Any<TableEntity>(), Arg.Any<ETag>(), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
         await h.Table.DidNotReceive().GetEntityIfExistsAsync<TableEntity>(
@@ -789,13 +792,13 @@ public class TableStorageTests
     }
 
     [Fact]
-    public async Task UpdateAsync_Strict_412Propagates_WithoutRetry()
+    public async Task UpdateAsync_Strict_ConflictPropagates_WithoutRetry()
     {
         using var h = new StorageHarness<TestEntity>();
         h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
             .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
 
-        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.UpdateAsync(
+        await Assert.ThrowsAsync<ConcurrencyConflictException>(() => h.Store.UpdateAsync(
             new TestEntity { Id = "p|r", Name = "x", ETag = "W/\"mine\"" }, ConcurrencyMode.Strict));
 
         await h.Table.Received(1).UpdateEntityAsync(

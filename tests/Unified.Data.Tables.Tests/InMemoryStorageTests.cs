@@ -110,7 +110,7 @@ public class InMemoryStorageTests
     }
 
     [Fact]
-    public async Task UpdateAsync_WithStaleETag_Throws412()
+    public async Task UpdateAsync_WithStaleETag_ThrowsConflict()
     {
         var store = new InMemoryStorage<TestEntity>();
         await store.CreateAsync(new TestEntity { Id = "p|r", Name = "v1" });
@@ -118,9 +118,9 @@ public class InMemoryStorageTests
         await store.UpdateAsync(new TestEntity { Id = "p|r", Name = "v2" });   // no ETag → LWW, bumps version
 
         readCopy!.Name = "conflicting";
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => store.UpdateAsync(readCopy));
+        var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(() => store.UpdateAsync(readCopy));
 
-        Assert.Equal(412, ex.Status);
+        Assert.Equal("p|r", ex.Id);
     }
 
     [Fact]

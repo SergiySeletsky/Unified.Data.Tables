@@ -6,10 +6,14 @@ namespace Unified.Data.Tables;
 /// <summary>
 /// Fluent, type-safe collector of the columns a builder-based partial update should write.
 /// Passed to <see cref="IStorage{T}.UpdateAsync(string, System.Action{UpdateBuilder{T}}, System.Threading.CancellationToken)"/>.
+/// Supports nested property paths (<c>x =&gt; x.Address.City</c> → column <c>Address_City</c>) and
+/// optional optimistic concurrency via <see cref="WithETag"/>.
 /// </summary>
 /// <typeparam name="T">The entity type being updated.</typeparam>
 public class UpdateBuilder<T>
 {
+    private const char PathSeparator = '_';
+
     // Properties declared on the Entity base (Id, CreatedAt, UpdatedAt, ETag, Timestamp) are
     // managed by the storage layer — Id is part of the partition+row key, CreatedAt is set on
     // insert, UpdatedAt is bumped automatically on every Merge, ETag is the row version, and
@@ -31,10 +35,33 @@ public class UpdateBuilder<T>
             .Select(p => p.Name),
         StringComparer.Ordinal);
 
-    /// <summary>The set of column names to value mappings collected so far.</summary>
+    /// <summary>
+    /// The property paths to write, keyed by the flattened column path (<c>"Name"</c>,
+    /// <c>"Address_City"</c>) — the same convention the serializer uses for nested columns.
+    /// </summary>
     public Dictionary<string, object> Updates { get; } = new();
 
+    /// <summary>
+    /// The ETag to enforce on the merge, or <c>null</c> for an unconditional merge. See
+    /// <see cref="WithETag"/>.
+    /// </summary>
+    public string? ETag { get; private set; }
+
     private bool _protectedAllowed;
+
+    /// <summary>
+    /// Makes the partial update conditional: the merge only applies when the row still carries
+    /// <paramref name="etag"/> (as read via <see cref="Entity.ETag"/>); otherwise the update fails
+    /// with <see cref="ConcurrencyConflictException"/>. Combine with a re-read loop for
+    /// compare-and-swap on specific columns.
+    /// </summary>
+    public UpdateBuilder<T> WithETag(string etag)
+    {
+        if (string.IsNullOrEmpty(etag))
+            throw new ArgumentException("ETag must be a non-empty row version read from the entity.", nameof(etag));
+        ETag = etag;
+        return this;
+    }
 
     /// <summary>
     /// Unlocks <see cref="ProtectedPropertyAttribute"/>-decorated properties for this builder
@@ -49,44 +76,64 @@ public class UpdateBuilder<T>
 
     /// <summary>
     /// Records that the property selected by <paramref name="propertyPicker"/> should be set to
-    /// <paramref name="value"/>.
+    /// <paramref name="value"/>. Nested access (<c>x =&gt; x.Address.City</c>) writes the flattened
+    /// <c>Address_City</c> column, leaving sibling columns of the nested object untouched.
     /// </summary>
     /// <exception cref="InvalidOperationException">
     /// The property is managed by the storage layer, is a protected property that has not been
     /// unlocked via <see cref="AllowProtected"/>, or was already set in this call.
     /// </exception>
     /// <exception cref="ArgumentNullException"><paramref name="value"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException">The expression is not a property access rooted at the lambda parameter.</exception>
     public UpdateBuilder<T> SetProperty<TProp>(
         Expression<Func<T, TProp>> propertyPicker,
         TProp value)
     {
-        string propertyName = GetPropertyName(propertyPicker);
+        var path = GetPropertyPath(propertyPicker);
+        var rootProperty = path[0];
+        var columnPath = string.Join(PathSeparator.ToString(), path);
 
-        if (ManagedPropertyNames.Contains(propertyName))
+        if (ManagedPropertyNames.Contains(rootProperty))
             throw new InvalidOperationException(
-                $"'{propertyName}' is managed by the storage layer and cannot be set via SetProperty.");
+                $"'{rootProperty}' is managed by the storage layer and cannot be set via SetProperty.");
 
-        if (ProtectedPropertyNames.Contains(propertyName) && !_protectedAllowed)
+        if (ProtectedPropertyNames.Contains(rootProperty) && !_protectedAllowed)
             throw new InvalidOperationException(
-                $"'{propertyName}' is a [ProtectedProperty] and cannot be set via the generic UpdateBuilder. Use a dedicated endpoint or call AllowProtected().");
+                $"'{rootProperty}' is a [ProtectedProperty] and cannot be set via the generic UpdateBuilder. Use a dedicated endpoint or call AllowProtected().");
 
-        if (Updates.ContainsKey(propertyName))
+        if (Updates.ContainsKey(columnPath))
             throw new InvalidOperationException(
-                $"Property '{propertyName}' was already set in this UpdateAsync call.");
+                $"Property '{columnPath}' was already set in this UpdateAsync call.");
 
         if (value is null)
-            throw new ArgumentNullException(nameof(value), $"Value for property '{propertyName}' cannot be null.");
+            throw new ArgumentNullException(nameof(value), $"Value for property '{columnPath}' cannot be null.");
 
-        Updates[propertyName] = value;
+        Updates[columnPath] = value;
         return this;
     }
 
-    private static string GetPropertyName<TProp>(Expression<Func<T, TProp>> expression)
+    // Walks the member chain back to the lambda parameter so nested access produces the full
+    // flattened path. Anything not rooted at the parameter (closures, method calls, casts of
+    // non-members) is rejected — silently accepting it is how columns end up orphaned.
+    private static IReadOnlyList<string> GetPropertyPath<TProp>(Expression<Func<T, TProp>> expression)
     {
-        if (expression.Body is MemberExpression member)
+        var segments = new Stack<string>();
+        var node = expression.Body;
+
+        // Unwrap a boxing/implicit conversion (e.g. value-type property picked as object).
+        if (node is UnaryExpression { NodeType: ExpressionType.Convert or ExpressionType.ConvertChecked } unary)
+            node = unary.Operand;
+
+        while (node is MemberExpression { Member: PropertyInfo } member)
         {
-            return member.Member.Name;
+            segments.Push(member.Member.Name);
+            node = member.Expression!;
         }
-        throw new ArgumentException("Expression must be a simple property access (e.g., x => x.Name).");
+
+        if (node is not ParameterExpression || segments.Count == 0)
+            throw new ArgumentException(
+                "Expression must be a property access rooted at the lambda parameter (e.g., x => x.Name or x => x.Address.City).");
+
+        return segments.ToArray();
     }
 }

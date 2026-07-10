@@ -41,7 +41,8 @@ public interface IStorage<T> where T : Entity, new()
     /// <summary>
     /// Replace an existing document in full using <see cref="ConcurrencyMode.Auto"/> semantics:
     /// if the caller supplies <see cref="Entity.ETag"/>, strict optimistic concurrency is
-    /// enforced; otherwise a stale-cache conflict is retried once.
+    /// enforced (a conflict throws <see cref="ConcurrencyConflictException"/>); otherwise a
+    /// stale-cache conflict is retried once.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -50,9 +51,11 @@ public interface IStorage<T> where T : Entity, new()
 
     /// <summary>
     /// Replace an existing document in full with explicit concurrency semantics — see
-    /// <see cref="ConcurrencyMode"/>. Prefer builder-based
+    /// <see cref="ConcurrencyMode"/>. A failed concurrency check throws
+    /// <see cref="ConcurrencyConflictException"/>. Prefer builder-based
     /// <see cref="UpdateAsync(string, Action{UpdateBuilder{T}}, CancellationToken)"/> for
-    /// disjoint-field mutation; it is race-safe by construction.
+    /// disjoint-field mutation (race-safe by construction), and
+    /// <c>StorageExtensions.MutateAsync</c> for values derived from the current row.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="mode">The optimistic-concurrency behaviour to apply.</param>
@@ -62,12 +65,16 @@ public interface IStorage<T> where T : Entity, new()
 
     /// <summary>
     /// Apply a builder-driven partial update to a single document by id. Only the declared columns
-    /// are written (server-side <c>Merge</c>); untouched columns are preserved, and no read is needed.
+    /// are written (server-side <c>Merge</c>); untouched columns are preserved, and no read is
+    /// needed — concurrent updates to disjoint columns never conflict. When the builder carries
+    /// <see cref="UpdateBuilder{T}.WithETag"/>, the merge is conditional and a lost race throws
+    /// <see cref="ConcurrencyConflictException"/>.
     /// </summary>
     /// <param name="id">Composite document identifier.</param>
     /// <param name="builderAction">Configures which properties to mutate.</param>
     /// <param name="ct">Cancellation token.</param>
-    Task UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default);
+    /// <returns>The row's new ETag (empty when the backend did not report one).</returns>
+    Task<string> UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default);
 
     /// <summary>Get a single document by its composite id, or <c>null</c> when it does not exist.</summary>
     /// <param name="id">Composite document identifier.</param>
