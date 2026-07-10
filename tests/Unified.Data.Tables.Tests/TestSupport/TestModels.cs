@@ -116,3 +116,33 @@ public sealed class ProtectedEntity : Entity
     [ProtectedProperty("admin,accountant")]
     public decimal Salary { get; set; }
 }
+
+/// <summary>
+/// Entity whose base-class timestamps were historically stored under legacy column names —
+/// the class-level <see cref="ColumnAliasAttribute"/> shape for inherited properties.
+/// </summary>
+[ColumnAlias(nameof(Entity.CreatedAt), "Created")]
+[ColumnAlias(nameof(Entity.UpdatedAt), "Modified")]
+public class LegacyStampedEntity : Entity
+{
+    public string Name { get; set; } = "";
+}
+
+/// <summary>Inherits the class-level aliases from <see cref="LegacyStampedEntity"/>.</summary>
+public sealed class InheritedAliasEntity : LegacyStampedEntity
+{
+}
+
+/// <summary>Property-level alias — the property was renamed at some point.</summary>
+public sealed class RenamedPropEntity : Entity
+{
+    [ColumnAlias("OldName")]
+    public string NewName { get; set; } = "";
+}
+
+/// <summary>Alias on a JSON-serialized (collection) property, exercising the suffix variants.</summary>
+public sealed class AliasedListEntity : Entity
+{
+    [ColumnAlias("OldTags")]
+    public List<string> Tags { get; set; } = [];
+}

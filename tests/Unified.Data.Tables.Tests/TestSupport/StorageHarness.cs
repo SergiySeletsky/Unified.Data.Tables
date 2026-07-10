@@ -82,6 +82,21 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
         Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
              .Returns(Mocks.EtagResponse(etag));
 
+    public void SetupUpsert(string etag = "W/\"etag1\"") =>
+        Table.UpsertEntityAsync(Arg.Any<TableEntity>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+             .Returns(Mocks.EtagResponse(etag));
+
+    /// <summary>The OData filter string passed to the most recent string-filter QueryAsync call.</summary>
+    public string? LastQueryFilter { get; private set; }
+
+    /// <summary>
+    /// Mocks the string-filter QueryAsync overload (used by QueryOptions/stream/count paths and
+    /// the no-partition scan) and captures the filter each call passes.
+    /// </summary>
+    public void SetupQueryByFilter(params TableEntity[] entities) =>
+        Table.QueryAsync<TableEntity>(Arg.Do<string?>(f => LastQueryFilter = f), Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+             .Returns(Mocks.Pageable(entities));
+
     public void SetupDelete() =>
         Table.DeleteEntityAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<ETag>(), Arg.Any<CancellationToken>())
              .Returns(new FakeResponse());

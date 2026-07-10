@@ -58,7 +58,7 @@ public static class TableEntitySerializer
             result = (T)SetProperty(result, val);
         }
 
-        return result;
+        return (T)ApplyColumnAliases(result!, entity, meta);
     }
 
     /// <summary>Late-bound deserialize; requires the row to have been written with <c>persistType: true</c>.</summary>
@@ -82,15 +82,63 @@ public static class TableEntitySerializer
             result = SetProperty(result, val);
         }
 
+        return ApplyColumnAliases(result, entity, meta);
+    }
+
+    // Mirrors TableEntityValue's private cell-format suffixes — an alias column may carry any of
+    // the three representations a canonical column can.
+    private static readonly string[] AliasSuffixes = ["", "__Json", "__GZip"];
+
+    /// <summary>
+    /// Second pass for <see cref="ColumnAliasAttribute"/>: a legacy (alias) column deserializes
+    /// into its property only when no canonical column for that property exists on the row, so
+    /// canonical data always wins and rewrites converge rows to the canonical schema.
+    /// </summary>
+    private static object ApplyColumnAliases(object result, TableEntity entity, TypeMetadata meta)
+    {
+        if (meta.AliasMap.Count == 0)
+            return result;
+
+        foreach (var kv in meta.AliasMap)
+        {
+            var aliasColumn = kv.Key;
+            var property = kv.Value;
+
+            var hasCanonical = false;
+            foreach (var suffix in AliasSuffixes)
+            {
+                if (entity.ContainsKey(property.Name + suffix))
+                {
+                    hasCanonical = true;
+                    break;
+                }
+            }
+            if (hasCanonical)
+                continue;
+
+            foreach (var suffix in AliasSuffixes)
+            {
+                if (entity.TryGetValue(aliasColumn + suffix, out var raw) && raw is not null)
+                {
+                    // Re-key the cell to the canonical name (+ its format suffix) and reuse the
+                    // normal deserialization path.
+                    var val = TableEntityValue.Create(property.Name + suffix, raw);
+                    result = SetProperty(result, val);
+                    break;
+                }
+            }
+        }
+
         return result;
     }
 
     /// <summary>
     /// Flatten a single named property/value into the column(s) it occupies on a row. Top-level
     /// scalars produce one entry; nested complex types fan out to <c>Parent_Child</c> columns just
-    /// like the full <see cref="ToTableEntity"/> path. Used by partial-update (Merge) flows.
+    /// like the full <see cref="ToTableEntity"/> path. Used by partial-update (Merge) flows and by
+    /// alternative <see cref="IStorage{T}"/> implementations (e.g. in-memory test doubles).
     /// </summary>
-    internal static Dictionary<string, object> FlattenProperty(string propertyName, object value)
+    public static Dictionary<string, object> FlattenProperty(string propertyName, object value)
     {
         var dict = new Dictionary<string, object>();
         if (value == null) return dict;
@@ -587,16 +635,65 @@ internal static class TypeMetadataCache
         var map = props.ToDictionary(p => p.Name, p => p);
         Func<object> creator = () => Activator.CreateInstance(t)!;
 
-        return new TypeMetadata(props, map, creator);
+        return new TypeMetadata(props, map, BuildAliasMap(t, map), creator);
+    }
+
+    // Collect [ColumnAlias] declarations — property-level for owned properties, class-level
+    // (inherited) for properties on base types the annotating class doesn't own — and validate
+    // them eagerly so a bad alias fails on first use of the type, not on some later row shape.
+    private static Dictionary<string, PropertyInfo> BuildAliasMap(Type t, Dictionary<string, PropertyInfo> map)
+    {
+        var aliases = new Dictionary<string, PropertyInfo>(StringComparer.Ordinal);
+
+        foreach (var prop in map.Values)
+        {
+            foreach (var attr in prop.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+            {
+                if (attr.PropertyName is not null)
+                    throw new InvalidOperationException(
+                        $"Property-level [ColumnAlias] on {t.Name}.{prop.Name} must use the single-argument constructor.");
+                AddAlias(aliases, map, attr.LegacyColumnName, prop, t);
+            }
+        }
+
+        foreach (var attr in t.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+        {
+            if (attr.PropertyName is null)
+                throw new InvalidOperationException(
+                    $"Class-level [ColumnAlias] on {t.Name} must use the (propertyName, legacyColumnName) constructor.");
+            if (!map.TryGetValue(attr.PropertyName, out var target))
+                throw new InvalidOperationException(
+                    $"[ColumnAlias] on {t.Name} references unknown or non-serialized property '{attr.PropertyName}'.");
+            AddAlias(aliases, map, attr.LegacyColumnName, target, t);
+        }
+
+        return aliases;
+    }
+
+    private static void AddAlias(
+        Dictionary<string, PropertyInfo> aliases, Dictionary<string, PropertyInfo> map,
+        string alias, PropertyInfo target, Type t)
+    {
+        if (string.IsNullOrWhiteSpace(alias))
+            throw new InvalidOperationException($"[ColumnAlias] on {t.Name} declares an empty legacy column name.");
+        if (map.ContainsKey(alias))
+            throw new InvalidOperationException(
+                $"[ColumnAlias] '{alias}' on {t.Name} collides with a real property name.");
+        if (aliases.TryGetValue(alias, out var existing) && !ReferenceEquals(existing, target))
+            throw new InvalidOperationException(
+                $"[ColumnAlias] '{alias}' on {t.Name} is declared for both '{existing.Name}' and '{target.Name}'.");
+        aliases[alias] = target;
     }
 }
 
 internal sealed class TypeMetadata(
     ImmutableList<PropertyInfo> props,
     Dictionary<string, PropertyInfo> map,
+    Dictionary<string, PropertyInfo> aliasMap,
     Func<object> creator)
 {
     public ImmutableList<PropertyInfo> Properties { get; } = props;
     public Dictionary<string, PropertyInfo> PropertyMap { get; } = map;
+    public Dictionary<string, PropertyInfo> AliasMap { get; } = aliasMap;
     public Func<object> Creator { get; } = creator;
 }

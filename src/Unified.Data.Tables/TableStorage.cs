@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using Azure;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Caching.Memory;
@@ -246,6 +247,154 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         return results;
     }
 
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<T>> QueryAsync(QueryOptions options, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var results = new List<T>(options.Take ?? 4);
+        await foreach (var entity in QueryStreamAsync(options, ct))
+        {
+            results.Add(entity);
+        }
+        return results;
+    }
+
+    /// <inheritdoc />
+    public async IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var partition = string.IsNullOrWhiteSpace(options?.Partition) ? null : options!.Partition;
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options?.RowKeyPrefix) ? null : options!.RowKeyPrefix;
+        var take = options?.Take;
+
+        if (rowKeyPrefix is not null && partition is null)
+            throw new ArgumentException(
+                "RowKeyPrefix requires Partition — a cross-partition RowKey range is a full table scan wearing a filter.",
+                nameof(options));
+        if (take is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(options), take, "Take must be positive.");
+
+        var filter = BuildFilter(partition, rowKeyPrefix);
+        var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
+        var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, cancellationToken: ct);
+
+        var yielded = 0;
+        await foreach (var row in pageable.WithCancellation(ct))
+        {
+            var entity = row.FromTableEntity<T>();
+            entity.ETag = row.ETag.ToString();
+            entity.Timestamp = row.Timestamp;
+            yield return entity;
+
+            if (take is int max && ++yielded >= max)
+                yield break;
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
+    /// the point of a batch) — treat them as trusted server-side paths.</remarks>
+    public Task<int> CreateBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
+        => WriteBatchAsync(entities, TableTransactionActionType.Add, ct);
+
+    /// <inheritdoc />
+    /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
+    /// the point of a batch) — treat them as trusted server-side paths.</remarks>
+    public Task<int> UpsertBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
+        => WriteBatchAsync(entities, TableTransactionActionType.UpsertReplace, ct);
+
+    /// <inheritdoc />
+    public async Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
+    {
+        var filter = string.IsNullOrWhiteSpace(partition)
+            ? null
+            : TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
+
+        // Keys-only projection keeps each page tiny; Azure Tables has no server-side count.
+        var count = 0;
+        await foreach (var _ in client.QueryAsync<TableEntity>(filter, select: ["PartitionKey"], cancellationToken: ct)
+                           .WithCancellation(ct))
+        {
+            count++;
+        }
+        return count;
+    }
+
+    private async Task<int> WriteBatchAsync(
+        IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(entities);
+        if (entities.Count == 0)
+            return 0;
+
+        var now = DateTimeOffset.UtcNow;
+        var rows = new List<(string Partition, string Id, TableEntity Row)>(entities.Count);
+        foreach (var entity in entities)
+        {
+            if (entity == null || string.IsNullOrWhiteSpace(entity.Id))
+                throw new ArgumentException("Every batched entity must be non-null and have an Id.", nameof(entities));
+
+            if (actionType == TableTransactionActionType.Add || entity.CreatedAt == default)
+                entity.CreatedAt = now;
+            entity.UpdatedAt = now;
+            entity.Timestamp = null;
+            entity.Id = NormalizeId(entity.Id);
+
+            var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+            rows.Add((partitionKey, entity.Id, entity.ToTableEntity(partitionKey, rowKey)));
+        }
+
+        foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
+        {
+            // Azure Table transactions: max 100 entities, single partition.
+            foreach (var chunk in group.Chunk(100))
+            {
+                var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
+                await client.SubmitTransactionAsync(actions, ct);
+            }
+            InvalidateQueryCache(group.Key);
+        }
+
+        // Drop (don't warm) the per-entity cache entries: transaction responses do carry per-item
+        // ETags, but correlating them back adds complexity for little gain — the next read re-warms.
+        foreach (var (_, id, _) in rows)
+            cache.Remove(EntityCacheKey(id));
+
+        logger.LogInformation("Batch-{Action} {Count} {Type} entities across {Partitions} partition(s)",
+            actionType, rows.Count, typeName, rows.Select(r => r.Partition).Distinct(StringComparer.Ordinal).Count());
+
+        return rows.Count;
+    }
+
+    private static string? BuildFilter(string? partition, string? rowKeyPrefix)
+    {
+        if (partition is null)
+            return null;
+        if (rowKeyPrefix is null)
+            return TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
+
+        // Canonical prefix range: RowKey >= prefix AND RowKey < next(prefix).
+        var upperBound = NextPrefix(rowKeyPrefix);
+        return upperBound is null
+            ? TableClient.CreateQueryFilter($"PartitionKey eq {partition} and RowKey ge {rowKeyPrefix}")
+            : TableClient.CreateQueryFilter($"PartitionKey eq {partition} and RowKey ge {rowKeyPrefix} and RowKey lt {upperBound}");
+    }
+
+    // The smallest string strictly greater than every string starting with `prefix`: increment the
+    // last incrementable char and truncate. An all-U+FFFF prefix has no finite upper bound → null.
+    private static string? NextPrefix(string prefix)
+    {
+        for (var i = prefix.Length - 1; i >= 0; i--)
+        {
+            if (prefix[i] != char.MaxValue)
+            {
+                return prefix[..i] + (char)(prefix[i] + 1);
+            }
+        }
+        return null;
+    }
+
     /// <summary>
     /// Apply a builder-driven partial update to a single entity by id. Sends only the declared
     /// columns via <see cref="TableUpdateMode.Merge"/>, so unrelated columns are preserved
@@ -317,46 +466,39 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     }
 
     /// <inheritdoc />
-    public async Task<T> UpdateAsync(T entity, CancellationToken ct = default)
+    public Task<T> UpdateAsync(T entity, CancellationToken ct = default)
+        => UpdateAsync(entity, ConcurrencyMode.Auto, ct);
+
+    /// <inheritdoc />
+    public async Task<T> UpdateAsync(T entity, ConcurrencyMode mode, CancellationToken ct = default)
     {
         if (entity == null || string.IsNullOrWhiteSpace(entity.Id))
         {
             throw new ArgumentNullException(nameof(entity));
         }
 
-        // Enforce [ProtectedProperty] on whole-entity replacement. If any protected field changed
-        // and the caller isn't authorised (or no authorizer is registered), throw rather than
-        // silently overwriting the protected data.
-        if (ProtectedProps.Count > 0)
+        await EnforceProtectedPropertiesAsync(entity, ct);
+
+        // Capture concurrency intent BEFORE mutating the entity.
+        var callerSuppliedETag = !string.IsNullOrEmpty(entity.ETag);
+        var etag = mode switch
         {
-            var stored = await OneAsync(entity.Id, ct);
-            if (stored is not null)
-            {
-                foreach (var (prop, attr) in ProtectedProps)
-                {
-                    var oldVal = prop.GetValue(stored);
-                    var newVal = prop.GetValue(entity);
-                    if (!Equals(oldVal, newVal) && !(authorizer?.IsAllowed(attr.Roles) ?? false))
-                    {
-                        throw new UnauthorizedAccessException(
-                            $"Property '{prop.Name}' on {typeName} is protected (requires roles: {attr.Roles}). " +
-                            $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'.");
-                    }
-                }
-            }
-        }
+            // Strict: the round-tripped row version is mandatory; its absence is a caller bug,
+            // not a case to silently degrade to last-writer-wins.
+            ConcurrencyMode.Strict when !callerSuppliedETag => throw new InvalidOperationException(
+                $"ConcurrencyMode.Strict requires {typeName}.ETag — read the entity first and round-trip its ETag."),
+            ConcurrencyMode.Strict => new ETag(entity.ETag!),
+            ConcurrencyMode.LastWriterWins => ETag.All,
+            // Auto: caller-supplied ETag wins (cross-process optimistic concurrency); fall back to
+            // the server-side cache, finally to ETag.All for legacy callers.
+            _ => callerSuppliedETag ? new ETag(entity.ETag!) : GetCachedETag(entity.Id)
+        };
 
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
 
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-
-        // Caller-supplied ETag wins (round-tripped through the API for cross-process optimistic
-        // concurrency). Fall back to the server-side cache if the caller didn't carry one, finally
-        // to ETag.All for legacy callers.
-        var callerSuppliedETag = !string.IsNullOrEmpty(entity.ETag);
-        var etag = callerSuppliedETag ? new ETag(entity.ETag!) : GetCachedETag(entity.Id);
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
 
         try
@@ -368,12 +510,12 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             CacheEntity(entity.Id, entity, newETag);
             InvalidateQueryCache(partitionKey);
         }
-        catch (RequestFailedException ex) when (ex.Status == 412 && !callerSuppliedETag)
+        catch (RequestFailedException ex) when (ex.Status == 412 && mode == ConcurrencyMode.Auto && !callerSuppliedETag)
         {
             // ETag mismatch on the cached (not caller-supplied) ETag — the cache was stale (e.g. a
             // concurrent write, or a QueryAsync overwrote the cache). Re-fetch the current ETag and
-            // retry once. When the caller DID supply an ETag we deliberately do NOT retry: the 412
-            // propagates so the genuine concurrency conflict surfaces to the caller.
+            // retry once. When the caller DID supply an ETag (or asked for Strict) we deliberately
+            // do NOT retry: the 412 propagates so the genuine conflict surfaces to the caller.
             logger.LogWarning(ex, "ETag mismatch for {Type} {Id} — re-fetching and retrying once", typeName, entity.Id);
 
             var freshResponse = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
@@ -392,15 +534,79 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         return entity;
     }
 
-    private static string NormalizeId(string id) => id.Trim().Replace(' ', '-').ToLowerInvariant();
+    /// <inheritdoc />
+    public async Task<T> UpsertAsync(T entity, CancellationToken ct = default)
+    {
+        if (entity == null || string.IsNullOrWhiteSpace(entity.Id))
+        {
+            throw new ArgumentNullException(nameof(entity));
+        }
+
+        await EnforceProtectedPropertiesAsync(entity, ct);
+
+        // Preserve a caller-supplied creation stamp (read-modify-write flows); stamp fresh
+        // otherwise. UpdatedAt is always bumped — an upsert is a write either way.
+        if (entity.CreatedAt == default)
+            entity.CreatedAt = DateTimeOffset.UtcNow;
+        entity.UpdatedAt = DateTimeOffset.UtcNow;
+        entity.Timestamp = null; // service last-write time is unknown until the next read
+        entity.Id = NormalizeId(entity.Id);
+
+        var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
+        var upsertResponse = await client.UpsertEntityAsync(dataEntity, TableUpdateMode.Replace, ct);
+
+        // Same header-first ETag read as CreateAsync — the SDK does not mutate dataEntity.ETag.
+        ETag? responseETag = null;
+        try
+        {
+            responseETag = upsertResponse?.Headers.ETag;
+        }
+        catch
+        {
+            // Test doubles may return a Response whose Headers struct has no backing store.
+        }
+        var newETag = responseETag ?? dataEntity.ETag;
+        entity.ETag = newETag.ToString();
+        CacheEntity(entity.Id, entity, newETag);
+        InvalidateQueryCache(partitionKey);
+
+        return entity;
+    }
+
+    /// <summary>
+    /// Enforce [ProtectedProperty] on whole-entity writes. If any protected field changed relative
+    /// to the stored row and the caller isn't authorised (or no authorizer is registered), throw
+    /// rather than silently overwriting the protected data. No-op (and no read) for entity types
+    /// without protected properties.
+    /// </summary>
+    private async Task EnforceProtectedPropertiesAsync(T entity, CancellationToken ct)
+    {
+        if (ProtectedProps.Count == 0)
+            return;
+
+        var stored = await OneAsync(entity.Id, ct);
+        if (stored is null)
+            return;
+
+        foreach (var (prop, attr) in ProtectedProps)
+        {
+            var oldVal = prop.GetValue(stored);
+            var newVal = prop.GetValue(entity);
+            if (!Equals(oldVal, newVal) && !(authorizer?.IsAllowed(attr.Roles) ?? false))
+            {
+                throw new UnauthorizedAccessException(
+                    $"Property '{prop.Name}' on {typeName} is protected (requires roles: {attr.Roles}). " +
+                    $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'.");
+            }
+        }
+    }
+
+    private static string NormalizeId(string id) => EntityId.Normalize(id);
 
     // Split on the FIRST separator only, so a row key may itself contain '|'
     // (e.g. "vision|execution|agent" → partition "vision", row "execution|agent").
-    private static (string PartitionKey, string RowKey) GetEntityKeys(string id)
-    {
-        var keys = id.Split(Separator, 2);
-        return keys.Length > 1 ? (keys[0], keys[1]) : (keys[0], keys[0]);
-    }
+    private static (string PartitionKey, string RowKey) GetEntityKeys(string id) => EntityId.Split(id);
 
     private string EntityCacheKey(string id) => $"{typeName}:entity:{id}";
     private string QueryCacheKey(string? partition) => $"{typeName}:query:{partition ?? "*"}";
