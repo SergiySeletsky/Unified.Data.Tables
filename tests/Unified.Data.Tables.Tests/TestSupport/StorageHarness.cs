@@ -62,13 +62,17 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
     public MemoryCache Cache { get; }
     public TableStorage<T> Store { get; }
 
-    public StorageHarness(IProtectedPropertyAuthorizer? authorizer = null)
+    public StorageHarness(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
     {
         Service = Substitute.For<TableServiceClient>();
         Table = Substitute.For<TableClient>();
         Service.GetTableClient(typeof(T).Name).Returns(Table);
+        // Table creation is lazy (first operation awaits it); an unmocked substitute would return
+        // a null Task and NRE on await, so every harness store gets a completed init by default.
+        Table.CreateIfNotExistsAsync(Arg.Any<CancellationToken>())
+             .Returns(Task.FromResult<Response<Azure.Data.Tables.Models.TableItem>>(null!));
         Cache = new MemoryCache(new MemoryCacheOptions());
-        Store = new TableStorage<T>(Service, Cache, NullLogger<TableStorage<T>>.Instance, authorizer);
+        Store = new TableStorage<T>(Service, Cache, NullLogger<TableStorage<T>>.Instance, authorizer, options);
     }
 
     public void Dispose() => Cache.Dispose();

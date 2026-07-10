@@ -77,6 +77,33 @@ public class ServiceCollectionExtensionsTests
     }
 
     [Fact]
+    public void AddUnifiedTableStorage_RegistersConfiguredOptions()
+    {
+        var services = ServicesWithMockedClient();
+
+        services.AddUnifiedTableStorage(o => o.Cache = CachePolicy.Absolute(TimeSpan.FromSeconds(30)));
+        using var provider = services.BuildServiceProvider();
+
+        var options = provider.GetRequiredService<UnifiedTableStorageOptions>();
+        Assert.Equal(CacheExpirationMode.Absolute, options.Cache.Mode);
+        Assert.Equal(TimeSpan.FromSeconds(30), options.Cache.Ttl);
+    }
+
+    [Fact]
+    public void AddUnifiedTableStorage_WithTokenCredential_RegistersTableServiceClient()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        var credential = Substitute.For<Azure.Core.TokenCredential>();
+
+        services.AddUnifiedTableStorage(new Uri("https://account.table.core.windows.net"), credential);
+        using var provider = services.BuildServiceProvider();
+
+        Assert.NotNull(provider.GetService<TableServiceClient>());
+        Assert.NotNull(provider.GetService<IStorage<TestEntity>>());
+    }
+
+    [Fact]
     public void AddUnifiedTableStorage_NullServices_Throws()
     {
         Assert.Throws<ArgumentNullException>(() => ServiceCollectionExtensions.AddUnifiedTableStorage(null!));

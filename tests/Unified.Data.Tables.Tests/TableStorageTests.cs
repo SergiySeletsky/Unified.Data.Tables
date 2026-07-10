@@ -22,10 +22,54 @@ public class TableStorageTests
     }
 
     [Fact]
-    public void Constructor_CallsCreateIfNotExists()
+    public void Constructor_DoesNotTouchStorage()
     {
         using var h = new StorageHarness<TestEntity>();
-        h.Table.Received(1).CreateIfNotExists(Arg.Any<CancellationToken>());
+
+        // Table creation is lazy — construction (DI resolve) must not perform network I/O.
+        h.Table.DidNotReceive().CreateIfNotExists(Arg.Any<CancellationToken>());
+        _ = h.Table.DidNotReceive().CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task FirstOperation_CreatesTable_ExactlyOnce()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupAdd();
+
+        await h.Store.CreateAsync(new TestEntity { Id = "a|1" });
+        await h.Store.CreateAsync(new TestEntity { Id = "a|2" });
+
+        _ = h.Table.Received(1).CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task EnsureCreatedAsync_CreatesTableEagerly()
+    {
+        using var h = new StorageHarness<TestEntity>();
+
+        await h.Store.EnsureCreatedAsync();
+
+        _ = h.Table.Received(1).CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task TableInit_FailedAttempt_IsRetried_NotPoisoned()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        var calls = 0;
+        h.Table.CreateIfNotExistsAsync(Arg.Any<CancellationToken>())
+            .Returns(_ => calls++ == 0
+                ? Task.FromException<Response<Azure.Data.Tables.Models.TableItem>>(
+                    new RequestFailedException(503, "storage unavailable"))
+                : Task.FromResult<Response<Azure.Data.Tables.Models.TableItem>>(null!));
+        h.SetupAdd();
+
+        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.CreateAsync(new TestEntity { Id = "a|1" }));
+        var recovered = await h.Store.CreateAsync(new TestEntity { Id = "a|2" });
+
+        Assert.NotNull(recovered);
+        _ = h.Table.Received(2).CreateIfNotExistsAsync(Arg.Any<CancellationToken>());
     }
 
     // ── CreateAsync ─────────────────────────────────────────────────────────

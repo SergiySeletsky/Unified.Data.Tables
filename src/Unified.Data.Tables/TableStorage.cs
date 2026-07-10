@@ -10,16 +10,17 @@ namespace Unified.Data.Tables;
 /// <summary>
 /// <see cref="IStorage{T}"/> implemented over a single Azure Table (one table per entity type
 /// <typeparamref name="T"/>, named after <c>typeof(T).Name</c>). Reads are served through an
-/// <see cref="IMemoryCache"/> (1&#160;hour sliding TTL); writes invalidate the relevant query caches
-/// and keep the per-entity cache coherent. Register as an open generic singleton, e.g.
-/// <c>services.AddSingleton(typeof(IStorage&lt;&gt;), typeof(TableStorage&lt;&gt;))</c> — or use
-/// <see cref="ServiceCollectionExtensions.AddUnifiedTableStorage(Microsoft.Extensions.DependencyInjection.IServiceCollection)"/>.
+/// <see cref="IMemoryCache"/> per the configured <see cref="CachePolicy"/> (default: 1&#160;hour
+/// sliding TTL); writes invalidate the relevant query caches and keep the per-entity cache
+/// coherent. The underlying table is created lazily on first use (see
+/// <see cref="EnsureCreatedAsync"/> for eager creation). Register as an open generic singleton,
+/// e.g. <c>services.AddSingleton(typeof(IStorage&lt;&gt;), typeof(TableStorage&lt;&gt;))</c> — or use
+/// <see cref="ServiceCollectionExtensions.AddUnifiedTableStorage(Microsoft.Extensions.DependencyInjection.IServiceCollection, Action{UnifiedTableStorageOptions})"/>.
 /// </summary>
 /// <typeparam name="T">The entity type; must derive from <see cref="Entity"/> and have a public parameterless constructor.</typeparam>
 public class TableStorage<T> : IStorage<T> where T : Entity, new()
 {
     private const char Separator = '|';
-    private static readonly TimeSpan CacheDuration = TimeSpan.FromHours(1);
 
     // Pre-computed list of properties decorated with [ProtectedProperty] for whole-entity
     // UpdateAsync(T) enforcement. Empty for entity types that have no protected fields.
@@ -34,15 +35,22 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     private readonly IMemoryCache cache;
     private readonly ILogger<TableStorage<T>> logger;
     private readonly IProtectedPropertyAuthorizer? authorizer;
+    private readonly CachePolicy cachePolicy;
     private readonly string typeName = typeof(T).Name;
 
     // Track known partition keys so we can invalidate query caches
     private readonly HashSet<string> trackedPartitions = new(StringComparer.OrdinalIgnoreCase);
     private readonly object partitionLock = new();
 
+    // Coalesced lazy CreateIfNotExists: no network I/O at construction/DI-resolve time, one create
+    // per store shared by all callers, and a FAILED attempt is forgotten so the next call retries
+    // instead of poisoning the store for the process lifetime.
+    private Task? tableInit;
+    private readonly object initLock = new();
+
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger)
-        : this(serviceClient, cache, logger, authorizer: null)
+        : this(serviceClient, cache, logger, authorizer: null, options: null)
     {
     }
 
@@ -52,13 +60,68 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     /// </summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
         IProtectedPropertyAuthorizer? authorizer)
+        : this(serviceClient, cache, logger, authorizer, options: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a store with an <see cref="UnifiedTableStorageOptions"/> (cache policy etc.) and an
+    /// optional <see cref="IProtectedPropertyAuthorizer"/>. Null options fall back to the defaults
+    /// (sliding 1&#160;hour cache — the 0.2.x behaviour). The trailing defaults let the DI
+    /// container select this constructor even when neither optional service is registered.
+    /// </summary>
+    public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
+        IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(serviceClient);
         this.cache = cache;
         this.logger = logger;
         this.authorizer = authorizer;
+        cachePolicy = (options ?? new UnifiedTableStorageOptions()).ResolveCachePolicy(typeof(T));
         client = serviceClient.GetTableClient(typeName);
-        client.CreateIfNotExists();
+    }
+
+    /// <summary>
+    /// Eagerly ensure the underlying table exists (it is otherwise created lazily on first use).
+    /// Call from host startup for fail-fast semantics.
+    /// </summary>
+    public Task EnsureCreatedAsync(CancellationToken ct = default) => EnsureTableAsync(ct);
+
+    private Task EnsureTableAsync(CancellationToken ct)
+    {
+        var existing = Volatile.Read(ref tableInit);
+        return existing is { IsCompletedSuccessfully: true } ? Task.CompletedTask : EnsureTableSlowAsync(ct);
+    }
+
+    private async Task EnsureTableSlowAsync(CancellationToken ct)
+    {
+        Task pending;
+        lock (initLock)
+        {
+            // Reuse an in-flight or succeeded attempt; start fresh after a failed/canceled one.
+            pending = tableInit is { IsFaulted: false, IsCanceled: false }
+                ? tableInit
+                // The shared operation deliberately ignores the first caller's token — a canceled
+                // caller must not cancel (and thereby poison) everyone else's init.
+                : tableInit = client.CreateIfNotExistsAsync(cancellationToken: CancellationToken.None);
+        }
+
+        try
+        {
+            await pending.WaitAsync(ct);
+        }
+        catch
+        {
+            if (pending.IsFaulted || pending.IsCanceled)
+            {
+                lock (initLock)
+                {
+                    if (ReferenceEquals(tableInit, pending))
+                        tableInit = null;
+                }
+            }
+            throw;
+        }
     }
 
     /// <inheritdoc />
@@ -68,6 +131,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         {
             throw new ArgumentNullException(nameof(entity));
         }
+
+        await EnsureTableAsync(ct);
 
         entity.CreatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null; // service last-write time is unknown until the next read
@@ -107,6 +172,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
         id = NormalizeId(id);
 
+        await EnsureTableAsync(ct);
+
         var (partitionKey, rowKey) = GetEntityKeys(id);
         await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
 
@@ -119,6 +186,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     {
         if (string.IsNullOrWhiteSpace(partition))
             throw new ArgumentNullException(nameof(partition));
+
+        await EnsureTableAsync(ct);
 
         var entities = new List<TableEntity>();
         await foreach (var entity in client.QueryAsync<TableEntity>(
@@ -160,13 +229,14 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         id = NormalizeId(id);
 
         var cacheKey = EntityCacheKey(id);
-        if (cache.TryGetValue<CachedEntity>(cacheKey, out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(cacheKey, out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.OneAsync id={Id}", typeName, id);
             return cached.Entity;
         }
 
         logger.LogDebug("[Cache MISS] {Type}.OneAsync id={Id} — fetching from Table Storage", typeName, id);
+        await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
 
@@ -189,13 +259,14 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
         id = NormalizeId(id);
 
-        if (cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.ExistsAsync id={Id}", typeName, id);
             return true;
         }
 
         logger.LogDebug("[Cache MISS] {Type}.ExistsAsync id={Id} — fetching from Table Storage", typeName, id);
+        await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
 
@@ -214,13 +285,14 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     public async Task<IEnumerable<T>> QueryAsync(string? partition = null, CancellationToken ct = default)
     {
         var cacheKey = QueryCacheKey(partition);
-        if (cache.TryGetValue<IEnumerable<T>>(cacheKey, out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<IEnumerable<T>>(cacheKey, out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.QueryAsync partition={Partition}", typeName, partition ?? "*");
             return cached;
         }
 
         logger.LogDebug("[Cache MISS] {Type}.QueryAsync partition={Partition} — fetching from Table Storage", typeName, partition ?? "*");
+        await EnsureTableAsync(ct);
         var results = new List<T>();
         var query = string.IsNullOrWhiteSpace(partition)
             ? client.QueryAsync<TableEntity>(cancellationToken: ct)
@@ -237,12 +309,11 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             CacheEntity(entity.Id, entity, tableEntity.ETag);
         }
 
-        cache.Set(cacheKey, (IEnumerable<T>)results, new MemoryCacheEntryOptions
+        if (cachePolicy.Enabled)
         {
-            SlidingExpiration = CacheDuration
-        });
-
-        TrackPartition(partition);
+            cache.Set(cacheKey, (IEnumerable<T>)results, CacheEntryOptions());
+            TrackPartition(partition);
+        }
 
         return results;
     }
@@ -274,6 +345,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
                 nameof(options));
         if (take is <= 0)
             throw new ArgumentOutOfRangeException(nameof(options), take, "Take must be positive.");
+
+        await EnsureTableAsync(ct);
 
         var filter = BuildFilter(partition, rowKeyPrefix);
         var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
@@ -307,6 +380,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     /// <inheritdoc />
     public async Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
     {
+        await EnsureTableAsync(ct);
+
         var filter = string.IsNullOrWhiteSpace(partition)
             ? null
             : TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
@@ -327,6 +402,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         ArgumentNullException.ThrowIfNull(entities);
         if (entities.Count == 0)
             return 0;
+
+        await EnsureTableAsync(ct);
 
         var now = DateTimeOffset.UtcNow;
         var rows = new List<(string Partition, string Id, TableEntity Row)>(entities.Count);
@@ -418,6 +495,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
 
         id = NormalizeId(id);
+        await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
 
         var partial = new TableEntity(partitionKey, rowKey);
@@ -436,7 +514,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         // Keep the cache coherent: if the entity is cached, patch it in-memory with the same updates
         // and the new ETag so subsequent reads stay warm. Otherwise drop the entry — the next
         // OneAsync will re-read fresh.
-        if (cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
         {
             ApplyUpdates(cached.Entity, builder.Updates);
             cached.Entity.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
@@ -498,6 +576,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
 
+        await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
 
@@ -552,6 +631,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
 
+        await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
         var upsertResponse = await client.UpsertEntityAsync(dataEntity, TableUpdateMode.Replace, ct);
@@ -613,11 +693,15 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
     private void CacheEntity(string id, T entity, ETag etag)
     {
-        cache.Set(EntityCacheKey(id), new CachedEntity(entity, etag), new MemoryCacheEntryOptions
-        {
-            SlidingExpiration = CacheDuration
-        });
+        if (!cachePolicy.Enabled)
+            return;
+
+        cache.Set(EntityCacheKey(id), new CachedEntity(entity, etag), CacheEntryOptions());
     }
+
+    private MemoryCacheEntryOptions CacheEntryOptions() => cachePolicy.Mode == CacheExpirationMode.Absolute
+        ? new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = cachePolicy.Ttl }
+        : new MemoryCacheEntryOptions { SlidingExpiration = cachePolicy.Ttl };
 
     private ETag GetCachedETag(string id)
     {
