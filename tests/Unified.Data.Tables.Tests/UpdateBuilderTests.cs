@@ -27,9 +27,10 @@ public class UpdateBuilderTests
 
     [Theory]
     [InlineData("Id")]
-    [InlineData("Created")]
-    [InlineData("Modified")]
+    [InlineData("CreatedAt")]
+    [InlineData("UpdatedAt")]
     [InlineData("ETag")]
+    [InlineData("Timestamp")]
     public void SetProperty_OnManagedProperty_Throws(string managed)
     {
         var builder = new UpdateBuilder<TestEntity>();
@@ -37,8 +38,9 @@ public class UpdateBuilderTests
         var ex = Assert.Throws<InvalidOperationException>(() => managed switch
         {
             "Id" => builder.SetProperty(x => x.Id, "x"),
-            "Created" => builder.SetProperty(x => x.Created, DateTimeOffset.UtcNow),
-            "Modified" => builder.SetProperty(x => x.Modified, DateTimeOffset.UtcNow),
+            "CreatedAt" => builder.SetProperty(x => x.CreatedAt, DateTimeOffset.UtcNow),
+            "UpdatedAt" => builder.SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow),
+            "Timestamp" => builder.SetProperty(x => x.Timestamp, DateTimeOffset.UtcNow),
             _ => builder.SetProperty(x => x.ETag!, "x")
         });
 
@@ -88,7 +90,7 @@ public class UpdateBuilderTests
     // ── Partial update through storage (Merge) ──────────────────────────────
 
     [Fact]
-    public async Task UpdateAsync_Builder_SendsOnlyDeclaredColumnsPlusModified_ViaMerge()
+    public async Task UpdateAsync_Builder_SendsOnlyDeclaredColumnsPlusUpdatedAt_ViaMerge()
     {
         using var h = new StorageHarness<TestEntity>();
         h.SetupUpdate();
@@ -96,7 +98,7 @@ public class UpdateBuilderTests
         await h.Store.UpdateAsync("pk|rk", b => b.SetProperty(x => x.Name, "updated"));
 
         await h.Table.Received(1).UpdateEntityAsync(
-            Arg.Is<TableEntity>(te => te.ContainsKey("Name") && te.ContainsKey("Modified") && !te.ContainsKey("Value")),
+            Arg.Is<TableEntity>(te => te.ContainsKey("Name") && te.ContainsKey("UpdatedAt") && !te.ContainsKey("Value")),
             ETag.All,
             TableUpdateMode.Merge,
             Arg.Any<CancellationToken>());

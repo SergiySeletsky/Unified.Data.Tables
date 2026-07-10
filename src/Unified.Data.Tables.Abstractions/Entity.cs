@@ -15,9 +15,11 @@ namespace Unified.Data.Tables;
 /// (<c>trim → replace spaces with '-' → ToLowerInvariant</c>).
 /// </para>
 /// <para>
-/// <see cref="Created"/> is stamped on insert and <see cref="Modified"/> on every write, both by
+/// <see cref="CreatedAt"/> is stamped on insert and <see cref="UpdatedAt"/> on every write, both by
 /// the storage layer. <see cref="ETag"/> carries the Azure Tables row version for optimistic
 /// concurrency and is excluded from row serialization by name, so it never becomes a column.
+/// <see cref="Timestamp"/> is the service-managed last-write time — populated on read, reset to
+/// <c>null</c> on write, and likewise never serialized as a column.
 /// </para>
 /// </remarks>
 public abstract class Entity : IEntity, IEquatable<Entity>
@@ -29,14 +31,17 @@ public abstract class Entity : IEntity, IEquatable<Entity>
 
     /// <inheritdoc />
     [DataType(DataType.DateTime)]
-    public DateTimeOffset Created { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     /// <inheritdoc />
     [DataType(DataType.DateTime)]
-    public DateTimeOffset Modified { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     /// <inheritdoc />
     public string? ETag { get; set; }
+
+    /// <inheritdoc />
+    public DateTimeOffset? Timestamp { get; set; }
 
     /// <inheritdoc />
     public override bool Equals(object? obj) => Equals(obj as Entity);

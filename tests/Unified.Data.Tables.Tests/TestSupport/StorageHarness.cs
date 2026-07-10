@@ -36,14 +36,17 @@ public static class Mocks
         return AsyncPageable<TableEntity>.FromPages(new[] { page });
     }
 
-    public static TableEntity Row(string partitionKey, string rowKey, string name = "test", int value = 42)
+    public static TableEntity Row(string partitionKey, string rowKey, string name = "test", int value = 42,
+        DateTimeOffset? timestamp = null)
     {
         var te = new TableEntity(partitionKey, rowKey) { ETag = new ETag("W/\"etag1\"") };
         te["Name"] = name;
         te["Value"] = value;
         te["Id"] = partitionKey == rowKey ? partitionKey : $"{partitionKey}|{rowKey}";
-        te["Created"] = DateTimeOffset.UtcNow;
-        te["Modified"] = DateTimeOffset.UtcNow;
+        te["CreatedAt"] = DateTimeOffset.UtcNow;
+        te["UpdatedAt"] = DateTimeOffset.UtcNow;
+        if (timestamp is not null)
+            te.Timestamp = timestamp;
         return te;
     }
 }

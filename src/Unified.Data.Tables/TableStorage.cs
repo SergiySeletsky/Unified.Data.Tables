@@ -68,7 +68,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             throw new ArgumentNullException(nameof(entity));
         }
 
-        entity.Created = DateTimeOffset.UtcNow;
+        entity.CreatedAt = DateTimeOffset.UtcNow;
+        entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
 
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
@@ -173,6 +174,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
         var entity = response.Value!.FromTableEntity<T>();
         entity.ETag = response.Value!.ETag.ToString();
+        entity.Timestamp = response.Value!.Timestamp;
         CacheEntity(id, entity, response.Value!.ETag);
         return entity;
     }
@@ -200,6 +202,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         {
             var entity = response.Value!.FromTableEntity<T>();
             entity.ETag = response.Value!.ETag.ToString();
+            entity.Timestamp = response.Value!.Timestamp;
             CacheEntity(id, entity, response.Value!.ETag);
         }
 
@@ -226,6 +229,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         {
             var entity = tableEntity.FromTableEntity<T>();
             entity.ETag = tableEntity.ETag.ToString();
+            entity.Timestamp = tableEntity.Timestamp;
             results.Add(entity);
 
             // Warm the individual entity cache with fresh ETags
@@ -275,8 +279,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
                 partial[col] = cell;
             }
         }
-        // Always bump Modified — set last so it wins over any caller-supplied value.
-        partial[nameof(Entity.Modified)] = DateTimeOffset.UtcNow;
+        // Always bump UpdatedAt — set last so it wins over any caller-supplied value.
+        partial[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
 
         var resp = await client.UpdateEntityAsync(partial, ETag.All, TableUpdateMode.Merge, ct);
 
@@ -286,7 +290,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         if (cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
         {
             ApplyUpdates(cached.Entity, builder.Updates);
-            cached.Entity.Modified = (DateTimeOffset)partial[nameof(Entity.Modified)];
+            cached.Entity.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
+            cached.Entity.Timestamp = null; // the row changed server-side; stale until re-read
             CacheEntity(id, cached.Entity, resp.Headers.ETag ?? cached.ETag);
         }
         else
@@ -341,7 +346,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             }
         }
 
-        entity.Modified = DateTimeOffset.UtcNow;
+        entity.UpdatedAt = DateTimeOffset.UtcNow;
+        entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
 
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);

@@ -10,11 +10,11 @@ namespace Unified.Data.Tables;
 /// <typeparam name="T">The entity type being updated.</typeparam>
 public class UpdateBuilder<T>
 {
-    // Properties declared on the Entity base (Id, Created, Modified, ETag) are managed by the
-    // storage layer — Id is part of the partition+row key, Created is set on insert, Modified is
-    // bumped automatically on every Merge, and ETag is the row version. Letting callers patch these
-    // via SetProperty would either silently corrupt the row's identity or be overridden anyway, so
-    // we reject them up front.
+    // Properties declared on the Entity base (Id, CreatedAt, UpdatedAt, ETag, Timestamp) are
+    // managed by the storage layer — Id is part of the partition+row key, CreatedAt is set on
+    // insert, UpdatedAt is bumped automatically on every Merge, ETag is the row version, and
+    // Timestamp is service-owned. Letting callers patch these via SetProperty would either
+    // silently corrupt the row's identity or be overridden anyway, so we reject them up front.
     private static readonly HashSet<string> ManagedPropertyNames = new(
         typeof(Entity)
             .GetProperties()

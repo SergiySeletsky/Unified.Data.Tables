@@ -66,7 +66,7 @@ public class TableStorageTests
     }
 
     [Fact]
-    public async Task CreateAsync_SetsCreatedToUtcNow()
+    public async Task CreateAsync_SetsCreatedAtToUtcNow()
     {
         using var h = new StorageHarness<TestEntity>();
         h.SetupAdd();
@@ -75,7 +75,19 @@ public class TableStorageTests
         var result = await h.Store.CreateAsync(new TestEntity { Id = "id1", Name = "Test" });
         var after = DateTimeOffset.UtcNow;
 
-        Assert.InRange(result.Created, before, after);
+        Assert.InRange(result.CreatedAt, before, after);
+    }
+
+    [Fact]
+    public async Task CreateAsync_ResetsTimestamp_UntilNextRead()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupAdd();
+
+        var entity = new TestEntity { Id = "ts1", Name = "Test", Timestamp = DateTimeOffset.UtcNow };
+        var result = await h.Store.CreateAsync(entity);
+
+        Assert.Null(result.Timestamp);
     }
 
     [Fact]
@@ -245,6 +257,18 @@ public class TableStorageTests
         var result = await h.Store.OneAsync("part|row");
 
         Assert.Equal(new ETag("W/\"etag1\"").ToString(), result!.ETag);
+    }
+
+    [Fact]
+    public async Task OneAsync_PopulatesTimestampFromRow()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        var serviceTime = new DateTimeOffset(2026, 7, 10, 12, 0, 0, TimeSpan.Zero);
+        h.SetupGet("part", "row", Mocks.Row("part", "row", timestamp: serviceTime));
+
+        var result = await h.Store.OneAsync("part|row");
+
+        Assert.Equal(serviceTime, result!.Timestamp);
     }
 
     [Fact]
@@ -454,7 +478,7 @@ public class TableStorageTests
     }
 
     [Fact]
-    public async Task UpdateAsync_SetsModifiedToUtcNow()
+    public async Task UpdateAsync_SetsUpdatedAtToUtcNow()
     {
         using var h = new StorageHarness<TestEntity>();
         h.SetupUpdate();
@@ -463,7 +487,19 @@ public class TableStorageTests
         var result = await h.Store.UpdateAsync(new TestEntity { Id = "upd2", Name = "Updated" });
         var after = DateTimeOffset.UtcNow;
 
-        Assert.InRange(result.Modified, before, after);
+        Assert.InRange(result.UpdatedAt, before, after);
+    }
+
+    [Fact]
+    public async Task UpdateAsync_ResetsTimestamp_UntilNextRead()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupUpdate();
+
+        var entity = new TestEntity { Id = "upd-ts", Name = "x", Timestamp = DateTimeOffset.UtcNow };
+        var result = await h.Store.UpdateAsync(entity);
+
+        Assert.Null(result.Timestamp);
     }
 
     [Fact]

@@ -56,16 +56,29 @@ public class TableEntitySerializerTests
     }
 
     [Fact]
-    public void CreatedAndModified_RoundTrip_AsColumns()
+    public void CreatedAtAndUpdatedAt_RoundTrip_AsColumns()
     {
         var created = new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero);
-        var modified = new DateTimeOffset(2024, 2, 2, 12, 30, 0, TimeSpan.Zero);
-        var original = new SimpleEntity { Id = "ts", Created = created, Modified = modified };
+        var updated = new DateTimeOffset(2024, 2, 2, 12, 30, 0, TimeSpan.Zero);
+        var original = new SimpleEntity { Id = "ts", CreatedAt = created, UpdatedAt = updated };
 
         var restored = RoundTrip(original);
 
-        Assert.Equal(created, restored.Created);
-        Assert.Equal(modified, restored.Modified);
+        Assert.Equal(created, restored.CreatedAt);
+        Assert.Equal(updated, restored.UpdatedAt);
+    }
+
+    [Fact]
+    public void TimestampAndETag_AreNeverSerialized_AsColumns()
+    {
+        var original = new SimpleEntity { Id = "ts-col", Timestamp = DateTimeOffset.UtcNow, ETag = "W/\"x\"" };
+
+        var tableEntity = original.ToTableEntity("pk", "rk");
+
+        // "Timestamp"/"ETag" on a service row are system properties; the entity's mirror
+        // properties must not produce data columns (they would collide on the wire).
+        Assert.DoesNotContain("Timestamp", tableEntity.Keys);
+        Assert.DoesNotContain("ETag", tableEntity.Keys);
     }
 
     [Fact]
