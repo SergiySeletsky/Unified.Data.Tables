@@ -504,7 +504,13 @@ internal sealed class TableEntityValue
             return ConvertDateTime(t, dt);
 
         if (val is long l)
-            return ConvertLong(t, l);
+        {
+            // Fall through to Convert.ChangeType for non-int64 targets (double, decimal, short…)
+            // — a long cell can face a property whose type drifted across versions.
+            var converted = ConvertLong(t, l);
+            if (converted is not null)
+                return converted;
+        }
 
         // String cells targeting a date type: parse explicitly. Convert.ChangeType can never produce
         // a DateTimeOffset, and this also round-trips dates written by older serializers.
@@ -557,13 +563,14 @@ internal sealed class TableEntityValue
     }
 
 #pragma warning disable CA1859 // Method intentionally returns different boxed value types
-    private static object ConvertLong(Type t, long l)
+    private static object? ConvertLong(Type t, long l)
 #pragma warning restore CA1859
     {
         if (t == typeof(int)) return (int)l;
         if (t == typeof(uint)) return (uint)l;
         if (t == typeof(ulong)) return (ulong)l;
-        return l;
+        if (t == typeof(long)) return l;
+        return null; // caller falls through to Convert.ChangeType
     }
 
     // Leaves generous headroom under the 32K-char (64 KB UTF-16) cell limit for the marker.

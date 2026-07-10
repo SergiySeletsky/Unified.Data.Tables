@@ -97,6 +97,29 @@ public class ColumnAliasTests
         Assert.DoesNotContain("Modified", row.Keys);
     }
 
+    // ── Legacy cell-type tolerance (regression guards from the IntelliSpec ancestor) ─────────
+
+    [Fact]
+    public void Int64Cell_TargetingDecimalProperty_Converts()
+    {
+        // A property whose type drifted (int → decimal) leaves old rows with Int64 cells.
+        var row = new TableEntity("p", "r") { ["Id"] = "p|r", ["Amount"] = 42L };
+
+        var entity = row.FromTableEntity<EntityWithDecimal>();
+
+        Assert.Equal(42m, entity.Amount);
+    }
+
+    [Fact]
+    public void Int64Cell_TargetingDoubleProperty_Converts()
+    {
+        var row = new TableEntity("p", "r") { ["Id"] = "p|r", ["OptionalDouble"] = 7L };
+
+        var entity = row.FromTableEntity<EntityWithNullable>();
+
+        Assert.Equal(7d, entity.OptionalDouble);
+    }
+
     // ── Eager validation ─────────────────────────────────────────────────────
 
     private sealed class CollidingAliasEntity : Entity
