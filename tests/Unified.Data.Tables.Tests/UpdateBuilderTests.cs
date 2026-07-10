@@ -87,6 +87,117 @@ public class UpdateBuilderTests
         Assert.Throws<ArgumentException>(() => builder.SetProperty(x => x.Value + 1, 5));
     }
 
+    // ── Nested property paths ───────────────────────────────────────────────
+
+    [Fact]
+    public void SetProperty_NestedAccess_RecordsTheFlattenedColumnPath()
+    {
+        var builder = new UpdateBuilder<NestedEntity>();
+
+        builder.SetProperty(x => x.Address.City, "Kyiv");
+
+        // Pre-0.4 this silently recorded a wrong top-level 'City' column (orphaned on read).
+        Assert.Equal("Kyiv", builder.Updates["Address_City"]);
+        Assert.False(builder.Updates.ContainsKey("City"));
+    }
+
+    [Fact]
+    public void SetProperty_NestedDuplicatePath_Throws()
+    {
+        var builder = new UpdateBuilder<NestedEntity>();
+        builder.SetProperty(x => x.Address.City, "Kyiv");
+
+        Assert.Throws<InvalidOperationException>(() => builder.SetProperty(x => x.Address.City, "Lviv"));
+    }
+
+    [Fact]
+    public void SetProperty_NestedProtectedProperty_WithoutAllowProtected_Throws()
+    {
+        var builder = new UpdateBuilder<NestedProtectedEntity>();
+
+        // The [ProtectedProperty] sits on the NESTED type's property — reaching it via a nested
+        // path must be rejected exactly like a root-level protected property.
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => builder.SetProperty(x => x.Payroll.Salary, 100m));
+
+        Assert.Contains("ProtectedProperty", ex.Message);
+    }
+
+    [Fact]
+    public void SetProperty_NestedProtectedProperty_WithAllowProtected_Succeeds()
+    {
+        var builder = new UpdateBuilder<NestedProtectedEntity>().AllowProtected();
+
+        builder.SetProperty(x => x.Payroll.Salary, 100m);
+
+        Assert.True(builder.Updates.ContainsKey("Payroll_Salary"));
+    }
+
+    [Fact]
+    public void SetProperty_ParentThenChildOverlap_Throws()
+    {
+        var builder = new UpdateBuilder<NestedEntity>();
+        builder.SetProperty(x => x.Address, new AddressInfo { City = "Kyiv", Country = "Ukraine" });
+
+        // The whole-object write already covers Address_City — a second write to the same
+        // column with an unspecified winner must be rejected, not silently recorded.
+        Assert.Throws<InvalidOperationException>(() => builder.SetProperty(x => x.Address.City, "Lviv"));
+    }
+
+    [Fact]
+    public void SetProperty_ChildThenParentOverlap_Throws()
+    {
+        var builder = new UpdateBuilder<NestedEntity>();
+        builder.SetProperty(x => x.Address.City, "Lviv");
+
+        Assert.Throws<InvalidOperationException>(
+            () => builder.SetProperty(x => x.Address, new AddressInfo { City = "Kyiv", Country = "Ukraine" }));
+    }
+
+    [Fact]
+    public void SetProperty_NotRootedAtTheLambdaParameter_Throws()
+    {
+        var somebodyElse = new TestEntity { Name = "other" };
+        var builder = new UpdateBuilder<TestEntity>();
+
+        // A closure member access is NOT a column of the row being updated.
+        Assert.Throws<ArgumentException>(() => builder.SetProperty(x => somebodyElse.Name, "x"));
+    }
+
+    [Fact]
+    public async Task UpdateAsync_Builder_NestedPath_SendsTheFlattenedColumn()
+    {
+        using var h = new StorageHarness<NestedEntity>();
+        h.SetupUpdate();
+
+        await h.Store.UpdateAsync("pk|rk", b => b.SetProperty(x => x.Address.City, "Kyiv"));
+
+        await h.Table.Received(1).UpdateEntityAsync(
+            Arg.Is<TableEntity>(te => te.ContainsKey("Address_City") && !te.ContainsKey("City") && !te.ContainsKey("Address_Country")),
+            ETag.All,
+            TableUpdateMode.Merge,
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task InMemory_NestedMerge_ChangesOnlyTheLeaf_AndPreservesSiblings()
+    {
+        var store = new Unified.Data.Tables.InMemory.InMemoryStorage<NestedEntity>();
+        await store.CreateAsync(new NestedEntity
+        {
+            Id = "p|r",
+            Title = "HQ",
+            Address = new AddressInfo { City = "Kyiv", Country = "Ukraine" },
+        });
+
+        await store.UpdateAsync("p|r", b => b.SetProperty(x => x.Address.City, "Lviv"));
+        var loaded = await store.OneAsync("p|r");
+
+        Assert.Equal("Lviv", loaded!.Address.City);
+        Assert.Equal("Ukraine", loaded.Address.Country);   // sibling column untouched
+        Assert.Equal("HQ", loaded.Title);                  // unrelated column untouched
+    }
+
     // ── Partial update through storage (Merge) ──────────────────────────────
 
     [Fact]

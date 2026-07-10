@@ -117,6 +117,21 @@ public sealed class ProtectedEntity : Entity
     public decimal Salary { get; set; }
 }
 
+/// <summary>Entity whose NESTED object carries a role-gated property — nested-path protection tests.</summary>
+public sealed class NestedProtectedEntity : Entity
+{
+    public string Name { get; set; } = "";
+    public PayrollInfo Payroll { get; set; } = new();
+}
+
+public sealed class PayrollInfo
+{
+    public string Bank { get; set; } = "";
+
+    [ProtectedProperty("admin")]
+    public decimal Salary { get; set; }
+}
+
 /// <summary>
 /// Entity whose base-class timestamps were historically stored under legacy column names —
 /// the class-level <see cref="ColumnAliasAttribute"/> shape for inherited properties.

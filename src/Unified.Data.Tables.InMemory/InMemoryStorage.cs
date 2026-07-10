@@ -160,13 +160,14 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
                 throw new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}");
 
             // Strict — and Auto with a caller-round-tripped ETag — enforce the row version; a
-            // mismatch surfaces as 412 with no retry, exactly like TableStorage<T>. Auto without
-            // an ETag converges last-writer-wins (the real cached-ETag path retries to the same
-            // outcome), and LastWriterWins skips the check by definition.
+            // mismatch surfaces as a conflict with no retry, exactly like TableStorage<T>. Auto
+            // without an ETag converges last-writer-wins (the real cached-ETag path retries to the
+            // same outcome), and LastWriterWins skips the check by definition.
             if (mode != ConcurrencyMode.LastWriterWins && callerSuppliedETag
                 && !string.Equals(existing.ETagString(), suppliedETag, StringComparison.Ordinal))
             {
-                throw new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer.");
+                throw new ConcurrencyConflictException(typeof(T).Name, entity.Id,
+                    new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer."));
             }
 
             entity.ETag = Store(keys, entity).ETagString();
@@ -176,7 +177,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     }
 
     /// <inheritdoc />
-    public Task UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default)
+    public Task<string> UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
@@ -198,6 +199,14 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             if (!rows.TryGetValue(keys, out var existing))
                 throw new RequestFailedException(404, $"The specified resource does not exist. Id: {id}");
 
+            // Conditional merge (WithETag): the merge only applies to the version that was read.
+            if (builder.ETag is not null
+                && !string.Equals(existing.ETagString(), builder.ETag, StringComparison.Ordinal))
+            {
+                throw new ConcurrencyConflictException(typeof(T).Name, id,
+                    new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer."));
+            }
+
             // Server-side Merge: only the declared (flattened) columns change; the rest survive.
             var merged = CopyOf(existing.Data);
             foreach (var (name, value) in builder.Updates)
@@ -209,10 +218,10 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             }
             merged[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
 
-            rows[keys] = new StoredRow(merged, ++versionCounter, DateTimeOffset.UtcNow);
+            var stored = new StoredRow(merged, ++versionCounter, DateTimeOffset.UtcNow);
+            rows[keys] = stored;
+            return Task.FromResult(stored.ETagString());
         }
-
-        return Task.CompletedTask;
     }
 
     /// <inheritdoc />

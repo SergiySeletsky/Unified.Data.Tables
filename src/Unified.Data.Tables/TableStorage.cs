@@ -486,11 +486,13 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     /// <summary>
     /// Apply a builder-driven partial update to a single entity by id. Sends only the declared
     /// columns via <see cref="TableUpdateMode.Merge"/>, so unrelated columns are preserved
-    /// server-side and no read is needed. Last-writer-wins on the declared columns (no ETag check);
-    /// other columns are race-safe by Merge semantics.
+    /// server-side and no read is needed — concurrent merges to disjoint columns never conflict.
+    /// Without <see cref="UpdateBuilder{T}.WithETag"/> the declared columns are last-writer-wins;
+    /// with it the merge is conditional and a lost race throws
+    /// <see cref="ConcurrencyConflictException"/>.
     /// </summary>
     /// <inheritdoc />
-    public async Task UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default)
+    public async Task<string> UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
@@ -520,17 +522,31 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         // Always bump UpdatedAt — set last so it wins over any caller-supplied value.
         partial[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
 
-        var resp = await client.UpdateEntityAsync(partial, ETag.All, TableUpdateMode.Merge, ct);
-
-        // Keep the cache coherent: if the entity is cached, patch it in-memory with the same updates
-        // and the new ETag so subsequent reads stay warm. Otherwise drop the entry — the next
-        // OneAsync will re-read fresh.
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
+        var condition = builder.ETag is null ? ETag.All : new ETag(builder.ETag);
+        Response resp;
+        try
         {
-            ApplyUpdates(cached.Entity, builder.Updates);
+            resp = await client.UpdateEntityAsync(partial, condition, TableUpdateMode.Merge, ct);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 412)
+        {
+            // Conditional merge lost the race. The 412 proves a foreign writer touched the row,
+            // so the cached entity AND any cached query results for its partition are stale.
+            cache.Remove(EntityCacheKey(id));
+            InvalidateQueryCache(partitionKey);
+            throw new ConcurrencyConflictException(typeName, id, ex);
+        }
+
+        // Keep the cache coherent: if the entity is cached and every declared path maps onto a
+        // top-level property, patch it in place with the new ETag so reads stay warm. Nested-path
+        // updates (or unknown names) evict instead — the next OneAsync re-reads fresh.
+        var newETag = ReadETagHeader(resp);
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null
+            && TryApplyUpdates(cached.Entity, builder.Updates))
+        {
             cached.Entity.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
             cached.Entity.Timestamp = null; // the row changed server-side; stale until re-read
-            CacheEntity(id, cached.Entity, resp.Headers.ETag ?? cached.ETag);
+            CacheEntity(id, cached.Entity, newETag ?? cached.ETag);
         }
         else
         {
@@ -538,20 +554,42 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
 
         InvalidateQueryCache(partitionKey);
+        return newETag?.ToString() ?? string.Empty;
     }
 
-    private static void ApplyUpdates(T entity, Dictionary<string, object> updates)
+    private static ETag? ReadETagHeader(Response response)
     {
+        try
+        {
+            return response?.Headers.ETag;
+        }
+        catch (Exception ex) when (ex is NotSupportedException or NotImplementedException or NullReferenceException)
+        {
+            // Test doubles (strict mocks, partial fakes) may not implement the Headers plumbing —
+            // tolerate exactly those. Anything else is a genuine SDK failure and must surface,
+            // not be masked as "no ETag".
+            return null;
+        }
+    }
+
+    private static bool TryApplyUpdates(T entity, Dictionary<string, object> updates)
+    {
+        // Validate every path BEFORE mutating: the cached instance is shared with prior readers,
+        // so a partial patch followed by eviction would leave them a half-updated object.
         var meta = TypeMetadataCache.GetMetadata(typeof(T));
+        foreach (var name in updates.Keys)
+        {
+            if (!meta.PropertyMap.ContainsKey(name))
+            {
+                return false; // nested/unknown path — caller evicts the cache entry instead
+            }
+        }
+
         foreach (var (name, value) in updates)
         {
-            if (!meta.PropertyMap.TryGetValue(name, out var prop))
-            {
-                throw new InvalidOperationException($"Property '{name}' not found on {typeof(T).Name}.");
-            }
-
-            prop.SetValue(entity, value);
+            meta.PropertyMap[name].SetValue(entity, value);
         }
+        return true;
     }
 
     /// <inheritdoc />
@@ -607,20 +645,45 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             // ETag mismatch on the cached (not caller-supplied) ETag — the cache was stale (e.g. a
             // concurrent write, or a QueryAsync overwrote the cache). Re-fetch the current ETag and
             // retry once. When the caller DID supply an ETag (or asked for Strict) we deliberately
-            // do NOT retry: the 412 propagates so the genuine conflict surfaces to the caller.
+            // do NOT retry: the genuine conflict surfaces to the caller (see the catch below).
             logger.LogWarning(ex, "ETag mismatch for {Type} {Id} — re-fetching and retrying once", typeName, entity.Id);
 
             var freshResponse = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
             if (!freshResponse.HasValue)
-                throw; // Entity was deleted externally
+            {
+                // Deleted externally between our read and this write — a conflict by definition.
+                cache.Remove(EntityCacheKey(entity.Id));
+                InvalidateQueryCache(partitionKey);
+                throw new ConcurrencyConflictException(typeName, entity.Id, ex);
+            }
 
             var freshETag = freshResponse.Value!.ETag;
-            var retryResponse = await client.UpdateEntityAsync(dataEntity, freshETag, TableUpdateMode.Replace, ct);
-            var newETag = retryResponse.Headers.ETag ?? freshETag;
-            entity.ETag = newETag.ToString();
+            try
+            {
+                var retryResponse = await client.UpdateEntityAsync(dataEntity, freshETag, TableUpdateMode.Replace, ct);
+                var newETag = retryResponse.Headers.ETag ?? freshETag;
+                entity.ETag = newETag.ToString();
 
-            CacheEntity(entity.Id, entity, newETag);
+                CacheEntity(entity.Id, entity, newETag);
+                InvalidateQueryCache(partitionKey);
+            }
+            catch (RequestFailedException retryEx) when (retryEx.Status == 412)
+            {
+                // Lost the race AGAIN between the re-fetch and the retry — a genuinely hot row.
+                cache.Remove(EntityCacheKey(entity.Id));
+                InvalidateQueryCache(partitionKey);
+                throw new ConcurrencyConflictException(typeName, entity.Id, retryEx);
+            }
+        }
+        catch (RequestFailedException ex) when (ex.Status == 412)
+        {
+            // Strict mode, or Auto with a caller-round-tripped ETag: the row changed since it was
+            // read. Surface the provider-agnostic conflict; the 412 also proves the cached entity
+            // and the partition's cached query results are stale, so drop both — a follow-up read
+            // (e.g. MutateAsync's retry) must see the fresh row.
+            cache.Remove(EntityCacheKey(entity.Id));
             InvalidateQueryCache(partitionKey);
+            throw new ConcurrencyConflictException(typeName, entity.Id, ex);
         }
 
         return entity;

@@ -31,15 +31,19 @@ copy-pasted into each one.
 - **Configurable caching** — reads are served from `IMemoryCache` per a registration-time `CachePolicy`
   (`Sliding`, `Absolute`, or `Disabled` — per entity type or globally); writes keep the entity cache
   coherent and invalidate the relevant query caches automatically.
-- **Optimistic concurrency (ETag)** — a caller-supplied `ETag` enforces strict concurrency (a conflict
-  surfaces as `RequestFailedException` 412 → map to 409); explicit `ConcurrencyMode.Strict` /
-  `LastWriterWins` overloads make intent greppable.
+- **Optimistic concurrency (ETag)** — a caller-supplied `ETag` enforces strict concurrency; a lost
+  race throws the provider-agnostic `ConcurrencyConflictException` (map to HTTP 409). Explicit
+  `ConcurrencyMode.Strict` / `LastWriterWins` overloads make intent greppable, and
+  `MutateAsync(id, e => e.Count++)` packages the read → mutate → strict-write → retry loop that makes
+  derived values (counters, unions) correct under concurrency.
 - **Upsert & batches** — `UpsertAsync` (single round-trip insert-or-replace), `CreateBatchAsync` /
   `UpsertBatchAsync` (partition-grouped 100-row transactions), `CountAsync` (keys-only projection).
 - **Bounded queries** — `QueryAsync(QueryOptions)` and streaming `QueryStreamAsync` with partition scope,
   canonical RowKey-prefix ranges, and `Take` — never cached, never a disguised full scan.
-- **Partial (Merge) updates** — `UpdateAsync(id, builder)` writes only the columns you declare, leaving the
-  rest of the row untouched with no read required.
+- **Partial (Merge) updates** — `UpdateAsync(id, builder)` writes only the columns you declare
+  (including nested paths: `x => x.Address.City` → `Address_City`), leaving the rest of the row
+  untouched with no read required — concurrent writers touching disjoint columns never conflict.
+  `builder.WithETag(...)` makes the merge conditional for column-level compare-and-swap.
 - **Legacy column aliases** — `[ColumnAlias]` reads old column names (e.g. after a property rename) when
   the canonical column is absent; writes stay canonical, so rows converge without a migration job.
 - **Protected properties** — mark a property `[ProtectedProperty("admin,...")]` and role-gate writes through
@@ -165,7 +169,8 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `QueryStreamAsync(options?)` | Streaming variant — never caches, never buffers. |
 | `UpdateAsync(entity)` | Full replace with adaptive (`Auto`) ETag concurrency. |
 | `UpdateAsync(entity, mode)` | Full replace with explicit `ConcurrencyMode`. |
-| `UpdateAsync(id, builder)` | Partial `Merge` — writes only the declared columns. |
+| `UpdateAsync(id, builder)` | Partial `Merge` — writes only the declared columns (nested paths supported, optional `WithETag`); returns the new ETag. |
+| `MutateAsync(id, e => …)` | Extension: read → mutate → `Strict` write, re-reading and re-applying on conflict (CAS). |
 | `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction. |
 | `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking. |
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
@@ -188,40 +193,58 @@ await foreach (var run in storage.QueryStreamAsync(new QueryOptions { Partition 
     Process(run);
 ```
 
-Results arrive in lexical (PartitionKey, RowKey) order — encode any other order into your RowKeys.
+Results arrive in lexical (PartitionKey, RowKey) order — encode any other order into your RowKeys;
+`RowKeys.InvertedTicks(now)` makes later timestamps sort FIRST, so "most recent N" is just
+`QueryAsync(new QueryOptions { Partition = p, Take = n })` with no client-side sorting.
 `RowKeyPrefix` requires `Partition` (a cross-partition RowKey range would be a full table scan).
 
 ### Partial updates
 
-Only the properties you set are written; everything else on the row is preserved, and no read is needed.
+Only the properties you set are written; everything else on the row is preserved, and no read is
+needed. Nested access writes the flattened column (`Address_City`), leaving sibling columns of the
+nested object untouched.
 
 ```csharp
 await storage.UpdateAsync("eu|alice@example.com", b => b
     .SetProperty(x => x.Balance, 250m)
+    .SetProperty(x => x.Address.City, "Lviv"));
+
+// Conditional merge — column-level compare-and-swap:
+var read = await storage.OneAsync(id);
+await storage.UpdateAsync(id, b => b
+    .WithETag(read!.ETag!)                 // ConcurrencyConflictException if the row moved on
     .SetProperty(x => x.Name, "Alice A."));
 ```
 
 ### Optimistic concurrency
 
 `OneAsync`/`QueryAsync` populate `Entity.ETag`. Pass it back on `UpdateAsync(entity)` for a strict
-check — a concurrent modification throws `RequestFailedException` with status `412`.
+check — a concurrent modification throws `ConcurrencyConflictException` (the provider's 412 rides
+along as `InnerException`), and the conflicting row's cache entry is evicted so the next read is
+fresh.
 
 ```csharp
 var c = await storage.OneAsync(id);
 c!.Balance += 100;
-await storage.UpdateAsync(c);   // 412 if the row changed since it was read
+await storage.UpdateAsync(c);   // ConcurrencyConflictException if the row changed since it was read
 ```
 
-Pick semantics explicitly when it matters:
+For values *derived* from the current row (counters, unions, merges), use the packaged
+compare-and-swap loop — it re-reads and re-applies on conflict, so no increment is ever lost:
 
-1. **Disjoint-field mutation** → `UpdateAsync(id, builder)` — Merge, race-safe by construction.
-2. **Read-modify-write of the whole object** → `UpdateAsync(entity)` — `Auto`: strict when the ETag
-   round-tripped, cached-ETag with one retry otherwise.
-3. **Deliberate overwrite** → `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` — explicit and
-   greppable. (Don't null the ETag to "turn off" concurrency; that silently selects the cached-ETag
-   path, which is neither strict nor last-writer-wins.)
-4. **Mandatory round-trip** → `UpdateAsync(entity, ConcurrencyMode.Strict)` — throws
-   `InvalidOperationException` when no ETag is present instead of degrading.
+```csharp
+await storage.MutateAsync(id, e => e.OccurrenceCount++);   // read → mutate → Strict write, ≤3 attempts with jittered backoff
+```
+
+### Choosing a write strategy (concurrency cookbook)
+
+| Your write looks like… | Use | Why |
+| --- | --- | --- |
+| Writers touch **different fields** of the same row (PATCH endpoints, per-subsystem status fields, progress columns vs. approval flags) | `UpdateAsync(id, builder)` | Merge is atomic per request; disjoint columns from concurrent writers both land — no ETags, no retries, no clobber |
+| The new value is **computed from the current one** (counters, evidence unions, weighted merges) | `MutateAsync(id, e => …)` | Merge would persist a value computed from a stale read; CAS re-reads and re-applies until it wins |
+| Mutating **inside a JSON-serialized column** (an item in a `List<>` property) | Remodel as row-per-item (RowKey prefix + `QueryOptions`), or `MutateAsync` | The column is the unit of atomicity — two writers editing different items of one list still clobber |
+| A transition that must happen **exactly once** (approve, resolve, finalize) | `UpdateAsync(entity, ConcurrencyMode.Strict)` | The loser must FAIL visibly (`ConcurrencyConflictException` → HTTP 409), not silently re-apply |
+| Deliberate unconditional overwrite (convergent upserts, supersede sweeps) | `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` | Explicit and greppable. Don't null the ETag to "turn off" concurrency — that selects the cached-ETag path, which is neither strict nor LWW |
 
 `Entity.Timestamp` mirrors the service-managed last-write time: populated on every read, reset to
 `null` on writes (write responses don't carry it), never stored as a column. Unlike `UpdatedAt` it is

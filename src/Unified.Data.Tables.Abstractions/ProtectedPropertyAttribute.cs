@@ -5,7 +5,7 @@ namespace Unified.Data.Tables;
 /// value. The storage layer enforces this on write:
 /// <list type="bullet">
 ///   <item><description>whole-entity <see cref="IStorage{T}.UpdateAsync(T, System.Threading.CancellationToken)"/> consults an <see cref="IProtectedPropertyAuthorizer"/>;</description></item>
-///   <item><description>builder-based <see cref="IStorage{T}.UpdateAsync(string, System.Action{UpdateBuilder{T}}, System.Threading.CancellationToken)"/> rejects the property unless <see cref="UpdateBuilder{T}.AllowProtected"/> was called.</description></item>
+///   <item><description>builder-based <see cref="IStorage{T}.UpdateAsync(string, System.Action{UpdateBuilder{T}}, System.Threading.CancellationToken)"/> rejects the property — at any depth of the set path (<c>x =&gt; x.Payroll.Salary</c>) — unless <see cref="UpdateBuilder{T}.AllowProtected"/> was called.</description></item>
 /// </list>
 /// </summary>
 [AttributeUsage(AttributeTargets.Property, AllowMultiple = false)]
