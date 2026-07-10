@@ -111,6 +111,50 @@ public class UpdateBuilderTests
     }
 
     [Fact]
+    public void SetProperty_NestedProtectedProperty_WithoutAllowProtected_Throws()
+    {
+        var builder = new UpdateBuilder<NestedProtectedEntity>();
+
+        // The [ProtectedProperty] sits on the NESTED type's property — reaching it via a nested
+        // path must be rejected exactly like a root-level protected property.
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => builder.SetProperty(x => x.Payroll.Salary, 100m));
+
+        Assert.Contains("ProtectedProperty", ex.Message);
+    }
+
+    [Fact]
+    public void SetProperty_NestedProtectedProperty_WithAllowProtected_Succeeds()
+    {
+        var builder = new UpdateBuilder<NestedProtectedEntity>().AllowProtected();
+
+        builder.SetProperty(x => x.Payroll.Salary, 100m);
+
+        Assert.True(builder.Updates.ContainsKey("Payroll_Salary"));
+    }
+
+    [Fact]
+    public void SetProperty_ParentThenChildOverlap_Throws()
+    {
+        var builder = new UpdateBuilder<NestedEntity>();
+        builder.SetProperty(x => x.Address, new AddressInfo { City = "Kyiv", Country = "Ukraine" });
+
+        // The whole-object write already covers Address_City — a second write to the same
+        // column with an unspecified winner must be rejected, not silently recorded.
+        Assert.Throws<InvalidOperationException>(() => builder.SetProperty(x => x.Address.City, "Lviv"));
+    }
+
+    [Fact]
+    public void SetProperty_ChildThenParentOverlap_Throws()
+    {
+        var builder = new UpdateBuilder<NestedEntity>();
+        builder.SetProperty(x => x.Address.City, "Lviv");
+
+        Assert.Throws<InvalidOperationException>(
+            () => builder.SetProperty(x => x.Address, new AddressInfo { City = "Kyiv", Country = "Ukraine" }));
+    }
+
+    [Fact]
     public void SetProperty_NotRootedAtTheLambdaParameter_Throws()
     {
         var somebodyElse = new TestEntity { Name = "other" };

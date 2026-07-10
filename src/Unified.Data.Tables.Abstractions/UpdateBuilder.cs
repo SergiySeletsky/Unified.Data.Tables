@@ -25,16 +25,6 @@ public class UpdateBuilder<T>
             .Select(p => p.Name),
         StringComparer.Ordinal);
 
-    // Properties decorated with [ProtectedProperty] are role-gated and must go through dedicated
-    // endpoints, never through generic builder-based updates — unless the caller has already
-    // verified authorisation and opted in via AllowProtected().
-    private static readonly HashSet<string> ProtectedPropertyNames = new(
-        typeof(T)
-            .GetProperties()
-            .Where(p => p.GetCustomAttribute<ProtectedPropertyAttribute>() is not null)
-            .Select(p => p.Name),
-        StringComparer.Ordinal);
-
     /// <summary>
     /// The property paths to write, keyed by the flattened column path (<c>"Name"</c>,
     /// <c>"Address_City"</c>) — the same convention the serializer uses for nested columns.
@@ -59,6 +49,10 @@ public class UpdateBuilder<T>
     {
         if (string.IsNullOrEmpty(etag))
             throw new ArgumentException("ETag must be a non-empty row version read from the entity.", nameof(etag));
+        if (etag == "*")
+            throw new ArgumentException(
+                "ETag \"*\" matches any row version, which would silently make the merge unconditional — omit WithETag for an unconditional merge.",
+                nameof(etag));
         ETag = etag;
         return this;
     }
@@ -80,8 +74,9 @@ public class UpdateBuilder<T>
     /// <c>Address_City</c> column, leaving sibling columns of the nested object untouched.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// The property is managed by the storage layer, is a protected property that has not been
-    /// unlocked via <see cref="AllowProtected"/>, or was already set in this call.
+    /// The property is managed by the storage layer, any segment of the path is a protected
+    /// property that has not been unlocked via <see cref="AllowProtected"/>, or the path was
+    /// already set (or overlaps a path already set) in this call.
     /// </exception>
     /// <exception cref="ArgumentNullException"><paramref name="value"/> is <c>null</c>.</exception>
     /// <exception cref="ArgumentException">The expression is not a property access rooted at the lambda parameter.</exception>
@@ -90,20 +85,33 @@ public class UpdateBuilder<T>
         TProp value)
     {
         var path = GetPropertyPath(propertyPicker);
-        var rootProperty = path[0];
-        var columnPath = string.Join(PathSeparator.ToString(), path);
+        var rootProperty = path[0].Name;
+        var columnPath = string.Join(PathSeparator.ToString(), path.Select(p => p.Name));
 
         if (ManagedPropertyNames.Contains(rootProperty))
             throw new InvalidOperationException(
                 $"'{rootProperty}' is managed by the storage layer and cannot be set via SetProperty.");
 
-        if (ProtectedPropertyNames.Contains(rootProperty) && !_protectedAllowed)
+        // [ProtectedProperty] is enforced on EVERY segment, not just the root — a nested path
+        // (x => x.Payroll.Salary) reaches the same role-gated column as a root-level one would.
+        var protectedSegment = path.FirstOrDefault(p => p.GetCustomAttribute<ProtectedPropertyAttribute>() is not null);
+        if (protectedSegment is not null && !_protectedAllowed)
             throw new InvalidOperationException(
-                $"'{rootProperty}' is a [ProtectedProperty] and cannot be set via the generic UpdateBuilder. Use a dedicated endpoint or call AllowProtected().");
+                $"'{protectedSegment.Name}' is a [ProtectedProperty] and cannot be set via the generic UpdateBuilder. Use a dedicated endpoint or call AllowProtected().");
 
         if (Updates.ContainsKey(columnPath))
             throw new InvalidOperationException(
                 $"Property '{columnPath}' was already set in this UpdateAsync call.");
+
+        // A whole-object write flattens into the same columns its nested paths would — writes
+        // along one ancestry collide with an unspecified winner, so reject the overlap up front.
+        foreach (var existing in Updates.Keys)
+        {
+            if (existing.StartsWith(columnPath + PathSeparator, StringComparison.Ordinal)
+                || columnPath.StartsWith(existing + PathSeparator, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"Property path '{columnPath}' overlaps '{existing}', which was already set in this UpdateAsync call — both would write the same columns.");
+        }
 
         if (value is null)
             throw new ArgumentNullException(nameof(value), $"Value for property '{columnPath}' cannot be null.");
@@ -115,18 +123,18 @@ public class UpdateBuilder<T>
     // Walks the member chain back to the lambda parameter so nested access produces the full
     // flattened path. Anything not rooted at the parameter (closures, method calls, casts of
     // non-members) is rejected — silently accepting it is how columns end up orphaned.
-    private static IReadOnlyList<string> GetPropertyPath<TProp>(Expression<Func<T, TProp>> expression)
+    private static IReadOnlyList<PropertyInfo> GetPropertyPath<TProp>(Expression<Func<T, TProp>> expression)
     {
-        var segments = new Stack<string>();
+        var segments = new Stack<PropertyInfo>();
         var node = expression.Body;
 
         // Unwrap a boxing/implicit conversion (e.g. value-type property picked as object).
         if (node is UnaryExpression { NodeType: ExpressionType.Convert or ExpressionType.ConvertChecked } unary)
             node = unary.Operand;
 
-        while (node is MemberExpression { Member: PropertyInfo } member)
+        while (node is MemberExpression { Member: PropertyInfo property } member)
         {
-            segments.Push(member.Member.Name);
+            segments.Push(property);
             node = member.Expression!;
         }
 

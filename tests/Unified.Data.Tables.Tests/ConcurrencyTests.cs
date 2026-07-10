@@ -74,6 +74,34 @@ public class ConcurrencyTests
         Assert.Throws<ArgumentException>(() => new UpdateBuilder<TestEntity>().WithETag(""));
     }
 
+    [Fact]
+    public void WithETag_Wildcard_Throws()
+    {
+        // "*" is ETag.All — it matches any row version, silently turning the "conditional"
+        // merge unconditional. Misuse must fail loudly, not degrade.
+        Assert.Throws<ArgumentException>(() => new UpdateBuilder<TestEntity>().WithETag("*"));
+    }
+
+    [Fact]
+    public async Task BuilderUpdate_Conflict_InvalidatesPartitionQueryCache()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByPartition(Mocks.Row("p", "r"));
+        await h.Store.QueryAsync("p");                                    // warm the partition query cache
+        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
+
+        await Assert.ThrowsAsync<ConcurrencyConflictException>(
+            () => h.Store.UpdateAsync("p|r", b => b.WithETag("W/\"stale\"").SetProperty(x => x.Name, "x")));
+        await h.Store.QueryAsync("p");                                    // must MISS the query cache
+
+        // The 412 proves a foreign writer touched the partition — cached query results for it
+        // are stale too, so the second query must go back to storage.
+        h.Table.Received(2).QueryAsync<TableEntity>(
+            Arg.Any<System.Linq.Expressions.Expression<Func<TableEntity, bool>>>(),
+            Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
     // ── Conflict-driven cache eviction on whole-entity updates ──────────────
 
     [Fact]
@@ -91,6 +119,26 @@ public class ConcurrencyTests
 
         await h.Table.Received(2).GetEntityIfExistsAsync<TableEntity>(
             "p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task StrictConflict_InvalidatesPartitionQueryCache()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupGet("p", "r", Mocks.Row("p", "r"));
+        h.SetupQueryByPartition(Mocks.Row("p", "r"));
+        var entity = await h.Store.OneAsync("p|r");                       // carry the ETag
+        await h.Store.QueryAsync("p");                                    // warm the partition query cache
+        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
+
+        await Assert.ThrowsAsync<ConcurrencyConflictException>(
+            () => h.Store.UpdateAsync(entity!, ConcurrencyMode.Strict));
+        await h.Store.QueryAsync("p");                                    // must MISS the query cache
+
+        h.Table.Received(2).QueryAsync<TableEntity>(
+            Arg.Any<System.Linq.Expressions.Expression<Func<TableEntity, bool>>>(),
+            Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     // ── WithETag — InMemory parity ──────────────────────────────────────────
@@ -173,6 +221,28 @@ public class ConcurrencyTests
                  .GetAwaiter().GetResult();
             e.Value += 1;
         }, maxAttempts: 2));
+    }
+
+    [Fact]
+    public async Task MutateAsync_BacksOffBetweenAttempts()
+    {
+        var store = new InMemoryStorage<TestEntity>();
+        await store.CreateAsync(new TestEntity { Id = "p|r", Value = 0 });
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAsync<ConcurrencyConflictException>(() => store.MutateAsync("p|r", e =>
+        {
+            store.UpdateAsync(new TestEntity { Id = "p|r", Value = 999 }, ConcurrencyMode.LastWriterWins)
+                 .GetAwaiter().GetResult();
+            e.Value += 1;
+        }, maxAttempts: 3));
+        stopwatch.Stop();
+
+        // Immediate retries re-race the same hot writer. Two lost non-final attempts must back
+        // off ≥ 20ms and ≥ 40ms (linear base + jitter); assert only the deterministic lower
+        // bound — no upper bound, so the test cannot flake under load.
+        Assert.True(stopwatch.ElapsedMilliseconds >= 55,
+            $"expected ≥55ms of accumulated backoff, got {stopwatch.ElapsedMilliseconds}ms");
     }
 
     [Fact]

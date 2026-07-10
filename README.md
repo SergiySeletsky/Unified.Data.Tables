@@ -233,7 +233,7 @@ For values *derived* from the current row (counters, unions, merges), use the pa
 compare-and-swap loop — it re-reads and re-applies on conflict, so no increment is ever lost:
 
 ```csharp
-await storage.MutateAsync(id, e => e.OccurrenceCount++);   // read → mutate → Strict write, retry ≤3
+await storage.MutateAsync(id, e => e.OccurrenceCount++);   // read → mutate → Strict write, ≤3 attempts with jittered backoff
 ```
 
 ### Choosing a write strategy (concurrency cookbook)

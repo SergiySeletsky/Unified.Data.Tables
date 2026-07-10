@@ -530,8 +530,10 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
         catch (RequestFailedException ex) when (ex.Status == 412)
         {
-            // Conditional merge lost the race. The 412 also proves any cached copy is stale.
+            // Conditional merge lost the race. The 412 proves a foreign writer touched the row,
+            // so the cached entity AND any cached query results for its partition are stale.
             cache.Remove(EntityCacheKey(id));
+            InvalidateQueryCache(partitionKey);
             throw new ConcurrencyConflictException(typeName, id, ex);
         }
 
@@ -561,9 +563,11 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         {
             return response?.Headers.ETag;
         }
-        catch
+        catch (Exception ex) when (ex is NotSupportedException or NotImplementedException or NullReferenceException)
         {
-            // Test doubles may return a Response whose Headers struct has no backing store.
+            // Test doubles (strict mocks, partial fakes) may not implement the Headers plumbing —
+            // tolerate exactly those. Anything else is a genuine SDK failure and must surface,
+            // not be masked as "no ETag".
             return null;
         }
     }
@@ -649,6 +653,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             {
                 // Deleted externally between our read and this write — a conflict by definition.
                 cache.Remove(EntityCacheKey(entity.Id));
+                InvalidateQueryCache(partitionKey);
                 throw new ConcurrencyConflictException(typeName, entity.Id, ex);
             }
 
@@ -666,15 +671,18 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             {
                 // Lost the race AGAIN between the re-fetch and the retry — a genuinely hot row.
                 cache.Remove(EntityCacheKey(entity.Id));
+                InvalidateQueryCache(partitionKey);
                 throw new ConcurrencyConflictException(typeName, entity.Id, retryEx);
             }
         }
         catch (RequestFailedException ex) when (ex.Status == 412)
         {
             // Strict mode, or Auto with a caller-round-tripped ETag: the row changed since it was
-            // read. Surface the provider-agnostic conflict; the 412 also proves any cached copy is
-            // stale, so drop it — a follow-up read (e.g. MutateAsync's retry) must see the fresh row.
+            // read. Surface the provider-agnostic conflict; the 412 also proves the cached entity
+            // and the partition's cached query results are stale, so drop both — a follow-up read
+            // (e.g. MutateAsync's retry) must see the fresh row.
             cache.Remove(EntityCacheKey(entity.Id));
+            InvalidateQueryCache(partitionKey);
             throw new ConcurrencyConflictException(typeName, entity.Id, ex);
         }
 

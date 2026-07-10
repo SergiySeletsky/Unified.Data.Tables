@@ -6,14 +6,30 @@ namespace Unified.Data.Tables;
 /// </summary>
 public static class StorageExtensions
 {
+    // Base for the between-attempt backoff: a lost attempt N waits N*Base plus up to Base of
+    // jitter. Immediate retries tend to re-race the same hot writer; the jitter desynchronizes
+    // competing retriers. This is contention smoothing, not an availability retry policy.
+    private const int BackoffBaseMs = 20;
+
+#if NETSTANDARD2_0
+    private static readonly Random JitterSource = new();
+
+    private static int NextJitterMs()
+    {
+        lock (JitterSource) return JitterSource.Next(BackoffBaseMs);
+    }
+#else
+    private static int NextJitterMs() => Random.Shared.Next(BackoffBaseMs);
+#endif
+
     /// <summary>
     /// Read-modify-write with optimistic concurrency and bounded retry (compare-and-swap): reads
     /// the entity, applies <paramref name="mutate"/>, and writes with
     /// <see cref="ConcurrencyMode.Strict"/>. When another writer got there first
-    /// (<see cref="ConcurrencyConflictException"/>), the entity is re-read and
-    /// <paramref name="mutate"/> is re-applied to the FRESH copy — which is what makes derived
-    /// values (counters, unions, merges) correct under concurrency, unlike a plain update that
-    /// would persist a value computed from a stale read.
+    /// (<see cref="ConcurrencyConflictException"/>), a brief jittered backoff is awaited, then the
+    /// entity is re-read and <paramref name="mutate"/> is re-applied to the FRESH copy — which is
+    /// what makes derived values (counters, unions, merges) correct under concurrency, unlike a
+    /// plain update that would persist a value computed from a stale read.
     /// </summary>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
@@ -49,7 +65,10 @@ public static class StorageExtensions
             }
             catch (ConcurrencyConflictException) when (attempt < maxAttempts)
             {
-                // Another writer won the race — loop re-reads the fresh row and re-applies.
+                // Another writer won the race — back off briefly so competing retriers spread
+                // out, then loop: re-read the fresh row and re-apply. The final attempt's
+                // conflict propagates without a pointless delay (the filter above excludes it).
+                await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
             }
         }
     }
