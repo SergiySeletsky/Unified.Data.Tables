@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>Unified.Data.Tables.InMemory</PackageId>
+    <RootNamespace>Unified.Data.Tables.InMemory</RootNamespace>
+    <AssemblyName>Unified.Data.Tables.InMemory</AssemblyName>
+    <Description>Faithful in-memory IStorage&lt;T&gt; for Unified.Data.Tables: rows round-trip through the real TableEntitySerializer (so tests exercise production serialization behavior — decimal-as-double, enum-as-string, nested flattening, 64KB cell handling), with 409-on-duplicate-create, ETag simulation with 412 conflicts, and identical id normalization and key splitting. For unit tests, dev mode, and offline runtime.</Description>
+    <PackageTags>azure;table-storage;repository;in-memory;testing;fake;storage;nosql</PackageTags>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Unified.Data.Tables\Unified.Data.Tables.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
