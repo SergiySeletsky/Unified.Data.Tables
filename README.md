@@ -160,7 +160,7 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 
 | Method | Description |
 | --- | --- |
-| `CreateAsync(entity)` | Insert a new row (409 when it exists); returns it with its populated `ETag`. |
+| `CreateAsync(entity)` | Insert a new row (`DuplicateKeyException` when it exists); returns it with its populated `ETag`. |
 | `UpsertAsync(entity)` | Insert-or-replace in one round trip. Unconditional by design (last writer wins); preserves a caller-supplied `CreatedAt`. |
 | `OneAsync(id)` | Fetch one row by composite id, or `null`. |
 | `ExistsAsync(id)` | Whether a row exists (cache-aware). |
@@ -171,7 +171,11 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `UpdateAsync(entity, mode)` | Full replace with explicit `ConcurrencyMode`. |
 | `UpdateAsync(id, builder)` | Partial `Merge` — writes only the declared columns (nested paths supported, optional `WithETag`); returns the new ETag. |
 | `MutateAsync(id, e => …)` | Extension: read → mutate → `Strict` write, re-reading and re-applying on conflict (CAS). |
-| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction. |
+| `GetOrCreateAsync(id, factory)` | Extension: read-or-insert; a lost create race converges on the winner's row. |
+| `MutateOrCreateAsync(id, create, mutate)` | Extension: insert-or-mutate CAS — the delta applies uniformly on first insert and on updates. |
+| `TryMutateAsync(id, e => …)` | Extension: outcome-returning CAS — `Updated` / `NotFound` / `Conflicted`, nothing thrown for expected branches. |
+| `TryTransitionAsync(id, when, apply)` | Extension: exactly-once transition as a result — the race-loser gets `PreconditionFailed` with the winner's row. |
+| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction (`DuplicateKeyException` on an existing or repeated key). |
 | `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking. |
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
 | `DeleteAsync(id)` | Delete one row (idempotent). |
@@ -236,6 +240,32 @@ compare-and-swap loop — it re-reads and re-applies on conflict, so no incremen
 await storage.MutateAsync(id, e => e.OccurrenceCount++);   // read → mutate → Strict write, ≤3 attempts with jittered backoff
 ```
 
+### Outcome verbs — expected situations as return values
+
+The expected branches of concurrent programs — *already exists*, *gone*, *someone got there
+first* — come back as return values instead of exceptions, so a forgotten catch can never turn an
+expected race into a 500:
+
+```csharp
+// Idempotent create — a lost create race converges on the winner's row:
+var member = await storage.GetOrCreateAsync(id, () => new MemberEntity { /* ... */ });
+
+// Insert-or-mutate CAS — the delta behaves identically on first insert and on updates:
+await storage.MutateOrCreateAsync(id,
+    create: () => new FeedbackEntity { OccurrenceCount = 0 },
+    mutate: e => e.OccurrenceCount++);
+
+// Exactly-once transitions — the race-loser is an EXPECTED branch, not an exception:
+var result = await storage.TryTransitionAsync(gateId,
+    when:  g => g.Status == "open",
+    apply: g => { g.Status = "resolved"; g.ResolvedBy = userId; });
+// result.Status: Updated | PreconditionFailed (carries the winner's fresh row) | NotFound | Conflicted
+```
+
+Losing the race to the *same* transition reports `PreconditionFailed` (the retry re-reads, sees
+the precondition no longer holds, and returns the winner's row) — `Conflicted` is reserved for a
+genuinely hot row whose precondition still held every attempt.
+
 ### Choosing a write strategy (concurrency cookbook)
 
 | Your write looks like… | Use | Why |
@@ -243,7 +273,9 @@ await storage.MutateAsync(id, e => e.OccurrenceCount++);   // read → mutate �
 | Writers touch **different fields** of the same row (PATCH endpoints, per-subsystem status fields, progress columns vs. approval flags) | `UpdateAsync(id, builder)` | Merge is atomic per request; disjoint columns from concurrent writers both land — no ETags, no retries, no clobber |
 | The new value is **computed from the current one** (counters, evidence unions, weighted merges) | `MutateAsync(id, e => …)` | Merge would persist a value computed from a stale read; CAS re-reads and re-applies until it wins |
 | Mutating **inside a JSON-serialized column** (an item in a `List<>` property) | Remodel as row-per-item (RowKey prefix + `QueryOptions`), or `MutateAsync` | The column is the unit of atomicity — two writers editing different items of one list still clobber |
-| A transition that must happen **exactly once** (approve, resolve, finalize) | `UpdateAsync(entity, ConcurrencyMode.Strict)` | The loser must FAIL visibly (`ConcurrencyConflictException` → HTTP 409), not silently re-apply |
+| A transition that must happen **exactly once** (approve, resolve, finalize) | `TryTransitionAsync(id, when, apply)` | The loser is an EXPECTED branch: it gets `PreconditionFailed` carrying the winner's row — three switch arms, no catch. (Raw `UpdateAsync(entity, ConcurrencyMode.Strict)` remains the primitive when you want the loser to throw.) |
+| **Create-if-absent** (member registration, idempotent provisioning) | `GetOrCreateAsync(id, factory)` | A lost create race converges on the winner's row instead of throwing `DuplicateKeyException` |
+| **Insert-or-apply-delta** (occurrence counters, feedback dedupe) | `MutateOrCreateAsync(id, create, mutate)` | The delta applies exactly once per attempt, uniformly on first insert and on every later call |
 | Deliberate unconditional overwrite (convergent upserts, supersede sweeps) | `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` | Explicit and greppable. Don't null the ETag to "turn off" concurrency — that selects the cached-ETag path, which is neither strict nor LWW |
 
 `Entity.Timestamp` mirrors the service-managed last-write time: populated on every read, reset to
@@ -369,8 +401,9 @@ Assert.Equal(1, store.Count);                  // + Clear(), Snapshot() convenie
 ```
 
 The fake is deliberately faithful: rows round-trip through the REAL serializer (decimal-as-double,
-enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `CreateAsync` throws 409,
-updating a missing row throws 404, stale ETags throw 412 per `ConcurrencyMode`, deletes are idempotent,
+enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `CreateAsync` throws
+`DuplicateKeyException`, updating a missing row throws 404, stale ETags throw
+`ConcurrencyConflictException` per `ConcurrencyMode`, deletes are idempotent,
 and results arrive in lexical key order — so a green test against the fake means the same code holds
 against Azure Tables.
 

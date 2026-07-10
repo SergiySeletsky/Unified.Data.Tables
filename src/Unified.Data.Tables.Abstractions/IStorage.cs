@@ -20,7 +20,10 @@ public interface IStorage<T> where T : Entity, new()
     /// <returns>The number of entities deleted.</returns>
     Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default);
 
-    /// <summary>Insert a new document. Fails with a 409 when the id already exists.</summary>
+    /// <summary>
+    /// Insert a new document; throws <see cref="DuplicateKeyException"/> when the id already
+    /// exists (use <c>StorageExtensions.GetOrCreateAsync</c> when that is an expected outcome).
+    /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The persisted entity, including its populated <see cref="Entity.ETag"/>.</returns>
@@ -112,9 +115,9 @@ public interface IStorage<T> where T : Entity, new()
 
     /// <summary>
     /// Transactional inserts, grouped by partition and chunked at 100 entities per transaction.
-    /// Atomic per chunk only. Any existing key fails its chunk with a 409. Batch sub-responses are
-    /// not correlated back, so every entity's <see cref="Entity.ETag"/> is reset to <c>null</c> —
-    /// re-read before optimistic updates.
+    /// Atomic per chunk only. Any existing key fails its chunk with
+    /// <see cref="DuplicateKeyException"/>. Batch sub-responses are not correlated back, so every
+    /// entity's <see cref="Entity.ETag"/> is reset to <c>null</c> — re-read before optimistic updates.
     /// </summary>
     /// <param name="entities">The entities to insert.</param>
     /// <param name="ct">Cancellation token.</param>
