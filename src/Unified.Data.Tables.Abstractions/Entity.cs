@@ -21,7 +21,15 @@ namespace Unified.Data.Tables;
 /// <see cref="Timestamp"/> is the service-managed last-write time — populated on read, reset to
 /// <c>null</c> on write, and likewise never serialized as a column.
 /// </para>
+/// <para>
+/// The class-level <see cref="ColumnAliasAttribute"/>s below let rows written by pre-0.3.0
+/// serializers (which stored the timestamps as <c>Created</c>/<c>Modified</c>) deserialize into the
+/// renamed <see cref="CreatedAt"/>/<see cref="UpdatedAt"/> properties. Reads only — writes always
+/// emit the canonical column names, so rows converge to the new schema as they are rewritten.
+/// </para>
 /// </remarks>
+[ColumnAlias(nameof(CreatedAt), "Created")]
+[ColumnAlias(nameof(UpdatedAt), "Modified")]
 public abstract class Entity : IEntity, IEquatable<Entity>
 {
     /// <inheritdoc />

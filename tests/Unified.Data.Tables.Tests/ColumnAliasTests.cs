@@ -60,6 +60,41 @@ public class ColumnAliasTests
         Assert.Equal(created, entity.CreatedAt);
     }
 
+    [Fact]
+    public void BaseEntity_Aliases_HydrateLegacyTimestamps_OnPlainEntity()
+    {
+        // A plain entity that declares no aliases of its own still reads legacy Created/Modified
+        // columns, because the aliases live on the base Entity type (0.2.0 → 0.3.0 back-compat).
+        var created = new DateTimeOffset(2022, 2, 2, 2, 2, 2, TimeSpan.Zero);
+        var updated = new DateTimeOffset(2022, 3, 3, 3, 3, 3, TimeSpan.Zero);
+        var row = new TableEntity("p", "r")
+        {
+            ["Id"] = "p|r",
+            ["Name"] = "plain",
+            ["Created"] = created,
+            ["Modified"] = updated,
+        };
+
+        var entity = row.FromTableEntity<TestEntity>();
+
+        Assert.Equal(created, entity.CreatedAt);
+        Assert.Equal(updated, entity.UpdatedAt);
+        Assert.Equal("plain", entity.Name);
+    }
+
+    [Fact]
+    public void BaseEntity_Writes_EmitCanonicalTimestampColumns_NotAliases()
+    {
+        var entity = new TestEntity { Id = "p|r", Name = "plain" };
+
+        var row = entity.ToTableEntity("p", "r");
+
+        Assert.Contains("CreatedAt", row.Keys);
+        Assert.Contains("UpdatedAt", row.Keys);
+        Assert.DoesNotContain("Created", row.Keys);
+        Assert.DoesNotContain("Modified", row.Keys);
+    }
+
     // ── Property-level aliases ───────────────────────────────────────────────
 
     [Fact]
