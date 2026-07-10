@@ -77,6 +77,7 @@ public static class StorageExtensions
     /// Read the entity, or create it when absent — converging on the winner's row when a
     /// concurrent creator gets there first (<see cref="DuplicateKeyException"/> is absorbed and
     /// the existing row returned). Idempotent create without exception handling at the call site.
+    /// The existing-row fast path goes through the storage's normal (possibly cached) read path.
     /// </summary>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
@@ -125,7 +126,11 @@ public static class StorageExtensions
     /// <param name="maxAttempts">Total attempts before the conflict propagates.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The persisted entity, including its refreshed <see cref="Entity.ETag"/>.</returns>
-    /// <exception cref="ConcurrencyConflictException">Still conflicted after <paramref name="maxAttempts"/> attempts.</exception>
+    /// <exception cref="ConcurrencyConflictException">
+    /// Still racing after <paramref name="maxAttempts"/> attempts — whether the last race lost was
+    /// an update conflict or a create race (a last-attempt <see cref="DuplicateKeyException"/> is
+    /// wrapped, never leaked).
+    /// </exception>
     public static async Task<T> MutateOrCreateAsync<T>(
         this IStorage<T> storage, string id, Func<T> create, Action<T> mutate,
         int maxAttempts = 3, CancellationToken ct = default)
@@ -152,9 +157,13 @@ public static class StorageExtensions
                 mutate(entity);
                 return await storage.UpdateAsync(entity, ConcurrencyMode.Strict, ct).ConfigureAwait(false);
             }
-            catch (DuplicateKeyException) when (attempt < maxAttempts)
+            catch (DuplicateKeyException ex)
             {
-                // Lost the create race — loop reads the winner's row and mutates THAT.
+                // Lost the create race — loop reads the winner's row and mutates THAT. When the
+                // budget is spent, surface the documented conflict type regardless of WHICH race
+                // was lost on the last attempt; the duplicate rides along as the inner exception.
+                if (attempt >= maxAttempts)
+                    throw new ConcurrencyConflictException(typeof(T).Name, id, ex);
                 await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
             }
             catch (ConcurrencyConflictException) when (attempt < maxAttempts)
@@ -218,6 +227,14 @@ public static class StorageExtensions
     ///   <item><description><see cref="MutationStatus.NotFound"/> / <see cref="MutationStatus.Conflicted"/>.</description></item>
     /// </list>
     /// </summary>
+    /// <remarks>
+    /// Reads go through the storage's normal (possibly cached) read path. A lost race always
+    /// converges on fresh state — the conflict evicts the cache before the retry — but the
+    /// <see cref="MutationStatus.PreconditionFailed"/> short-circuit performs no write, so in
+    /// MULTI-INSTANCE deployments it can reflect another instance's cached view of the row for up
+    /// to the configured cache TTL. Single-writer-per-row and single-instance topologies are
+    /// unaffected (local writes keep the local cache coherent).
+    /// </remarks>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
     /// <param name="id">Composite document identifier (<c>"{PartitionKey}|{RowKey}"</c>).</param>

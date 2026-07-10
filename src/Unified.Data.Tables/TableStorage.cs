@@ -450,9 +450,13 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
                         await client.SubmitTransactionAsync(actions, ct);
                     }
                     catch (TableTransactionFailedException ex)
-                        when (actionType == TableTransactionActionType.Add && ex.Status == 409)
+                        when (actionType == TableTransactionActionType.Add
+                            && (ex.Status == 409 || ex.ErrorCode == "InvalidDuplicateRow"))
                     {
-                        var duplicateId = ex.FailedTransactionActionIndex is int i && i < chunk.Length
+                        // 409 = a row already exists in the table; 400 InvalidDuplicateRow = the
+                        // same key twice WITHIN this transaction. Both are duplicate keys — and
+                        // InMemoryStorage translates both, so production must match the fake.
+                        var duplicateId = ex.FailedTransactionActionIndex is int i && i >= 0 && i < chunk.Length
                             ? chunk[i].Id
                             : chunk[0].Partition + Separator + "?";
                         throw new DuplicateKeyException(typeName, duplicateId, ex);

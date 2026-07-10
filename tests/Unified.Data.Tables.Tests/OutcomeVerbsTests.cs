@@ -30,6 +30,45 @@ public class OutcomeVerbsTests
         Assert.Equal(409, Assert.IsType<RequestFailedException>(ex.InnerException).Status);
     }
 
+    [Fact]
+    public async Task CreateBatchAsync_OnAzure409_ThrowsDuplicateKey_WithPartitionFallbackId()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        // Without a parsable FailedTransactionActionIndex the id falls back to "{partition}|?" —
+        // still enough for the caller to know WHERE the duplicate landed.
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns<Response<IReadOnlyList<Response>>>(_ => throw new TableTransactionFailedException(
+                new RequestFailedException(409, "The specified entity already exists.")));
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => h.Store.CreateBatchAsync(
+        [
+            new TestEntity { Id = "p|r1" },
+            new TestEntity { Id = "p|r2" },
+        ]));
+
+        Assert.Equal("p|?", ex.Id);
+        Assert.IsType<TableTransactionFailedException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task CreateBatchAsync_OnWithinBatchDuplicate400_ThrowsDuplicateKey_LikeInMemory()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        // A duplicate INSIDE one transaction surfaces as 400 InvalidDuplicateRow, not 409 —
+        // it must translate identically, or tests written against InMemory lie about production.
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns<Response<IReadOnlyList<Response>>>(_ => throw new TableTransactionFailedException(
+                new RequestFailedException(400, "InvalidDuplicateRow", "InvalidDuplicateRow", null)));
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => h.Store.CreateBatchAsync(
+        [
+            new TestEntity { Id = "p|same" },
+            new TestEntity { Id = "p|same" },
+        ]));
+
+        Assert.IsType<TableTransactionFailedException>(ex.InnerException);
+    }
+
     // ── GetOrCreateAsync ────────────────────────────────────────────────────
 
     [Fact]
@@ -113,6 +152,43 @@ public class OutcomeVerbsTests
 
         // The retry read the winner's 100 and applied the delta to THAT.
         Assert.Equal(101, result.Value);
+    }
+
+    [Fact]
+    public async Task MutateOrCreate_CreateRaceLostOnTheFinalAttempt_SurfacesAsConcurrencyConflict()
+    {
+        // A pathological interleaving: every read misses, yet every create hits an existing key
+        // (create-then-delete competitors). Exhausted attempts must surface as the documented
+        // ConcurrencyConflictException — never as a leaked DuplicateKeyException.
+        var storage = Substitute.For<IStorage<TestEntity>>();
+        storage.OneAsync(Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns((TestEntity?)null);
+        storage.CreateAsync(Arg.Any<TestEntity>(), Arg.Any<CancellationToken>())
+            .Returns<TestEntity>(_ => throw new DuplicateKeyException("TestEntity", "p|r", null));
+
+        var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(() => storage.MutateOrCreateAsync("p|r",
+            create: () => new TestEntity { Value = 0 },
+            mutate: e => e.Value++,
+            maxAttempts: 2));
+
+        Assert.IsType<DuplicateKeyException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task MutateAsync_CanceledDuringBackoff_PropagatesCancellation()
+    {
+        var store = new InMemoryStorage<TestEntity>();
+        await store.CreateAsync(new TestEntity { Id = "p|r", Value = 0 });
+        using var cts = new CancellationTokenSource();
+
+        // The competitor wins the first race AND cancels — the backoff delay must observe the
+        // token and surface cancellation instead of retrying into a canceled operation.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.MutateAsync("p|r", e =>
+        {
+            store.UpdateAsync(new TestEntity { Id = "p|r", Value = 999 }, ConcurrencyMode.LastWriterWins)
+                 .GetAwaiter().GetResult();
+            cts.Cancel();
+            e.Value++;
+        }, maxAttempts: 3, ct: cts.Token));
     }
 
     // ── TryMutateAsync ──────────────────────────────────────────────────────
@@ -248,6 +324,30 @@ public class OutcomeVerbsTests
 
         Assert.Equal(MutationStatus.Conflicted, result.Status);
         Assert.Equal("open", (await store.OneAsync("p|r"))!.Name);   // transition never half-applied
+    }
+
+    [Fact]
+    public async Task TryTransition_AgainstTableStorage_LostRace_ReReadsThroughEvictedCache_AndReportsPreconditionFailed()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        var reads = 0;
+        h.Table.GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => reads++ == 0
+                ? Mocks.Found(Mocks.Row("p", "r", name: "open"))
+                : Mocks.Found(Mocks.Row("p", "r", name: "resolved")));
+        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
+
+        var result = await h.Store.TryTransitionAsync("p|r",
+            when: e => e.Name == "open",
+            apply: e => e.Name = "resolved");
+
+        // Attempt 1 read "open" (cached), lost the strict write — the conflict evicted the cache,
+        // so attempt 2's read went back to storage, saw the winner's "resolved", and reported the
+        // EXPECTED outcome instead of a conflict.
+        Assert.Equal(MutationStatus.PreconditionFailed, result.Status);
+        Assert.Equal("resolved", result.Entity!.Name);
+        Assert.Equal(2, reads);
     }
 
     // ── The verbs work against TableStorage too (cache interplay) ───────────
