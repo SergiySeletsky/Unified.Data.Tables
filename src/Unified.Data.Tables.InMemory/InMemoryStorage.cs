@@ -97,7 +97,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
         lock (gate)
         {
             if (rows.ContainsKey(keys))
-                throw new RequestFailedException(409, $"The specified entity already exists. Id: {entity.Id}");
+                throw new DuplicateKeyException(typeof(T).Name, entity.Id,
+                    new RequestFailedException(409, $"The specified entity already exists. Id: {entity.Id}"));
             entity.ETag = Store(keys, entity).ETagString();
         }
 
@@ -380,7 +381,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             var keys = EntityId.Split(entity.Id);
 
             if (!upsert && !withinBatch.Add(keys))
-                throw new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}");
+                throw new DuplicateKeyException(typeof(T).Name, entity.Id,
+                    new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}"));
             prepared.Add((keys, entity));
         }
 
@@ -393,7 +395,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
                 // per-partition 100-row transactions for test purposes).
                 var duplicate = prepared.FirstOrDefault(p => rows.ContainsKey(p.Keys));
                 if (duplicate.Entity is not null)
-                    throw new RequestFailedException(409, $"The specified entity already exists. Id: {duplicate.Entity.Id}");
+                    throw new DuplicateKeyException(typeof(T).Name, duplicate.Entity.Id,
+                        new RequestFailedException(409, $"The specified entity already exists. Id: {duplicate.Entity.Id}"));
             }
 
             foreach (var (keys, entity) in prepared)

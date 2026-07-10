@@ -8,7 +8,7 @@ namespace Unified.Data.Tables.Tests;
 
 /// <summary>
 /// The <see cref="InMemoryStorage{T}"/> fake must be semantically faithful to
-/// <see cref="TableStorage{T}"/>: same id conventions, 409 on duplicate create, 404 on updating a
+/// <see cref="TableStorage{T}"/>: same id conventions, DuplicateKeyException on duplicate create, 404 on updating a
 /// missing row, ETag simulation with 412 conflicts, idempotent delete, real-serializer round-trips,
 /// and lexical result ordering — so tests written against it hold in production.
 /// </summary>
@@ -28,15 +28,15 @@ public class InMemoryStorageTests
     }
 
     [Fact]
-    public async Task CreateAsync_DuplicateId_Throws409()
+    public async Task CreateAsync_DuplicateId_ThrowsDuplicateKey()
     {
         var store = new InMemoryStorage<TestEntity>();
         await store.CreateAsync(new TestEntity { Id = "p|r" });
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(
             () => store.CreateAsync(new TestEntity { Id = "p|r" }));
 
-        Assert.Equal(409, ex.Status);
+        Assert.Equal("p|r", ex.Id);
     }
 
     [Fact]
@@ -261,18 +261,18 @@ public class InMemoryStorageTests
     // ── Batch + count + delete ──────────────────────────────────────────────
 
     [Fact]
-    public async Task CreateBatchAsync_DuplicateInBatch_Throws409_WithoutPartialWrites()
+    public async Task CreateBatchAsync_DuplicateInBatch_ThrowsDuplicateKey_WithoutPartialWrites()
     {
         var store = new InMemoryStorage<TestEntity>();
         await store.CreateAsync(new TestEntity { Id = "p|existing" });
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => store.CreateBatchAsync(
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => store.CreateBatchAsync(
         [
             new TestEntity { Id = "p|new1" },
             new TestEntity { Id = "p|existing" },
         ]));
 
-        Assert.Equal(409, ex.Status);
+        Assert.Equal("p|existing", ex.Id);
         Assert.Equal(1, store.Count);   // nothing from the failed batch landed
     }
 
@@ -304,17 +304,17 @@ public class InMemoryStorageTests
     }
 
     [Fact]
-    public async Task CreateBatchAsync_DuplicateWithinBatch_Throws400()
+    public async Task CreateBatchAsync_DuplicateWithinBatch_ThrowsDuplicateKey()
     {
         var store = new InMemoryStorage<TestEntity>();
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => store.CreateBatchAsync(
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => store.CreateBatchAsync(
         [
             new TestEntity { Id = "p|same" },
             new TestEntity { Id = "p|same" },
         ]));
 
-        Assert.Equal(400, ex.Status);
+        Assert.Equal("p|same", ex.Id);
         Assert.Equal(0, store.Count);
     }
 

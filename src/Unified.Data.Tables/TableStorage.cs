@@ -141,7 +141,17 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
-        var addResponse = await client.AddEntityAsync(dataEntity, ct);
+        Response addResponse;
+        try
+        {
+            addResponse = await client.AddEntityAsync(dataEntity, ct);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 409)
+        {
+            // An existing key is an EXPECTED outcome of concurrent creates — surface it
+            // provider-agnostically (GetOrCreateAsync/MutateOrCreateAsync absorb it entirely).
+            throw new DuplicateKeyException(typeName, entity.Id, ex);
+        }
 
         // Read ETag from the response headers. Relying on dataEntity.ETag being mutated by the SDK
         // is brittle — an empty ETag would then be handed to the next UpdateEntityAsync call and
@@ -435,7 +445,18 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
                 foreach (var chunk in group.Chunk(100))
                 {
                     var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
-                    await client.SubmitTransactionAsync(actions, ct);
+                    try
+                    {
+                        await client.SubmitTransactionAsync(actions, ct);
+                    }
+                    catch (TableTransactionFailedException ex)
+                        when (actionType == TableTransactionActionType.Add && ex.Status == 409)
+                    {
+                        var duplicateId = ex.FailedTransactionActionIndex is int i && i < chunk.Length
+                            ? chunk[i].Id
+                            : chunk[0].Partition + Separator + "?";
+                        throw new DuplicateKeyException(typeName, duplicateId, ex);
+                    }
                 }
             }
         }
