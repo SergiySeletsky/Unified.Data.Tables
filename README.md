@@ -243,11 +243,14 @@ public sealed class Customer : Entity
     public string Name { get; set; } = "";
 }
 
-// Inherited property (e.g. the Entity base timestamps, pre-0.3 names):
-[ColumnAlias(nameof(Entity.CreatedAt), "Created")]
-[ColumnAlias(nameof(Entity.UpdatedAt), "Modified")]
+// Inherited property — the class-level form targets properties on base types:
+[ColumnAlias(nameof(Entity.CreatedAt), "LegacyStamp")]
 public sealed class LegacyCustomer : Entity { }
 ```
+
+The `Entity` base class itself ships with `Created` → `CreatedAt` and `Modified` → `UpdatedAt`
+aliases, so rows written by pre-0.3.0 serializers deserialize correctly out of the box — no
+per-project opt-in needed.
 
 The canonical column wins unconditionally when both exist. Aliases cover the `__Json`/`__GZip` cell
 variants and are validated eagerly (collisions and unknown targets throw on first use of the type).
