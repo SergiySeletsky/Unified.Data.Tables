@@ -293,6 +293,32 @@ public class InMemoryStorageTests
     }
 
     [Fact]
+    public async Task UpsertBatchAsync_ResetsETags_LikeTableStorage()
+    {
+        var store = new InMemoryStorage<TestEntity>();
+        var entity = new TestEntity { Id = "p|a", ETag = "W/\"stale\"" };
+
+        await store.UpsertBatchAsync([entity]);
+
+        Assert.Null(entity.ETag);
+    }
+
+    [Fact]
+    public async Task CreateBatchAsync_DuplicateWithinBatch_Throws400()
+    {
+        var store = new InMemoryStorage<TestEntity>();
+
+        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => store.CreateBatchAsync(
+        [
+            new TestEntity { Id = "p|same" },
+            new TestEntity { Id = "p|same" },
+        ]));
+
+        Assert.Equal(400, ex.Status);
+        Assert.Equal(0, store.Count);
+    }
+
+    [Fact]
     public async Task DeleteAsync_MissingRow_IsIdempotent()
     {
         var store = new InMemoryStorage<TestEntity>();

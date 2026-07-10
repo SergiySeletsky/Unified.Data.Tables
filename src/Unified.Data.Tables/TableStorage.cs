@@ -135,6 +135,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         await EnsureTableAsync(ct);
 
         entity.CreatedAt = DateTimeOffset.UtcNow;
+        entity.UpdatedAt = entity.CreatedAt; // an insert is a write — keep audit stamps consistent
         entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
 
@@ -416,27 +417,37 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
                 entity.CreatedAt = now;
             entity.UpdatedAt = now;
             entity.Timestamp = null;
+            // Row versions change but transaction sub-responses aren't correlated back — a kept
+            // ETag would be a phantom-412 trap on the next optimistic update. Null = "re-read
+            // before optimistic concurrency", the same doctrine as Timestamp.
+            entity.ETag = null;
             entity.Id = NormalizeId(entity.Id);
 
             var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
             rows.Add((partitionKey, entity.Id, entity.ToTableEntity(partitionKey, rowKey)));
         }
 
-        foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
+        try
         {
-            // Azure Table transactions: max 100 entities, single partition.
-            foreach (var chunk in group.Chunk(100))
+            foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
             {
-                var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
-                await client.SubmitTransactionAsync(actions, ct);
+                // Azure Table transactions: max 100 entities, single partition.
+                foreach (var chunk in group.Chunk(100))
+                {
+                    var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
+                    await client.SubmitTransactionAsync(actions, ct);
+                }
             }
-            InvalidateQueryCache(group.Key);
         }
-
-        // Drop (don't warm) the per-entity cache entries: transaction responses do carry per-item
-        // ETags, but correlating them back adds complexity for little gain — the next read re-warms.
-        foreach (var (_, id, _) in rows)
-            cache.Remove(EntityCacheKey(id));
+        finally
+        {
+            // A partially-failed batch has still COMMITTED earlier chunks — invalidate the caches
+            // for everything we may have touched, success or not, so no pre-image is ever served.
+            foreach (var partition in rows.Select(r => r.Partition).Distinct(StringComparer.Ordinal))
+                InvalidateQueryCache(partition);
+            foreach (var (_, id, _) in rows)
+                cache.Remove(EntityCacheKey(id));
+        }
 
         logger.LogInformation("Batch-{Action} {Count} {Type} entities across {Partitions} partition(s)",
             actionType, rows.Count, typeName, rows.Select(r => r.Partition).Distinct(StringComparer.Ordinal).Count());
@@ -557,6 +568,9 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
+        // Normalize first: the cached-ETag fallback below is keyed by the normalized id.
+        entity.Id = NormalizeId(entity.Id);
+
         // Capture concurrency intent BEFORE mutating the entity.
         var callerSuppliedETag = !string.IsNullOrEmpty(entity.ETag);
         var etag = mode switch
@@ -574,7 +588,6 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null; // service last-write time is unknown until the next read
-        entity.Id = NormalizeId(entity.Id);
 
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);

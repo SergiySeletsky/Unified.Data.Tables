@@ -105,7 +105,9 @@ public interface IStorage<T> where T : Entity, new()
 
     /// <summary>
     /// Transactional inserts, grouped by partition and chunked at 100 entities per transaction.
-    /// Atomic per chunk only. Any existing key fails its chunk with a 409.
+    /// Atomic per chunk only. Any existing key fails its chunk with a 409. Batch sub-responses are
+    /// not correlated back, so every entity's <see cref="Entity.ETag"/> is reset to <c>null</c> —
+    /// re-read before optimistic updates.
     /// </summary>
     /// <param name="entities">The entities to insert.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -114,7 +116,8 @@ public interface IStorage<T> where T : Entity, new()
 
     /// <summary>
     /// Transactional insert-or-replace, grouped by partition and chunked at 100 entities per
-    /// transaction. Last writer wins per row.
+    /// transaction. Last writer wins per row. Every entity's <see cref="Entity.ETag"/> is reset to
+    /// <c>null</c> — re-read before optimistic updates.
     /// </summary>
     /// <param name="entities">The entities to upsert.</param>
     /// <param name="ct">Cancellation token.</param>

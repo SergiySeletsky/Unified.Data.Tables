@@ -354,6 +354,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
 
         var now = DateTimeOffset.UtcNow;
         var prepared = new List<((string, string) Keys, T Entity)>(entities.Count);
+        var withinBatch = new HashSet<(string, string)>();
         foreach (var entity in entities)
         {
             if (entity == null || string.IsNullOrWhiteSpace(entity.Id))
@@ -363,8 +364,15 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
                 entity.CreatedAt = now;
             entity.UpdatedAt = now;
             entity.Timestamp = null;
+            // Parity with TableStorage: batch sub-responses aren't correlated back, so the ETag is
+            // unknown after a batch — re-read before optimistic updates.
+            entity.ETag = null;
             entity.Id = EntityId.Normalize(entity.Id);
-            prepared.Add((EntityId.Split(entity.Id), entity));
+            var keys = EntityId.Split(entity.Id);
+
+            if (!upsert && !withinBatch.Add(keys))
+                throw new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}");
+            prepared.Add((keys, entity));
         }
 
         lock (gate)
@@ -380,7 +388,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             }
 
             foreach (var (keys, entity) in prepared)
-                entity.ETag = Store(keys, entity).ETagString();
+                Store(keys, entity);
         }
 
         return Task.FromResult(prepared.Count);

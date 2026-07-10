@@ -978,6 +978,41 @@ public class TableStorageTests
     }
 
     [Fact]
+    public async Task UpsertBatchAsync_ResetsETags_ToNull()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupTransaction();
+        var entity = new TestEntity { Id = "p|r", ETag = "W/\"stale\"" };
+
+        await h.Store.UpsertBatchAsync([entity]);
+
+        // Batch sub-responses aren't correlated back; a kept ETag would be a phantom-412 trap.
+        Assert.Null(entity.ETag);
+    }
+
+    [Fact]
+    public async Task UpsertBatchAsync_PartialFailure_StillInvalidatesCaches()
+    {
+        using var h = new StorageHarness<TestEntity>();
+        h.SetupQueryByPartition(Mocks.Row("p", "warm"));
+        await h.Store.QueryAsync("p");                                     // warm the partition query cache
+
+        var calls = 0;
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => calls++ == 0
+                ? Substitute.For<Response<IReadOnlyList<Response>>>()
+                : throw new RequestFailedException(503, "storage unavailable"));
+        var entities = Enumerable.Range(0, 150).Select(i => new TestEntity { Id = $"p|r{i:D3}" }).ToList();
+
+        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.UpsertBatchAsync(entities));
+        await h.Store.QueryAsync("p");                                     // must MISS — first chunk committed
+
+        h.Table.Received(2).QueryAsync<TableEntity>(
+            Arg.Any<System.Linq.Expressions.Expression<Func<TableEntity, bool>>>(),
+            Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task UpsertBatchAsync_EntityWithoutId_Throws()
     {
         using var h = new StorageHarness<TestEntity>();
