@@ -108,26 +108,6 @@ public interface IStorage<T> where T : Entity, new()
     Task<IReadOnlyList<T>> QueryAsync(QueryOptions options, CancellationToken ct = default);
 
     /// <summary>
-    /// Streaming variant of <see cref="QueryAsync(QueryOptions, CancellationToken)"/> for large
-    /// result sets: never caches, never buffers. <c>null</c> options streams the whole table.
-    /// </summary>
-    /// <param name="options">Optional query bounds.</param>
-    /// <param name="ct">Cancellation token.</param>
-    IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null, CancellationToken ct = default);
-
-    /// <summary>
-    /// Fetch one server page plus an opaque cursor for the next page — the resumable paging primitive
-    /// for grids and infinite scroll. <paramref name="options"/>'s <see cref="QueryOptions.Take"/> is
-    /// the page size (default 100, clamped to 1..1000); pass a prior page's
-    /// <see cref="QueryOptions.ContinuationToken"/> to resume. Never cached.
-    /// </summary>
-    /// <param name="options">Query bounds; <see cref="QueryOptions.Take"/> is the page size and
-    /// <see cref="QueryOptions.ContinuationToken"/> the resume cursor.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>One page of results and, when more remain, a cursor bound to these exact bounds.</returns>
-    Task<EntityPage<T>> QueryPageAsync(QueryOptions options, CancellationToken ct = default);
-
-    /// <summary>
     /// Query documents with a <b>server-side</b> LINQ predicate translated to an Azure Tables OData
     /// filter (see <c>TableFilterTranslator</c>). Optionally scope to one <paramref name="partition"/>
     /// and cap with <paramref name="take"/>. Never cached; an unsupported predicate throws
@@ -140,6 +120,14 @@ public interface IStorage<T> where T : Entity, new()
     Task<IReadOnlyList<T>> QueryAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default);
 
     /// <summary>
+    /// Streaming variant of <see cref="QueryAsync(QueryOptions, CancellationToken)"/> for large
+    /// result sets: never caches, never buffers. <c>null</c> options streams the whole table.
+    /// </summary>
+    /// <param name="options">Optional query bounds.</param>
+    /// <param name="ct">Cancellation token.</param>
+    IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null, CancellationToken ct = default);
+
+    /// <summary>
     /// Streaming variant of <see cref="QueryAsync(Expression{Func{T, bool}}, string?, int?, CancellationToken)"/>
     /// — never caches, never buffers.
     /// </summary>
@@ -148,6 +136,18 @@ public interface IStorage<T> where T : Entity, new()
     /// <param name="take">Optional maximum number of results.</param>
     /// <param name="ct">Cancellation token.</param>
     IAsyncEnumerable<T> QueryStreamAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// Fetch one server page plus an opaque cursor for the next page — the resumable paging primitive
+    /// for grids and infinite scroll. <paramref name="options"/>'s <see cref="QueryOptions.Take"/> is
+    /// the page size (default 100, clamped to 1..1000); pass a prior page's
+    /// <see cref="QueryOptions.ContinuationToken"/> to resume. Never cached.
+    /// </summary>
+    /// <param name="options">Query bounds; <see cref="QueryOptions.Take"/> is the page size and
+    /// <see cref="QueryOptions.ContinuationToken"/> the resume cursor.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>One page of results and, when more remain, a cursor bound to these exact bounds.</returns>
+    Task<EntityPage<T>> QueryPageAsync(QueryOptions options, CancellationToken ct = default);
 
     /// <summary>
     /// Whether any document matches the server-side <paramref name="predicate"/> — a

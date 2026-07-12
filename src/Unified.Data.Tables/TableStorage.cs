@@ -344,8 +344,16 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     }
 
     /// <inheritdoc />
-    public async IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null,
-        [EnumeratorCancellation] CancellationToken ct = default)
+    public async Task<IReadOnlyList<T>> QueryAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default)
+    {
+        var results = new List<T>(take ?? 4);
+        await foreach (var entity in QueryStreamAsync(predicate, partition, take, ct))
+            results.Add(entity);
+        return results;
+    }
+
+    /// <inheritdoc />
+    public IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null, CancellationToken ct = default)
     {
         var partition = string.IsNullOrWhiteSpace(options?.Partition) ? null : options!.Partition;
         var rowKeyPrefix = string.IsNullOrWhiteSpace(options?.RowKeyPrefix) ? null : options!.RowKeyPrefix;
@@ -362,19 +370,39 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
                 "ContinuationToken is only honored by QueryPageAsync — use QueryPageAsync to resume paging.",
                 nameof(options));
 
+        // A bounded query is the "never cached" read path — it does not warm the per-entity cache.
+        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct);
+    }
+
+    /// <inheritdoc />
+    public IAsyncEnumerable<T> QueryStreamAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        if (take is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(take), take, "Take must be positive.");
+
+        var predicateFilter = TableFilterTranslator.Translate(predicate);
+        var filter = string.IsNullOrWhiteSpace(partition)
+            ? predicateFilter
+            : $"{TableClient.CreateQueryFilter($"PartitionKey eq {partition}")} and ({predicateFilter})";
+
+        return StreamAsync(filter, take, warmCache: true, ct);
+    }
+
+    // Shared server-side streaming iterator. Validation lives in the public methods so it throws
+    // eagerly rather than being deferred to the first MoveNext of the returned sequence.
+    private async IAsyncEnumerable<T> StreamAsync(string? filter, int? take, bool warmCache,
+        [EnumeratorCancellation] CancellationToken ct)
+    {
         await EnsureTableAsync(ct);
 
-        var filter = BuildFilter(partition, rowKeyPrefix);
         var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
         var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, cancellationToken: ct);
 
         var yielded = 0;
         await foreach (var row in pageable.WithCancellation(ct))
         {
-            var entity = row.FromTableEntity<T>();
-            entity.ETag = row.ETag.ToString();
-            entity.Timestamp = row.Timestamp;
-            yield return entity;
+            yield return warmCache ? Materialize(row) : Deserialize(row);
 
             if (take is int max && ++yielded >= max)
                 yield break;
@@ -405,66 +433,37 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         var filter = BuildFilter(partition, rowKeyPrefix);
         var pageable = client.QueryAsync<TableEntity>(filter, pageSize, cancellationToken: ct);
 
-        await foreach (var page in pageable.AsPages(innerToken, pageSize).WithCancellation(ct))
-        {
-            var items = page.Values.Select(Materialize).ToList();
-            var next = page.ContinuationToken is null ? null : PageCursor.Encode(fingerprint, page.ContinuationToken);
-            return new EntityPage<T>(items, next);
-        }
+        // Take the first server page from the cursor position (one page per call).
+        await using var pages = pageable.AsPages(innerToken, pageSize).GetAsyncEnumerator(ct);
+        if (!await pages.MoveNextAsync())
+            return new EntityPage<T>([], null);
 
-        return new EntityPage<T>([], null);
-    }
-
-    /// <inheritdoc />
-    public async Task<IReadOnlyList<T>> QueryAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default)
-    {
-        var results = new List<T>(take ?? 4);
-        await foreach (var entity in QueryStreamAsync(predicate, partition, take, ct))
-            results.Add(entity);
-        return results;
-    }
-
-    /// <inheritdoc />
-    public async IAsyncEnumerable<T> QueryStreamAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(predicate);
-        if (take is <= 0)
-            throw new ArgumentOutOfRangeException(nameof(take), take, "Take must be positive.");
-
-        var predicateFilter = TableFilterTranslator.Translate(predicate);
-        var filter = string.IsNullOrWhiteSpace(partition)
-            ? predicateFilter
-            : $"{TableClient.CreateQueryFilter($"PartitionKey eq {partition}")} and ({predicateFilter})";
-
-        await EnsureTableAsync(ct);
-
-        var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
-        var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, cancellationToken: ct);
-
-        var yielded = 0;
-        await foreach (var row in pageable.WithCancellation(ct))
-        {
-            yield return Materialize(row);
-            if (take is int max && ++yielded >= max)
-                yield break;
-        }
+        var page = pages.Current;
+        var items = page.Values.Select(Materialize).ToList();
+        var next = page.ContinuationToken is null ? null : PageCursor.Encode(fingerprint, page.ContinuationToken);
+        return new EntityPage<T>(items, next);
     }
 
     /// <inheritdoc />
     public async Task<bool> AnyAsync(Expression<Func<T, bool>> predicate, string? partition = null, CancellationToken ct = default)
     {
-        await foreach (var _ in QueryStreamAsync(predicate, partition, 1, ct))
-            return true;
-        return false;
+        await using var enumerator = QueryStreamAsync(predicate, partition, 1, ct).GetAsyncEnumerator(ct);
+        return await enumerator.MoveNextAsync();
     }
 
-    // Deserialize a queried row, stamp its ETag/Timestamp, and warm the per-entity cache.
-    private T Materialize(TableEntity row)
+    // Deserialize a queried row and stamp its ETag/Timestamp (no caching).
+    private static T Deserialize(TableEntity row)
     {
         var entity = row.FromTableEntity<T>();
         entity.ETag = row.ETag.ToString();
         entity.Timestamp = row.Timestamp;
+        return entity;
+    }
+
+    // Deserialize and warm the per-entity cache with the fresh ETag.
+    private T Materialize(TableEntity row)
+    {
+        var entity = Deserialize(row);
         CacheEntity(entity.Id, entity, row.ETag);
         return entity;
     }
