@@ -283,86 +283,6 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     }
 
     /// <inheritdoc />
-    public async IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
-    {
-        List<T> snapshot;
-        lock (gate)
-        {
-            snapshot = Bounded(options ?? new QueryOptions()).ToList();
-        }
-
-        foreach (var entity in snapshot)
-        {
-            ct.ThrowIfCancellationRequested();
-            yield return entity;
-        }
-
-        await Task.CompletedTask;
-    }
-
-    /// <inheritdoc />
-    public Task<EntityPage<T>> QueryPageAsync(QueryOptions options, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(options);
-
-        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : options.Partition;
-        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : options.RowKeyPrefix;
-
-        if (rowKeyPrefix is not null && partition is null)
-            throw new ArgumentException(
-                "RowKeyPrefix requires Partition — a cross-partition RowKey range is a full table scan wearing a filter.",
-                nameof(options));
-        if (options.Take is <= 0)
-            throw new ArgumentOutOfRangeException(nameof(options), options.Take, "Take (page size) must be positive.");
-
-        var pageSize = options.Take is int t ? Math.Min(t, 1000) : 100;
-        var fingerprint = PageCursor.Fingerprint(partition, rowKeyPrefix, pageSize);
-
-        (string PartitionKey, string RowKey)? after = null;
-        if (options.ContinuationToken is not null)
-        {
-            var inner = PageCursor.Decode(options.ContinuationToken, fingerprint);
-            var sep = inner.IndexOf(' ');
-            if (sep < 0)
-                throw new ArgumentException(
-                    "Malformed in-memory continuation token (was it issued by a different backend? " +
-                    "cursors are backend-specific).", nameof(options));
-            after = (inner.Substring(0, sep), inner.Substring(sep + 1));
-        }
-
-        lock (gate)
-        {
-            IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = OrderedRows()
-                .Where(kv => partition is null || kv.Key.PartitionKey == partition)
-                .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal));
-            if (after is { } a)
-                rowsQuery = rowsQuery.Where(kv => KeyCompare(kv.Key, a) > 0);
-
-            var candidate = rowsQuery.Take(pageSize + 1).ToList();
-            var hasMore = candidate.Count > pageSize;
-            var pageRows = hasMore ? candidate.Take(pageSize).ToList() : candidate;
-            var items = pageRows.Select(kv => Materialize(kv.Value)).ToList();
-
-            string? next = null;
-            if (hasMore)
-            {
-                var last = pageRows[pageRows.Count - 1].Key;
-                next = PageCursor.Encode(fingerprint, last.PartitionKey + " " + last.RowKey);
-            }
-
-            return Task.FromResult(new EntityPage<T>(items, next));
-        }
-    }
-
-    // Cursor ordering matches OrderedRows: Ordinal PartitionKey, then Ordinal RowKey.
-    private static int KeyCompare((string PartitionKey, string RowKey) key, (string PartitionKey, string RowKey) after)
-    {
-        var c = string.CompareOrdinal(key.PartitionKey, after.PartitionKey);
-        return c != 0 ? c : string.CompareOrdinal(key.RowKey, after.RowKey);
-    }
-
-    /// <inheritdoc />
     public Task<IReadOnlyList<T>> QueryAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(predicate);
@@ -388,6 +308,25 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     }
 
     /// <inheritdoc />
+    public async IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        List<T> snapshot;
+        lock (gate)
+        {
+            snapshot = Bounded(options ?? new QueryOptions()).ToList();
+        }
+
+        foreach (var entity in snapshot)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return entity;
+        }
+
+        await Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
     public async IAsyncEnumerable<T> QueryStreamAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -397,6 +336,67 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             ct.ThrowIfCancellationRequested();
             yield return entity;
         }
+    }
+
+    /// <inheritdoc />
+    public Task<EntityPage<T>> QueryPageAsync(QueryOptions options, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : options.Partition;
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : options.RowKeyPrefix;
+
+        if (rowKeyPrefix is not null && partition is null)
+            throw new ArgumentException(
+                "RowKeyPrefix requires Partition — a cross-partition RowKey range is a full table scan wearing a filter.",
+                nameof(options));
+        if (options.Take is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(options), options.Take, "Take (page size) must be positive.");
+
+        var pageSize = options.Take is int t ? Math.Min(t, 1000) : 100;
+        var fingerprint = PageCursor.Fingerprint(partition, rowKeyPrefix, pageSize);
+
+        (string PartitionKey, string RowKey)? after = null;
+        if (options.ContinuationToken is not null)
+        {
+            var inner = PageCursor.Decode(options.ContinuationToken, fingerprint);
+            var sep = inner.IndexOf('\0');
+            if (sep < 0)
+                throw new ArgumentException(
+                    "Malformed in-memory continuation token (was it issued by a different backend? " +
+                    "cursors are backend-specific).", nameof(options));
+            after = (inner.Substring(0, sep), inner.Substring(sep + 1));
+        }
+
+        lock (gate)
+        {
+            IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = OrderedRows()
+                .Where(kv => partition is null || kv.Key.PartitionKey == partition)
+                .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal));
+            if (after is { } a)
+                rowsQuery = rowsQuery.Where(kv => KeyCompare(kv.Key, a) > 0);
+
+            var candidate = rowsQuery.Take(pageSize + 1).ToList();
+            var hasMore = candidate.Count > pageSize;
+            var pageRows = hasMore ? candidate.Take(pageSize).ToList() : candidate;
+            var items = pageRows.Select(kv => Materialize(kv.Value)).ToList();
+
+            string? next = null;
+            if (hasMore)
+            {
+                var last = pageRows[pageRows.Count - 1].Key;
+                next = PageCursor.Encode(fingerprint, last.PartitionKey + "\0" + last.RowKey);
+            }
+
+            return Task.FromResult(new EntityPage<T>(items, next));
+        }
+    }
+
+    // Cursor ordering matches OrderedRows: Ordinal PartitionKey, then Ordinal RowKey.
+    private static int KeyCompare((string PartitionKey, string RowKey) key, (string PartitionKey, string RowKey) after)
+    {
+        var c = string.CompareOrdinal(key.PartitionKey, after.PartitionKey);
+        return c != 0 ? c : string.CompareOrdinal(key.RowKey, after.RowKey);
     }
 
     /// <inheritdoc />

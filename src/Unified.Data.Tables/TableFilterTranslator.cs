@@ -131,6 +131,13 @@ public static class TableFilterTranslator
     private static bool IsNullableOrReference(Type leafType) =>
         !leafType.IsValueType || Nullable.GetUnderlyingType(leafType) is not null;
 
+    private static Expression? MemberSideOrNull(BinaryExpression b, ParameterExpression p)
+    {
+        if (IsParameterRooted(b.Left, p)) return b.Left;
+        if (IsParameterRooted(b.Right, p)) return b.Right;
+        return null;
+    }
+
     // Negating ANY comparison on a column that can be UNSET (nullable value or reference) is rejected for
     // the same reason as atomic '!=': Azure's treatment of an absent column under negation is
     // version-dependent and not equal to the in-memory CLR result, and rejecting negated-equality while
@@ -141,9 +148,7 @@ public static class TableFilterTranslator
     {
         if (operand is not BinaryExpression b || !IsComparison(b.NodeType))
             return;
-        var memberSide = IsParameterRooted(b.Left, p) ? b.Left
-            : IsParameterRooted(b.Right, p) ? b.Right
-            : null;
+        var memberSide = MemberSideOrNull(b, p);
         if (memberSide is null)
             return;
         ResolveColumn(memberSide, p, out var leafType);
@@ -259,20 +264,7 @@ public static class TableFilterTranslator
             throw new NotSupportedException(
                 "Null comparisons are not supported — Azure Tables stores no null cells (an unset property is an absent column).");
 
-        if (t.IsEnum)
-        {
-            if (t.IsInstanceOfType(value))
-                return value.ToString()!; // stored as the enum name
-            try
-            {
-                return Enum.ToObject(t, Convert.ToInt64(value, CultureInfo.InvariantCulture)).ToString()!;
-            }
-            catch (Exception ex) when (ex is InvalidCastException or FormatException or OverflowException or ArgumentException)
-            {
-                throw new NotSupportedException($"Cannot compare enum '{t.Name}' with value '{value}'.");
-            }
-        }
-
+        if (t.IsEnum) return MapEnumValue(t, value);
         if (t == typeof(string)) return Convert.ToString(value, CultureInfo.InvariantCulture)!;
         if (t == typeof(bool)) return Convert.ToBoolean(value, CultureInfo.InvariantCulture);
         if (t == typeof(int)) return Convert.ToInt32(value, CultureInfo.InvariantCulture);
@@ -280,17 +272,37 @@ public static class TableFilterTranslator
         if (t == typeof(ulong)) return unchecked((long)Convert.ToUInt64(value, CultureInfo.InvariantCulture));
         if (t == typeof(double)) return Convert.ToDouble(value, CultureInfo.InvariantCulture);
         if (t == typeof(decimal)) return (double)Convert.ToDecimal(value, CultureInfo.InvariantCulture); // stored as double
-        if (t == typeof(Guid))
-            return value is Guid g ? g : Guid.Parse(Convert.ToString(value, CultureInfo.InvariantCulture)!);
-        if (t == typeof(DateTimeOffset))
-            return value is DateTimeOffset dto ? dto : new DateTimeOffset(Convert.ToDateTime(value, CultureInfo.InvariantCulture), TimeSpan.Zero);
-        if (t == typeof(DateTime))
-            return value is DateTime dt
-                ? new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc))
-                : new DateTimeOffset(Convert.ToDateTime(value, CultureInfo.InvariantCulture), TimeSpan.Zero);
+        if (t == typeof(Guid)) return AsGuid(value);
+        if (t == typeof(DateTimeOffset)) return AsDateTimeOffset(value);
+        if (t == typeof(DateTime)) return AsDateTimeOffsetFromDateTime(value);
 
         throw new NotSupportedException(
             $"Filtering on type '{t.Name}' is not supported. Supported leaf types: string, bool, int, uint, " +
             "long, ulong, double, decimal, Guid, DateTime, DateTimeOffset, and enums (and their nullable forms).");
     }
+
+    private static object MapEnumValue(Type enumType, object value)
+    {
+        if (enumType.IsInstanceOfType(value))
+            return value.ToString()!; // stored as the enum name
+        try
+        {
+            return Enum.ToObject(enumType, Convert.ToInt64(value, CultureInfo.InvariantCulture)).ToString()!;
+        }
+        catch (Exception ex) when (ex is InvalidCastException or FormatException or OverflowException or ArgumentException)
+        {
+            throw new NotSupportedException($"Cannot compare enum '{enumType.Name}' with value '{value}'.");
+        }
+    }
+
+    private static Guid AsGuid(object value) =>
+        value is Guid g ? g : Guid.Parse(Convert.ToString(value, CultureInfo.InvariantCulture)!);
+
+    private static DateTimeOffset AsDateTimeOffset(object value) =>
+        value is DateTimeOffset dto ? dto : new DateTimeOffset(Convert.ToDateTime(value, CultureInfo.InvariantCulture), TimeSpan.Zero);
+
+    private static DateTimeOffset AsDateTimeOffsetFromDateTime(object value) =>
+        value is DateTime dt
+            ? new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc))
+            : new DateTimeOffset(Convert.ToDateTime(value, CultureInfo.InvariantCulture), TimeSpan.Zero);
 }
