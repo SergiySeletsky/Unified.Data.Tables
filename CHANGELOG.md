@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-07-12
+
+### Changed
+
+- **Enum values inside JSON/GZip fallback cells are now written using the declared member name
+  (PascalCase)** instead of camelCase, matching the default of both System.Text.Json and
+  Newtonsoft.Json. This keeps stored enum tokens byte-stable and compatible with data written by
+  name-as-declared serializers (e.g. a Newtonsoft `StringEnumConverter`), which matters for tables
+  migrated onto this library. Reads remain case-insensitive, so lowercase/camelCase tokens written
+  by `<= 0.5.0` still round-trip. Top-level (flattened) enum columns are unaffected — they were
+  already written via `ToString()`. Only the `JsonStringEnumConverter` naming policy changed
+  (`TableEntityValue.JsonOptions`); property names remain camelCase.
+
 ## [0.5.0] — 2026-07-12
 
 ### Added
