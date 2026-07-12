@@ -29,7 +29,7 @@
   </PropertyGroup>
 
   <PropertyGroup Label="Package metadata">
-    <Version>0.5.0</Version>
+    <Version>0.5.1</Version>
     <Authors>Serhii Seletskyi</Authors>
     <Company>Serhii Seletskyi</Company>
     <Copyright>Copyright © Serhii Seletskyi</Copyright>

@@ -281,11 +281,15 @@ internal sealed class TableEntityValue
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        // Keep camelCase + case-insensitive matching
+        // camelCase property names; reads stay case-insensitive.
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
+        // Enum values are written using the declared member name (PascalCase) — the default of
+        // both System.Text.Json and Newtonsoft.Json — so stored tokens stay stable and
+        // byte-compatible with name-as-declared serializers. Reads remain case-insensitive, so
+        // lowercase/camelCase tokens written by <= 0.5.0 still round-trip.
+        Converters = { new JsonStringEnumConverter() },
         // Allow full Unicode so Cyrillic (and other) characters aren't \uXXXX escaped in stored JSON
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };
