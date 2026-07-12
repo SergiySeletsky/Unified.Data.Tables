@@ -40,6 +40,10 @@ copy-pasted into each one.
   `UpsertBatchAsync` (partition-grouped 100-row transactions), `CountAsync` (keys-only projection).
 - **Bounded queries** — `QueryAsync(QueryOptions)` and streaming `QueryStreamAsync` with partition scope,
   canonical RowKey-prefix ranges, and `Take` — never cached, never a disguised full scan.
+- **Server-side LINQ, paging & append logs** — `QueryAsync(x => x.Status == Open)` translates to an OData
+  `$filter` (server-side, not a scan); `QueryPageAsync` returns a page plus a query-bound continuation
+  cursor for grids and infinite scroll; `AppendAsync`/`RecentAsync` give the newest-N event-stream shape
+  for free. The in-memory fake validates predicates through the same translator, so green tests hold on Azure.
 - **Partial (Merge) updates** — `UpdateAsync(id, builder)` writes only the columns you declare
   (including nested paths: `x => x.Address.City` → `Address_City`), leaving the rest of the row
   untouched with no read required — concurrent writers touching disjoint columns never conflict.
@@ -167,6 +171,12 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `QueryAsync(partition?)` | All rows, or just one partition (the cached read path). |
 | `QueryAsync(options)` | Bounded query: partition + RowKey prefix + Take. Never cached. |
 | `QueryStreamAsync(options?)` | Streaming variant — never caches, never buffers. |
+| `QueryPageAsync(options)` | One server page + an opaque, query-bound cursor for the next (`Take` = page size, default 100). Resumable grid / infinite-scroll paging. |
+| `QueryAsync(predicate, partition?, take?)` | **Server-side** LINQ filter translated to an OData `$filter` — not a client-side scan. |
+| `QueryStreamAsync(predicate, partition?, take?)` | Streaming variant of the LINQ filter. |
+| `AnyAsync(predicate, partition?)` | `Take(1)` existence check for a server-side predicate. |
+| `AppendAsync(partition, entity, subStream?)` | Extension: append a time-ordered event (inverted-ticks RowKey); the `Id` is assigned for you. |
+| `RecentAsync(partition, count, subStream?)` | Extension: read the newest N events, newest-first — one bounded partition scan. |
 | `UpdateAsync(entity)` | Full replace with adaptive (`Auto`) ETag concurrency. |
 | `UpdateAsync(entity, mode)` | Full replace with explicit `ConcurrencyMode`. |
 | `UpdateAsync(id, builder)` | Partial `Merge` — writes only the declared columns (nested paths supported, optional `WithETag`); returns the new ETag. |
@@ -201,6 +211,75 @@ Results arrive in lexical (PartitionKey, RowKey) order — encode any other orde
 `RowKeys.InvertedTicks(now)` makes later timestamps sort FIRST, so "most recent N" is just
 `QueryAsync(new QueryOptions { Partition = p, Take = n })` with no client-side sorting.
 `RowKeyPrefix` requires `Partition` (a cross-partition RowKey range would be a full table scan).
+
+### Server-side LINQ filters
+
+`QueryAsync(predicate)` translates a strongly-typed predicate into a **server-side** Azure Tables
+OData `$filter` — the service does the filtering, not a client-side scan of the whole partition. The
+translation maps to the *stored* representation: an `enum` compares against its string name, a
+`decimal` against its stored `double`, and a nested `x.Address.City` against the flattened
+`Address_City` column.
+
+```csharp
+var open = await storage.QueryAsync(x => x.Status == Status.Open && x.Amount >= 100m);
+var mine = await storage.QueryAsync(x => x.Owner == userId, partition: tenantId, take: 50);
+if (await storage.AnyAsync(x => x.Email == email)) { /* ... */ }
+```
+
+Supported: `== != < <= > >=`, `&&`, `||`, `!`, and a bare `bool` member, over `string`, `bool`,
+`int`/`uint`/`long`/`ulong`, `double`, `decimal`, `Guid`, `DateTime(Offset)`, and enums. Anything the
+service can't filter — method calls (`StartsWith`, `Contains`), column-to-column comparisons, null
+comparisons, or a JSON-backed property — throws `NotSupportedException` rather than silently degrading
+to a scan. The in-memory fake validates the predicate through the *same* translator, so a green test
+means the filter also runs on Azure.
+
+To keep that "green fake ⇒ works on Azure" guarantee airtight, the translator also **rejects** the
+handful of shapes where a server-side OData filter would disagree with in-memory evaluation: ordering
+(`<`/`>`) on an `enum` or `ulong` (stored form isn't order-preserving), inequality or a negated comparison
+(`!=`, `!(x == v)`, `!(x >= v)`) on a nullable-or-reference column (absent-column semantics differ between
+Azure and in-memory evaluation), computed / get-only / `[IgnoreDataMember]` properties (no stored column),
+and `x.Nullable.Value` (compare the member directly). Two remaining caveats are documented rather than blocked: `decimal` is stored and
+compared as `double`, so equality can differ beyond ~15 significant digits (prefer range comparisons);
+and a server-side filter on a property that still carries only a legacy `[ColumnAlias]` column won't match
+until that row is rewritten. The `partition` argument is matched against stored (already-normalized) keys.
+
+### Resumable paging
+
+`QueryPageAsync` returns one server page plus an opaque cursor bound to the query — the canonical
+grid / infinite-scroll primitive, with no load-the-whole-partition-then-slice:
+
+```csharp
+string? cursor = null;
+do
+{
+    var page = await storage.QueryPageAsync(new QueryOptions
+    {
+        Partition = visionId, Take = 50, ContinuationToken = cursor,
+    });
+    Render(page.Items);
+    cursor = page.ContinuationToken;   // null when exhausted
+}
+while (cursor is not null);             // loop on HasMore, not on Items.Count
+```
+
+The cursor is bound to its exact bounds (partition, RowKey prefix, page size) — replaying it against a
+different query throws. There is deliberately no total count (Azure Tables has none; a total would
+force a second full scan) — drive the UI off `HasMore` and use `CountAsync` only when you truly need a
+number.
+
+### Append logs
+
+For the "append an event, read the newest N in order" shape — events, chat, agent runs, audit — the
+append helpers key rows with inverted ticks so the newest sort first, making `RecentAsync` a single
+bounded partition scan:
+
+```csharp
+await storage.AppendAsync("vision-42", new ChatMessage { Text = "hi" }, subStream: sessionId);
+var latest = await storage.RecentAsync("vision-42", 20, subStream: sessionId); // newest first
+```
+
+The optional `subStream` lets one partition hold several independent streams (e.g. per session) that
+`RecentAsync` isolates by RowKey prefix.
 
 ### Partial updates
 

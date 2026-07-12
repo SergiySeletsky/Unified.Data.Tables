@@ -23,7 +23,17 @@ public sealed record QueryOptions
     /// <summary>
     /// Stop after this many entities. Bounds data transfer (page-size hinted), but note Azure
     /// Tables has no server-side "top N of the whole set" — results are always in lexical
-    /// RowKey order, so "most recent N" requires order-encoding RowKeys.
+    /// RowKey order, so "most recent N" requires order-encoding RowKeys. For
+    /// <see cref="IStorage{T}.QueryPageAsync(QueryOptions, System.Threading.CancellationToken)"/>
+    /// this is the page size (default 100, clamped to 1..1000).
     /// </summary>
     public int? Take { get; init; }
+
+    /// <summary>
+    /// Resume cursor from a prior <see cref="EntityPage{T}"/> — set only for
+    /// <see cref="IStorage{T}.QueryPageAsync(QueryOptions, System.Threading.CancellationToken)"/>.
+    /// The token is opaque and bound to the query bounds (partition, RowKey prefix, page size) it was
+    /// issued for; replaying it against a different query throws. Leave <c>null</c> for the first page.
+    /// </summary>
+    public string? ContinuationToken { get; init; }
 }

@@ -139,4 +139,57 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         Assert.Equal(2, deleted);
         Assert.Empty(await Store<TestEntity>().QueryAsync("delpart"));
     }
+
+    [Fact]
+    public async Task QueryAsync_ServerSidePredicate_RoundTripsThroughRealAzurite()
+    {
+        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+
+        var store = Store<TestEntity>();
+        const string p = "linqfilter";
+        for (var i = 0; i < 6; i++)
+        {
+            var id = $"{p}|{i:D2}";
+            Track<TestEntity>(id);
+            await store.CreateAsync(new TestEntity { Id = id, Name = i % 2 == 0 ? "even" : "odd", Value = i });
+        }
+
+        // Translated to a server-side OData $filter — proves the translation matches real Azure semantics.
+        var highEvens = await Store<TestEntity>().QueryAsync(x => x.Value >= 2 && x.Name == "even", partition: p);
+
+        Assert.Equal(new[] { 2, 4 }, highEvens.OrderBy(x => x.Value).Select(x => x.Value));
+    }
+
+    [Fact]
+    public async Task QueryPageAsync_PagesThroughRealAzurite_WithContinuationTokens()
+    {
+        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+
+        var store = Store<TestEntity>();
+        const string p = "paging";
+        const int total = 25;
+        for (var i = 0; i < total; i++)
+        {
+            var id = $"{p}|{i:D3}";
+            Track<TestEntity>(id);
+            await store.CreateAsync(new TestEntity { Id = id, Value = i });
+        }
+
+        var seen = new List<int>();
+        string? cursor = null;
+        var pages = 0;
+        do
+        {
+            var page = await Store<TestEntity>().QueryPageAsync(
+                new QueryOptions { Partition = p, Take = 10, ContinuationToken = cursor });
+            seen.AddRange(page.Items.Select(x => x.Value));
+            cursor = page.ContinuationToken;
+            Assert.True(++pages <= 50, "paging did not terminate");
+        }
+        while (cursor is not null);
+
+        // Azure page sizes are advisory, so assert coverage, not an exact page count.
+        Assert.Equal(total, seen.Count);
+        Assert.Equal(Enumerable.Range(0, total), seen.OrderBy(x => x));
+    }
 }

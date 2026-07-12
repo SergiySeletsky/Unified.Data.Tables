@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Linq.Expressions;
 using System.Reflection;
 using Azure;
 using Azure.Data.Tables;
@@ -301,6 +302,111 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     }
 
     /// <inheritdoc />
+    public Task<EntityPage<T>> QueryPageAsync(QueryOptions options, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : options.Partition;
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : options.RowKeyPrefix;
+
+        if (rowKeyPrefix is not null && partition is null)
+            throw new ArgumentException(
+                "RowKeyPrefix requires Partition — a cross-partition RowKey range is a full table scan wearing a filter.",
+                nameof(options));
+        if (options.Take is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(options), options.Take, "Take (page size) must be positive.");
+
+        var pageSize = options.Take is int t ? Math.Min(t, 1000) : 100;
+        var fingerprint = PageCursor.Fingerprint(partition, rowKeyPrefix, pageSize);
+
+        (string PartitionKey, string RowKey)? after = null;
+        if (options.ContinuationToken is not null)
+        {
+            var inner = PageCursor.Decode(options.ContinuationToken, fingerprint);
+            var sep = inner.IndexOf(' ');
+            if (sep < 0)
+                throw new ArgumentException(
+                    "Malformed in-memory continuation token (was it issued by a different backend? " +
+                    "cursors are backend-specific).", nameof(options));
+            after = (inner.Substring(0, sep), inner.Substring(sep + 1));
+        }
+
+        lock (gate)
+        {
+            IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = OrderedRows()
+                .Where(kv => partition is null || kv.Key.PartitionKey == partition)
+                .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal));
+            if (after is { } a)
+                rowsQuery = rowsQuery.Where(kv => KeyCompare(kv.Key, a) > 0);
+
+            var candidate = rowsQuery.Take(pageSize + 1).ToList();
+            var hasMore = candidate.Count > pageSize;
+            var pageRows = hasMore ? candidate.Take(pageSize).ToList() : candidate;
+            var items = pageRows.Select(kv => Materialize(kv.Value)).ToList();
+
+            string? next = null;
+            if (hasMore)
+            {
+                var last = pageRows[pageRows.Count - 1].Key;
+                next = PageCursor.Encode(fingerprint, last.PartitionKey + " " + last.RowKey);
+            }
+
+            return Task.FromResult(new EntityPage<T>(items, next));
+        }
+    }
+
+    // Cursor ordering matches OrderedRows: Ordinal PartitionKey, then Ordinal RowKey.
+    private static int KeyCompare((string PartitionKey, string RowKey) key, (string PartitionKey, string RowKey) after)
+    {
+        var c = string.CompareOrdinal(key.PartitionKey, after.PartitionKey);
+        return c != 0 ? c : string.CompareOrdinal(key.RowKey, after.RowKey);
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<T>> QueryAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        if (take is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(take), take, "Take must be positive.");
+
+        // Reject predicates the real store cannot translate to OData, so a green fake test means the
+        // same predicate holds against Azure Tables — then evaluate the caller's real semantics.
+        _ = TableFilterTranslator.Translate(predicate);
+        var matches = predicate.Compile();
+        var scope = string.IsNullOrWhiteSpace(partition) ? null : partition;
+
+        lock (gate)
+        {
+            IEnumerable<T> query = OrderedRows()
+                .Where(kv => scope is null || kv.Key.PartitionKey == scope)
+                .Select(kv => Materialize(kv.Value))
+                .Where(matches);
+            if (take is int t)
+                query = query.Take(t);
+            return Task.FromResult<IReadOnlyList<T>>(query.ToList());
+        }
+    }
+
+    /// <inheritdoc />
+    public async IAsyncEnumerable<T> QueryStreamAsync(Expression<Func<T, bool>> predicate, string? partition = null, int? take = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var snapshot = await QueryAsync(predicate, partition, take, ct);
+        foreach (var entity in snapshot)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return entity;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> AnyAsync(Expression<Func<T, bool>> predicate, string? partition = null, CancellationToken ct = default)
+    {
+        var first = await QueryAsync(predicate, partition, 1, ct);
+        return first.Count > 0;
+    }
+
+    /// <inheritdoc />
     public Task<int> CreateBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
         => WriteBatch(entities, upsert: false);
 
@@ -417,6 +523,10 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
                 nameof(options));
         if (options.Take is <= 0)
             throw new ArgumentOutOfRangeException(nameof(options), options.Take, "Take must be positive.");
+        if (options.ContinuationToken is not null)
+            throw new ArgumentException(
+                "ContinuationToken is only honored by QueryPageAsync — use QueryPageAsync to resume paging.",
+                nameof(options));
 
         var matches = OrderedRows()
             .Where(kv => partition is null || kv.Key.PartitionKey == partition)

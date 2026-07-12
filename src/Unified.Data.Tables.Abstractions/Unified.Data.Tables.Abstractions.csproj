@@ -18,6 +18,12 @@
     <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <!-- Internal paging-cursor plumbing is shared with the two implementation assemblies. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables" />
+    <InternalsVisibleTo Include="Unified.Data.Tables.InMemory" />
+  </ItemGroup>
+
   <!-- [Key]/[DataType] live in the shared framework on net10.0, but need this package on netstandard2.0.
        IAsyncEnumerable (QueryStreamAsync) likewise needs the BCL bridge on netstandard2.0 only. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
