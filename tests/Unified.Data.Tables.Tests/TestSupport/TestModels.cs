@@ -91,6 +91,22 @@ public sealed class ScalarStreamImpl : List<int>, IScalarStream
     public double Score { get; set; }
 }
 
+/// <summary>
+/// Entity with a NON-LIST payload (a dictionary can't be prefix-trimmed) — exercises the
+/// oversized-cell DROP branch: the property is omitted and only a __Truncated marker remains.
+/// </summary>
+public sealed class EntityWithBigBlob : Entity
+{
+    public Dictionary<string, string>? Blob { get; set; }
+}
+
+/// <summary>Same drop-branch shape, but INTERFACE-typed — the worst case for phantom
+/// materialization on read (an interface cannot be constructed).</summary>
+public sealed class EntityWithInterfaceBlob : Entity
+{
+    public IDictionary<string, string>? Blob { get; set; }
+}
+
 public sealed class EntityWithDateTime : Entity
 {
     public DateTime EventDate { get; set; }

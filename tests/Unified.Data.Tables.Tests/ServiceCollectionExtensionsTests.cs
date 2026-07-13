@@ -13,6 +13,9 @@ namespace Unified.Data.Tables.Tests;
 /// the open-generic <see cref="IStorage{T}"/> mapping, the memory cache, the connection-string
 /// overload, and argument validation.
 /// </summary>
+// AddUnifiedTableStorage applies options.OversizedCells to the STATIC serializer policy, so this
+// class shares the collection with every other policy-sensitive test to avoid parallel races.
+[Collection("OversizedCellPolicy")]
 public class ServiceCollectionExtensionsTests
 {
     private static ServiceCollection ServicesWithMockedClient()

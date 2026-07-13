@@ -14,7 +14,11 @@ public class TableEntitySerializerTests
 {
     private static T RoundTrip<T>(T entity) where T : Entity, new()
     {
-        var te = entity.ToTableEntity("pk", "rk");
+        // Derive the keys from the id, as the storage layer does — since 0.5.3 the row's
+        // PartitionKey/RowKey are the authoritative identity on read (B9), so mismatched
+        // literal keys would (correctly) win over the Id column.
+        var (pk, rk) = EntityId.Split(entity.Id);
+        var te = entity.ToTableEntity(pk, rk);
         return te.FromTableEntity<T>();
     }
 

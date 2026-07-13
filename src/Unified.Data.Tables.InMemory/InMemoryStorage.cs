@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Linq.Expressions;
 using System.Reflection;
 using Azure;
@@ -35,10 +35,12 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     private readonly Dictionary<(string PartitionKey, string RowKey), StoredRow> rows = [];
     private readonly object gate = new();
     private readonly IProtectedPropertyAuthorizer? authorizer;
+    private readonly IdNormalization idNormalization;
     private long versionCounter;
 
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public InMemoryStorage()
+        : this(null, null)
     {
     }
 
@@ -46,7 +48,27 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     /// Creates a store that gates <see cref="ProtectedPropertyAttribute"/>-decorated properties
     /// through <paramref name="authorizer"/>, mirroring <c>TableStorage&lt;T&gt;</c>.
     /// </summary>
-    public InMemoryStorage(IProtectedPropertyAuthorizer? authorizer) => this.authorizer = authorizer;
+    public InMemoryStorage(IProtectedPropertyAuthorizer? authorizer)
+        : this(authorizer, null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a store, optionally gating <see cref="ProtectedPropertyAttribute"/>-decorated
+    /// properties through <paramref name="authorizer"/> and honouring
+    /// <see cref="UnifiedTableStorageOptions.IdNormalization"/>, mirroring <c>TableStorage&lt;T&gt;</c>
+    /// so a green fake test holds against Azure. The trailing defaults let the DI container select
+    /// this constructor even when neither optional service is registered.
+    /// </summary>
+    public InMemoryStorage(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
+    {
+        this.authorizer = authorizer;
+        idNormalization = (options ?? new UnifiedTableStorageOptions()).IdNormalization;
+    }
+
+    // Mode-aware id normalization — identical to TableStorage's, preserving fake/Azure parity.
+    private string NormalizeId(string id) =>
+        idNormalization == IdNormalization.Normalized ? EntityId.Normalize(id) : id;
 
     // ── Test conveniences (not part of IStorage) ────────────────────────────
 
@@ -92,7 +114,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
 
         entity.CreatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
-        entity.Id = EntityId.Normalize(entity.Id);
+        entity.Id = NormalizeId(entity.Id);
         var keys = EntityId.Split(entity.Id);
 
         lock (gate)
@@ -120,7 +142,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             entity.CreatedAt = DateTimeOffset.UtcNow;
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
-        entity.Id = EntityId.Normalize(entity.Id);
+        entity.Id = NormalizeId(entity.Id);
         var keys = EntityId.Split(entity.Id);
 
         lock (gate)
@@ -153,7 +175,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
         var suppliedETag = entity.ETag;
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
-        entity.Id = EntityId.Normalize(entity.Id);
+        entity.Id = NormalizeId(entity.Id);
         var keys = EntityId.Split(entity.Id);
 
         lock (gate)
@@ -194,7 +216,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             throw new InvalidOperationException("No updates specified.");
         }
 
-        var keys = EntityId.Split(EntityId.Normalize(id));
+        var keys = EntityId.Split(NormalizeId(id));
 
         lock (gate)
         {
@@ -234,7 +256,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             throw new ArgumentNullException(nameof(id));
         }
 
-        var keys = EntityId.Split(EntityId.Normalize(id));
+        var keys = EntityId.Split(NormalizeId(id));
 
         lock (gate)
         {
@@ -250,7 +272,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             throw new ArgumentNullException(nameof(id));
         }
 
-        var keys = EntityId.Split(EntityId.Normalize(id));
+        var keys = EntityId.Split(NormalizeId(id));
 
         lock (gate)
         {
@@ -261,7 +283,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     /// <inheritdoc />
     public Task<IEnumerable<T>> QueryAsync(string? partition = null, CancellationToken ct = default)
     {
-        var scope = string.IsNullOrWhiteSpace(partition) ? null : EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
+        var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
         lock (gate)
         {
             var matches = OrderedRows()
@@ -294,7 +316,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
         // same predicate holds against Azure Tables — then evaluate the caller's real semantics.
         _ = TableFilterTranslator.Translate(predicate);
         var matches = predicate.Compile();
-        var scope = string.IsNullOrWhiteSpace(partition) ? null : EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
+        var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
 
         lock (gate)
         {
@@ -344,8 +366,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : EntityId.Normalize(options.Partition); // match stored (normalized) PartitionKeys
-        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : EntityId.Normalize(options.RowKeyPrefix); // stored RowKeys are normalized too
+        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition); // match stored (normalized) PartitionKeys
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : NormalizeId(options.RowKeyPrefix); // stored RowKeys are normalized too
 
         if (rowKeyPrefix is not null && partition is null)
             throw new ArgumentException(
@@ -420,7 +442,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     {
         lock (gate)
         {
-            var scope = string.IsNullOrWhiteSpace(partition) ? null : EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
+            var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
             var count = scope is null
                 ? rows.Count
                 : rows.Keys.Count(k => k.PartitionKey == scope);
@@ -436,7 +458,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             throw new ArgumentNullException(nameof(id));
         }
 
-        var keys = EntityId.Split(EntityId.Normalize(id));
+        var keys = EntityId.Split(NormalizeId(id));
 
         lock (gate)
         {
@@ -453,7 +475,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
         if (string.IsNullOrWhiteSpace(partition))
             throw new ArgumentNullException(nameof(partition));
 
-        partition = EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
+        partition = NormalizeId(partition); // match stored (normalized) PartitionKeys
         lock (gate)
         {
             var doomed = rows.Keys.Where(k => k.PartitionKey == partition).ToList();
@@ -486,7 +508,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             // Parity with TableStorage: batch sub-responses aren't correlated back, so the ETag is
             // unknown after a batch — re-read before optimistic updates.
             entity.ETag = null;
-            entity.Id = EntityId.Normalize(entity.Id);
+            entity.Id = NormalizeId(entity.Id);
             var keys = EntityId.Split(entity.Id);
 
             if (!upsert && !withinBatch.Add(keys))
@@ -517,8 +539,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
 
     private IEnumerable<T> Bounded(QueryOptions options)
     {
-        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : EntityId.Normalize(options.Partition); // match stored (normalized) PartitionKeys
-        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : EntityId.Normalize(options.RowKeyPrefix); // stored RowKeys are normalized too
+        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition); // match stored (normalized) PartitionKeys
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : NormalizeId(options.RowKeyPrefix); // stored RowKeys are normalized too
 
         if (rowKeyPrefix is not null && partition is null)
             throw new ArgumentException(
@@ -580,7 +602,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             return;
 
         T? stored;
-        var keys = EntityId.Split(EntityId.Normalize(entity.Id));
+        var keys = EntityId.Split(NormalizeId(entity.Id));
         lock (gate)
         {
             stored = rows.TryGetValue(keys, out var row) ? Materialize(row) : null;

@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] — 2026-07-13
+
+Migration-safety patch driven by a consumer review (IntelliGrowth / Intellias.CQRS migration).
+No breaking API changes; one new marker column by default (see below).
+
+### Fixed
+
+- **`Entity.Id` is now derived from the row's `PartitionKey`/`RowKey` on every read** instead of
+  trusting a stored `"Id"` column. A legacy row written by another serializer (no `Id` column) read
+  back with `Id = ""`, and a legacy single-segment id split as the wrong keys on the next write —
+  writes could land on a different row than the one read. Keys are the authoritative identity; a
+  stored id that already addresses the row's exact keys is kept verbatim (so explicit forms like
+  `"a|a"` round-trip byte-identically), and serializer-only round-trips without keys keep the
+  stored column. *Known limitations:* a legacy `PartitionKey` containing `'|'` cannot be expressed
+  in the single-separator id grammar, and server-side predicates on `Id` still target the stored
+  `Id` **column** — legacy rows without one are invisible to `QueryAsync(x => x.Id == …)` until
+  backfilled (key-based predicate translation is tracked for 0.6.0). (B9)
+- **Types without a public parameterless constructor can be read late-bound again.** Legacy
+  FormatterServices-based serializers persisted such events/commands; `FromTableEntity()` now falls
+  back to `RuntimeHelpers.GetUninitializedObject` when no public parameterless ctor exists, instead
+  of throwing `MissingMethodException`. Types with a ctor keep ctor semantics (initializers run).
+
+### Added
+
+- **`OversizedCellPolicy`** (`UnifiedTableStorageOptions.OversizedCells` /
+  `TableEntitySerializer.OversizedCellPolicy`) — what happens when a payload exceeds the 64 KB cell
+  cap even compressed. The new default, `TrimWithMarker`, records the loss in a sibling
+  `{Column}__Truncated` cell (e.g. `"kept 125 of 2000 items"`) — previously the serializer kept the
+  largest fitting list prefix (or dropped the property) with **no trace**. `Throw` fails the write
+  loudly for data where loss is never acceptable; `TrimSilently` restores the pre-0.5.3 behaviour.
+  The marker column is ignored on read.
+- **`IdNormalization.AsWritten`** (`UnifiedTableStorageOptions.IdNormalization`) — opt out of id
+  normalization (trim → spaces to `-` → lower-case) for tables whose keys are case-sensitive
+  payloads (Base64, hex, mixed-case natural keys) or pre-existing data written by another layer.
+  Applied uniformly to ids, partition scopes, and `RowKeyPrefix` in both `TableStorage` and the
+  in-memory fake (parity preserved). Default remains `Normalized`.
+- **`AddUnifiedInMemoryStorage(configure)`** — the fake's DI registration now accepts the same
+  options delegate as `AddUnifiedTableStorage`, so a DI-wired fake honours the configured
+  `IdNormalization`/`OversizedCells` instead of silently running defaults. The static serializer
+  policy follows first-registration-wins semantics (mirroring `TryAddSingleton`), so a later bare
+  registration can never reset an explicitly configured policy.
+
+### Changed
+
+- **`ConcurrencyMode.Auto` now logs a warning when it degrades to an unconditional write.** With no
+  caller ETag and no cached ETag (cold start, cache eviction, scale-out), Auto silently wrote
+  last-writer-wins; the fall-through is now visible in logs, steering intentional LWW to the
+  explicit `ConcurrencyMode.LastWriterWins`.
+- **Query-cache entries are sized by row count** (entity entries remain size 1), so a
+  `SizeLimit`-bounded `IMemoryCache` actually accounts for large or whole-table cached results.
+
 ## [0.5.2] — 2026-07-13
 
 A correctness patch — no API changes. Fixes write/query bugs and hardens the cache.

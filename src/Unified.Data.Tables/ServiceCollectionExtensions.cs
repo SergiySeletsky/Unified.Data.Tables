@@ -24,6 +24,14 @@ public static class ServiceCollectionExtensions
         var options = new UnifiedTableStorageOptions();
         configure?.Invoke(options);
 
+        // The serializer is static, so its oversized-cell policy is process-wide state. Mirror
+        // TryAddSingleton's first-registration-wins semantics: only the call whose options actually
+        // register also applies the policy, so a later bare AddUnifiedTableStorage() from another
+        // module cannot silently reset an explicitly configured policy.
+        var optionsAlreadyRegistered = services.Any(d => d.ServiceType == typeof(UnifiedTableStorageOptions));
+        if (!optionsAlreadyRegistered)
+            TableEntitySerializer.OversizedCellPolicy = options.OversizedCells;
+
         services.AddMemoryCache();
         services.TryAddSingleton(options);
         services.TryAddSingleton(typeof(IStorage<>), typeof(TableStorage<>));

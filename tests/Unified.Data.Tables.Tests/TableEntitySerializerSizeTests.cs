@@ -8,7 +8,11 @@ namespace Unified.Data.Tables.Tests;
 /// and the WHOLE entity insert fails. These regression tests pin the serializer's guarantee that
 /// every produced cell stays within the limit — losslessly GZip-compressed when possible, truncated
 /// as a last resort — so a single oversized property can never silently lose the whole row.
+/// These tests assume the default TrimWithMarker policy; they share a collection with everything
+/// that mutates the static <see cref="TableEntitySerializer.OversizedCellPolicy"/> so a policy
+/// change in a parallel test can never leak in.
 /// </summary>
+[Collection("OversizedCellPolicy")]
 public class TableEntitySerializerSizeTests
 {
     private const int MaxCellBytes = 65536;
