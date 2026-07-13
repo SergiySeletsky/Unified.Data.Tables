@@ -27,6 +27,14 @@ public static class TableEntitySerializer
     /// <summary>Column that stores the assembly-qualified type name when <c>persistType</c> is used.</summary>
     public const string TypeNameColumnName = "_TypeName";
 
+    /// <summary>
+    /// Process-wide policy for payloads that exceed the 64 KB cell cap even compressed — see
+    /// <see cref="Unified.Data.Tables.OversizedCellPolicy"/>. The serializer is static, so this is
+    /// static too; <c>AddUnifiedTableStorage</c> applies
+    /// <see cref="UnifiedTableStorageOptions.OversizedCells"/> here.
+    /// </summary>
+    public static OversizedCellPolicy OversizedCellPolicy { get; set; } = OversizedCellPolicy.TrimWithMarker;
+
     /// <summary>Flatten and serialize <paramref name="root"/> into a <see cref="TableEntity"/>.</summary>
     public static TableEntity ToTableEntity(
         this object root,
@@ -54,11 +62,15 @@ public static class TableEntitySerializer
 
         foreach (var kv in entity)
         {
+            // A __Truncated marker is metadata about a trimmed/dropped cell, not data — feeding it
+            // through SetProperty would drill into (and materialize) the property it describes.
+            if (TableEntityValue.IsTruncationMarker(kv.Key))
+                continue;
             var val = TableEntityValue.Create(kv.Key, kv.Value);
             result = (T)SetProperty(result, val);
         }
 
-        return (T)ApplyColumnAliases(result!, entity, meta);
+        return (T)RestoreIdFromKeys(ApplyColumnAliases(result!, entity, meta), entity);
     }
 
     /// <summary>Late-bound deserialize; requires the row to have been written with <c>persistType: true</c>.</summary>
@@ -78,11 +90,42 @@ public static class TableEntitySerializer
 
         foreach (var kv in entity)
         {
+            if (TableEntityValue.IsTruncationMarker(kv.Key))
+                continue;
             var val = TableEntityValue.Create(kv.Key, kv.Value);
             result = SetProperty(result, val);
         }
 
-        return ApplyColumnAliases(result, entity, meta);
+        return RestoreIdFromKeys(ApplyColumnAliases(result, entity, meta), entity);
+    }
+
+    // The row's PartitionKey/RowKey are the authoritative identity. A legacy row written by another
+    // serializer has no "Id" column (Id would read back empty), and a legacy single-segment id would
+    // split as the wrong keys on the next write — so whenever the row carries real keys and the
+    // stored column does not already address them, recompute the composite id from the keys. A
+    // stored id that Splits to these exact keys is kept verbatim, so explicit forms like "a|a"
+    // round-trip byte-identically. Rows serialized without keys (plain dictionary round-trips) keep
+    // whatever the "Id" column said. (A PartitionKey that itself contains '|' cannot be expressed
+    // in the single-separator id grammar; the stored column — if consistent — is the only handle.)
+    private static object RestoreIdFromKeys(object result, TableEntity entity)
+    {
+        if (result is not Entity e
+            || string.IsNullOrEmpty(entity.PartitionKey)
+            || string.IsNullOrEmpty(entity.RowKey))
+        {
+            return result;
+        }
+
+        if (!string.IsNullOrEmpty(e.Id)
+            && EntityId.Split(e.Id) == (entity.PartitionKey, entity.RowKey))
+        {
+            return result; // the stored id already addresses this exact row — keep it verbatim
+        }
+
+        e.Id = entity.PartitionKey == entity.RowKey
+            ? entity.PartitionKey
+            : EntityId.Combine(entity.PartitionKey, entity.RowKey);
+        return result;
     }
 
     // Mirrors TableEntityValue's private cell-format suffixes — an alias column may carry any of
@@ -212,6 +255,10 @@ public static class TableEntitySerializer
         {
             if (cell != null)
                 dict[col] = cell;
+            // Under OversizedCellPolicy.TrimWithMarker, a trimmed/dropped payload leaves a visible
+            // trace in the row itself; FromTableEntity explicitly skips __Truncated columns on read.
+            if (value.TruncationNote is { } note)
+                dict[value.TruncationMarkerColumn] = note;
             return true;
         }
 
@@ -306,6 +353,7 @@ internal sealed class TableEntityValue
     private const string Delim = "_";
     private const string JsonSuffix = "__Json";
     private const string GZipSuffix = "__GZip";
+    private const string TruncatedSuffix = "__Truncated";
     private static readonly DateTimeOffset MinDto =
         new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
@@ -379,6 +427,20 @@ internal sealed class TableEntityValue
     public Type? Type { get; }
     public TableEntityValueFormat Format { get; private set; }
 
+    /// <summary>
+    /// Set by <see cref="TrySerialize"/> when the oversized-cell policy trimmed (or dropped) this
+    /// value — human-readable "kept X of Y" text the caller writes into the sibling
+    /// <see cref="TruncationMarkerColumn"/> cell. Null when nothing was lost.
+    /// </summary>
+    public string? TruncationNote { get; private set; }
+
+    /// <summary>The marker column recording a truncation, e.g. <c>Tags__Truncated</c>.</summary>
+    public string TruncationMarkerColumn => string.Join(Delim, Path) + TruncatedSuffix;
+
+    /// <summary>Whether a column is a truncation marker — metadata that must be skipped on read.</summary>
+    internal static bool IsTruncationMarker(string column) =>
+        column.EndsWith(TruncatedSuffix, StringComparison.Ordinal);
+
     public TableEntityValue(
         ImmutableList<string> path,
         object? value,
@@ -444,7 +506,14 @@ internal sealed class TableEntityValue
                 }
                 else
                 {
-                    value = TruncateForCell(s);
+                    // Even compressed it exceeds the cap — the oversized-cell policy decides.
+                    if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.Throw)
+                        throw new SerializationException(
+                            $"Property '{columnName}' is a {s.Length}-char string whose compressed form " +
+                            "still exceeds the 64 KB cell cap (OversizedCellPolicy.Throw).");
+                    value = TruncateForCell(s, out var keptChars);
+                    if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.TrimWithMarker)
+                        TruncationNote = $"kept {keptChars} of {s.Length} chars";
                 }
             }
 
@@ -470,11 +539,28 @@ internal sealed class TableEntityValue
             Format = TableEntityValueFormat.GZip;
 
             // Even compressed, a huge high-entropy payload can exceed the 64 KB cell cap — and a
-            // cell the service rejects loses the WHOLE row. Trim list payloads to the largest prefix
-            // that still fits; as a last resort drop the property (null cell = column omitted) so
-            // the rest of the row survives.
+            // cell the service rejects loses the WHOLE row. The oversized-cell policy decides:
+            // throw, or trim list payloads to the largest prefix that fits (as a last resort drop
+            // the property — null cell = column omitted) with or without a __Truncated marker.
             if (Encoding.Unicode.GetByteCount(json) > MaxCellBytes)
-                json = Value is IList list ? CompressLargestFittingPrefix(list) : null;
+            {
+                if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.Throw)
+                    throw new SerializationException(
+                        $"Property '{columnName}' serializes to a payload whose compressed form " +
+                        "exceeds the 64 KB cell cap (OversizedCellPolicy.Throw).");
+                if (Value is IList list)
+                {
+                    json = CompressLargestFittingPrefix(list, out var keptItems);
+                    if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.TrimWithMarker)
+                        TruncationNote = $"kept {keptItems} of {list.Count} items";
+                }
+                else
+                {
+                    json = null;
+                    if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.TrimWithMarker)
+                        TruncationNote = "property dropped: compressed payload exceeds the 64 KB cell cap";
+                }
+            }
         }
         else
         {
@@ -616,17 +702,18 @@ internal sealed class TableEntityValue
     // Leaves generous headroom under the 32K-char (64 KB UTF-16) cell limit for the marker.
     private const int TruncatedCellChars = 30_000;
 
-    private static string TruncateForCell(string s)
+    private static string TruncateForCell(string s, out int keptChars)
     {
         // Never cut between a surrogate pair — a lone surrogate is invalid UTF-16 and corrupts (or
         // fails) the SDK's wire encoding.
         var cut = TruncatedCellChars;
         if (char.IsHighSurrogate(s[cut - 1]))
             cut--;
+        keptChars = cut;
         return $"{s[..cut]}\n…[truncated {s.Length - cut} chars to fit table storage]";
     }
 
-    private static string? CompressLargestFittingPrefix(IList list)
+    private static string? CompressLargestFittingPrefix(IList list, out int keptItems)
     {
         for (var n = list.Count / 2; ; n /= 2)
         {
@@ -635,9 +722,15 @@ internal sealed class TableEntityValue
                 prefix.Add(list[i]);
             var candidate = Compress(JsonSerializer.Serialize(prefix, JsonOptions));
             if (Encoding.Unicode.GetByteCount(candidate) <= MaxCellBytes)
+            {
+                keptItems = n;
                 return candidate;
+            }
             if (n == 0)
+            {
+                keptItems = 0;
                 return null; // even an empty list doesn't fit — cannot happen in practice
+            }
         }
     }
 
@@ -680,7 +773,13 @@ internal static class TypeMetadataCache
                      .ToImmutableList();
 
         var map = props.ToDictionary(p => p.Name, p => p);
-        Func<object> creator = () => Activator.CreateInstance(t)!;
+        // Prefer the real ctor (runs field initializers). For types WITHOUT a public parameterless
+        // ctor — common for events/commands read late-bound from legacy tables — fall back to an
+        // uninitialized instance, the same construction the legacy FormatterServices-based
+        // serializers used, so those rows stay readable instead of throwing MissingMethodException.
+        Func<object> creator = t.IsValueType || t.GetConstructor(Type.EmptyTypes) is not null
+            ? () => Activator.CreateInstance(t)!
+            : () => RuntimeHelpers.GetUninitializedObject(t);
 
         return new TypeMetadata(props, map, BuildAliasMap(t, map), creator);
     }

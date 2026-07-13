@@ -38,6 +38,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     private readonly ILogger<TableStorage<T>> logger;
     private readonly IProtectedPropertyAuthorizer? authorizer;
     private readonly CachePolicy cachePolicy;
+    private readonly IdNormalization idNormalization;
     private readonly string typeName = typeof(T).Name;
 
     // Cache keys use the fully-qualified type name so two entity types with the same simple name in
@@ -80,7 +81,9 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         this.cache = cache;
         this.logger = logger;
         this.authorizer = authorizer;
-        cachePolicy = (options ?? new UnifiedTableStorageOptions()).ResolveCachePolicy(typeof(T));
+        var opts = options ?? new UnifiedTableStorageOptions();
+        cachePolicy = opts.ResolveCachePolicy(typeof(T));
+        idNormalization = opts.IdNormalization;
         client = serviceClient.GetTableClient(typeName);
     }
 
@@ -332,7 +335,9 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
 
         if (cachePolicy.Enabled)
-            cache.Set(cacheKey, (IEnumerable<T>)results, CacheEntryOptions());
+            // Sized by row count so a SizeLimit-bounded cache actually accounts for a large (or
+            // whole-table) result list instead of counting it as one unit.
+            cache.Set(cacheKey, (IEnumerable<T>)results, CacheEntryOptions(Math.Max(1, results.Count)));
 
         // Hand back isolated copies so a caller mutating a result never corrupts the cached instances.
         return results.Select(Clone).ToList();
@@ -771,6 +776,16 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
             _ => callerSuppliedETag ? new ETag(entity.ETag!) : GetCachedETag(entity.Id)
         };
 
+        // Auto with no ETag anywhere degrades to an UNCONDITIONAL full-row replace (last-writer-
+        // wins) — silent lost-update territory. Say so: intentional LWW should be spelled
+        // ConcurrencyMode.LastWriterWins; protected writes should round-trip the ETag or use
+        // MutateAsync.
+        if (mode == ConcurrencyMode.Auto && !callerSuppliedETag && etag == ETag.All)
+            logger.LogWarning(
+                "{Type}.UpdateAsync({Id}): Auto mode found no ETag (caller or cache) — writing " +
+                "unconditionally (last-writer-wins). Round-trip the ETag, use MutateAsync, or opt in " +
+                "explicitly with ConcurrencyMode.LastWriterWins.", typeName, entity.Id);
+
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null; // service last-write time is unknown until the next read
 
@@ -905,7 +920,10 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
     }
 
-    private static string NormalizeId(string id) => EntityId.Normalize(id);
+    // Mode-aware id normalization — every id and partition/prefix argument funnels through here,
+    // so IdNormalization.AsWritten uniformly disables the rewrite for case-sensitive legacy keys.
+    private string NormalizeId(string id) =>
+        idNormalization == IdNormalization.Normalized ? EntityId.Normalize(id) : id;
 
     // Split on the FIRST separator only, so a row key may itself contain '|'
     // (e.g. "vision|execution|agent" → partition "vision", row "execution|agent").
@@ -941,11 +959,12 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         cache.Set(EntityCacheKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
     }
 
-    // Size = 1 makes every entry countable so the store works with a SizeLimit-bounded IMemoryCache
-    // (otherwise cache.Set throws AFTER the write is already committed to Azure).
-    private MemoryCacheEntryOptions CacheEntryOptions() => cachePolicy.Mode == CacheExpirationMode.Absolute
-        ? new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = cachePolicy.Ttl, Size = 1 }
-        : new MemoryCacheEntryOptions { SlidingExpiration = cachePolicy.Ttl, Size = 1 };
+    // Size makes every entry countable so the store works with a SizeLimit-bounded IMemoryCache
+    // (otherwise cache.Set throws AFTER the write is already committed to Azure). Single entities
+    // count 1; query result lists count their row count.
+    private MemoryCacheEntryOptions CacheEntryOptions(long size = 1) => cachePolicy.Mode == CacheExpirationMode.Absolute
+        ? new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = cachePolicy.Ttl, Size = size }
+        : new MemoryCacheEntryOptions { SlidingExpiration = cachePolicy.Ttl, Size = size };
 
     private ETag GetCachedETag(string id)
     {

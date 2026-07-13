@@ -17,6 +17,21 @@ public sealed class UnifiedTableStorageOptions
     public CachePolicy Cache { get; set; } = CachePolicy.Sliding(TimeSpan.FromHours(1));
 
     /// <summary>
+    /// What happens when a serialized payload exceeds the 64 KB cell cap even compressed —
+    /// see <see cref="OversizedCellPolicy"/>. Default: trim and leave a <c>__Truncated</c> marker.
+    /// Applied to the (static) serializer at registration time.
+    /// </summary>
+    public OversizedCellPolicy OversizedCells { get; set; } = OversizedCellPolicy.TrimWithMarker;
+
+    /// <summary>
+    /// How ids and partition/prefix arguments are treated before hitting the table — see
+    /// <see cref="IdNormalization"/>. Default: <see cref="IdNormalization.Normalized"/> (trim,
+    /// spaces to '-', lower-case). Use <see cref="IdNormalization.AsWritten"/> for tables whose
+    /// keys are case-sensitive payloads or pre-existing data written by another layer.
+    /// </summary>
+    public IdNormalization IdNormalization { get; set; } = IdNormalization.Normalized;
+
+    /// <summary>
     /// Override the cache policy for one entity type (e.g. disable for high-churn types or
     /// huge partitions).
     /// </summary>

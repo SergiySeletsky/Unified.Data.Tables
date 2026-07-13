@@ -69,8 +69,9 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
     /// shared cache across two harnesses to exercise cache-key isolation. When omitted, the harness
     /// owns and disposes a default unbounded cache.
     /// </param>
+    /// <param name="logger">Optional logger to inject (e.g. a recording logger for log assertions).</param>
     public StorageHarness(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null,
-        IMemoryCache? cache = null)
+        IMemoryCache? cache = null, Microsoft.Extensions.Logging.ILogger<TableStorage<T>>? logger = null)
     {
         Service = Substitute.For<TableServiceClient>();
         Table = Substitute.For<TableClient>();
@@ -81,7 +82,7 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
              .Returns(Task.FromResult<Response<Azure.Data.Tables.Models.TableItem>>(null!));
         ownsCache = cache is null;
         Cache = cache ?? new MemoryCache(new MemoryCacheOptions());
-        Store = new TableStorage<T>(Service, Cache, NullLogger<TableStorage<T>>.Instance, authorizer, options);
+        Store = new TableStorage<T>(Service, Cache, logger ?? NullLogger<TableStorage<T>>.Instance, authorizer, options);
     }
 
     // Only dispose a cache we created — a caller-injected (possibly shared) cache outlives us.
