@@ -659,20 +659,23 @@ public class TableStorageTests
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
-    // ── Cross-partition cache invalidation ──────────────────────────────────
+    // ── Cache invalidation on write ─────────────────────────────────────────
 
     [Fact]
-    public async Task InvalidateQueryCache_ClearsTrackedPartitions()
+    public async Task InvalidateQueryCache_EvictsWrittenPartitionAndTableWide_ButNotOthers()
     {
         using var h = new StorageHarness<TestEntity>();
         h.SetupQueryByPartition(Mocks.Row("p1", "r1"));
         h.SetupAdd();
 
-        await h.Store.QueryAsync("p1");
-        await h.Store.QueryAsync("p2");
-        await h.Store.CreateAsync(new TestEntity { Id = "p1|new", Name = "New" });   // invalidates p1, p2, *
-        await h.Store.QueryAsync("p2");
+        await h.Store.QueryAsync("p1");   // fetch #1, caches p1
+        await h.Store.QueryAsync("p2");   // fetch #2, caches p2
+        await h.Store.CreateAsync(new TestEntity { Id = "p1|new", Name = "New" }); // invalidates p1 + table-wide only
+        await h.Store.QueryAsync("p2");   // cache hit — a write to p1 must NOT evict an unrelated partition (G4)
+        await h.Store.QueryAsync("p1");   // fetch #3 — p1's own cache WAS evicted
 
+        // 0.5.2 (G4) scopes invalidation to the written partition plus the table-wide ("*") key,
+        // instead of walking a process-wide tracked-partition set. p2 stays warm → 3 fetches, not 4.
         h.Table.Received(3).QueryAsync<TableEntity>(
             Arg.Any<System.Linq.Expressions.Expression<Func<TableEntity, bool>>>(),
             Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());

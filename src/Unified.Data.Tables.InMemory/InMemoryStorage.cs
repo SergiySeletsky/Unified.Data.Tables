@@ -261,10 +261,11 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     /// <inheritdoc />
     public Task<IEnumerable<T>> QueryAsync(string? partition = null, CancellationToken ct = default)
     {
+        var scope = string.IsNullOrWhiteSpace(partition) ? null : EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
         lock (gate)
         {
             var matches = OrderedRows()
-                .Where(kv => string.IsNullOrWhiteSpace(partition) || kv.Key.PartitionKey == partition)
+                .Where(kv => scope is null || kv.Key.PartitionKey == scope)
                 .Select(kv => Materialize(kv.Value))
                 .ToList();
             return Task.FromResult<IEnumerable<T>>(matches);
@@ -293,7 +294,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
         // same predicate holds against Azure Tables — then evaluate the caller's real semantics.
         _ = TableFilterTranslator.Translate(predicate);
         var matches = predicate.Compile();
-        var scope = string.IsNullOrWhiteSpace(partition) ? null : partition;
+        var scope = string.IsNullOrWhiteSpace(partition) ? null : EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
 
         lock (gate)
         {
@@ -343,8 +344,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : options.Partition;
-        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : options.RowKeyPrefix;
+        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : EntityId.Normalize(options.Partition); // match stored (normalized) PartitionKeys
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : EntityId.Normalize(options.RowKeyPrefix); // stored RowKeys are normalized too
 
         if (rowKeyPrefix is not null && partition is null)
             throw new ArgumentException(
@@ -419,9 +420,10 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     {
         lock (gate)
         {
-            var count = string.IsNullOrWhiteSpace(partition)
+            var scope = string.IsNullOrWhiteSpace(partition) ? null : EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
+            var count = scope is null
                 ? rows.Count
-                : rows.Keys.Count(k => k.PartitionKey == partition);
+                : rows.Keys.Count(k => k.PartitionKey == scope);
             return Task.FromResult(count);
         }
     }
@@ -451,6 +453,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
         if (string.IsNullOrWhiteSpace(partition))
             throw new ArgumentNullException(nameof(partition));
 
+        partition = EntityId.Normalize(partition); // match stored (normalized) PartitionKeys
         lock (gate)
         {
             var doomed = rows.Keys.Where(k => k.PartitionKey == partition).ToList();
@@ -514,8 +517,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
 
     private IEnumerable<T> Bounded(QueryOptions options)
     {
-        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : options.Partition;
-        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : options.RowKeyPrefix;
+        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : EntityId.Normalize(options.Partition); // match stored (normalized) PartitionKeys
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : EntityId.Normalize(options.RowKeyPrefix); // stored RowKeys are normalized too
 
         if (rowKeyPrefix is not null && partition is null)
             throw new ArgumentException(

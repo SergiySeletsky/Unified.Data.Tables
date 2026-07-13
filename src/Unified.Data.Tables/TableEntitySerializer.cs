@@ -151,6 +151,36 @@ public static class TableEntitySerializer
         return dict;
     }
 
+    /// <summary>
+    /// Whether a complex type is FLATTENED into <c>Parent_Child</c> columns (the serializer recurses
+    /// into it) rather than stored as a single JSON/GZip cell. Mirrors the serializer's own decision so
+    /// callers (e.g. the LINQ filter translator) can tell whether an <c>Owner_Child</c> column exists at
+    /// all for a nested member access.
+    /// </summary>
+    internal static bool FlattensToColumns(Type type)
+    {
+        // An IEnumerable (other than string) is ALWAYS stored as a single JSON cell, whatever the
+        // runtime type — so this is statically decidable and must be checked first, even for an
+        // interface/abstract collection type (e.g. IList<T>), before the can't-determine fallback below.
+        if (type != typeof(string) && typeof(IEnumerable).IsAssignableFrom(type))
+            return false; // collections serialize to JSON, not columns
+        // Non-enumerable interfaces and abstract types never appear as a runtime VALUE type — the
+        // serializer decides flatten-vs-JSON from the concrete instance at write time, which we cannot
+        // see here. Their (public) ctor list is empty, which would otherwise read as "JSON". Don't claim
+        // JSON on that artifact: a polymorphic-owner filter (e.g. IShape Shape = new Circle()) whose
+        // runtime type really does flatten to Owner_Child columns must not be rejected. Assume flattenable.
+        if (type.IsInterface || type.IsAbstract)
+            return true;
+        var ctors = type.GetConstructors();
+        if (ctors.Length == 0)
+            return false;
+        if (ctors.All(c => c.GetParameters().Length > 0))
+            return false; // positional records / parameterized-only DTOs -> JSON
+        if (ctors.Any(c => c.GetCustomAttributes(typeof(JsonConstructorAttribute), true).Length > 0))
+            return false;
+        return true;
+    }
+
     //───────────────────────────────────────────────────────────────────────────
 
     private static Dictionary<string, object> Flatten(object root, bool persistType)
@@ -305,13 +335,13 @@ internal sealed class TableEntityValue
             {
                 var dt = (DateTime)v;
                 if (dt == default) dt = MinDto.DateTime;
-                return new DateTimeOffset(dt, TimeSpan.Zero);
+                return new DateTimeOffset(NormalizeToUtc(dt), TimeSpan.Zero);
             }
         },
         { typeof(DateTime?), v =>
             {
                 var dt = ((DateTime?)v) ?? MinDto.DateTime;
-                return new DateTimeOffset(dt, TimeSpan.Zero);
+                return new DateTimeOffset(NormalizeToUtc(dt), TimeSpan.Zero);
             }
         },
         { typeof(DateTimeOffset), v =>
@@ -548,6 +578,17 @@ internal sealed class TableEntityValue
         return Convert.ChangeType(dto, t, CultureInfo.InvariantCulture);
     }
 
+    // Convert a DateTime to a UTC-kind DateTime: a Local value becomes its UTC instant, an
+    // Unspecified value is assumed to be UTC. Used by BOTH the write (flatten) and read
+    // (deserialize) paths so that `new DateTimeOffset(x, TimeSpan.Zero)` never throws on a
+    // Local-kind value on a non-UTC host, and both directions agree on the stored instant.
+    internal static DateTime NormalizeToUtc(DateTime dt) => dt.Kind switch
+    {
+        DateTimeKind.Utc => dt,
+        DateTimeKind.Local => dt.ToUniversalTime(),
+        _ => DateTime.SpecifyKind(dt, DateTimeKind.Utc),
+    };
+
     private static object ConvertDateTime(Type t, DateTime dt)
     {
         if (t == typeof(DateTime)) return dt;
@@ -555,12 +596,7 @@ internal sealed class TableEntityValue
         {
             // Azure Tables persists dates in UTC; treat Unspecified as UTC and normalize Local to
             // UTC so the resulting offset is zero.
-            var utc = dt.Kind switch
-            {
-                DateTimeKind.Utc => dt,
-                DateTimeKind.Local => dt.ToUniversalTime(),
-                _ => DateTime.SpecifyKind(dt, DateTimeKind.Utc)
-            };
+            var utc = NormalizeToUtc(dt);
             return new DateTimeOffset(utc);
         }
         return Convert.ChangeType(dt, t, CultureInfo.InvariantCulture);

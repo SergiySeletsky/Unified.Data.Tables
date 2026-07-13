@@ -59,10 +59,18 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
 {
     public TableServiceClient Service { get; }
     public TableClient Table { get; }
-    public MemoryCache Cache { get; }
+    public IMemoryCache Cache { get; }
     public TableStorage<T> Store { get; }
 
-    public StorageHarness(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
+    private readonly bool ownsCache;
+
+    /// <param name="cache">
+    /// Optional cache to inject — pass a size-limited cache to exercise <c>Size</c> on entries, or a
+    /// shared cache across two harnesses to exercise cache-key isolation. When omitted, the harness
+    /// owns and disposes a default unbounded cache.
+    /// </param>
+    public StorageHarness(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null,
+        IMemoryCache? cache = null)
     {
         Service = Substitute.For<TableServiceClient>();
         Table = Substitute.For<TableClient>();
@@ -71,11 +79,17 @@ public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
         // a null Task and NRE on await, so every harness store gets a completed init by default.
         Table.CreateIfNotExistsAsync(Arg.Any<CancellationToken>())
              .Returns(Task.FromResult<Response<Azure.Data.Tables.Models.TableItem>>(null!));
-        Cache = new MemoryCache(new MemoryCacheOptions());
+        ownsCache = cache is null;
+        Cache = cache ?? new MemoryCache(new MemoryCacheOptions());
         Store = new TableStorage<T>(Service, Cache, NullLogger<TableStorage<T>>.Instance, authorizer, options);
     }
 
-    public void Dispose() => Cache.Dispose();
+    // Only dispose a cache we created — a caller-injected (possibly shared) cache outlives us.
+    public void Dispose()
+    {
+        if (ownsCache && Cache is IDisposable d)
+            d.Dispose();
+    }
 
     // ── Common mock setups ───────────────────────────────────────────────────
 

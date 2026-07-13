@@ -312,6 +312,16 @@ c!.Balance += 100;
 await storage.UpdateAsync(c);   // ConcurrencyConflictException if the row changed since it was read
 ```
 
+> **⚠️ `UpdateAsync(entity)` protects you only when the entity carries an ETag.** With no ETag set,
+> `Auto` mode has no version to check against: it writes unconditionally and, on the rare 412, retries
+> once against the latest row — a **last-writer-wins full-row replace** that can silently clobber a
+> concurrent update (a lost update). If you read, mutate a field, and write it back, you **must**
+> round-trip the ETag (`OneAsync`/`QueryAsync` populate it) so the write is checked — or use
+> `MutateAsync`, which owns the read→mutate→strict-write loop for you. Passing no ETag is only correct
+> when you genuinely mean "make the row look like this object regardless of its current state"; say so
+> explicitly with `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` rather than relying on a
+> missing ETag. (Tightening this default is tracked for 0.6.0.)
+
 For values *derived* from the current row (counters, unions, merges), use the packaged
 compare-and-swap loop — it re-reads and re-applies on conflict, so no increment is ever lost:
 
