@@ -234,6 +234,15 @@ public static class TableFilterTranslator
                     $"'{pi.Name}' on {ownerType.Name} is not a persisted column (it is computed, get-only, " +
                     "[IgnoreDataMember], or ETag/Timestamp) and cannot be filtered server-side.");
 
+            // A NESTED owner (x.Owner.Child) only yields an "Owner_Child" column when the serializer
+            // FLATTENS it. A JSON-blobbed owner (positional record, collection, [JsonConstructor]) is
+            // stored as one cell, so no such column exists — the filter would match nothing on Azure
+            // while the in-memory fake evaluates it. Reject the divergence rather than translate it wrong.
+            if (StripConvert(m.Expression!) is MemberExpression && !TableEntitySerializer.FlattensToColumns(ownerType))
+                throw new NotSupportedException(
+                    $"'{ownerType.Name}' is stored as a single JSON cell (not flattened columns), so its nested " +
+                    $"member cannot be filtered server-side: '{memberExpr}'. Filter a top-level or flattened property.");
+
             if (first) { leafType = pi.PropertyType; first = false; }
             names.Add(pi.Name);
             current = StripConvert(m.Expression!);

@@ -16,7 +16,9 @@ public sealed record QueryOptions
 
     /// <summary>
     /// Canonical Azure Tables RowKey range scan: returns rows where
-    /// <c>RowKey &gt;= prefix</c> and <c>RowKey &lt; next(prefix)</c>.
+    /// <c>RowKey &gt;= prefix</c> and <c>RowKey &lt; next(prefix)</c>. Normalized to the stored form the
+    /// same way ids are on write (trim → spaces to <c>'-'</c> → lower-case), so a natural-form prefix
+    /// matches the normalized RowKeys writes produce, consistent with <see cref="Partition"/>.
     /// </summary>
     public string? RowKeyPrefix { get; init; }
 

@@ -1,6 +1,7 @@
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.Serialization;
 using Azure;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Caching.Memory;
@@ -39,9 +40,10 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     private readonly CachePolicy cachePolicy;
     private readonly string typeName = typeof(T).Name;
 
-    // Track known partition keys so we can invalidate query caches
-    private readonly HashSet<string> trackedPartitions = new(StringComparer.OrdinalIgnoreCase);
-    private readonly object partitionLock = new();
+    // Cache keys use the fully-qualified type name so two entity types with the same simple name in
+    // different namespaces never collide in a shared IMemoryCache. (The Azure table name still uses the
+    // simple name for back-compat — changing that would rename the table and need a data migration.)
+    private readonly string cacheKeyPrefix = typeof(T).FullName ?? typeof(T).Name;
 
     // Coalesced lazy CreateIfNotExists: no network I/O at construction/DI-resolve time, one create
     // per store shared by all callers, and a FAILED attempt is forgotten so the next call retries
@@ -198,6 +200,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     {
         if (string.IsNullOrWhiteSpace(partition))
             throw new ArgumentNullException(nameof(partition));
+        partition = NormalizeId(partition); // match stored (normalized) PartitionKeys
 
         await EnsureTableAsync(ct);
 
@@ -244,7 +247,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(cacheKey, out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.OneAsync id={Id}", typeName, id);
-            return cached.Entity;
+            return Clone(cached.Entity);
         }
 
         logger.LogDebug("[Cache MISS] {Type}.OneAsync id={Id} — fetching from Table Storage", typeName, id);
@@ -259,6 +262,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         entity.ETag = response.Value!.ETag.ToString();
         entity.Timestamp = response.Value!.Timestamp;
         CacheEntity(id, entity, response.Value!.ETag);
+        // `entity` is now caller-private (CacheEntity snapshotted its own copy), so hand it back as-is.
         return entity;
     }
 
@@ -296,11 +300,17 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     /// <inheritdoc />
     public async Task<IEnumerable<T>> QueryAsync(string? partition = null, CancellationToken ct = default)
     {
+        // Match stored (normalized) PartitionKeys — writes normalize the id, so a natural-form partition
+        // ("My Vision") would otherwise silently match nothing. Collapse whitespace to null so a
+        // whole-table query caches under the "*" key that writes actually invalidate (not a raw
+        // whitespace key that InvalidateQueryCache would never evict).
+        partition = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition);
+
         var cacheKey = QueryCacheKey(partition);
         if (cachePolicy.Enabled && cache.TryGetValue<IEnumerable<T>>(cacheKey, out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.QueryAsync partition={Partition}", typeName, partition ?? "*");
-            return cached;
+            return cached.Select(Clone).ToList();
         }
 
         logger.LogDebug("[Cache MISS] {Type}.QueryAsync partition={Partition} — fetching from Table Storage", typeName, partition ?? "*");
@@ -322,12 +332,10 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         }
 
         if (cachePolicy.Enabled)
-        {
             cache.Set(cacheKey, (IEnumerable<T>)results, CacheEntryOptions());
-            TrackPartition(partition);
-        }
 
-        return results;
+        // Hand back isolated copies so a caller mutating a result never corrupts the cached instances.
+        return results.Select(Clone).ToList();
     }
 
     /// <inheritdoc />
@@ -355,8 +363,11 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     /// <inheritdoc />
     public IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null, CancellationToken ct = default)
     {
-        var partition = string.IsNullOrWhiteSpace(options?.Partition) ? null : options!.Partition;
-        var rowKeyPrefix = string.IsNullOrWhiteSpace(options?.RowKeyPrefix) ? null : options!.RowKeyPrefix;
+        var partition = string.IsNullOrWhiteSpace(options?.Partition) ? null : NormalizeId(options!.Partition);
+        // Normalize the RowKey prefix too: writes normalize the whole id, so stored RowKeys are
+        // normalized — a natural-form prefix would otherwise silently match nothing, exactly like an
+        // un-normalized partition. (Idempotent for the append-log path, which pre-normalizes.)
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options?.RowKeyPrefix) ? null : NormalizeId(options!.RowKeyPrefix);
         var take = options?.Take;
 
         if (rowKeyPrefix is not null && partition is null)
@@ -380,6 +391,8 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         ArgumentNullException.ThrowIfNull(predicate);
         if (take is <= 0)
             throw new ArgumentOutOfRangeException(nameof(take), take, "Take must be positive.");
+        if (!string.IsNullOrWhiteSpace(partition))
+            partition = NormalizeId(partition); // match stored (normalized) PartitionKeys
 
         var predicateFilter = TableFilterTranslator.Translate(predicate);
         var filter = string.IsNullOrWhiteSpace(partition)
@@ -414,8 +427,10 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : options.Partition;
-        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : options.RowKeyPrefix;
+        var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition);
+        // Normalize the prefix to the stored form (see QueryStreamAsync); done BEFORE the fingerprint so
+        // paging with the same natural-form prefix across pages yields a matching cursor.
+        var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : NormalizeId(options.RowKeyPrefix);
 
         if (rowKeyPrefix is not null && partition is null)
             throw new ArgumentException(
@@ -468,6 +483,18 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         return entity;
     }
 
+    // A cache-isolated deep copy of an entity (serializer round-trip, like the in-memory fake), so a
+    // caller mutating a returned entity never corrupts the shared cached instance. ETag/Timestamp are
+    // not serialized as columns, so they are restored explicitly.
+    private static T Clone(T entity)
+    {
+        var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        var copy = entity.ToTableEntity(partitionKey, rowKey).FromTableEntity<T>();
+        copy.ETag = entity.ETag;
+        copy.Timestamp = entity.Timestamp;
+        return copy;
+    }
+
     /// <inheritdoc />
     /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
     /// the point of a batch) — treat them as trusted server-side paths.</remarks>
@@ -483,6 +510,9 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     /// <inheritdoc />
     public async Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
     {
+        if (!string.IsNullOrWhiteSpace(partition))
+            partition = NormalizeId(partition); // match stored (normalized) PartitionKeys
+
         await EnsureTableAsync(ct);
 
         var filter = string.IsNullOrWhiteSpace(partition)
@@ -881,20 +911,41 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     // (e.g. "vision|execution|agent" → partition "vision", row "execution|agent").
     private static (string PartitionKey, string RowKey) GetEntityKeys(string id) => EntityId.Split(id);
 
-    private string EntityCacheKey(string id) => $"{typeName}:entity:{id}";
-    private string QueryCacheKey(string? partition) => $"{typeName}:query:{partition ?? "*"}";
+    private string EntityCacheKey(string id) => $"{cacheKeyPrefix}:entity:{id}";
+    private string QueryCacheKey(string? partition) => $"{cacheKeyPrefix}:query:{partition ?? "*"}";
 
     private void CacheEntity(string id, T entity, ETag etag)
     {
         if (!cachePolicy.Enabled)
             return;
 
-        cache.Set(EntityCacheKey(id), new CachedEntity(entity, etag), CacheEntryOptions());
+        // Store a private snapshot, never the caller-visible instance. Every read path (OneAsync,
+        // QueryAsync, the Materialize-based predicate/stream/page paths) and every write path
+        // (Create/Update/Upsert) hands its entity to the caller too; caching a clone here is the one
+        // choke point that keeps a caller mutating a returned/written entity from corrupting the cache.
+        T snapshot;
+        try
+        {
+            snapshot = Clone(entity);
+        }
+        catch (Exception ex) when (ex is SerializationException or InvalidOperationException or NotSupportedException)
+        {
+            // Caching is best-effort and runs AFTER the write is committed. If this entity cannot
+            // round-trip through the serializer (e.g. an interface-typed member that falls to a JSON
+            // cell), skip the cache rather than failing an already-successful write — such an entity is
+            // not cacheable anyway, and a later read goes to the backend (its own concern).
+            logger.LogDebug(ex, "[Cache SKIP] {Type} id={Id} — entity is not round-trippable for caching", typeName, id);
+            return;
+        }
+
+        cache.Set(EntityCacheKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
     }
 
+    // Size = 1 makes every entry countable so the store works with a SizeLimit-bounded IMemoryCache
+    // (otherwise cache.Set throws AFTER the write is already committed to Azure).
     private MemoryCacheEntryOptions CacheEntryOptions() => cachePolicy.Mode == CacheExpirationMode.Absolute
-        ? new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = cachePolicy.Ttl }
-        : new MemoryCacheEntryOptions { SlidingExpiration = cachePolicy.Ttl };
+        ? new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = cachePolicy.Ttl, Size = 1 }
+        : new MemoryCacheEntryOptions { SlidingExpiration = cachePolicy.Ttl, Size = 1 };
 
     private ETag GetCachedETag(string id)
     {
@@ -905,25 +956,11 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
     private void InvalidateQueryCache(string partitionKey)
     {
+        // A write to one partition can only affect that partition's cached query and the whole-table
+        // ("all") query — never another partition's filtered results — so evict exactly those two.
+        // (This replaces the old "evict every tracked partition" sweep and its unbounded tracked set.)
         cache.Remove(QueryCacheKey(partitionKey));
-        cache.Remove(QueryCacheKey(null)); // Also invalidate the "all" query
-
-        lock (partitionLock)
-        {
-            foreach (var p in trackedPartitions)
-            {
-                cache.Remove(QueryCacheKey(p));
-            }
-        }
-    }
-
-    private void TrackPartition(string? partition)
-    {
-        if (partition == null) return;
-        lock (partitionLock)
-        {
-            trackedPartitions.Add(partition);
-        }
+        cache.Remove(QueryCacheKey(null));
     }
 
     private sealed record CachedEntity(T Entity, ETag ETag);

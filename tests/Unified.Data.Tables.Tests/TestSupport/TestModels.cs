@@ -35,6 +35,62 @@ public sealed class AddressInfo
     public string Country { get; set; } = "";
 }
 
+/// <summary>
+/// Entity whose nested value is a POSITIONAL RECORD — the serializer stores it as a single JSON
+/// cell (no flattened <c>Location_Lat</c> columns), so a member-access filter into it cannot be
+/// translated to OData and must be rejected (B2).
+/// </summary>
+public sealed class EntityWithJsonNested : Entity
+{
+    public string Title { get; set; } = "";
+    public GeoPoint Location { get; set; } = new(0, 0);
+}
+
+public sealed record GeoPoint(double Lat, double Lng);
+
+/// <summary>
+/// Entity whose nested value is declared as an ABSTRACT base but holds a flattenable concrete
+/// instance — the serializer flattens by runtime type (Circle → Shape_Radius columns), so a filter
+/// into it is valid and must NOT be rejected by the B2 guard (which sees only the static type).
+/// </summary>
+public sealed class EntityWithAbstractNested : Entity
+{
+    public ShapeBase Shape { get; set; } = new Circle();
+}
+
+public abstract class ShapeBase
+{
+    public double Radius { get; set; }
+}
+
+public sealed class Circle : ShapeBase
+{
+    public string Label { get; set; } = "";
+}
+
+/// <summary>
+/// Nested owner typed as an interface that is ALSO <see cref="System.Collections.IEnumerable"/> — the
+/// serializer always stores an enumerable value as one JSON cell, so a filter into it must be rejected
+/// even though the owner is an interface (B2: the IEnumerable signal must win over the interface
+/// "can't determine" fallback).
+/// </summary>
+public sealed class EntityWithEnumerableInterfaceNested : Entity
+{
+    public IScalarStream Stream { get; set; } = null!;
+}
+
+public interface IScalarStream : IEnumerable<int>
+{
+    double Score { get; set; }
+}
+
+/// <summary>A concrete <see cref="IScalarStream"/> that serializes to a JSON array (dropping
+/// <see cref="Score"/>) and cannot be deserialized back into the interface — i.e. not round-trippable.</summary>
+public sealed class ScalarStreamImpl : List<int>, IScalarStream
+{
+    public double Score { get; set; }
+}
+
 public sealed class EntityWithDateTime : Entity
 {
     public DateTime EventDate { get; set; }
