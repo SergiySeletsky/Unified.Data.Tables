@@ -14,13 +14,14 @@ public class UpdateBuilder<T>
 {
     private const char PathSeparator = '_';
 
-    // Properties declared on the Entity base (Id, CreatedAt, UpdatedAt, ETag, Timestamp) are
+    // Properties declared on the IEntity contract (Id, CreatedAt, UpdatedAt, ETag, Timestamp) are
     // managed by the storage layer — Id is part of the partition+row key, CreatedAt is set on
     // insert, UpdatedAt is bumped automatically on every Merge, ETag is the row version, and
     // Timestamp is service-owned. Letting callers patch these via SetProperty would either
     // silently corrupt the row's identity or be overridden anyway, so we reject them up front.
+    // Sourced from the interface so interface-only entities (no Entity base) get the same guard.
     private static readonly HashSet<string> ManagedPropertyNames = new(
-        typeof(Entity)
+        typeof(IEntity)
             .GetProperties()
             .Select(p => p.Name),
         StringComparer.Ordinal);

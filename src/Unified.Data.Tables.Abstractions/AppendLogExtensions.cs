@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -37,7 +37,7 @@ public static class AppendLogExtensions
     public static Task<T> AppendAsync<T>(
         this IStorage<T> storage, string partition, T entity,
         string? subStream = null, DateTimeOffset? at = null, CancellationToken ct = default)
-        where T : Entity, new()
+        where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
         Guard.NotNull(entity, nameof(entity));
@@ -70,7 +70,7 @@ public static class AppendLogExtensions
     public static Task<IReadOnlyList<T>> RecentAsync<T>(
         this IStorage<T> storage, string partition, int count,
         string? subStream = null, CancellationToken ct = default)
-        where T : Entity, new()
+        where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
         if (string.IsNullOrWhiteSpace(partition))

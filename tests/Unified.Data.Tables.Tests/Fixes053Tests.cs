@@ -12,7 +12,7 @@ namespace Unified.Data.Tables.Tests;
 
 /// <summary>
 /// Regression tests for the 0.5.3 slate. Each test names the finding it guards (B9, ctor fallback,
-/// IdNormalization, Auto warning, query-cache sizing) so a future breakage points at the fix it undid.
+/// IdNormalization, Auto ETag contract, query-cache sizing) so a future breakage points at the fix it undid.
 /// </summary>
 public class Fixes053Tests
 {
@@ -143,7 +143,7 @@ public class Fixes053Tests
         Assert.Null(await store.OneAsync("my-x|case=="));
     }
 
-    // ── Auto-mode ETag.All fall-through warning ─────────────────────────────
+    // ── Auto-mode without an ETag: throws by default (0.6.0), warns under the opt-in ────────
 
     private sealed class ListLogger<T> : ILogger<T>
     {
@@ -157,14 +157,35 @@ public class Fixes053Tests
     }
 
     [Fact]
-    public async Task Auto_NoETagAnywhere_WarnsAboutLastWriterWins()
+    public async Task Auto_NoETag_ThrowsByDefault()
     {
-        var logger = new ListLogger<TableStorage<TestEntity>>();
-        using var h = new StorageHarness<TestEntity>(logger: logger);
+        using var h = new StorageHarness<TestEntity>();
         h.SetupUpdate();
 
-        await h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" });   // no ETag, cold cache
+        // Since 0.6.0, Auto with no ETag has no version to check — that's a caller bug, not a
+        // license to silently clobber. Nothing may reach the table.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" }));   // no ETag, cold cache
 
+        Assert.Contains("Auto mode requires", ex.Message);
+        await h.Table.DidNotReceive().UpdateEntityAsync(
+            Arg.Any<TableEntity>(), Arg.Any<Azure.ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Auto_NoETag_ImplicitLastWriterWinsOptIn_WritesUnconditionally_AndWarns()
+    {
+        var logger = new ListLogger<TableStorage<TestEntity>>();
+        using var h = new StorageHarness<TestEntity>(
+            options: new UnifiedTableStorageOptions { ImplicitLastWriterWins = true }, logger: logger);
+        h.SetupUpdate();
+
+        await h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" });   // no ETag, opted-in fallback
+
+        // The migration cushion restores the pre-0.6.0 unconditional replace (ETag.All) — but
+        // still says so out loud: deliberate LWW should be spelled ConcurrencyMode.LastWriterWins.
+        await h.Table.Received(1).UpdateEntityAsync(
+            Arg.Any<TableEntity>(), Azure.ETag.All, Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>());
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("last-writer-wins"));
     }
 
@@ -182,17 +203,25 @@ public class Fixes053Tests
     }
 
     [Fact]
-    public async Task Auto_WithCachedETag_DoesNotWarn()
+    public async Task Auto_NoCallerETag_ThrowsEvenWithWarmCache()
     {
-        var logger = new ListLogger<TableStorage<TestEntity>>();
-        using var h = new StorageHarness<TestEntity>(logger: logger);
+        using var h = new StorageHarness<TestEntity>();
         h.SetupGet(Mocks.Row("p", "r"));
         h.SetupUpdate();
 
-        _ = await h.Store.OneAsync("p|r");                                   // warms the ETag cache
-        await h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" }); // Auto uses the cached ETag
+        _ = await h.Store.OneAsync("p|r");   // warms the entity cache (ETag and all)
 
-        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning);
+        // The cached ETag is never consulted for writes since 0.6.0 — a write conditional on cache
+        // state was itself a lost-update vector — so Auto without a caller-round-tripped ETag
+        // throws regardless of cache warmth, with no refetch and no write.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" }));
+
+        Assert.Contains("Auto mode requires", ex.Message);
+        await h.Table.Received(1).GetEntityIfExistsAsync<TableEntity>(   // the OneAsync warm-up only — no refetch
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+        await h.Table.DidNotReceive().UpdateEntityAsync(
+            Arg.Any<TableEntity>(), Arg.Any<Azure.ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>());
     }
 
     // ── Query-cache entries are sized by row count ──────────────────────────

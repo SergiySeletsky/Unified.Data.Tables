@@ -1,5 +1,6 @@
 using Azure;
 using Azure.Data.Tables;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
 using Unified.Data.Tables.Tests.TestSupport;
 
@@ -8,7 +9,7 @@ namespace Unified.Data.Tables.Tests;
 /// <summary>
 /// Behavioural tests for <see cref="TableStorage{T}"/> against NSubstitute mocks of the Azure Tables
 /// SDK: CRUD, id normalization and composite-key splitting, in-memory cache hits/invalidation,
-/// batch partition delete, and the ETag optimistic-concurrency / retry semantics.
+/// batch partition delete, and the ETag optimistic-concurrency semantics.
 /// </summary>
 public class TableStorageTests
 {
@@ -514,7 +515,7 @@ public class TableStorageTests
         using var h = new StorageHarness<TestEntity>();
         h.SetupUpdate("W/\"etag2\"");
 
-        var result = await h.Store.UpdateAsync(new TestEntity { Id = "upd1", Name = "Updated", Value = 99 });
+        var result = await h.Store.UpdateAsync(new TestEntity { Id = "upd1", Name = "Updated", Value = 99, ETag = "W/\"etag1\"" });
 
         Assert.NotNull(result);
         Assert.Equal("Updated", result.Name);
@@ -528,7 +529,7 @@ public class TableStorageTests
         h.SetupUpdate();
 
         var before = DateTimeOffset.UtcNow;
-        var result = await h.Store.UpdateAsync(new TestEntity { Id = "upd2", Name = "Updated" });
+        var result = await h.Store.UpdateAsync(new TestEntity { Id = "upd2", Name = "Updated", ETag = "W/\"etag1\"" });
         var after = DateTimeOffset.UtcNow;
 
         Assert.InRange(result.UpdatedAt, before, after);
@@ -540,7 +541,7 @@ public class TableStorageTests
         using var h = new StorageHarness<TestEntity>();
         h.SetupUpdate();
 
-        var entity = new TestEntity { Id = "upd-ts", Name = "x", Timestamp = DateTimeOffset.UtcNow };
+        var entity = new TestEntity { Id = "upd-ts", Name = "x", Timestamp = DateTimeOffset.UtcNow, ETag = "W/\"etag1\"" };
         var result = await h.Store.UpdateAsync(entity);
 
         Assert.Null(result.Timestamp);
@@ -566,7 +567,7 @@ public class TableStorageTests
         using var h = new StorageHarness<TestEntity>();
         h.SetupUpdate();
 
-        var result = await h.Store.UpdateAsync(new TestEntity { Id = "  UpD ", Name = "Normalized" });
+        var result = await h.Store.UpdateAsync(new TestEntity { Id = "  UpD ", Name = "Normalized", ETag = "W/\"etag1\"" });
 
         Assert.Equal("upd", result.Id);
     }
@@ -584,47 +585,57 @@ public class TableStorageTests
     }
 
     [Fact]
-    public async Task UpdateAsync_UsesCachedETag_WhenCallerSuppliesNone()
+    public async Task UpdateAsync_Auto_WithoutCallerETag_Throws_EvenWhenEntityIsCached()
     {
         using var h = new StorageHarness<TestEntity>();
         h.SetupGet("pk", "rk", Mocks.Row("pk", "rk"));   // caches with ETag W/"etag1"
         await h.Store.OneAsync("pk|rk");
         h.SetupUpdate("W/\"new\"");
 
-        await h.Store.UpdateAsync(new TestEntity { Id = "pk|rk", Name = "updated" });   // no ETag
+        // 0.6.0: the cached ETag is never consulted for writes — a write conditional on local
+        // cache state was itself a lost-update vector. No caller ETag means no version to check.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Store.UpdateAsync(new TestEntity { Id = "pk|rk", Name = "updated" }));   // no ETag
 
-        await h.Table.Received(1).UpdateEntityAsync(
-            Arg.Any<TableEntity>(), new ETag("W/\"etag1\""), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+        Assert.Contains("Auto mode requires", ex.Message);
+        await h.Table.DidNotReceive().UpdateEntityAsync(
+            Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
-    public async Task UpdateAsync_WithNoCachedETag_UsesETagAll()
+    public async Task UpdateAsync_ImplicitLastWriterWins_OptIn_WithoutETag_UsesETagAll_AndWarns()
     {
-        using var h = new StorageHarness<TestEntity>();
+        var logger = new ListLogger();
+        using var h = new StorageHarness<TestEntity>(
+            options: new UnifiedTableStorageOptions { ImplicitLastWriterWins = true }, logger: logger);
         h.SetupUpdate();
 
         await h.Store.UpdateAsync(new TestEntity { Id = "no-cache-etag", Name = "Test" });
 
+        // The pre-0.6.0 fallback survives only behind the explicit opt-in: an unconditional
+        // replace, said out loud with a warning — never silently.
         await h.Table.Received(1).UpdateEntityAsync(
             Arg.Any<TableEntity>(), ETag.All, TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("last-writer-wins"));
     }
 
     [Fact]
-    public async Task UpdateAsync_OnETagMismatch_WithoutCallerETag_RetriesWithFreshETag()
+    public async Task UpdateAsync_Auto_WithoutCallerETag_Throws_WithoutRefetchOrWrite()
     {
         using var h = new StorageHarness<TestEntity>();
-        var calls = 0;
-        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
-            .Returns(_ => calls++ == 0
-                ? throw new RequestFailedException(412, "Precondition Failed")
-                : Mocks.EtagResponse("W/\"fresh-etag\""));
+        h.SetupUpdate();
         h.SetupGet("retry", "key", Mocks.Row("retry", "key"));
 
-        var result = await h.Store.UpdateAsync(new TestEntity { Id = "retry|key", Name = "Retry" });
+        // 0.6.0 deleted the refetch-and-retry path: Auto with no ETag throws up front instead of
+        // fetching a fresh ETag and silently overwriting the concurrent write it just detected.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Store.UpdateAsync(new TestEntity { Id = "retry|key", Name = "Retry" }));
 
-        Assert.NotNull(result);
-        await h.Table.Received(2).UpdateEntityAsync(
-            Arg.Any<TableEntity>(), Arg.Any<ETag>(), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+        Assert.Contains("Auto mode requires", ex.Message);
+        await h.Table.DidNotReceive().UpdateEntityAsync(
+            Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>());
+        await h.Table.DidNotReceive().GetEntityIfExistsAsync<TableEntity>(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -633,11 +644,15 @@ public class TableStorageTests
         using var h = new StorageHarness<TestEntity>();
         h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
             .Returns<Response>(_ => throw new RequestFailedException(412, "Precondition Failed"));
-        h.SetupGet("deleted", "key", entity: null);
 
+        // A concurrent delete surfaces like any lost race: the conditional write 412s and the
+        // conflict propagates — 0.6.0 no longer refetches to distinguish "deleted" from "changed".
         var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(
-            () => h.Store.UpdateAsync(new TestEntity { Id = "deleted|key", Name = "Gone" }));
+            () => h.Store.UpdateAsync(new TestEntity { Id = "deleted|key", Name = "Gone", ETag = "W/\"etag1\"" }));
+
         Assert.IsType<RequestFailedException>(ex.InnerException);
+        await h.Table.DidNotReceive().GetEntityIfExistsAsync<TableEntity>(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -1067,5 +1082,19 @@ public class TableStorageTests
 
         Assert.Equal(1, count);
         Assert.Equal("PartitionKey eq 'p'", h.LastQueryFilter);
+    }
+
+    // ── Test support ────────────────────────────────────────────────────────
+
+    /// <summary>Recording logger for asserting on log output (e.g. the ImplicitLastWriterWins warning).</summary>
+    private sealed class ListLogger : ILogger<TableStorage<TestEntity>>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Entries.Add((logLevel, formatter(state, exception)));
     }
 }

@@ -233,3 +233,25 @@ public sealed class AliasedListEntity : Entity
     [ColumnAlias("OldTags")]
     public List<string> Tags { get; set; } = [];
 }
+
+/// <summary>A domain base class unrelated to storage — occupies the single-inheritance slot.</summary>
+public abstract class DomainAggregate
+{
+    public string AggregateKind => GetType().Name;
+}
+
+/// <summary>
+/// INTERFACE-ONLY entity: implements <see cref="IEntity"/> directly (its base-class slot is taken
+/// by a domain type), proving the 0.6.0 <c>where T : class, IEntity, new()</c> constraint — models
+/// that cannot derive <see cref="Entity"/> still work end to end.
+/// </summary>
+public sealed class InterfaceOnlyEntity : DomainAggregate, IEntity
+{
+    public string Id { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+    public string? ETag { get; set; }
+    public DateTimeOffset? Timestamp { get; set; }
+    public string Name { get; set; } = "";
+    public int Value { get; set; }
+}

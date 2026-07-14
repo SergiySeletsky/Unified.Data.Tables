@@ -1,4 +1,4 @@
-using Azure;
+﻿using Azure;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -50,11 +50,11 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         }
     }
 
-    private TableStorage<T> Store<T>() where T : Entity, new()
+    private TableStorage<T> Store<T>() where T : class, IEntity, new()
         => new(_service, new MemoryCache(new MemoryCacheOptions()), NullLogger<TableStorage<T>>.Instance);
 
     /// <summary>Replicates TableStorage id normalization so cleanup targets the right row.</summary>
-    private void Track<T>(string id) where T : Entity
+    private void Track<T>(string id) where T : class, IEntity
     {
         var parts = id.Trim().Replace(' ', '-').ToLowerInvariant().Split('|', 2);
         _cleanup.Add((typeof(T).Name, parts[0], parts.Length > 1 ? parts[1] : parts[0]));

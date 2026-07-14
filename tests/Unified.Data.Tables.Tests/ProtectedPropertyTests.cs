@@ -52,7 +52,9 @@ public class ProtectedPropertyTests
         h.SetupGet("all", "e1", StoredRow(salary: 100m));
         h.SetupUpdate();
 
-        var result = await h.Store.UpdateAsync(new ProtectedEntity { Id = "all|e1", Name = "old", Salary = 200m });
+        // Round-trip the stored row's ETag — since 0.6.0, Auto without one throws instead of writing.
+        var entity = new ProtectedEntity { Id = "all|e1", Name = "old", Salary = 200m, ETag = "W/\"etag1\"" };
+        var result = await h.Store.UpdateAsync(entity);
 
         Assert.Equal(200m, result.Salary);
         authorizer.Received(1).IsAllowed("admin,accountant");
@@ -65,8 +67,9 @@ public class ProtectedPropertyTests
         h.SetupGet("all", "e1", StoredRow(salary: 100m, name: "old"));
         h.SetupUpdate();
 
-        // Salary unchanged (still 100) — the protected guard is not triggered.
-        var result = await h.Store.UpdateAsync(new ProtectedEntity { Id = "all|e1", Name = "renamed", Salary = 100m });
+        // Salary unchanged (still 100) — the protected guard is not triggered. The ETag is
+        // round-tripped because Auto without one throws since 0.6.0.
+        var result = await h.Store.UpdateAsync(new ProtectedEntity { Id = "all|e1", Name = "renamed", Salary = 100m, ETag = "W/\"etag1\"" });
 
         Assert.Equal("renamed", result.Name);
     }
@@ -78,7 +81,10 @@ public class ProtectedPropertyTests
         h.SetupGet(entity: null);   // nothing stored yet (first write)
         h.SetupUpdate();
 
-        var result = await h.Store.UpdateAsync(new ProtectedEntity { Id = "all|e1", Name = "x", Salary = 999m });
+        // A first write has no ETag to round-trip, so spell the unconditional replace explicitly —
+        // Auto without an ETag throws since 0.6.0.
+        var result = await h.Store.UpdateAsync(new ProtectedEntity { Id = "all|e1", Name = "x", Salary = 999m },
+            ConcurrencyMode.LastWriterWins);
 
         Assert.Equal(999m, result.Salary);
     }

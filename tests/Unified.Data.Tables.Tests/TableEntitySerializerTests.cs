@@ -1,4 +1,4 @@
-using Azure.Data.Tables;
+﻿using Azure.Data.Tables;
 using Unified.Data.Tables.Tests.TestSupport;
 
 namespace Unified.Data.Tables.Tests;
@@ -12,7 +12,7 @@ namespace Unified.Data.Tables.Tests;
 /// </summary>
 public class TableEntitySerializerTests
 {
-    private static T RoundTrip<T>(T entity) where T : Entity, new()
+    private static T RoundTrip<T>(T entity) where T : class, IEntity, new()
     {
         // Derive the keys from the id, as the storage layer does — since 0.5.3 the row's
         // PartitionKey/RowKey are the authoritative identity on read (B9), so mismatched

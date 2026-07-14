@@ -1,4 +1,4 @@
-using Azure;
+﻿using Azure;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -55,7 +55,7 @@ public static class Mocks
 /// Builds a <see cref="TableStorage{T}"/> wired to NSubstitute mocks of the Azure Tables SDK, plus
 /// terse helpers to arrange the common SDK calls.
 /// </summary>
-public sealed class StorageHarness<T> : IDisposable where T : Entity, new()
+public sealed class StorageHarness<T> : IDisposable where T : class, IEntity, new()
 {
     public TableServiceClient Service { get; }
     public TableClient Table { get; }

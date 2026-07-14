@@ -39,4 +39,13 @@ public static class EntityId
 
     /// <summary>Combines a partition and row key into a composite id.</summary>
     public static string Combine(string partitionKey, string rowKey) => $"{partitionKey}{Separator}{rowKey}";
+
+    // The canonical spelling of an id: the single-segment form when both keys are equal ("a|a" and
+    // "a" address the same row → "a"), otherwise the id unchanged. Used to compare ids by the ROW
+    // they address rather than by their spelling — mirrors the serializer's key-derived Id (B9).
+    internal static string Canonicalize(string id)
+    {
+        var (partitionKey, rowKey) = Split(id);
+        return partitionKey == rowKey ? partitionKey : id;
+    }
 }

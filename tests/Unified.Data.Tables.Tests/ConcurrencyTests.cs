@@ -163,7 +163,7 @@ public class ConcurrencyTests
         var store = new InMemoryStorage<TestEntity>();
         var created = await store.CreateAsync(new TestEntity { Id = "p|r", Name = "v1" });
         var staleETag = created.ETag!;
-        await store.UpdateAsync(new TestEntity { Id = "p|r", Name = "v2" });   // bump the version
+        await store.UpdateAsync(new TestEntity { Id = "p|r", Name = "v2" }, ConcurrencyMode.LastWriterWins); // bump the version
 
         await Assert.ThrowsAsync<ConcurrencyConflictException>(
             () => store.UpdateAsync("p|r", b => b.WithETag(staleETag).SetProperty(x => x.Name, "v3")));
