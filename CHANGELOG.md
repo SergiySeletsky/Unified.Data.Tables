@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-07-14
+
+The pre-announced breaking batch, plus the versioned-stream shape. Every change either tightens an
+existing opinion or composes over `IStorage<T>` — no new abstractions. Scope was set by an
+adversarial multi-agent evaluation of the full consumer wishlist; the rejected items (public
+`TableGateway`, pluggable key strategy, polymorphic read surface, `FullName` table-name flip) are
+documented in the evaluation notes.
+
+### Changed — BREAKING
+
+- **`UpdateAsync(entity)` in `Auto` mode with no ETag now throws `InvalidOperationException`**
+  instead of silently writing last-writer-wins (announced in the 0.5.2 README). There is no version
+  to check without an ETag: round-trip it (`OneAsync`/`QueryAsync` populate it), use `MutateAsync`
+  for read-modify-write, or spell the intent with `ConcurrencyMode.LastWriterWins`. The cached-ETag
+  fallback (and its 412 refetch-and-retry path — itself a lost-update vector) is **deleted**, making
+  `Auto` deterministic: the outcome no longer depends on cache state, and the in-memory fake (which
+  never had an ETag cache) now matches the real store byte-for-byte, including the exception
+  message. Migration cushion: `UnifiedTableStorageOptions.ImplicitLastWriterWins = true` restores
+  the pre-0.6.0 unconditional fallback (with a warning log) while call sites are converted.
+- **A LINQ predicate on `Id` now translates equality to the key pair** —
+  `x => x.Id == "p|r"` becomes `(PartitionKey eq 'p' and RowKey eq 'r')` (announced in the 0.5.3
+  changelog). Keys are the authoritative identity (B9), so legacy rows *without* an `Id` column are
+  now matched, and rows are matched by the row a value addresses rather than its spelling
+  (`"a"` == `"a|a"`); the in-memory fake canonicalizes identically. Every operator other than `==`
+  on `Id` is rejected with `NotSupportedException` (the `Id` column is not guaranteed to exist).
+
+### Changed
+
+- **The storage constraint is loosened from `where T : Entity, new()` to
+  `where T : class, IEntity, new()`** across `IStorage<T>`, both implementations, and all extension
+  packs. Models whose single base-class slot is taken (interface-first domain types) can now
+  implement `IEntity` directly instead of deriving `Entity`. Non-breaking for existing code —
+  `Entity` implements `IEntity` and remains the recommended default.
+
+### Added
+
+- **Versioned streams** — append-only, per-stream versioned snapshots ("state as of version N") for
+  event-sourced read models: `VersionedEntity` / `IVersionedEntity` (adds `int Version`),
+  `RowKeys.VersionKey(version)` (inverted zero-padded key; a stable wire format byte-compatible
+  with the common hand-rolled `int.MaxValue - version` scheme), and `VersionedStreamExtensions` —
+  `AppendVersionAsync` (immutable; duplicate version throws `DuplicateKeyException`),
+  `AtVersionAsync`, `LatestAsync`, `AtOrBeforeAsync` (server-side `Version <= v`, one bounded
+  read), `HistoryAsync` (newest-first), plus throwing `Get*` variants. Like the append-log helpers,
+  these are thin compositions over `IStorage<T>` — no new interface, no separate backend — so
+  caching, outcome verbs, and the in-memory fake work unchanged. Stream ids are validated (no `|`,
+  trimmed). Adoption note for pre-existing inverted-key tables: the key-addressed reads work over
+  legacy rows as-is; `AtOrBeforeAsync` filters on the `Version` column (present on every row the
+  pack writes) — backfill it on foreign rows before relying on "state as of" there.
+
 ## [0.5.3] — 2026-07-13
 
 Migration-safety patch driven by a consumer review (IntelliGrowth / Intellias.CQRS migration).

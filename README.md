@@ -281,6 +281,35 @@ var latest = await storage.RecentAsync("vision-42", 20, subStream: sessionId); /
 The optional `subStream` lets one partition hold several independent streams (e.g. per session) that
 `RecentAsync` isolates by RowKey prefix.
 
+### Versioned streams
+
+For append-only, per-stream versioned snapshots — event-sourced read models, "state as of version N"
+— derive from `VersionedEntity` (or implement `IVersionedEntity`) and use the versioned-stream
+extensions. The stream id is the partition; the version becomes the RowKey via
+`RowKeys.VersionKey(version)` — inverted and zero-padded (a stable wire format, byte-compatible with
+the common hand-rolled `int.MaxValue - version` scheme), so the **newest version sorts first** and
+every read below is a single bounded, server-side operation:
+
+```csharp
+public sealed class OrderSnapshot : VersionedEntity { public string State { get; set; } = ""; }
+
+await storage.AppendVersionAsync("order-42", new OrderSnapshot { Version = 3, State = "packed" });
+// versions are immutable: appending an existing version throws DuplicateKeyException
+
+var latest = await storage.LatestAsync("order-42");          // newest snapshot, 1 bounded read
+var exact  = await storage.AtVersionAsync("order-42", 2);    // or null
+var asOf   = await storage.AtOrBeforeAsync("order-42", 5);   // highest version <= 5 ("state as of")
+await foreach (var s in storage.HistoryAsync("order-42", take: 10)) { /* newest first */ }
+```
+
+Like the append-log helpers, these are thin compositions over `IStorage<T>` — no new interface, no
+separate backend — so caching, the outcome verbs, and the in-memory fake work unchanged. Throwing
+variants (`GetLatestAsync`, `GetAtVersionAsync`, `GetAtOrBeforeAsync`) raise `KeyNotFoundException`.
+For case-sensitive stream ids, configure `IdNormalization.AsWritten` (the all-digit version segment
+is unaffected either way). Adopting a pre-existing inverted-key table: the key-addressed reads work
+over legacy rows as-is, but `AtOrBeforeAsync` filters on the `Version` column (present on every row
+the pack writes) — backfill it on foreign rows before relying on "state as of" there.
+
 ### Partial updates
 
 Only the properties you set are written; everything else on the row is preserved, and no read is
@@ -312,15 +341,15 @@ c!.Balance += 100;
 await storage.UpdateAsync(c);   // ConcurrencyConflictException if the row changed since it was read
 ```
 
-> **⚠️ `UpdateAsync(entity)` protects you only when the entity carries an ETag.** With no ETag set,
-> `Auto` mode has no version to check against: it writes unconditionally and, on the rare 412, retries
-> once against the latest row — a **last-writer-wins full-row replace** that can silently clobber a
-> concurrent update (a lost update). If you read, mutate a field, and write it back, you **must**
-> round-trip the ETag (`OneAsync`/`QueryAsync` populate it) so the write is checked — or use
-> `MutateAsync`, which owns the read→mutate→strict-write loop for you. Passing no ETag is only correct
-> when you genuinely mean "make the row look like this object regardless of its current state"; say so
-> explicitly with `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` rather than relying on a
-> missing ETag. (Tightening this default is tracked for 0.6.0.)
+> **⚠️ Since 0.6.0, `UpdateAsync(entity)` with no ETag throws `InvalidOperationException`.** `Auto`
+> mode has no version to check against without one, and silently writing unconditionally was
+> lost-update territory — so the contract violation now surfaces loudly instead. If you read, mutate
+> a field, and write it back, round-trip the ETag (`OneAsync`/`QueryAsync` populate it) — or use
+> `MutateAsync`, which owns the read→mutate→strict-write loop for you. When you genuinely mean "make
+> the row look like this object regardless of its current state", say so explicitly with
+> `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)`. Migrating a large codebase? Set
+> `UnifiedTableStorageOptions.ImplicitLastWriterWins = true` to temporarily restore the pre-0.6.0
+> fallback (unconditional replace + a warning log) while you convert call sites.
 
 For values *derived* from the current row (counters, unions, merges), use the packaged
 compare-and-swap loop — it re-reads and re-applies on conflict, so no increment is ever lost:
@@ -365,7 +394,7 @@ genuinely hot row whose precondition still held every attempt.
 | A transition that must happen **exactly once** (approve, resolve, finalize) | `TryTransitionAsync(id, when, apply)` | The loser is an EXPECTED branch: it gets `PreconditionFailed` carrying the winner's row — three switch arms, no catch. (Raw `UpdateAsync(entity, ConcurrencyMode.Strict)` remains the primitive when you want the loser to throw.) |
 | **Create-if-absent** (member registration, idempotent provisioning) | `GetOrCreateAsync(id, factory)` | A lost create race converges on the winner's row instead of throwing `DuplicateKeyException` |
 | **Insert-or-apply-delta** (occurrence counters, feedback dedupe) | `MutateOrCreateAsync(id, create, mutate)` | The delta applies exactly once per attempt, uniformly on first insert and on every later call |
-| Deliberate unconditional overwrite (convergent upserts, supersede sweeps) | `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` | Explicit and greppable. Don't null the ETag to "turn off" concurrency — that selects the cached-ETag path, which is neither strict nor LWW |
+| Deliberate unconditional overwrite (convergent upserts, supersede sweeps) | `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)` | Explicit and greppable. Nulling the ETag to "turn off" concurrency throws since 0.6.0 — LWW must be spelled out |
 
 `Entity.Timestamp` mirrors the service-managed last-write time: populated on every read, reset to
 `null` on writes (write responses don't carry it), never stored as a column. Unlike `UpdatedAt` it is

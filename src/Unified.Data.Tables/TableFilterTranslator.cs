@@ -90,6 +90,13 @@ public static class TableFilterTranslator
 
         var column = ResolveColumn(memberSide, p, out var leafType);
 
+        // Since 0.6.0 the row's PartitionKey/RowKey are the AUTHORITATIVE identity (B9) — a legacy
+        // row written by another layer may have no "Id" column at all. Translate top-level Id
+        // EQUALITY into a key filter so those rows are matched; every other operator on Id is
+        // rejected (its column may simply not exist).
+        if (column == "Id" && leafType == typeof(string))
+            return VisitIdComparison(b, op, valueSide, args);
+
         // Reject ordering on leaf types whose STORED form does not preserve CLR ordering — an enum is
         // stored by name (lexical, not numeric), a ulong wraps to a signed Int64 — so a server-side
         // ordering compare would silently disagree with the in-memory (compiled-predicate) fake.
@@ -126,6 +133,38 @@ public static class TableFilterTranslator
 
         args.Add(value);
         return $"{column} {ODataOperator(op)} {{{args.Count - 1}}}";
+    }
+
+    // x.Id == "p|r" → (PartitionKey eq 'p' and RowKey eq 'r'). The literal is Split as-written (the
+    // caller passes the STORED form, exactly as they would for the Id column pre-0.6.0); an id
+    // without a separator addresses the pk == rk row. Everything except equality is rejected: the
+    // Id COLUMN is not guaranteed to exist (legacy rows), and negation/ordering cannot be expressed
+    // faithfully over the key pair.
+    private static string VisitIdComparison(BinaryExpression b, ExpressionType op, Expression valueSide, List<object> args)
+    {
+        if (op != ExpressionType.Equal)
+            throw new NotSupportedException(
+                $"Only equality (==) is supported on Id: '{b}'. Id is derived from PartitionKey/RowKey — " +
+                "for other shapes filter on the keys via QueryOptions (Partition / RowKeyPrefix) instead.");
+
+        object? raw;
+        try
+        {
+            raw = Evaluate(valueSide);
+        }
+        catch (Exception ex)
+        {
+            throw new NotSupportedException($"Cannot translate the value in comparison '{b}': {ex.Message}", ex);
+        }
+
+        if (raw is not string id || string.IsNullOrEmpty(id))
+            throw new NotSupportedException(
+                $"Id equality requires a non-null, non-empty string value: '{b}'. A stored row always has keys.");
+
+        var (partitionKey, rowKey) = EntityId.Split(id);
+        args.Add(partitionKey);
+        args.Add(rowKey);
+        return $"(PartitionKey eq {{{args.Count - 2}}} and RowKey eq {{{args.Count - 1}}})";
     }
 
     private static bool IsNullableOrReference(Type leafType) =>

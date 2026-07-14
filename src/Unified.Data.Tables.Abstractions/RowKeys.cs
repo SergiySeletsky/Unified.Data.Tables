@@ -53,6 +53,24 @@ public static class RowKeys
     }
 
     /// <summary>
+    /// Encodes a per-stream snapshot version as a RowKey so that HIGHER versions sort lexically
+    /// FIRST: <c>(int.MaxValue - version)</c> zero-padded to 20 digits. This exact byte format is a
+    /// WIRE CONTRACT — it matches the inverted-version keys used by existing event-sourced stores,
+    /// so the key-addressed <c>VersionedStreamExtensions</c> reads (append / at-version / latest /
+    /// history) work over such pre-existing rows as-is. <c>AtOrBeforeAsync</c> additionally filters
+    /// on the <c>Version</c> column, which every row written by the pack carries but a legacy row
+    /// may not — backfill the column (or read legacy states by exact version) before relying on
+    /// "state as of" over foreign rows.
+    /// </summary>
+    /// <param name="version">The monotonic, non-negative per-stream version.</param>
+    public static string VersionKey(int version)
+    {
+        if (version < 0)
+            throw new ArgumentOutOfRangeException(nameof(version), version, "A stream version must be non-negative.");
+        return (int.MaxValue - version).ToString("D20", CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
     /// The RowKey prefix that isolates one sub-stream — pass as
     /// <see cref="QueryOptions.RowKeyPrefix"/> to read only that stream's events.
     /// </summary>

@@ -103,8 +103,9 @@ public class InMemoryStorageTests
     {
         var store = new InMemoryStorage<TestEntity>();
 
+        // ETag supplied so Auto proceeds to the row lookup instead of the 0.6.0 Auto-requires-ETag throw.
         var ex = await Assert.ThrowsAsync<RequestFailedException>(
-            () => store.UpdateAsync(new TestEntity { Id = "p|r" }));
+            () => store.UpdateAsync(new TestEntity { Id = "p|r", ETag = "W/\"1\"" }));
 
         Assert.Equal(404, ex.Status);
     }
@@ -115,7 +116,8 @@ public class InMemoryStorageTests
         var store = new InMemoryStorage<TestEntity>();
         await store.CreateAsync(new TestEntity { Id = "p|r", Name = "v1" });
         var readCopy = await store.OneAsync("p|r");
-        await store.UpdateAsync(new TestEntity { Id = "p|r", Name = "v2" });   // no ETag → LWW, bumps version
+        await store.UpdateAsync(
+            new TestEntity { Id = "p|r", Name = "v2" }, ConcurrencyMode.LastWriterWins);   // concurrent writer bumps version
 
         readCopy!.Name = "conflicting";
         var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(() => store.UpdateAsync(readCopy));
@@ -156,7 +158,8 @@ public class InMemoryStorageTests
         var store = new InMemoryStorage<TestEntity>();
         await store.CreateAsync(new TestEntity { Id = "p|r", Name = "v1" });
         var stale = await store.OneAsync("p|r");
-        await store.UpdateAsync(new TestEntity { Id = "p|r", Name = "v2" });
+        await store.UpdateAsync(
+            new TestEntity { Id = "p|r", Name = "v2" }, ConcurrencyMode.LastWriterWins);   // bump the version so `stale` is stale
 
         stale!.Name = "forced";
         await store.UpdateAsync(stale, ConcurrencyMode.LastWriterWins);

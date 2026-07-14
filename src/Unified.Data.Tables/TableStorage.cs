@@ -1,4 +1,4 @@
-using System.Linq.Expressions;
+﻿using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
@@ -19,8 +19,8 @@ namespace Unified.Data.Tables;
 /// e.g. <c>services.AddSingleton(typeof(IStorage&lt;&gt;), typeof(TableStorage&lt;&gt;))</c> — or use
 /// <see cref="ServiceCollectionExtensions.AddUnifiedTableStorage(Microsoft.Extensions.DependencyInjection.IServiceCollection, Action{UnifiedTableStorageOptions})"/>.
 /// </summary>
-/// <typeparam name="T">The entity type; must derive from <see cref="Entity"/> and have a public parameterless constructor.</typeparam>
-public class TableStorage<T> : IStorage<T> where T : Entity, new()
+/// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
+public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 {
     private const char Separator = '|';
 
@@ -39,6 +39,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     private readonly IProtectedPropertyAuthorizer? authorizer;
     private readonly CachePolicy cachePolicy;
     private readonly IdNormalization idNormalization;
+    private readonly bool implicitLastWriterWins;
     private readonly string typeName = typeof(T).Name;
 
     // Cache keys use the fully-qualified type name so two entity types with the same simple name in
@@ -84,6 +85,7 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
         var opts = options ?? new UnifiedTableStorageOptions();
         cachePolicy = opts.ResolveCachePolicy(typeof(T));
         idNormalization = opts.IdNormalization;
+        implicitLastWriterWins = opts.ImplicitLastWriterWins;
         client = serviceClient.GetTableClient(typeName);
     }
 
@@ -758,7 +760,6 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
-        // Normalize first: the cached-ETag fallback below is keyed by the normalized id.
         entity.Id = NormalizeId(entity.Id);
 
         // Capture concurrency intent BEFORE mutating the entity.
@@ -771,20 +772,24 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
                 $"ConcurrencyMode.Strict requires {typeName}.ETag — read the entity first and round-trip its ETag."),
             ConcurrencyMode.Strict => new ETag(entity.ETag!),
             ConcurrencyMode.LastWriterWins => ETag.All,
-            // Auto: caller-supplied ETag wins (cross-process optimistic concurrency); fall back to
-            // the server-side cache, finally to ETag.All for legacy callers.
-            _ => callerSuppliedETag ? new ETag(entity.ETag!) : GetCachedETag(entity.Id)
+            // Auto without an ETag has NO version to check — since 0.6.0 that is a caller bug, not
+            // a case to silently degrade to last-writer-wins (the pre-0.6.0 fallback survives
+            // behind options.ImplicitLastWriterWins as a migration cushion). Deterministic by
+            // design: the cached ETag is deliberately NOT consulted for writes — a write conditional
+            // on cache state was itself a lost-update vector, and the in-memory fake (which has no
+            // ETag cache) stays behaviourally identical.
+            ConcurrencyMode.Auto when !callerSuppliedETag && !implicitLastWriterWins =>
+                throw new InvalidOperationException(ConcurrencyMessages.AutoRequiresETag(typeName)),
+            _ => callerSuppliedETag ? new ETag(entity.ETag!) : ETag.All
         };
 
-        // Auto with no ETag anywhere degrades to an UNCONDITIONAL full-row replace (last-writer-
-        // wins) — silent lost-update territory. Say so: intentional LWW should be spelled
-        // ConcurrencyMode.LastWriterWins; protected writes should round-trip the ETag or use
-        // MutateAsync.
-        if (mode == ConcurrencyMode.Auto && !callerSuppliedETag && etag == ETag.All)
+        // The opted-in fallback still says so out loud: intentional LWW should be spelled
+        // ConcurrencyMode.LastWriterWins.
+        if (mode == ConcurrencyMode.Auto && !callerSuppliedETag)
             logger.LogWarning(
-                "{Type}.UpdateAsync({Id}): Auto mode found no ETag (caller or cache) — writing " +
-                "unconditionally (last-writer-wins). Round-trip the ETag, use MutateAsync, or opt in " +
-                "explicitly with ConcurrencyMode.LastWriterWins.", typeName, entity.Id);
+                "{Type}.UpdateAsync({Id}): Auto mode with no ETag is writing unconditionally " +
+                "(last-writer-wins) because ImplicitLastWriterWins is enabled. Round-trip the ETag, " +
+                "use MutateAsync, or spell it ConcurrencyMode.LastWriterWins.", typeName, entity.Id);
 
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null; // service last-write time is unknown until the next read
@@ -801,41 +806,6 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
 
             CacheEntity(entity.Id, entity, newETag);
             InvalidateQueryCache(partitionKey);
-        }
-        catch (RequestFailedException ex) when (ex.Status == 412 && mode == ConcurrencyMode.Auto && !callerSuppliedETag)
-        {
-            // ETag mismatch on the cached (not caller-supplied) ETag — the cache was stale (e.g. a
-            // concurrent write, or a QueryAsync overwrote the cache). Re-fetch the current ETag and
-            // retry once. When the caller DID supply an ETag (or asked for Strict) we deliberately
-            // do NOT retry: the genuine conflict surfaces to the caller (see the catch below).
-            logger.LogWarning(ex, "ETag mismatch for {Type} {Id} — re-fetching and retrying once", typeName, entity.Id);
-
-            var freshResponse = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
-            if (!freshResponse.HasValue)
-            {
-                // Deleted externally between our read and this write — a conflict by definition.
-                cache.Remove(EntityCacheKey(entity.Id));
-                InvalidateQueryCache(partitionKey);
-                throw new ConcurrencyConflictException(typeName, entity.Id, ex);
-            }
-
-            var freshETag = freshResponse.Value!.ETag;
-            try
-            {
-                var retryResponse = await client.UpdateEntityAsync(dataEntity, freshETag, TableUpdateMode.Replace, ct);
-                var newETag = retryResponse.Headers.ETag ?? freshETag;
-                entity.ETag = newETag.ToString();
-
-                CacheEntity(entity.Id, entity, newETag);
-                InvalidateQueryCache(partitionKey);
-            }
-            catch (RequestFailedException retryEx) when (retryEx.Status == 412)
-            {
-                // Lost the race AGAIN between the re-fetch and the retry — a genuinely hot row.
-                cache.Remove(EntityCacheKey(entity.Id));
-                InvalidateQueryCache(partitionKey);
-                throw new ConcurrencyConflictException(typeName, entity.Id, retryEx);
-            }
         }
         catch (RequestFailedException ex) when (ex.Status == 412)
         {
@@ -965,13 +935,6 @@ public class TableStorage<T> : IStorage<T> where T : Entity, new()
     private MemoryCacheEntryOptions CacheEntryOptions(long size = 1) => cachePolicy.Mode == CacheExpirationMode.Absolute
         ? new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = cachePolicy.Ttl, Size = size }
         : new MemoryCacheEntryOptions { SlidingExpiration = cachePolicy.Ttl, Size = size };
-
-    private ETag GetCachedETag(string id)
-    {
-        return cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null
-            ? cached.ETag
-            : ETag.All;
-    }
 
     private void InvalidateQueryCache(string partitionKey)
     {

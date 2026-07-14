@@ -17,8 +17,8 @@ namespace Unified.Data.Tables.InMemory;
 /// missing row, ETag simulation with 412 conflicts, idempotent delete, and lexical
 /// (PartitionKey, RowKey) result ordering.
 /// </summary>
-/// <typeparam name="T">The entity type; must derive from <see cref="Entity"/> and have a public parameterless constructor.</typeparam>
-public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
+/// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
+public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, new()
 {
     private static readonly List<(PropertyInfo Prop, ProtectedPropertyAttribute Attr)> ProtectedProps =
         typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)
@@ -36,6 +36,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     private readonly object gate = new();
     private readonly IProtectedPropertyAuthorizer? authorizer;
     private readonly IdNormalization idNormalization;
+    private readonly bool implicitLastWriterWins;
     private long versionCounter;
 
     /// <summary>Creates a store without protected-property enforcement.</summary>
@@ -63,7 +64,9 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
     public InMemoryStorage(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
     {
         this.authorizer = authorizer;
-        idNormalization = (options ?? new UnifiedTableStorageOptions()).IdNormalization;
+        var opts = options ?? new UnifiedTableStorageOptions();
+        idNormalization = opts.IdNormalization;
+        implicitLastWriterWins = opts.ImplicitLastWriterWins;
     }
 
     // Mode-aware id normalization — identical to TableStorage's, preserving fake/Azure parity.
@@ -113,6 +116,10 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
         }
 
         entity.CreatedAt = DateTimeOffset.UtcNow;
+        // An insert is a write — keep audit stamps consistent, mirroring TableStorage. (Entity's
+        // property initializer masked this for derived models; interface-only IEntity models have
+        // no initializer, so the stamp must come from the storage layer.)
+        entity.UpdatedAt = entity.CreatedAt;
         entity.Timestamp = null;
         entity.Id = NormalizeId(entity.Id);
         var keys = EntityId.Split(entity.Id);
@@ -172,6 +179,12 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             throw new InvalidOperationException(
                 $"ConcurrencyMode.Strict requires {typeof(T).Name}.ETag — read the entity first and round-trip its ETag.");
 
+        // Auto without an ETag throws since 0.6.0 (no version to check ≠ permission to clobber) —
+        // byte-identical message and semantics to TableStorage<T>, so a green fake test still
+        // documents the real contract. The pre-0.6.0 fallback survives behind the same option.
+        if (mode == ConcurrencyMode.Auto && !callerSuppliedETag && !implicitLastWriterWins)
+            throw new InvalidOperationException(ConcurrencyMessages.AutoRequiresETag(typeof(T).Name));
+
         var suppliedETag = entity.ETag;
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
@@ -185,8 +198,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
 
             // Strict — and Auto with a caller-round-tripped ETag — enforce the row version; a
             // mismatch surfaces as a conflict with no retry, exactly like TableStorage<T>. Auto
-            // without an ETag converges last-writer-wins (the real cached-ETag path retries to the
-            // same outcome), and LastWriterWins skips the check by definition.
+            // without an ETag either threw above or (via ImplicitLastWriterWins) converges
+            // last-writer-wins, and LastWriterWins skips the check by definition.
             if (mode != ConcurrencyMode.LastWriterWins && callerSuppliedETag
                 && !string.Equals(existing.ETagString(), suppliedETag, StringComparison.Ordinal))
             {
@@ -314,8 +327,12 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
 
         // Reject predicates the real store cannot translate to OData, so a green fake test means the
         // same predicate holds against Azure Tables — then evaluate the caller's real semantics.
+        // Id equality is canonicalized first: the real store translates it to a PartitionKey/RowKey
+        // filter (0.6.0), which matches by the row a value ADDRESSES ("a" and "a|a" are the same
+        // row) — the compiled CLR comparison must agree or the fake diverges on alias spellings.
         _ = TableFilterTranslator.Translate(predicate);
-        var matches = predicate.Compile();
+        var canonical = (Expression<Func<T, bool>>)new IdEqualityCanonicalizer(predicate.Parameters[0]).Visit(predicate);
+        var matches = canonical.Compile();
         var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
 
         lock (gate)
@@ -412,6 +429,37 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : Entity, new()
             }
 
             return Task.FromResult(new EntityPage<T>(items, next));
+        }
+    }
+
+    // Rewrites top-level Id EQUALITY comparisons so both sides are canonicalized before comparing —
+    // matching the real store's PartitionKey/RowKey translation, which compares by the row a value
+    // addresses rather than by its spelling ("a" == "a|a"). Only `param.Id == <string>` (either
+    // side) is rewritten; everything else passes through untouched.
+    private sealed class IdEqualityCanonicalizer(ParameterExpression param) : ExpressionVisitor
+    {
+        private static readonly System.Reflection.MethodInfo Canon =
+            ((Func<string, string>)EntityId.Canonicalize).Method;
+
+        protected override Expression VisitBinary(BinaryExpression node)
+        {
+            if (node.NodeType == ExpressionType.Equal
+                && node.Left.Type == typeof(string) && node.Right.Type == typeof(string)
+                && (IsEntityIdMember(node.Left) || IsEntityIdMember(node.Right)))
+            {
+                return Expression.Equal(
+                    Expression.Call(Canon, node.Left),
+                    Expression.Call(Canon, node.Right));
+            }
+
+            return base.VisitBinary(node);
+        }
+
+        private bool IsEntityIdMember(Expression e)
+        {
+            while (e is UnaryExpression { NodeType: ExpressionType.Convert or ExpressionType.ConvertChecked } u)
+                e = u.Operand;
+            return e is MemberExpression { Member.Name: nameof(IEntity.Id) } m && m.Expression == param;
         }
     }
 

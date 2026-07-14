@@ -68,15 +68,37 @@ public class CachePolicyTests
     }
 
     [Fact]
-    public async Task DisabledCache_UpdateAsync_UsesWildcardETag()
+    public async Task DisabledCache_UpdateAsync_AutoWithoutETag_ThrowsRegardlessOfCacheState()
     {
         using var h = new StorageHarness<TestEntity>(options: DisabledCache());
+        h.SetupUpdate();
+
+        // Since 0.6.0 writes never consult the cache, so cache policy cannot change write
+        // behaviour: Auto with no round-tripped ETag is a caller bug whether the cache is
+        // enabled, disabled, or cold — nothing is ever sent to storage.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" }));
+
+        Assert.Contains("Auto mode requires", ex.Message);
+        await h.Table.DidNotReceive().UpdateEntityAsync(
+            Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task DisabledCache_UpdateAsync_ImplicitLastWriterWins_UsesWildcardETag()
+    {
+        // The pre-0.6.0 fallback survives behind the opt-in: with ImplicitLastWriterWins on,
+        // an ETag-less Auto update writes unconditionally — still without any cached-ETag lookup.
+        using var h = new StorageHarness<TestEntity>(
+            options: new UnifiedTableStorageOptions { Cache = CachePolicy.Disabled, ImplicitLastWriterWins = true });
         h.SetupUpdate();
 
         await h.Store.UpdateAsync(new TestEntity { Id = "p|r", Name = "x" });
 
         await h.Table.Received(1).UpdateEntityAsync(
             Arg.Any<TableEntity>(), ETag.All, TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+        await h.Table.DidNotReceive().GetEntityIfExistsAsync<TableEntity>(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]

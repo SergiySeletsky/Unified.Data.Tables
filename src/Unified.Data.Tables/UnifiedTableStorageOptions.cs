@@ -1,4 +1,4 @@
-namespace Unified.Data.Tables;
+﻿namespace Unified.Data.Tables;
 
 /// <summary>
 /// Behavioural options for the unified table-storage layer, configured at registration time via
@@ -32,10 +32,20 @@ public sealed class UnifiedTableStorageOptions
     public IdNormalization IdNormalization { get; set; } = IdNormalization.Normalized;
 
     /// <summary>
+    /// Pre-0.6.0 compatibility switch. Since 0.6.0, <see cref="ConcurrencyMode.Auto"/> with no
+    /// caller-supplied ETag throws — there is no version to check, and silently writing
+    /// unconditionally is lost-update territory. Setting this to <c>true</c> restores the 0.5.x
+    /// fallback (unconditional last-writer-wins replace, with a warning log) as a migration
+    /// cushion. Prefer spelling the intent explicitly with
+    /// <see cref="ConcurrencyMode.LastWriterWins"/> and leaving this off.
+    /// </summary>
+    public bool ImplicitLastWriterWins { get; set; }
+
+    /// <summary>
     /// Override the cache policy for one entity type (e.g. disable for high-churn types or
     /// huge partitions).
     /// </summary>
-    public UnifiedTableStorageOptions CacheFor<T>(CachePolicy policy) where T : Entity, new()
+    public UnifiedTableStorageOptions CacheFor<T>(CachePolicy policy) where T : class, IEntity, new()
     {
         ArgumentNullException.ThrowIfNull(policy);
         overrides[typeof(T)] = policy;

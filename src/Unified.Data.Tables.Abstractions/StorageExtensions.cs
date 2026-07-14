@@ -1,4 +1,4 @@
-namespace Unified.Data.Tables;
+﻿namespace Unified.Data.Tables;
 
 /// <summary>
 /// Convenience patterns composed from the core <see cref="IStorage{T}"/> surface — they work
@@ -46,7 +46,7 @@ public static class StorageExtensions
     public static async Task<T> MutateAsync<T>(
         this IStorage<T> storage, string id, Action<T> mutate,
         int maxAttempts = 3, CancellationToken ct = default)
-        where T : Entity, new()
+        where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
         Guard.NotNull(mutate, nameof(mutate));
@@ -87,7 +87,7 @@ public static class StorageExtensions
     /// <returns>The existing or newly created entity.</returns>
     public static async Task<T> GetOrCreateAsync<T>(
         this IStorage<T> storage, string id, Func<T> factory, CancellationToken ct = default)
-        where T : Entity, new()
+        where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
         Guard.NotNull(factory, nameof(factory));
@@ -134,7 +134,7 @@ public static class StorageExtensions
     public static async Task<T> MutateOrCreateAsync<T>(
         this IStorage<T> storage, string id, Func<T> create, Action<T> mutate,
         int maxAttempts = 3, CancellationToken ct = default)
-        where T : Entity, new()
+        where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
         Guard.NotNull(create, nameof(create));
@@ -187,7 +187,7 @@ public static class StorageExtensions
     public static async Task<MutationResult<T>> TryMutateAsync<T>(
         this IStorage<T> storage, string id, Action<T> mutate,
         int maxAttempts = 3, CancellationToken ct = default)
-        where T : Entity, new()
+        where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
         Guard.NotNull(mutate, nameof(mutate));
@@ -245,7 +245,7 @@ public static class StorageExtensions
     public static async Task<MutationResult<T>> TryTransitionAsync<T>(
         this IStorage<T> storage, string id, Func<T, bool> when, Action<T> apply,
         int maxAttempts = 3, CancellationToken ct = default)
-        where T : Entity, new()
+        where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
         Guard.NotNull(when, nameof(when));

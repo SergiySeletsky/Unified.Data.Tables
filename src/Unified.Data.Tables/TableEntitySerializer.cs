@@ -109,7 +109,7 @@ public static class TableEntitySerializer
     // in the single-separator id grammar; the stored column — if consistent — is the only handle.)
     private static object RestoreIdFromKeys(object result, TableEntity entity)
     {
-        if (result is not Entity e
+        if (result is not IEntity e
             || string.IsNullOrEmpty(entity.PartitionKey)
             || string.IsNullOrEmpty(entity.RowKey))
         {

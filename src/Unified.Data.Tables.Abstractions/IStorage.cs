@@ -1,4 +1,4 @@
-using System.Linq.Expressions;
+﻿using System.Linq.Expressions;
 
 namespace Unified.Data.Tables;
 
@@ -6,8 +6,8 @@ namespace Unified.Data.Tables;
 /// Generic persistence contract over a single Azure Table (one table per entity type
 /// <typeparamref name="T"/>). Implemented by <c>TableStorage&lt;T&gt;</c> in the Unified.Data.Tables package.
 /// </summary>
-/// <typeparam name="T">The entity type; must derive from <see cref="Entity"/> and have a public parameterless constructor.</typeparam>
-public interface IStorage<T> where T : Entity, new()
+/// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
+public interface IStorage<T> where T : class, IEntity, new()
 {
     /// <summary>Delete a single document by its composite id.</summary>
     /// <param name="id">Composite document identifier (<c>"{PartitionKey}|{RowKey}"</c>).</param>
@@ -45,9 +45,11 @@ public interface IStorage<T> where T : Entity, new()
 
     /// <summary>
     /// Replace an existing document in full using <see cref="ConcurrencyMode.Auto"/> semantics:
-    /// if the caller supplies <see cref="Entity.ETag"/>, strict optimistic concurrency is
-    /// enforced (a conflict throws <see cref="ConcurrencyConflictException"/>); otherwise a
-    /// stale-cache conflict is retried once.
+    /// the caller-supplied <see cref="Entity.ETag"/> is enforced (a conflict throws
+    /// <see cref="ConcurrencyConflictException"/>). An entity WITHOUT an ETag throws
+    /// <see cref="InvalidOperationException"/> — there is no version to check; round-trip the ETag,
+    /// use <c>StorageExtensions.MutateAsync</c>, or say <see cref="ConcurrencyMode.LastWriterWins"/>
+    /// explicitly.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
