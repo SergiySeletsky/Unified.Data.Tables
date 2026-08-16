@@ -21,6 +21,13 @@
     <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
   </ItemGroup>
 
+  <!-- The store classes are internal: consumers get them through AddUnifiedIdentityStores() and
+       resolve them as IUserStore<IdentityUser> / IRoleStore<IdentityRole>. The tests construct
+       them directly so each IStorage<T> dependency can be inspected row by row. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables.Identity.Tests" />
+  </ItemGroup>
+
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
