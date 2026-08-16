@@ -4,6 +4,38 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-08-16
+
+### Added
+
+- **`Unified.Data.Tables.Identity`** — ASP.NET Core Identity stores persisted through `IStorage<T>`.
+  Seven `Entity`-derived row models (one table each, named after the type), deterministic key
+  composition, and `IUserStore`/`IRoleStore` implementations covering passwords, external logins,
+  claims, roles, tokens, two-factor and lockout. It depends on **`Unified.Data.Tables.Abstractions`
+  only**, so it runs against Azure Table Storage, the in-memory provider, or any other
+  `IStorage<T>` — an entire Identity stack becomes unit-testable with no emulator. Register with
+  `AddIdentityCore<IdentityUser>().AddRoles<IdentityRole>().AddUnifiedIdentityStores()`; the package
+  deliberately does not register a storage provider, leaving that choice to the consumer.
+
+  Two behaviours worth knowing before reading the source. **Login rows are written with
+  `CreateAsync` and fail loud on a duplicate while the four other association tables upsert** — not
+  an inconsistency: a login's key is `{provider}|{md5(providerKey)}` and the owning `UserId` lives in
+  the row *value*, so an upsert would silently reassign ownership of an external identity to whoever
+  wrote last. And **user rows should have caching disabled** on Azure
+  (`o.CacheFor<IdentityUserModel>(CachePolicy.Disabled)`): they carry `SecurityStamp`, `PasswordHash`
+  and `LockoutEnd`, and the default sliding cache can serve a revoked stamp indefinitely on a
+  multi-instance host.
+
+  Custom user and role types are not supported in this version — `AddUnifiedIdentityStores()` throws
+  at startup for anything but `IdentityUser`/`IdentityRole`. Supporting them requires the consumer to
+  supply their own row model, since table names derive from `typeof(T).Name`; that is an additive
+  change for a later version.
+
+  One dependency note for existing consumers: the package pins `Microsoft.Extensions.Identity.Stores`
+  10.0.11, which transitively raises the floor on `Microsoft.Extensions.DependencyInjection` to
+  **10.0.11** for anyone who references it. A restore pinned below that floor fails with NU1605
+  rather than silently downgrading.
+
 ## [0.6.0] — 2026-07-14
 
 The pre-announced breaking batch, plus the versioned-stream shape. Every change either tightens an
