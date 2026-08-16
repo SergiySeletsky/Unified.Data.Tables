@@ -62,13 +62,14 @@ copy-pasted into each one.
 dotnet add package Unified.Data.Tables
 ```
 
-This is shipped as three packages:
+This is shipped as four packages:
 
 | Package | Contents | Use it in |
 | --- | --- | --- |
 | **Unified.Data.Tables** | `TableStorage<T>`, the serializer, cache policies, DI helpers (Azure dependencies) | server / host projects |
 | **Unified.Data.Tables.Abstractions** | `Entity`, `IStorage<T>`, `QueryOptions`, `ConcurrencyMode`, `UpdateBuilder<T>`, `EntityId`, `[ColumnAlias]`, `[ProtectedProperty]` — no Azure/hosting deps | shared/domain & Blazor WebAssembly projects |
 | **Unified.Data.Tables.InMemory** | `InMemoryStorage<T>` — serializer-faithful in-memory `IStorage<T>` | test projects, dev/offline mode |
+| **Unified.Data.Tables.Identity** | ASP.NET Core Identity `IUserStore`/`IRoleStore` persisted through `IStorage<T>` | hosts using ASP.NET Core Identity |
 
 `Unified.Data.Tables` references the abstractions transitively, so most apps just install it. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone.
 
@@ -521,6 +522,77 @@ enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `
 `ConcurrencyConflictException` per `ConcurrencyMode`, deletes are idempotent,
 and results arrive in lexical key order — so a green test against the fake means the same code holds
 against Azure Tables.
+
+---
+
+## ASP.NET Core Identity
+
+`Unified.Data.Tables.Identity` ports ASP.NET Core Identity's `IUserStore`/`IRoleStore` contracts onto
+`IStorage<T>` — passwords, external logins, claims, roles, tokens, two-factor and lockout, all as
+ordinary rows through the same storage abstraction as your domain entities.
+
+```bash
+dotnet add package Unified.Data.Tables.Identity
+```
+
+### Register it
+
+The package depends on `Unified.Data.Tables.Abstractions` only, so it deliberately does **not**
+register a storage provider — pick one yourself, then wire the stores on top:
+
+```csharp
+using Unified.Data.Tables.Identity;
+
+builder.Services.AddUnifiedTableStorage(connectionString);   // or AddUnifiedInMemoryStorage() in tests
+
+builder.Services
+    .AddIdentityCore<IdentityUser>()
+    .AddRoles<IdentityRole>()
+    .AddUnifiedIdentityStores();
+```
+
+Because it only touches `IStorage<T>`, the same registration works unmodified against
+`Unified.Data.Tables.InMemory` — an entire Identity stack becomes unit-testable with no Azurite
+emulator, no test container, nothing but the fake.
+
+### Tables
+
+Seven `Entity`-derived row models, one Azure table each (named after the type, per the package's
+usual `typeof(T).Name` convention): `IdentityUserModel`, `IdentityRoleModel`,
+`IdentityUserRoleModel`, `IdentityUserClaimModel`, `IdentityRoleClaimModel`,
+`IdentityUserLoginModel`, `IdentityUserTokenModel`. Keys are composed deterministically by
+`IdentityKeys` — GUID and constant components are used verbatim, unbounded user- or
+provider-supplied text (claim values, login provider keys) is MD5-hashed, because Azure Table
+Storage rejects `/`, `\`, `#`, `?` and control characters in `PartitionKey`/`RowKey`.
+
+### Disable caching for user rows
+
+User rows carry `SecurityStamp`, `PasswordHash` and `LockoutEnd`. On Azure, the default sliding
+cache can serve a revoked security stamp indefinitely on a multi-instance host — signing a user out
+everywhere, or locking them out, wouldn't reliably take effect. Turn caching off for that one type:
+
+```csharp
+builder.Services.AddUnifiedTableStorage(connectionString, o =>
+    o.CacheFor<IdentityUserModel>(CachePolicy.Disabled));
+```
+
+### Login rows use `CreateAsync`, not upsert
+
+Every other association table (roles, claims, tokens) upserts. Login rows don't, and that's
+intentional rather than an inconsistency: a login's key is `{provider}|{md5(providerKey)}`, and the
+owning `UserId` lives in the row's *value*, not its key. An upsert would silently reassign
+ownership of an external identity to whoever wrote last; `CreateAsync` fails loud on a duplicate
+instead, so a second account colliding on the same external identity surfaces as an error rather
+than a silent takeover.
+
+### Custom user and role types are not supported yet
+
+`AddUnifiedIdentityStores()` inspects the `IdentityBuilder` and throws `InvalidOperationException`
+at startup for anything but exactly `IdentityUser` and (if roles are enabled) exactly
+`IdentityRole` — a subclass like `class AppUser : IdentityUser` is rejected, not silently coerced.
+Table names are derived from `typeof(T).Name`, so supporting custom types means the consumer
+supplying their own row model; that's an additive change reserved for a later version, not
+something this version does partially.
 
 ---
 

@@ -56,5 +56,33 @@ public class AddUnifiedIdentityStoresTests
         Assert.Contains("IdentityUser", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void ThrowsForACustomRoleType()
+    {
+        // Arrange
+        var services = Base();
+
+        // Act / Assert — the role-type equivalent of ThrowsForACustomUserType
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => services.AddIdentityCore<IdentityUser>().AddRoles<CustomRole>().AddUnifiedIdentityStores());
+        Assert.Contains("IdentityRole", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RegistersUserStoreOnlyWhenRolesAreNotAdded()
+    {
+        // Arrange — no .AddRoles<>() call, so builder.RoleType is null
+        var services = Base();
+
+        // Act
+        services.AddIdentityCore<IdentityUser>().AddUnifiedIdentityStores();
+        using var provider = services.BuildServiceProvider();
+
+        // Assert — the UserOnlyStore path still resolves an IUserStore<IdentityUser>
+        Assert.NotNull(provider.GetRequiredService<IUserStore<IdentityUser>>());
+    }
+
     private sealed class CustomUser : IdentityUser;
+
+    private sealed class CustomRole : IdentityRole;
 }
