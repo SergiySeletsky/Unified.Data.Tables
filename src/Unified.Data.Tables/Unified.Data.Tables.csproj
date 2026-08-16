@@ -29,4 +29,11 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
   </ItemGroup>
 
+  <!-- BuildSelect and ResolveTableName are internal implementation details with non-obvious
+       contracts (a projection must not omit the system columns; a resolver returning nothing must
+       fall back rather than produce an unusable client), so they are unit-tested directly. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
+  </ItemGroup>
+
 </Project>

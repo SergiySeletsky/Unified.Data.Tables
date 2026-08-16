@@ -1,4 +1,4 @@
-﻿namespace Unified.Data.Tables;
+namespace Unified.Data.Tables;
 
 /// <summary>
 /// Behavioural options for the unified table-storage layer, configured at registration time via
@@ -21,7 +21,7 @@ public sealed class UnifiedTableStorageOptions
     /// see <see cref="OversizedCellPolicy"/>. Default: trim and leave a <c>__Truncated</c> marker.
     /// Applied to the (static) serializer at registration time.
     /// </summary>
-    public OversizedCellPolicy OversizedCells { get; set; } = OversizedCellPolicy.TrimWithMarker;
+    public OversizedCellPolicy OversizedCells { get; set; } = OversizedCellPolicy.Throw;
 
     /// <summary>
     /// How ids and partition/prefix arguments are treated before hitting the table — see
@@ -40,6 +40,20 @@ public sealed class UnifiedTableStorageOptions
     /// <see cref="ConcurrencyMode.LastWriterWins"/> and leaving this off.
     /// </summary>
     public bool ImplicitLastWriterWins { get; set; }
+
+    /// <summary>
+    /// Overrides the table name, which otherwise defaults to <c>typeof(T).Name</c>.
+    ///
+    /// Two cases the default cannot serve. A multi-tenant host that wants a table per tenant has no
+    /// seam to express it — every <c>IStorage&lt;T&gt;</c> for the same <c>T</c> lands in one table
+    /// regardless of who is asking. And "delete everything for tenant X" becomes O(n) delete
+    /// transactions rather than a single <c>DeleteTableAsync</c>, which is both far slower and, for
+    /// anyone with an erasure obligation, far harder to prove complete.
+    ///
+    /// Return a valid Azure table name (alphanumeric, 3-63 chars, starting with a letter); the
+    /// service rejects anything else. <c>null</c> keeps the existing behaviour exactly.
+    /// </summary>
+    public Func<Type, string>? TableNameResolver { get; set; }
 
     /// <summary>
     /// Override the cache policy for one entity type (e.g. disable for high-churn types or

@@ -1,4 +1,4 @@
-﻿using Azure;
+using Azure;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -191,5 +191,57 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         // Azure page sizes are advisory, so assert coverage, not an exact page count.
         Assert.Equal(total, seen.Count);
         Assert.Equal(Enumerable.Range(0, total), seen.OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task UpsertBatch_SplitsOnPayloadSize_SoALargeBatchIsNotRejectedWith413()
+    {
+        // Assert.Skip, not `if (!_available) return;` — a silent early return reports PASS for a
+        // test that never ran, which is indistinguishable from the fix working.
+        Assert.SkipUnless(_available, "Azurite is not reachable on UseDevelopmentStorage=true.");
+
+        // The regression this closes. Azure caps a transaction at 100 entities AND 4 MB, and the
+        // REST layer base64-expands binary 1.333x. Chunking on count alone sends a legal-looking
+        // 100-entity batch that the service rejects with 413 — after earlier chunks have already
+        // committed, leaving a half-written table. 60 x 60,000 chars is ~7 MB of payload, i.e.
+        // comfortably one "legal" 100-entity chunk under the old planner and comfortably over the
+        // transaction limit.
+        var store = Store<TestEntity>();
+        var blob = new string('x', 60_000);
+        var entities = Enumerable.Range(0, 60)
+            .Select(i => new TestEntity { Id = $"batch413|row{i:D3}", Name = blob, Value = i })
+            .ToArray();
+
+        foreach (var e in entities) Track<TestEntity>(e.Id);
+
+        var written = await store.UpsertBatchAsync(entities);
+
+        Assert.Equal(entities.Length, written);
+
+        // Round-trip: every row is readable and intact, so the split did not lose or truncate one.
+        var readBack = await store.QueryAsync(new QueryOptions { Partition = "batch413" });
+        Assert.Equal(entities.Length, readBack.Count);
+        Assert.All(readBack, e => Assert.Equal(60_000, e.Name.Length));
+    }
+
+    [Fact]
+    public async Task Query_WithProjection_OmitsTheUnselectedColumn()
+    {
+        Assert.SkipUnless(_available, "Azurite is not reachable on UseDevelopmentStorage=true.");
+
+        // Projection is the difference between reading a scalar and dragging every large payload
+        // in the partition across the wire with it.
+        var store = Store<TestEntity>();
+        var entity = new TestEntity { Id = "projection|row1", Name = new string('y', 40_000), Value = 42 };
+        Track<TestEntity>(entity.Id);
+        await store.UpsertAsync(entity);
+
+        var projected = await store.QueryAsync(
+            new QueryOptions { Partition = "projection", Select = ["Value"] });
+
+        var row = Assert.Single(projected);
+        Assert.Equal(42, row.Value);
+        Assert.Equal("projection|row1", row.Id);        // keys survive — they are added back
+        Assert.True(string.IsNullOrEmpty(row.Name), "an unselected column must not come back populated");
     }
 }

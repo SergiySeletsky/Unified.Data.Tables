@@ -8,13 +8,26 @@ namespace Unified.Data.Tables.Tests;
 /// and the WHOLE entity insert fails. These regression tests pin the serializer's guarantee that
 /// every produced cell stays within the limit — losslessly GZip-compressed when possible, truncated
 /// as a last resort — so a single oversized property can never silently lose the whole row.
-/// These tests assume the default TrimWithMarker policy; they share a collection with everything
-/// that mutates the static <see cref="TableEntitySerializer.OversizedCellPolicy"/> so a policy
-/// change in a parallel test can never leak in.
+/// These tests pin TRIMMING behaviour, so they opt into it: the shipped default is
+/// <see cref="OversizedCellPolicy.Throw"/>, because trimming a value to its largest fitting prefix
+/// and reporting success loses data with no signal at any layer. They share a collection with
+/// everything that mutates the static <see cref="TableEntitySerializer.OversizedCellPolicy"/> so a
+/// policy change in a parallel test can never leak in.
 /// </summary>
 [Collection("OversizedCellPolicy")]
-public class TableEntitySerializerSizeTests
+public class TableEntitySerializerSizeTests : IDisposable
 {
+    private readonly OversizedCellPolicy previousPolicy = TableEntitySerializer.OversizedCellPolicy;
+
+    public TableEntitySerializerSizeTests()
+        => TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.TrimWithMarker;
+
+    public void Dispose()
+    {
+        TableEntitySerializer.OversizedCellPolicy = previousPolicy;
+        GC.SuppressFinalize(this);
+    }
+
     private const int MaxCellBytes = 65536;
 
     private static int CellBytes(object? cell) => cell is string s ? Encoding.Unicode.GetByteCount(s) : 0;
