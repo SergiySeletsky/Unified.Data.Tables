@@ -7,5 +7,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Unified.Data.Tables.Tests/Unified.Data.Tables.Tests.csproj" />
+    <Project Path="tests/Unified.Data.Tables.Identity.Tests/Unified.Data.Tables.Identity.Tests.csproj" />
   </Folder>
 </Solution>
