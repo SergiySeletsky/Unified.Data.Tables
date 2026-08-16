@@ -1,5 +1,4 @@
-using Unified.Data.Tables.Identity;
-using Unified.Data.Tables.Identity.Models;
+﻿using Unified.Data.Tables.Identity.Models;
 using Microsoft.AspNetCore.Identity;
 using Unified.Data.Tables.InMemory;
 

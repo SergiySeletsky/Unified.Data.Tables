@@ -1,4 +1,4 @@
-using Unified.Data.Tables.Identity;
+﻿using Unified.Data.Tables.Identity;
 using Unified.Data.Tables.Identity.Models;
 using Microsoft.AspNetCore.Identity;
 
@@ -43,13 +43,13 @@ namespace Unified.Data.Tables.Identity.Tests
         public async Task CreateAsync_ReturnsFailedWithCode_OnDuplicate()
         {
             // Arrange — a create, not an upsert: a second registration for an existing user id must
-            // not overwrite the live row.
+            // not overwrite the existing row.
             await Store.CreateAsync(NewUser(), TestContext.Current.CancellationToken);
 
             // Act
             var second = await Store.CreateAsync(NewUser(), TestContext.Current.CancellationToken);
 
-            // Assert — the old code swallowed every exception with no Code at all
+            // Assert — an earlier implementation swallowed every exception with no Code at all
             Assert.False(second.Succeeded);
             Assert.Contains(second.Errors, e => e.Code == "DuplicateKey");
         }
@@ -86,7 +86,7 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public async Task UpdateAsync_ClearsLockout_WhenSetBackToNull()
         {
-            // Arrange — the old Merge-mode upsert could never clear a column, so an unlocked user
+            // Arrange — a Merge-mode upsert can never clear a column, so an unlocked user
             // stayed locked forever.
             var user = NewUser();
             user.LockoutEnd = new DateTimeOffset(2026, 8, 1, 0, 0, 0, TimeSpan.Zero);
@@ -116,7 +116,7 @@ namespace Unified.Data.Tables.Identity.Tests
         public async Task Users_ReturnsEveryUser()
         {
             // Arrange — IQueryableUserStore.Users is a synchronous property by force of the
-            // interface; UsersController.Get() reads every user through it.
+            // interface; a controller listing all users reads them through it.
             await Store.CreateAsync(NewUser("u1"), TestContext.Current.CancellationToken);
             await Store.CreateAsync(NewUser("u2"), TestContext.Current.CancellationToken);
 

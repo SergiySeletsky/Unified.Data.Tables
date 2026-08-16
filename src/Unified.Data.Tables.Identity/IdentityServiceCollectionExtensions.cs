@@ -1,6 +1,5 @@
-using Microsoft.AspNetCore.Identity;
+﻿using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using Unified.Data.Tables.Identity.Models;
 
 namespace Unified.Data.Tables.Identity;
 

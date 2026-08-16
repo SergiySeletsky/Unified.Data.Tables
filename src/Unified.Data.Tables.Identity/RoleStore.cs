@@ -1,7 +1,6 @@
-using Unified.Data.Tables.Identity.Models;
+﻿using Unified.Data.Tables.Identity.Models;
 using Microsoft.AspNetCore.Identity;
 using System.Security.Claims;
-using Unified.Data.Tables;
 
 namespace Unified.Data.Tables.Identity
 {

@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using Microsoft.AspNetCore.Identity;
 
 namespace Unified.Data.Tables.Identity.Tests
@@ -19,8 +19,8 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public async Task CreateAsync_KeysByIdNotName_SoFindByIdSucceeds()
         {
-            // Arrange — the old RolesTable wrote RowKey = role.Name but read by role.Id, so the
-            // live 'accountant' row could not be found by id.
+            // Arrange — an earlier role store wrote RowKey = role.Name but read by role.Id, so an
+            // existing 'accountant' row could not be found by id.
             var role = new IdentityRole("accountant") { Id = "role-guid-1", NormalizedName = "ACCOUNTANT" };
 
             // Act
@@ -51,7 +51,7 @@ namespace Unified.Data.Tables.Identity.Tests
         public async Task UpdateAsync_DoesNotCreateDuplicateRow()
         {
             // Arrange — RoleManager.UpdateAsync used to mint a second row, which made
-            // UsersController.Get() throw on ToDictionary.
+            // a caller keying users or roles by id throw on ToDictionary.
             var role = new IdentityRole("teacher") { Id = "role-guid-2", NormalizedName = "TEACHER" };
             await Store.CreateAsync(role, TestContext.Current.CancellationToken);
 

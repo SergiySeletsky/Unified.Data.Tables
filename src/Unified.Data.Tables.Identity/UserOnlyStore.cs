@@ -1,5 +1,4 @@
-using Unified.Data.Tables.Identity.Models;
-using Unified.Data.Tables;
+﻿using Unified.Data.Tables.Identity.Models;
 
 namespace Unified.Data.Tables.Identity
 {

@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Identity;
+﻿using Microsoft.AspNetCore.Identity;
 
 namespace Unified.Data.Tables.Identity.Tests
 {
@@ -18,7 +18,7 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public async Task IsInRoleAsync_ReturnsFalse_WhenRoleMissing()
         {
-            // Act — the old implementation threw InvalidOperationException("Role Not Found")
+            // Act — a naive implementation would throw InvalidOperationException("Role Not Found")
             var result = await RoleStore.IsInRoleAsync(new IdentityUser { Id = "u1" }, "NOSUCHROLE",
                                                        TestContext.Current.CancellationToken);
 
@@ -41,7 +41,7 @@ namespace Unified.Data.Tables.Identity.Tests
         {
             // Act — a silent no-op here is indistinguishable from success: UserManager does not
             // validate role existence, so it returns IdentityResult.Success and
-            // UsersController.AssignRole answers 200 OK having assigned nothing. EF Core's own
+            // a controller assigning roles answers 200 OK having assigned nothing. EF Core's own
             // UserStore throws, and so must this one.
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 RoleStore.AddToRoleAsync(new IdentityUser { Id = "u1" }, "NOSUCHROLE",

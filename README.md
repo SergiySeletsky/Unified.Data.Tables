@@ -51,6 +51,10 @@ copy-pasted into each one.
   a pluggable `IProtectedPropertyAuthorizer` (the package itself has **no** ASP.NET Core dependency).
 - **Faithful in-memory backend** — `Unified.Data.Tables.InMemory` round-trips rows through the REAL
   serializer with 409/412/404 and ETag semantics, so tests exercise production behaviour.
+- **ASP.NET Core Identity stores** — `Unified.Data.Tables.Identity` implements Identity's
+  `IUserStore`/`IRoleStore` family (users, roles, claims, logins, tokens, two-factor and lockout) on top
+  of `IStorage<T>`, registered with one `AddUnifiedIdentityStores()` call — and, because it is just
+  `IStorage<T>`, the whole Identity stack runs against the in-memory backend in unit tests.
 - **Composite id convention** — `Id` is `"{PartitionKey}|{RowKey}"` (shared helpers in `EntityId`); row keys
   may themselves contain `|`.
 
@@ -584,6 +588,16 @@ owning `UserId` lives in the row's *value*, not its key. An upsert would silentl
 ownership of an external identity to whoever wrote last; `CreateAsync` fails loud on a duplicate
 instead, so a second account colliding on the same external identity surfaces as an error rather
 than a silent takeover.
+
+### `AddToRoleAsync` throws when the role does not exist
+
+The other role members stay quiet about a missing role — `IsInRoleAsync` returns `false`,
+`RemoveFromRoleAsync` is a no-op and `GetUsersInRoleAsync` returns empty. `AddToRoleAsync` is the
+exception: it throws `InvalidOperationException`, matching EF Core's own store. It is a mutation
+that cannot be satisfied, and `UserManager.AddToRoleAsync` does not validate role existence itself,
+so a silent return would surface to the caller as `IdentityResult.Success` having assigned nothing.
+Code wrapping `UserManager.AddToRoleAsync` should expect the throw and translate it (typically to a
+400) rather than assume every failure arrives as a failed `IdentityResult`.
 
 ### Custom user and role types are not supported yet
 

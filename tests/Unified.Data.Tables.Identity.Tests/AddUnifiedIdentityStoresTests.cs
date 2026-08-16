@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Identity;
+﻿using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.DependencyInjection;
 using Unified.Data.Tables.InMemory;
 
@@ -78,8 +78,9 @@ public class AddUnifiedIdentityStoresTests
         services.AddIdentityCore<IdentityUser>().AddUnifiedIdentityStores();
         using var provider = services.BuildServiceProvider();
 
-        // Assert — the UserOnlyStore path still resolves an IUserStore<IdentityUser>
-        Assert.NotNull(provider.GetRequiredService<IUserStore<IdentityUser>>());
+        // Assert — it must be UserOnlyStore concretely, not the role-aware UserStore: a bare
+        // NotNull check would pass either way and miss the whole point of this branch.
+        Assert.IsType<UserOnlyStore>(provider.GetRequiredService<IUserStore<IdentityUser>>());
     }
 
     private sealed class CustomUser : IdentityUser;

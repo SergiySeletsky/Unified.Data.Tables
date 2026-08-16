@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using Microsoft.AspNetCore.Identity;
 
 namespace Unified.Data.Tables.Identity.Tests
@@ -76,7 +76,7 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public async Task BulkClaimRead_ReturnsEveryClaim_PreservingEveryField()
         {
-            // Arrange — UsersController reads every user claim in one unpartitioned query, so this
+            // Arrange — a controller listing users reads every user claim in one unpartitioned query, so this
             // exercises IStorage<IdentityUserClaimModel> the way the controller does. Asserting the
             // fields as well as the count catches a transposed ClaimType/ClaimValue or a dropped
             // UserId, which a bare count would not.
@@ -161,7 +161,7 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public async Task ReplaceClaimAsync_SwapsTheValue()
         {
-            // Arrange — UsersController.Update renames a user through ReplaceClaimAsync, and the
+            // Arrange — renaming a user goes through ReplaceClaimAsync, and the
             // claim key is derived from type+value, so the old row must be deleted, not merged.
             await AddUserClaim("u1", "friendly-name", "Alice");
 

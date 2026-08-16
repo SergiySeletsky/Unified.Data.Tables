@@ -1,4 +1,4 @@
-using Unified.Data.Tables.Identity;
+﻿using Unified.Data.Tables.Identity;
 using Microsoft.AspNetCore.Identity;
 
 namespace Unified.Data.Tables.Identity.Tests
@@ -30,7 +30,7 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public async Task FindByLogin_ResolvesToTheOwningUser()
         {
-            // Arrange — this is the Google sign-in path; all 37 live logins depend on it
+            // Arrange — this is the external sign-in path every federated login depends on
             await _fixture.SeedUserAsync("u1", "alice", TestContext.Current.CancellationToken);
             await AddLogin("u1", "Google", "google-sub-123", "Google");
 
@@ -67,8 +67,8 @@ namespace Unified.Data.Tables.Identity.Tests
             // Arrange — unlike the user-role, user-claim, role-claim and user-token writes, this one
             // must NOT upsert: the owning UserId lives in the row's VALUE, not its key
             // ({provider}|{hash(providerKey)}). An upsert would let u2 silently steal u1's Google
-            // login. Production has 37 Google logins and one password user, so that's an
-            // account-takeover-shaped failure mode.
+            // login, which is an account-takeover-shaped failure mode for any deployment
+            // that uses external logins.
             await _fixture.SeedUserAsync("u1", "alice", TestContext.Current.CancellationToken);
             await AddLogin("u1", "Google", "sub-1");
 

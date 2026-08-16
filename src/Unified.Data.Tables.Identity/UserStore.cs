@@ -1,6 +1,5 @@
-using Unified.Data.Tables.Identity.Models;
+﻿using Unified.Data.Tables.Identity.Models;
 using Microsoft.AspNetCore.Identity;
-using Unified.Data.Tables;
 
 namespace Unified.Data.Tables.Identity
 {
@@ -40,7 +39,7 @@ namespace Unified.Data.Tables.Identity
             var role = await FindRoleByNormalizedNameAsync(roleName, cancellationToken);
             // Unlike the three query-shaped members below, this is a mutation that CANNOT be
             // satisfied. UserManager.AddToRoleAsync does not validate role existence itself, so a
-            // silent return here surfaces as IdentityResult.Success and UsersController.AssignRole
+            // silent return here surfaces as IdentityResult.Success and a controller assigning roles
             // answers 200 OK having assigned nothing. EF Core's own UserStore throws here; match it.
             if (role is null)
                 throw new InvalidOperationException($"Role {roleName} does not exist.");

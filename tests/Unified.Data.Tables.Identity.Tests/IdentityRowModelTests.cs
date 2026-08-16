@@ -20,6 +20,39 @@ namespace Unified.Data.Tables.Identity.Tests
         }
 
         [Fact]
+        public void Hash_MatchesKnownLiteralDigests()
+        {
+            // These literals are the regression guard for the on-disk key format: they are the
+            // lowercase-hex MD5 of the UTF-8 bytes of the input. Every persisted row's key is
+            // derived from this function, so changing the digest, the text encoding, or the hex
+            // casing orphans every existing row. If these assertions fail, the change is a
+            // breaking data migration — do not "fix" the test by updating the literals.
+            Assert.Equal("827ccb0eea8a706c4c34a16891f84e7b", IdentityKeys.Hash("12345"));
+            Assert.Equal("fbbd4c210e88504da7a732c59084ef49", IdentityKeys.Hash("Google-12345"));
+            Assert.Equal(string.Empty, IdentityKeys.Hash(string.Empty));
+        }
+
+        [Fact]
+        public void Keys_ComposeExpectedLiteralIds()
+        {
+            // Fully literal expectations — no call to IdentityKeys.Hash on the expected side, so
+            // both the separator layout AND the hash itself are pinned. These are the exact
+            // strings written to storage; a failure here means existing rows become unreachable.
+            Assert.Equal(
+                "Google|827ccb0eea8a706c4c34a16891f84e7b",
+                IdentityKeys.UserLogin("Google", "12345"));
+            Assert.Equal(
+                "u1|9872af6969e880b1438106f4a6e7cf32",
+                IdentityKeys.UserClaim("u1", "friendly-name", "Bob"));
+            Assert.Equal(
+                "u1|a92660cffb43f1f88f52617e09118370",
+                IdentityKeys.UserToken("u1", "Google", "AuthenticatorKey"));
+            Assert.Equal(
+                "r1|d95564ddfe8b558513601ba05961f3e4",
+                IdentityKeys.RoleClaim("r1", "perm", "read"));
+        }
+
+        [Fact]
         public void Keys_ComposeExpectedIds()
         {
             // Assert
@@ -35,7 +68,8 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public void UserModel_RoundTripsEveryProperty_IncludingLockoutEnd()
         {
-            // Arrange — LockoutEnd is the property the old reflection serializer could never read back
+            // Arrange — LockoutEnd is the property an earlier reflection-based serializer could
+            // never read back
             var lockoutEnd = new DateTimeOffset(2026, 8, 1, 12, 0, 0, TimeSpan.Zero);
             var user = new IdentityUser
             {
@@ -91,7 +125,8 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public void LoginModel_RoundTripsProviderDisplayName()
         {
-            // Arrange — ProviderDisplayName is present on all 37 live rows and must not be dropped
+            // Arrange — ProviderDisplayName is present on existing external-login rows and must
+            // not be dropped
             var login = new IdentityUserLogin<string>
             {
                 UserId = "u1",

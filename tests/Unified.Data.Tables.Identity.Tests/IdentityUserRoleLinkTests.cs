@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Identity;
+﻿using Microsoft.AspNetCore.Identity;
 
 namespace Unified.Data.Tables.Identity.Tests
 {
@@ -107,7 +107,7 @@ namespace Unified.Data.Tables.Identity.Tests
         [Fact]
         public async Task BulkUserRoleRead_ReturnsEveryPair()
         {
-            // Arrange — UsersController reads every user-role link in one unpartitioned query, so
+            // Arrange — a controller listing users reads every user-role link in one unpartitioned query, so
             // this exercises IStorage<IdentityUserRoleModel> the way the controller does.
             await SeedRoles("admin", "teacher");
             await Add("u1", "ADMIN");

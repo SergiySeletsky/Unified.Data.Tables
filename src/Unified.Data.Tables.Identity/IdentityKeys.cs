@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 
 namespace Unified.Data.Tables.Identity
@@ -39,7 +39,7 @@ namespace Unified.Data.Tables.Identity
 
         /// <summary>
         /// Lowercase hex MD5. Key derivation only — not a security control. Independent of the
-        /// legacy uppercase-hex hash format used by the pre-migration Azure Table Storage layer.
+        /// legacy uppercase-hex hash format used by some earlier Azure Table Storage identity layers.
         /// </summary>
         public static string Hash(string value)
         {
