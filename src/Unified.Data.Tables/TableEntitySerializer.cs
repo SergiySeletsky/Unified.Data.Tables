@@ -33,7 +33,7 @@ public static class TableEntitySerializer
     /// static too; <c>AddUnifiedTableStorage</c> applies
     /// <see cref="UnifiedTableStorageOptions.OversizedCells"/> here.
     /// </summary>
-    public static OversizedCellPolicy OversizedCellPolicy { get; set; } = OversizedCellPolicy.TrimWithMarker;
+    public static OversizedCellPolicy OversizedCellPolicy { get; set; } = OversizedCellPolicy.Throw;
 
     /// <summary>Flatten and serialize <paramref name="root"/> into a <see cref="TableEntity"/>.</summary>
     public static TableEntity ToTableEntity(
@@ -508,9 +508,8 @@ internal sealed class TableEntityValue
                 {
                     // Even compressed it exceeds the cap — the oversized-cell policy decides.
                     if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.Throw)
-                        throw new SerializationException(
-                            $"Property '{columnName}' is a {s.Length}-char string whose compressed form " +
-                            "still exceeds the 64 KB cell cap (OversizedCellPolicy.Throw).");
+                        throw new OversizedCellException(
+                            columnName, Encoding.Unicode.GetByteCount(compressed), MaxCellBytes);
                     value = TruncateForCell(s, out var keptChars);
                     if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.TrimWithMarker)
                         TruncationNote = $"kept {keptChars} of {s.Length} chars";
@@ -545,9 +544,8 @@ internal sealed class TableEntityValue
             if (Encoding.Unicode.GetByteCount(json) > MaxCellBytes)
             {
                 if (TableEntitySerializer.OversizedCellPolicy == OversizedCellPolicy.Throw)
-                    throw new SerializationException(
-                        $"Property '{columnName}' serializes to a payload whose compressed form " +
-                        "exceeds the 64 KB cell cap (OversizedCellPolicy.Throw).");
+                    throw new OversizedCellException(
+                        columnName, Encoding.Unicode.GetByteCount(json), MaxCellBytes);
                 if (Value is IList list)
                 {
                     json = CompressLargestFittingPrefix(list, out var keptItems);

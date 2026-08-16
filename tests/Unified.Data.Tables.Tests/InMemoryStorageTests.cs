@@ -12,6 +12,12 @@ namespace Unified.Data.Tables.Tests;
 /// missing row, ETag simulation with 412 conflicts, idempotent delete, real-serializer round-trips,
 /// and lexical result ordering — so tests written against it hold in production.
 /// </summary>
+// AddUnifiedInMemoryStorage applies UnifiedTableStorageOptions to the process-wide
+// TableEntitySerializer.OversizedCellPolicy, so this class mutates the same static the
+// policy tests do and must share their collection. Without this it runs in parallel and
+// resets the policy mid-test — which stayed invisible only while the default happened to
+// be the value those tests wanted.
+[Collection("OversizedCellPolicy")]
 public class InMemoryStorageTests
 {
     // ── Create ──────────────────────────────────────────────────────────────
@@ -386,15 +392,26 @@ public class InMemoryStorageTests
     [Fact]
     public void AddUnifiedInMemoryStorage_RegistersOpenGenericSingleton()
     {
-        var services = new ServiceCollection();
-        services.AddUnifiedInMemoryStorage();
-        using var provider = services.BuildServiceProvider();
+        // This registration writes UnifiedTableStorageOptions through to the process-wide
+        // TableEntitySerializer.OversizedCellPolicy, so it must put back what it found. A test that
+        // mutates process state and walks away makes every later test order-dependent.
+        var previousPolicy = TableEntitySerializer.OversizedCellPolicy;
+        try
+        {
+            var services = new ServiceCollection();
+            services.AddUnifiedInMemoryStorage();
+            using var provider = services.BuildServiceProvider();
 
-        var first = provider.GetRequiredService<IStorage<TestEntity>>();
-        var second = provider.GetRequiredService<IStorage<TestEntity>>();
+            var first = provider.GetRequiredService<IStorage<TestEntity>>();
+            var second = provider.GetRequiredService<IStorage<TestEntity>>();
 
-        Assert.IsType<InMemoryStorage<TestEntity>>(first);
-        Assert.Same(first, second);
+            Assert.IsType<InMemoryStorage<TestEntity>>(first);
+            Assert.Same(first, second);
+        }
+        finally
+        {
+            TableEntitySerializer.OversizedCellPolicy = previousPolicy;
+        }
     }
 
     [Fact]

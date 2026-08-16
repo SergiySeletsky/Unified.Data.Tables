@@ -1,4 +1,4 @@
-﻿using System.Linq.Expressions;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
@@ -86,7 +86,20 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         cachePolicy = opts.ResolveCachePolicy(typeof(T));
         idNormalization = opts.IdNormalization;
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
-        client = serviceClient.GetTableClient(typeName);
+        client = serviceClient.GetTableClient(ResolveTableName(opts));
+    }
+
+
+    /// <summary>
+    /// The table this store reads and writes. Defaults to <c>typeof(T).Name</c>; see
+    /// <see cref="UnifiedTableStorageOptions.TableNameResolver"/> for why an override exists.
+    /// A resolver returning null or whitespace falls back to the default rather than producing an
+    /// unusable client — a silently wrong table name is far worse than ignoring a broken resolver.
+    /// </summary>
+    internal static string ResolveTableName(UnifiedTableStorageOptions options)
+    {
+        var resolved = options.TableNameResolver?.Invoke(typeof(T));
+        return string.IsNullOrWhiteSpace(resolved) ? typeof(T).Name : resolved!;
     }
 
     /// <summary>
@@ -389,7 +402,9 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
                 nameof(options));
 
         // A bounded query is the "never cached" read path — it does not warm the per-entity cache.
-        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct);
+        // A PROJECTED row must never warm it either: a partial entity in the cache would be served
+        // to a later caller that asked for every column.
+        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, BuildSelect(options));
     }
 
     /// <inheritdoc />
@@ -409,15 +424,40 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         return StreamAsync(filter, take, warmCache: true, ct);
     }
 
+
+    /// <summary>
+    /// Expands a caller's <see cref="QueryOptions.Select"/> with the columns deserialization cannot
+    /// work without, and returns <c>null</c> (meaning every column) when no projection was asked for.
+    ///
+    /// The trap this closes: a projection of <c>["Content"]</c> is a perfectly valid Tables query
+    /// that comes back with no PartitionKey, no RowKey, no ETag and no type discriminator, and
+    /// deserializes into a silently wrong entity. Projection is a transfer optimisation, never a
+    /// change to what an entity IS, so the system columns are not the caller's to omit.
+    /// </summary>
+    internal static IEnumerable<string>? BuildSelect(QueryOptions? options)
+    {
+        if (options?.Select is not { Count: > 0 } requested) return null;
+
+        var columns = new List<string>(requested.Count + SystemColumns.Length);
+        columns.AddRange(SystemColumns);
+        foreach (var column in requested)
+            if (!columns.Contains(column, StringComparer.Ordinal)) columns.Add(column);
+
+        return columns;
+    }
+
+    /// <summary>Columns every projection carries whether the caller asked for them or not.</summary>
+    private static readonly string[] SystemColumns = ["PartitionKey", "RowKey", "Timestamp", "odata.etag", "_TypeName"];
+
     // Shared server-side streaming iterator. Validation lives in the public methods so it throws
     // eagerly rather than being deferred to the first MoveNext of the returned sequence.
     private async IAsyncEnumerable<T> StreamAsync(string? filter, int? take, bool warmCache,
-        [EnumeratorCancellation] CancellationToken ct)
+        [EnumeratorCancellation] CancellationToken ct, IEnumerable<string>? select = null)
     {
         await EnsureTableAsync(ct);
 
         var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
-        var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, cancellationToken: ct);
+        var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, select, ct);
 
         var yielded = 0;
         await foreach (var row in pageable.WithCancellation(ct))
@@ -453,7 +493,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         await EnsureTableAsync(ct);
 
         var filter = BuildFilter(partition, rowKeyPrefix);
-        var pageable = client.QueryAsync<TableEntity>(filter, pageSize, cancellationToken: ct);
+        var pageable = client.QueryAsync<TableEntity>(filter, pageSize, BuildSelect(options), ct);
 
         // Take the first server page from the cursor position (one page per call).
         await using var pages = pageable.AsPages(innerToken, pageSize).GetAsyncEnumerator(ct);
@@ -536,6 +576,31 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         return count;
     }
 
+
+    /// <summary>
+    /// Serialized size of one row, for transaction planning. Binary and string columns dominate;
+    /// the fixed per-property and per-entity overhead is approximated rather than computed exactly,
+    /// because the budget already sits well under the service limit to absorb it.
+    /// </summary>
+    private static long EstimateSize(TableEntity row)
+    {
+        // Azure's own accounting: ~88 B of entity overhead plus 8 B per property, before values.
+        var bytes = 88L + (row.Count * 8L);
+        foreach (var key in row.Keys)
+        {
+            bytes += key.Length * 2L;
+            bytes += row[key] switch
+            {
+                byte[] binary => binary.Length,
+                BinaryData binary => binary.ToMemory().Length,
+                string text => text.Length * 2L,
+                _ => 8L,
+            };
+        }
+
+        return bytes;
+    }
+
     private async Task<int> WriteBatchAsync(
         IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
@@ -570,9 +635,18 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         {
             foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
             {
-                // Azure Table transactions: max 100 entities, single partition.
-                foreach (var chunk in group.Chunk(100))
+                // Azure Table transactions cap on BOTH entity count and payload size, and a
+                // count-only chunker sends a legal-looking 100-entity batch that the service
+                // rejects with 413 once the rows carry binary columns — after earlier chunks
+                // have already committed. BatchPlanner caps on both axes and refuses an
+                // unsendable entity up front. See BatchPlanner for the measured budget.
+                var groupRows = group.ToArray();
+                var plan = BatchPlanner.Plan([.. groupRows.Select(r => EstimateSize(r.Row))]);
+                foreach (var range in plan)
                 {
+                    var chunk = new (string Partition, string Id, TableEntity Row)[range.Count];
+                    Array.Copy(groupRows, range.Start, chunk, 0, range.Count);
+
                     var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
                     try
                     {

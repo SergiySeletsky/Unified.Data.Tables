@@ -14,6 +14,11 @@ namespace Unified.Data.Tables.Tests;
 /// Regression tests for the 0.5.3 slate. Each test names the finding it guards (B9, ctor fallback,
 /// IdNormalization, Auto ETag contract, query-cache sizing) so a future breakage points at the fix it undid.
 /// </summary>
+// Calls AddUnifiedInMemoryStorage, which applies UnifiedTableStorageOptions to the process-wide
+// TableEntitySerializer.OversizedCellPolicy — so this class mutates the same static the policy
+// tests do and must share their collection. It raced them before, which only stayed invisible
+// while the default happened to be the value those tests expected.
+[Collection("OversizedCellPolicy")]
 public class Fixes053Tests
 {
     // ── B9: Id is derived from PartitionKey/RowKey on read ──────────────────
@@ -253,7 +258,15 @@ public class Fixes053Tests
 [Collection("OversizedCellPolicy")]
 public sealed class OversizedCellPolicyTests : IDisposable
 {
-    public void Dispose() => TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.TrimWithMarker;
+    private readonly OversizedCellPolicy previousPolicy = TableEntitySerializer.OversizedCellPolicy;
+
+    // Every test starts from the SHIPPED default rather than from whatever the previous test left
+    // behind, then opts into the policy it is actually about. A Dispose with no matching ctor makes
+    // these order-dependent, which is how a policy test starts passing for the wrong reason.
+    public OversizedCellPolicyTests()
+        => TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.Throw;
+
+    public void Dispose() => TableEntitySerializer.OversizedCellPolicy = previousPolicy;
 
     // High-entropy payloads (fixed seed) that blow the 64 KB cap even gzip-compressed.
     private static EntityWithSteps HugeList()
@@ -280,8 +293,10 @@ public sealed class OversizedCellPolicyTests : IDisposable
     }
 
     [Fact]
-    public void Default_TrimWithMarker_List_WritesTruncatedMarker()
+    public void TrimWithMarker_List_WritesTruncatedMarker()
     {
+        TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.TrimWithMarker;
+
         var te = HugeList().ToTableEntity("pk", "rk");
 
         Assert.True(te.ContainsKey("Steps__Truncated"), "a trimmed list must leave a __Truncated marker");
@@ -294,8 +309,10 @@ public sealed class OversizedCellPolicyTests : IDisposable
     }
 
     [Fact]
-    public void Default_TrimWithMarker_String_WritesTruncatedMarker()
+    public void TrimWithMarker_String_WritesTruncatedMarker()
     {
+        TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.TrimWithMarker;
+
         var te = HugeString().ToTableEntity("pk", "rk");
 
         Assert.True(te.ContainsKey("Content__Truncated"));
@@ -308,8 +325,14 @@ public sealed class OversizedCellPolicyTests : IDisposable
     {
         TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.Throw;
 
-        var ex = Assert.Throws<SerializationException>(() => HugeList().ToTableEntity("pk", "rk"));
-        Assert.Contains("64 KB", ex.Message);
+        var ex = Assert.Throws<OversizedCellException>(() => HugeList().ToTableEntity("pk", "rk"));
+
+        // The typed exception carries what a caller needs to act: which column, how big, and the cap.
+        // ColumnName is the PHYSICAL column, so it keeps the encoding suffix the value was written
+        // under ("Steps__GZip") — that is the cell the service would have rejected.
+        Assert.StartsWith("Steps", ex.ColumnName, StringComparison.Ordinal);
+        Assert.Equal(65536, ex.LimitBytes);
+        Assert.True(ex.ActualBytes > ex.LimitBytes);
     }
 
     [Fact]
@@ -317,7 +340,7 @@ public sealed class OversizedCellPolicyTests : IDisposable
     {
         TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.Throw;
 
-        Assert.Throws<SerializationException>(() => HugeString().ToTableEntity("pk", "rk"));
+        Assert.Throws<OversizedCellException>(() => HugeString().ToTableEntity("pk", "rk"));
     }
 
     [Fact]
@@ -356,6 +379,9 @@ public sealed class OversizedCellPolicyTests : IDisposable
     [Fact]
     public void DroppedNonListPayload_LeavesMarkerOnly_AndRowStaysReadable()
     {
+        // These pin the DROP branch of trimming, which only runs under a Trim* policy.
+        TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.TrimWithMarker;
+
         // A dictionary can't be prefix-trimmed — the DROP branch omits the cell and writes only the
         // marker. The marker must be SKIPPED on read: pre-fix it drilled into the property and
         // resurrected it as a phantom empty instance.
@@ -372,6 +398,9 @@ public sealed class OversizedCellPolicyTests : IDisposable
     [Fact]
     public void DroppedInterfaceTypedPayload_RowStaysReadable()
     {
+        // These pin the DROP branch of trimming, which only runs under a Trim* policy.
+        TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.TrimWithMarker;
+
         // Worst case: the dropped property is interface-typed, which cannot be constructed at all —
         // pre-fix, reading the marker made the whole row permanently unreadable.
         var te = new EntityWithInterfaceBlob { Id = "p|r", Blob = HugeBlob() }.ToTableEntity("p", "r");
