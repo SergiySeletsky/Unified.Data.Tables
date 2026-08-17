@@ -490,6 +490,89 @@ Customer     back = row.FromTableEntity<Customer>();
   deserializes into a `DateTimeOffset` (or `DateTime`) property without throwing.
 - Set `persistType: true` to embed the type name and use the late-bound `FromTableEntity()` overload.
 - `TableEntitySerializer.FlattenProperty` is public for alternative `IStorage<T>` implementations.
+- **A leading `_` is reserved.** `_`-prefixed columns belong to the storage layer: they are never
+  produced from a property and never written into one. Before 0.8.0, `_TypeName` was parsed as
+  property path `["TypeName"]`, so a type declaring a `TypeName` property silently received the
+  assembly-qualified name as its value — the same held for any `_`-prefixed sentinel.
+- **`persistType: true` writes `_TypeName`** with `Type.AssemblyQualifiedName`. `FromTableEntity<TBase>(discriminator)`
+  reads it back constrained to a base type, and `TryFromTableEntity<TBase>` additionally tolerates a
+  row that carries no discriminator at all.
+- A base-constrained read does **not** recompute `Id` from the row keys, because a polymorphic key
+  (an aggregate version, an inverted tick count) is unrelated to any property.
+
+---
+
+## Polymorphic storage
+
+`IStorage<T>` is one CLR type per table. When many types share one table — an event store, a command
+log, an outbox — use `IPolymorphicStorage<TBase>` instead. Rows carry a `_TypeName` discriminator and
+read back as `TBase` with the true derived instance intact.
+
+```csharp
+services.AddUnifiedTableStorage(connectionString);
+services.AddUnifiedPolymorphicTable<IEvent>("StateEventStore");
+services.AddUnifiedPolymorphicTable<IEvent>("TransactionStore");
+```
+
+```csharp
+public sealed class StateEventStore(
+    [FromKeyedServices("StateEventStore")] IPolymorphicStorage<IEvent> storage)
+{
+    public Task SaveAsync(string aggregateId, IReadOnlyCollection<IEvent> events) =>
+        storage.InsertBatchAsync(
+            [.. events.Select(e => new PolymorphicWrite<IEvent>(
+                new TableKey(aggregateId, e.Version.ToString("D9")), e))]);
+
+    public async Task<IReadOnlyList<IEvent>> GetAsync(string aggregateId)
+    {
+        var entries = await storage.QueryAsync(aggregateId);
+        return [.. entries.Select(e => e.Value)];
+    }
+}
+```
+
+**Keys are explicit and verbatim.** `TableKey(PartitionKey, RowKey)` is passed on every operation and
+is never normalized — a polymorphic row key is usually a case-sensitive payload or a zero-padded
+counter, and lower-casing it would address a different row.
+
+**Marker rows.** A write whose `Item` is `null` stores system columns only, with no discriminator.
+That lets a commit flag share one transaction with the rows it guards; it reads back as an entry
+whose `Item` is `null` and whose `Columns` are intact.
+
+```csharp
+await storage.InsertBatchAsync([
+    ..events.Select(e => new PolymorphicWrite<IEvent>(new TableKey(txId, RowKey(e)), e)),
+    PolymorphicWrite<IEvent>.Marker(new TableKey(txId, "FlagEntity"),
+        new Dictionary<string, object> { ["_IsCommitted"] = false }),
+]);
+
+await storage.MergeColumnsAsync(new TableKey(txId, "FlagEntity"),
+    new Dictionary<string, object> { ["_IsCommitted"] = true });
+```
+
+**Type discriminators.** The default `AssemblyQualifiedTypeDiscriminator` stores
+`Type.AssemblyQualifiedName`, byte-identical to what `persistType: true` has always written — so an
+existing table reads with no migration. Prefer a map for anything new: an assembly-qualified name
+breaks on rename and costs a few hundred bytes on every row, charged against the transaction budget
+that caps batch size.
+
+```csharp
+services.AddUnifiedTableStorage(cs, o => o.TypeDiscriminator =
+    new TypeDiscriminatorMap()
+        .MapAssignableTo<IEvent>(typeof(OrderPlaced).Assembly)
+        .WithAssemblyQualifiedFallback());   // keep reading legacy rows while writes converge
+```
+
+Every read verifies the resolved type is assignable to `TBase` and throws otherwise. **No
+configuration disables that check** — deserializing a type named by stored bytes is a gadget surface,
+and a resolver is not a security boundary.
+
+**The store owns its table.** There is no server-side type filter, so every enumerating operation
+sees every row in scope. Point two stores at one table and each sees the other's rows.
+
+**Not supported here:** caching, LINQ predicates, `QueryPageAsync` cursors, `UpdateBuilder`,
+`ConcurrencyMode`, and `[ProtectedProperty]`. Rows are immutable facts plus mutable `_`-prefixed
+system columns; `MergeColumnsAsync` is the one mutation.
 
 ---
 

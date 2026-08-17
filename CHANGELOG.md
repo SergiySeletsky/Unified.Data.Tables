@@ -4,6 +4,100 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-08-17
+
+Polymorphic storage: many concrete types in one table, discriminated by `_TypeName`, read back as a
+common base with the true derived instance intact. A polymorphic *mode* on `IStorage<T>` was
+evaluated and rejected in 0.6.0, and that conclusion stands — an abstract or interface base fails
+`new()`, and a message or event base typically does not implement `IEntity` either, so the constraint
+fails twice over. This ships instead as a **separate contract**, leaving `IStorage<T>` and every
+existing behaviour untouched.
+
+### Added
+
+- **`IPolymorphicStorage<TBase>`** (`where TBase : class` — no `IEntity`, no `new()`) with
+  `PolymorphicTableStorage<TBase>` and `InMemoryPolymorphicStorage<TBase>`. Insert (strict — a
+  duplicate key throws `DuplicateKeyException`), upsert, heterogeneous transactional batch, blind
+  sentinel-column merge, key/partition/table reads, streaming reads, delete and count. The store
+  **owns its table**: there is no server-side type filter, so every enumerating operation sees every
+  row in scope.
+- **`TableKey`** — an explicit `(PartitionKey, RowKey)` pair, used **verbatim**. `IStorage<T>` derives
+  keys from `Entity.Id`; a polymorphic table orders rows by things the object does not carry — an
+  aggregate version, an inverted tick count, an ambient transaction id, a literal marker key — so the
+  caller computes the pair and every scheme is expressible without a hook. `IdNormalization` is
+  deliberately **not** applied: it lower-cases, and a case-sensitive key would be rewritten into a
+  different row. `TableKey.FromId`/`ToId` bridge to the composite-id convention.
+- **`ITypeDiscriminator`, `AssemblyQualifiedTypeDiscriminator`, `TypeDiscriminatorMap`** — the
+  type-resolution seam, wired through `UnifiedTableStorageOptions.TypeDiscriminator`. The default
+  stores an `AssemblyQualifiedName`, byte-identical to what `persistType: true` has always written, so
+  an existing table is readable with no migration. Prefer a `TypeDiscriminatorMap` for anything new:
+  an assembly-qualified name welds stored rows to assembly identity — a rename, strong-name change or
+  namespace move orphans them — and costs a few hundred bytes on *every* row, charged against the
+  transaction byte budget that caps batch size. `MapAssignableTo<TBase>(assembly)` bulk-registers a
+  hierarchy and fails at registration on a token collision; `WithAssemblyQualifiedFallback()` keeps
+  legacy rows readable while rewrites converge them, so the migration is in-place rather than a
+  backfill.
+- **A base-type gate that cannot be switched off.** Every polymorphic read verifies
+  `typeof(TBase).IsAssignableFrom(resolved)` and throws otherwise — including when a custom resolver
+  claims to have checked. Deserializing a type named by stored bytes is a gadget surface; this is the
+  control that needs no configuration to be effective, and `TypeDiscriminatorMap` narrows it further.
+- **`TableEntitySerializer.FromTableEntity<TBase>(entity, discriminator)` and
+  `TryFromTableEntity<TBase>`.** `Try` returns `false` for a row with **no** discriminator — a
+  deliberate typeless marker row, which previously threw and had to be skipped by RowKey before
+  deserializing. A discriminator that is *present* but unresolvable or incompatible still throws:
+  absent and broken are different failures and must not look alike. Neither overload rewrites the
+  object's `Id` from the row keys, because a polymorphic key is unrelated to any property.
+- **Raw system columns.** A write may carry `_`-prefixed cells alongside the serialized object, read
+  back strictly (`Column<T>`, throws when absent) or tolerantly (`TryColumn<T>`), and patched with
+  `MergeColumnsAsync` — a blind, unconditional server-side merge with no prior read and no
+  `_TypeName` in the payload. This is the "mark as published / committed" primitive.
+- **`AddUnifiedPolymorphicTable<TBase>(tableName)`** and its in-memory mirror
+  `AddUnifiedInMemoryPolymorphicTable<TBase>(tableName)`, registering each store **keyed by table
+  name**. Keyed rather than open-generic because one base type routinely addresses several tables, and
+  an open-generic registration can only bind one. Resolve with
+  `[FromKeyedServices("StateEventStore")] IPolymorphicStorage<IEvent>`.
+
+### Fixed
+
+- **A system column is no longer written into a property that happens to share its name.** Column
+  parsing strips the leading `_` (`_TypeName` splits to path `["TypeName"]`), so a type declaring a
+  `TypeName` property silently received an assembly-qualified name as its value; the same held for
+  any `_`-prefixed sentinel. A leading `_` now marks a **system column** on every read path: never
+  produced from a property, never fed to a property setter. This codifies existing reality rather
+  than inventing a rule — a property literally named `_Foo` already wrote to column `_Foo` and read
+  back into property `Foo`. Nothing this library has ever written produces a `_`-prefixed column
+  other than `_TypeName`, so no row it authored changes meaning; a **hand-authored** `_X` column that
+  relied on landing in property `X` no longer will.
+
+### Changed
+
+- `TableStorage<T>`'s row-size estimation and its coalesced lazy table creation moved to internal
+  helpers (`TableRowSize`, `TableInitializer`) shared with the polymorphic store, so both measure and
+  initialise identically instead of drifting. No public surface, no semantics, no test changes.
+
+### Known limitations
+
+Deliberately out of scope, to keep this landable. **No caching** on the polymorphic store —
+`TableStorage<T>` keys its cache on `typeof(T).FullName`, so two stores over one table would never
+invalidate each other, and its snapshot round-trips through the base-typed read, silently downcasting
+a derived instance and dropping its data. Rather than fix three coupled hazards, this store has none,
+which also suits an append-only fact table. **No LINQ predicates and no `_TypeName` filtering** — the
+filter translator only admits persisted columns, and a type filter would have to join
+`PageCursor.Fingerprint` or resumed pages would silently change shape. **No `QueryPageAsync` cursors**
+— `QueryStreamAsync` follows continuation tokens internally, which is what a scan actually needs.
+**No `[ProtectedProperty]`, `UpdateBuilder` or `ConcurrencyMode`** — rows are immutable facts plus
+mutable system columns. And note that batches are planned on payload bytes as well as entity count,
+so a set that a count-only chunker sends as one transaction may split into two; batches remain atomic
+per chunk only.
+
+### Note on `RowKeys.InvertedTicks`
+
+`InvertedTicks` formats `"D19"`. A common pre-existing convention formats the same arithmetic as
+`"D20"`; since `DateTime.MaxValue.Ticks` is 19 digits, `D20` zero-pads to 20 characters and `D19` does
+not. Each sorts correctly in isolation, but mixed in one partition the 20-character keys sort before
+every 19-character key and interleave wrongly. Keep your own helper for such a table — the explicit
+`TableKey` design imposes no key generation. A width-parameterised overload is under consideration.
+
 ## [0.7.0] — 2026-08-16
 
 ### Added
