@@ -383,4 +383,102 @@ public class TableEntitySerializerTests
     {
         Assert.Equal(SystemColumnNames.TypeName, TableEntitySerializer.TypeNameColumnName);
     }
+
+    // ── Base-constrained polymorphic read ───────────────────────────────────
+
+    [Fact]
+    public void FromTableEntity_BaseConstrained_ReturnsTrueDerivedInstance()
+    {
+        var discriminator = AssemblyQualifiedTypeDiscriminator.Instance;
+        var row = new TestCreatedEvent { Id = "e1", Version = 7 }.ToTableEntity("agg-1", "000000001");
+        row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(typeof(TestCreatedEvent));
+
+        var result = row.FromTableEntity<TestMessage>(discriminator);
+
+        var typed = Assert.IsType<TestCreatedEvent>(result);
+        Assert.Equal(7, typed.Version);
+        Assert.Equal("e1", typed.Id);
+    }
+
+    [Fact]
+    public void FromTableEntity_BaseConstrained_DoesNotRewriteIdFromKeys()
+    {
+        var discriminator = AssemblyQualifiedTypeDiscriminator.Instance;
+        var row = new TestCommand { Id = "cmd-9", Operation = "op" }.ToTableEntity("agg-1", "cmd-9");
+        row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(typeof(TestCommand));
+
+        var result = row.FromTableEntity<TestMessage>(discriminator);
+
+        Assert.Equal("cmd-9", result.Id);
+    }
+
+    [Fact]
+    public void TryFromTableEntity_NoDiscriminator_ReturnsFalse()
+    {
+        var row = new TableEntity("t1", "FlagEntity") { ["_IsCommitted"] = true };
+
+        Assert.False(row.TryFromTableEntity<TestMessage>(
+            AssemblyQualifiedTypeDiscriminator.Instance, out var result));
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void TryFromTableEntity_UnresolvableDiscriminator_Throws()
+    {
+        var row = new TableEntity("p", "r") { [SystemColumnNames.TypeName] = "No.Such, No.Asm" };
+
+        Assert.Throws<TypeLoadException>(() => row.TryFromTableEntity<TestMessage>(
+            AssemblyQualifiedTypeDiscriminator.Instance, out _));
+    }
+
+    [Fact]
+    public void TryFromTableEntity_TypeNotAssignableToBase_Throws()
+    {
+        var discriminator = AssemblyQualifiedTypeDiscriminator.Instance;
+        var row = new TableEntity("p", "r")
+        {
+            [SystemColumnNames.TypeName] = discriminator.ToDiscriminator(typeof(UnrelatedType)),
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            row.TryFromTableEntity<TestMessage>(discriminator, out _));
+        Assert.Contains("not assignable", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void FromTableEntity_BaseConstrained_ProtectedSetterRoundTrips()
+    {
+        var discriminator = AssemblyQualifiedTypeDiscriminator.Instance;
+        var stamp = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+        var source = new TestCreatedEvent { Id = "e1", Version = 1 };
+        source.SetCreated(stamp);
+
+        var row = source.ToTableEntity("p", "r");
+        row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(typeof(TestCreatedEvent));
+
+        var result = row.FromTableEntity<TestMessage>(discriminator);
+
+        Assert.Equal(stamp, result.Created);
+    }
+
+    [Fact]
+    public void FromTableEntity_BaseConstrained_CtorlessDerivedType_Materializes()
+    {
+        var discriminator = AssemblyQualifiedTypeDiscriminator.Instance;
+        var row = new TestCtorlessEvent("payload") { Id = "e1" }.ToTableEntity("p", "r");
+        row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(typeof(TestCtorlessEvent));
+
+        var result = row.FromTableEntity<TestMessage>(discriminator);
+
+        Assert.Equal("payload", Assert.IsType<TestCtorlessEvent>(result).Payload);
+    }
+
+    [Fact]
+    public void FromTableEntity_BaseConstrained_MissingDiscriminator_Throws()
+    {
+        var row = new TableEntity("p", "r") { ["Id"] = "x" };
+
+        Assert.Throws<InvalidOperationException>(() =>
+            row.FromTableEntity<TestMessage>(AssemblyQualifiedTypeDiscriminator.Instance));
+    }
 }
