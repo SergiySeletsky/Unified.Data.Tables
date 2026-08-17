@@ -18,10 +18,12 @@
     <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
-  <!-- Internal paging-cursor plumbing is shared with the two implementation assemblies. -->
+  <!-- Internal paging-cursor plumbing is shared with the two implementation assemblies. The test
+       project also needs PolymorphicMessages for the fake/real message-parity assertion. -->
   <ItemGroup>
     <InternalsVisibleTo Include="Unified.Data.Tables" />
     <InternalsVisibleTo Include="Unified.Data.Tables.InMemory" />
+    <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
   </ItemGroup>
 
   <!-- [Key]/[DataType] live in the shared framework on net10.0, but need this package on netstandard2.0.
