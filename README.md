@@ -490,6 +490,96 @@ Customer     back = row.FromTableEntity<Customer>();
   deserializes into a `DateTimeOffset` (or `DateTime`) property without throwing.
 - Set `persistType: true` to embed the type name and use the late-bound `FromTableEntity()` overload.
 - `TableEntitySerializer.FlattenProperty` is public for alternative `IStorage<T>` implementations.
+- **A leading `_` is reserved.** `_`-prefixed columns belong to the storage layer and are never
+  written into a property. Before 0.8.0, `_TypeName` was parsed as property path `["TypeName"]`, so a
+  type declaring a `TypeName` property silently received the assembly-qualified name as its value —
+  the same held for any `_`-prefixed sentinel. The rule is enforced on **read** only: flattening still
+  names columns after the property verbatim, so a property called `_Foo` does write a column `_Foo`
+  (which is then skipped on the way back). Keep `_` out of property names.
+- **`persistType: true` writes `_TypeName`** with `Type.AssemblyQualifiedName`. `FromTableEntity<TBase>(discriminator)`
+  reads it back constrained to a base type, and `TryFromTableEntity<TBase>` additionally tolerates a
+  row that carries no discriminator at all.
+- A base-constrained read does **not** recompute `Id` from the row keys, because a polymorphic key
+  (an aggregate version, an inverted tick count) is unrelated to any property.
+
+---
+
+## Polymorphic storage
+
+`IStorage<T>` is one CLR type per table. When many types share one table — an event store, a command
+log, an outbox — use `IPolymorphicStorage<TBase>` instead. Rows carry a `_TypeName` discriminator and
+read back as `TBase` with the true derived instance intact.
+
+```csharp
+services.AddUnifiedTableStorage(connectionString);
+services.AddUnifiedPolymorphicTable<IEvent>("StateEventStore");
+services.AddUnifiedPolymorphicTable<IEvent>("TransactionStore");
+```
+
+```csharp
+public sealed class StateEventStore(
+    [FromKeyedServices("StateEventStore")] IPolymorphicStorage<IEvent> storage)
+{
+    public Task SaveAsync(string aggregateId, IReadOnlyCollection<IEvent> events) =>
+        storage.InsertBatchAsync(
+            [.. events.Select(e => new PolymorphicWrite<IEvent>(
+                new TableKey(aggregateId, e.Version.ToString("D9")), e))]);
+
+    public async Task<IReadOnlyList<IEvent>> GetAsync(string aggregateId)
+    {
+        var entries = await storage.QueryAsync(aggregateId);
+        // Item, not Value: a partition may hold marker rows (see below), and Value throws on one.
+        return [.. entries.Where(e => e.Item is not null).Select(e => e.Item!)];
+    }
+}
+```
+
+`[FromKeyedServices]` takes an attribute argument, so the table name has to be a compile-time
+constant; a name computed at runtime must be resolved imperatively with
+`serviceProvider.GetRequiredKeyedService<IPolymorphicStorage<IEvent>>(tableName)` instead.
+
+**Keys are explicit and verbatim.** `TableKey(PartitionKey, RowKey)` is passed on every operation and
+is never normalized — a polymorphic row key is usually a case-sensitive payload or a zero-padded
+counter, and lower-casing it would address a different row.
+
+**Marker rows.** A write whose `Item` is `null` stores system columns only, with no discriminator.
+That lets a commit flag share one transaction with the rows it guards; it reads back as an entry
+whose `Item` is `null` and whose `Columns` are intact.
+
+```csharp
+await storage.InsertBatchAsync([
+    ..events.Select(e => new PolymorphicWrite<IEvent>(new TableKey(txId, RowKey(e)), e)),
+    PolymorphicWrite<IEvent>.Marker(new TableKey(txId, "FlagEntity"),
+        new Dictionary<string, object> { ["_IsCommitted"] = false }),
+]);
+
+await storage.MergeColumnsAsync(new TableKey(txId, "FlagEntity"),
+    new Dictionary<string, object> { ["_IsCommitted"] = true });
+```
+
+**Type discriminators.** The default `AssemblyQualifiedTypeDiscriminator` stores
+`Type.AssemblyQualifiedName`, byte-identical to what `persistType: true` has always written — so an
+existing table reads with no migration. Prefer a map for anything new: an assembly-qualified name
+breaks on rename and costs a few hundred bytes on every row, charged against the transaction budget
+that caps batch size.
+
+```csharp
+services.AddUnifiedTableStorage(cs, o => o.TypeDiscriminator =
+    new TypeDiscriminatorMap()
+        .MapAssignableTo<IEvent>(typeof(OrderPlaced).Assembly)
+        .WithAssemblyQualifiedFallback());   // keep reading legacy rows while writes converge
+```
+
+Every read verifies the resolved type is assignable to `TBase` and throws otherwise. **No
+configuration disables that check** — deserializing a type named by stored bytes is a gadget surface,
+and a resolver is not a security boundary.
+
+**The store owns its table.** There is no server-side type filter, so every enumerating operation
+sees every row in scope. Point two stores at one table and each sees the other's rows.
+
+**Not supported here:** caching, LINQ predicates, `QueryPageAsync` cursors, `UpdateBuilder`,
+`ConcurrencyMode`, and `[ProtectedProperty]`. Rows are immutable facts plus mutable `_`-prefixed
+system columns; `MergeColumnsAsync` is the one mutation.
 
 ---
 
@@ -526,6 +616,20 @@ enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `
 `ConcurrencyConflictException` per `ConcurrencyMode`, deletes are idempotent,
 and results arrive in lexical key order — so a green test against the fake means the same code holds
 against Azure Tables.
+
+The polymorphic store has the same mirror, keyed the same way:
+
+```csharp
+services.AddUnifiedInMemoryPolymorphicTable<IEvent>("StateEventStore",
+    o => o.TypeDiscriminator = new TypeDiscriminatorMap().MapAssignableTo<IEvent>(asm));
+```
+
+Pass the **same discriminator configuration production uses**. Without it the fake resolves whatever
+`UnifiedTableStorageOptions` the container happens to hold — and a test host that registers only this
+line holds none, so it would quietly fall back to assembly-qualified tokens while production writes
+short ones. Nothing fails; the tokens simply differ, in the one place no assertion looks. The table
+name is passed through to the store too, not just used as the DI key, so `DuplicateKeyException`
+names the same table the Azure store would.
 
 ---
 

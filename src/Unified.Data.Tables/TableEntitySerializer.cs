@@ -24,8 +24,13 @@ namespace Unified.Data.Tables;
 /// </summary>
 public static class TableEntitySerializer
 {
-    /// <summary>Column that stores the assembly-qualified type name when <c>persistType</c> is used.</summary>
-    public const string TypeNameColumnName = "_TypeName";
+    /// <summary>
+    /// Column that stores the type discriminator when <c>persistType</c> is used. An alias for
+    /// <see cref="SystemColumnNames.TypeName"/>, which is the single definition — Abstractions
+    /// cannot reference this package, so the constant lives there and this is the historical name
+    /// for it.
+    /// </summary>
+    public const string TypeNameColumnName = SystemColumnNames.TypeName;
 
     /// <summary>
     /// Process-wide policy for payloads that exceed the 64 KB cell cap even compressed — see
@@ -57,23 +62,19 @@ public static class TableEntitySerializer
         where T : new()
     {
         ArgumentNullException.ThrowIfNull(entity);
-        var meta = TypeMetadataCache.GetMetadata(typeof(T));
-        var result = (T)meta.Creator();
-
-        foreach (var kv in entity)
-        {
-            // A __Truncated marker is metadata about a trimmed/dropped cell, not data — feeding it
-            // through SetProperty would drill into (and materialize) the property it describes.
-            if (TableEntityValue.IsTruncationMarker(kv.Key))
-                continue;
-            var val = TableEntityValue.Create(kv.Key, kv.Value);
-            result = (T)SetProperty(result, val);
-        }
-
-        return (T)RestoreIdFromKeys(ApplyColumnAliases(result!, entity, meta), entity);
+        return (T)Materialize(entity, typeof(T), restoreId: true);
     }
 
     /// <summary>Late-bound deserialize; requires the row to have been written with <c>persistType: true</c>.</summary>
+    /// <remarks>
+    /// This overload performs <b>no base-type check</b>: it resolves whatever assembly-qualified name
+    /// the row's <c>_TypeName</c> cell holds and materializes it, so the stored bytes choose the type
+    /// to construct. Prefer
+    /// <see cref="FromTableEntity{TBase}(TableEntity, ITypeDiscriminator)"/>, which resolves through
+    /// an <see cref="ITypeDiscriminator"/> and enforces assignability to <c>TBase</c> — a gate no
+    /// configuration can disable — or <see cref="TryFromTableEntity{TBase}"/> when the row may be a
+    /// typeless marker. Kept as-is for rows and call sites that predate the discriminator seam.
+    /// </remarks>
     public static object FromTableEntity(this TableEntity entity)
     {
         ArgumentNullException.ThrowIfNull(entity);
@@ -85,18 +86,133 @@ public static class TableEntitySerializer
 
         var t = Type.GetType(asmQName)
                 ?? throw new TypeLoadException($"Type '{asmQName}' not found.");
-        var meta = TypeMetadataCache.GetMetadata(t);
+
+        return Materialize(entity, t, restoreId: true);
+    }
+
+    /// <summary>
+    /// Late-bound deserialize constrained to a base type: resolves the stored discriminator through
+    /// <paramref name="discriminator"/> and returns the TRUE derived instance typed as
+    /// <typeparamref name="TBase"/>.
+    /// </summary>
+    /// <typeparam name="TBase">The base type the row must materialize as.</typeparam>
+    /// <param name="entity">The row to read.</param>
+    /// <param name="discriminator">The resolver for the stored token.</param>
+    /// <returns>The materialized object.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="entity"/> or <paramref name="discriminator"/> is null.
+    /// </exception>
+    /// <exception cref="TypeLoadException">The stored token could not be resolved.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The row carries no discriminator, or names a type not assignable to <typeparamref name="TBase"/>.
+    /// </exception>
+    public static TBase FromTableEntity<TBase>(this TableEntity entity, ITypeDiscriminator discriminator)
+        where TBase : class
+    {
+        if (!entity.TryFromTableEntity<TBase>(discriminator, out var result))
+            throw new InvalidOperationException($"Missing '{TypeNameColumnName}' column.");
+
+        return result!;
+    }
+
+    /// <summary>
+    /// Base-constrained deserialize that tolerates a TYPELESS row.
+    /// </summary>
+    /// <remarks>
+    /// Returns false when the row carries NO discriminator — a deliberate marker row, such as a
+    /// two-phase-commit flag carrying only system columns. A discriminator that is PRESENT but
+    /// unresolvable or not assignable to <typeparamref name="TBase"/> still throws: "no type was
+    /// ever written" and "the wrong type was written" are different failures and must not look alike.
+    /// </remarks>
+    /// <typeparam name="TBase">The base type the row must materialize as.</typeparam>
+    /// <param name="entity">The row to read.</param>
+    /// <param name="discriminator">The resolver for the stored token.</param>
+    /// <param name="result">The materialized object, or null for a marker row.</param>
+    /// <returns>True when the row carried a discriminator and materialized.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="entity"/> or <paramref name="discriminator"/> is null.
+    /// </exception>
+    /// <exception cref="TypeLoadException">The stored token could not be resolved.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The resolved type is not assignable to <typeparamref name="TBase"/>.
+    /// </exception>
+    public static bool TryFromTableEntity<TBase>(
+        this TableEntity entity, ITypeDiscriminator discriminator, out TBase? result)
+        where TBase : class
+    {
+        ArgumentNullException.ThrowIfNull(entity);
+        ArgumentNullException.ThrowIfNull(discriminator);
+
+        result = null;
+        if (!entity.TryGetValue(TypeNameColumnName, out var raw)
+            || raw is not string token
+            || string.IsNullOrEmpty(token))
+        {
+            return false;
+        }
+
+        var type = discriminator.Resolve(token, typeof(TBase));
+
+        // The gate no configuration can disable. A resolver is not a security boundary: deserializing
+        // a type named by stored bytes is a gadget surface, and this is the check that holds even when
+        // a custom resolver claims to have made it.
+        if (!typeof(TBase).IsAssignableFrom(type))
+            throw new InvalidOperationException(PolymorphicMessages.NotAssignable(token, typeof(TBase)));
+
+        result = (TBase)Materialize(entity, type, restoreId: false);
+        return true;
+    }
+
+    // The shared read loop behind all four FromTableEntity overloads (TryFromTableEntity<TBase> and
+    // the FromTableEntity<TBase> that delegates to it share ONE call here, not a loop each). Extracted
+    // rather than copied a third time: the truncation-marker skip, the system-column skip and the
+    // alias pass must stay in lockstep, and the two PRE-EXISTING copies had already drifted once (one
+    // loop's explanatory comment on the truncation-marker check was missing from the other, until an
+    // earlier fix resynced them).
+    private static object Materialize(TableEntity entity, Type type, bool restoreId)
+    {
+        var meta = TypeMetadataCache.GetMetadata(type);
         var result = meta.Creator();
 
         foreach (var kv in entity)
         {
+            // A column that is EXACTLY "__Json"/"__GZip"/"__Truncated" (no property name in front of
+            // it) can only be a legacy artifact: a version older than the write-side Path.IsEmpty
+            // guard blobbed (or trimmed/dropped) a whole root object with no usable ctor into a single
+            // cell. Neither this nor any prior skip below may treat it as ordinary metadata — that
+            // would silently hand back an empty, no-data object where every earlier release threw.
+            // Checked before IsTruncationMarker specifically so a bare "__Truncated" is caught here
+            // too, not silently skipped as if it were an ordinary per-property truncation note.
+            if (TableEntityValue.IsBareFormatColumn(kv.Key))
+            {
+                throw new SerializationException(
+                    $"Column '{kv.Key}' cannot be read: the row was written by a version that " +
+                    "serialized the whole object as a single cell instead of columns, and this " +
+                    "version has no properties to put that data back into. Re-write the row with the " +
+                    "current serializer.");
+            }
+
+            // A __Truncated marker (on a real property, e.g. "Tags__Truncated") is metadata about a
+            // trimmed/dropped cell, not data — feeding it through SetProperty would drill into (and
+            // materialize) the property it describes.
             if (TableEntityValue.IsTruncationMarker(kv.Key))
                 continue;
-            var val = TableEntityValue.Create(kv.Key, kv.Value);
-            result = SetProperty(result, val);
+
+            // A leading '_' marks a column the storage layer owns. It must never reach a property
+            // setter: TableEntityValue.Create strips the prefix, so "_TypeName" resolves to path
+            // ["TypeName"] and "_IsPublished" to ["IsPublished"] — a stored type declaring either
+            // property was silently receiving the storage layer's value.
+            if (SystemColumnNames.IsSystemColumn(kv.Key))
+                continue;
+
+            result = SetProperty(result, TableEntityValue.Create(kv.Key, kv.Value));
         }
 
-        return RestoreIdFromKeys(ApplyColumnAliases(result, entity, meta), entity);
+        result = ApplyColumnAliases(result, entity, meta);
+
+        // A polymorphic row's keys encode an aggregate version or a tick count, not an id — so
+        // recomputing Id from them would overwrite the object's real id with "partition|row".
+        return restoreId ? RestoreIdFromKeys(result, entity) : result;
     }
 
     // The row's PartitionKey/RowKey are the authoritative identity. A legacy row written by another
@@ -261,6 +377,18 @@ public static class TableEntitySerializer
                 dict[value.TruncationMarkerColumn] = note;
             return true;
         }
+
+        // A collection at the TRUE root (empty Path) has no properties to flatten into. TrySerialize
+        // above declined to JSON-blob it (Path.IsEmpty), so without this check we'd fall through to
+        // "recurse into cached properties" below and hit List<T>'s Item INDEXER: it passes the
+        // CanRead/CanWrite filter in TypeMetadataCache, but PropertyInfo.GetValue with no index args
+        // throws TargetParameterCountException — a raw reflection leak, not a serializer diagnostic. A
+        // NESTED collection never reaches this line: its Path is non-empty, so TrySerialize's own
+        // IEnumerable branch already routed it to one JSON cell before this point. Fail the same way
+        // FlattenProperty already does for an unflattenable value — the caller (Flatten(object, bool))
+        // turns this into "Cannot flatten object of type ...".
+        if (value.Path.IsEmpty && value.Type != typeof(string) && typeof(IEnumerable).IsAssignableFrom(value.Type!))
+            return false;
 
         // cycle detection
         if (!value.Type!.IsValueType && !seen.Add(value.Value))
@@ -441,6 +569,17 @@ internal sealed class TableEntityValue
     internal static bool IsTruncationMarker(string column) =>
         column.EndsWith(TruncatedSuffix, StringComparison.Ordinal);
 
+    /// <summary>
+    /// Whether a column name is EXACTLY a cell-format/truncation suffix, with no property name in
+    /// front of it. TrySerialize never produces this shape for a real property — a column is always
+    /// "PropertyName" plus, optionally, one of these suffixes — so the only way it reaches a row is a
+    /// pre-write-side-fix version that blobbed a whole root object (no usable ctor, or a bare
+    /// collection) into one cell. That row can never be read back into properties: Materialize must
+    /// diagnose it rather than let it collide with the (unrelated) '_' system-column prefix.
+    /// </summary>
+    internal static bool IsBareFormatColumn(string column) =>
+        column is JsonSuffix or GZipSuffix or TruncatedSuffix;
+
     public TableEntityValue(
         ImmutableList<string> path,
         object? value,
@@ -525,7 +664,17 @@ internal sealed class TableEntityValue
             return true;
         }
 
-        if (CanSerializeWithoutJson(Value))
+        // A root value (empty Path) that reaches this point is neither a primitive nor an enum (both
+        // returned true above) — so it must never fall to the JSON branch below and become "the whole
+        // row is one cell", even when the root type has no public parameterless ctor (the exact shape
+        // a polymorphic base-constrained read reconstructs via the uninitialized-object fallback).
+        // Without this, such a root would produce a column named by its bare "__Json"/"__GZip" suffix
+        // — a name that starts with the reserved '_' system-column prefix by sheer coincidence of
+        // string concatenation, so Materialize's system-column skip would silently swallow the whole
+        // object. A root that is itself an IEnumerable (a collection) also lands here and is handled
+        // one level up, in Flatten: it cannot be flattened into properties either (see the comment
+        // there), so it must fail loudly rather than let this method's caller try.
+        if (Path.IsEmpty || CanSerializeWithoutJson(Value))
             return false;
 
         // fallback to JSON / GZip

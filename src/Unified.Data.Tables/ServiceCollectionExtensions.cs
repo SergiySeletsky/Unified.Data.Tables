@@ -2,6 +2,7 @@ using Azure.Core;
 using Azure.Data.Tables;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace Unified.Data.Tables;
 
@@ -72,5 +73,65 @@ public static class ServiceCollectionExtensions
 
         services.TryAddSingleton(_ => new TableServiceClient(endpoint, credential));
         return services.AddUnifiedTableStorage(configure);
+    }
+
+    /// <summary>
+    /// Registers one <see cref="IPolymorphicStorage{TBase}"/> over <paramref name="tableName"/>,
+    /// KEYED by that table name. Requires a registered <see cref="TableServiceClient"/> — call an
+    /// <c>AddUnifiedTableStorage</c> overload first.
+    /// </summary>
+    /// <remarks>
+    /// Keyed rather than open-generic because one base type routinely addresses several tables (an
+    /// event base is both the state-event store and the transaction store), and an open-generic
+    /// registration can only bind one. Resolve with
+    /// <c>[FromKeyedServices("TableName")] IPolymorphicStorage&lt;TBase&gt;</c>. A key attribute needs
+    /// a compile-time constant, so a table name only known at runtime must be resolved imperatively
+    /// with <c>IServiceProvider.GetRequiredKeyedService&lt;IPolymorphicStorage&lt;TBase&gt;&gt;(name)</c>.
+    /// <para>
+    /// <b>One token namespace for the whole process.</b> Unless <paramref name="configure"/> is
+    /// supplied, every polymorphic store resolves the single registered
+    /// <see cref="UnifiedTableStorageOptions"/> and therefore shares ONE
+    /// <see cref="ITypeDiscriminator"/> — tokens are global, not per-table. So
+    /// <c>new TypeDiscriminatorMap().MapAssignableTo&lt;IEvent&gt;(asm).MapAssignableTo&lt;ICommand&gt;(asm)</c>
+    /// throws at startup on any simple name the two hierarchies share, and two different tables
+    /// cannot each map their own <c>Created</c>. Give the colliding types explicit tokens, pass a
+    /// naming function, or hand one table its own options through <paramref name="configure"/>.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="TBase">The common base type the table's rows materialize as.</typeparam>
+    /// <param name="services">The service collection.</param>
+    /// <param name="tableName">The table this store owns; also the DI key.</param>
+    /// <param name="configure">
+    /// Options for this table only — chiefly its <see cref="ITypeDiscriminator"/>. Null resolves the
+    /// registered <see cref="UnifiedTableStorageOptions"/>, or the defaults when none is registered.
+    /// </param>
+    /// <returns>The service collection, for chaining.</returns>
+    public static IServiceCollection AddUnifiedPolymorphicTable<TBase>(
+        this IServiceCollection services,
+        string tableName,
+        Action<UnifiedTableStorageOptions>? configure = null)
+        where TBase : class
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
+
+        // A per-table options instance rather than a registration: the discriminator is the only
+        // setting a polymorphic store reads, and one table's type map has no business becoming the
+        // process-wide default that every IStorage<T> also resolves.
+        UnifiedTableStorageOptions? local = null;
+        if (configure is not null)
+        {
+            local = new UnifiedTableStorageOptions();
+            configure(local);
+        }
+
+        services.TryAddKeyedSingleton<IPolymorphicStorage<TBase>>(tableName, (sp, _) =>
+            new PolymorphicTableStorage<TBase>(
+                sp.GetRequiredService<TableServiceClient>(),
+                tableName,
+                sp.GetRequiredService<ILogger<PolymorphicTableStorage<TBase>>>(),
+                local ?? sp.GetService<UnifiedTableStorageOptions>()));
+
+        return services;
     }
 }
