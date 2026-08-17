@@ -47,11 +47,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     // simple name for back-compat — changing that would rename the table and need a data migration.)
     private readonly string cacheKeyPrefix = typeof(T).FullName ?? typeof(T).Name;
 
-    // Coalesced lazy CreateIfNotExists: no network I/O at construction/DI-resolve time, one create
-    // per store shared by all callers, and a FAILED attempt is forgotten so the next call retries
-    // instead of poisoning the store for the process lifetime.
-    private Task? tableInit;
-    private readonly object initLock = new();
+    private readonly TableInitializer tableInitializer;
 
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger)
@@ -87,6 +83,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         idNormalization = opts.IdNormalization;
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
         client = serviceClient.GetTableClient(ResolveTableName(opts));
+        tableInitializer = new TableInitializer(client);
     }
 
 
@@ -108,42 +105,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     /// </summary>
     public Task EnsureCreatedAsync(CancellationToken ct = default) => EnsureTableAsync(ct);
 
-    private Task EnsureTableAsync(CancellationToken ct)
-    {
-        var existing = Volatile.Read(ref tableInit);
-        return existing is { IsCompletedSuccessfully: true } ? Task.CompletedTask : EnsureTableSlowAsync(ct);
-    }
-
-    private async Task EnsureTableSlowAsync(CancellationToken ct)
-    {
-        Task pending;
-        lock (initLock)
-        {
-            // Reuse an in-flight or succeeded attempt; start fresh after a failed/canceled one.
-            pending = tableInit is { IsFaulted: false, IsCanceled: false }
-                ? tableInit
-                // The shared operation deliberately ignores the first caller's token — a canceled
-                // caller must not cancel (and thereby poison) everyone else's init.
-                : tableInit = client.CreateIfNotExistsAsync(cancellationToken: CancellationToken.None);
-        }
-
-        try
-        {
-            await pending.WaitAsync(ct);
-        }
-        catch
-        {
-            if (pending.IsFaulted || pending.IsCanceled)
-            {
-                lock (initLock)
-                {
-                    if (ReferenceEquals(tableInit, pending))
-                        tableInit = null;
-                }
-            }
-            throw;
-        }
-    }
+    private Task EnsureTableAsync(CancellationToken ct) => tableInitializer.EnsureAsync(ct);
 
     /// <inheritdoc />
     public async Task<T> CreateAsync(T entity, CancellationToken ct = default)
@@ -577,30 +539,6 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     }
 
 
-    /// <summary>
-    /// Serialized size of one row, for transaction planning. Binary and string columns dominate;
-    /// the fixed per-property and per-entity overhead is approximated rather than computed exactly,
-    /// because the budget already sits well under the service limit to absorb it.
-    /// </summary>
-    private static long EstimateSize(TableEntity row)
-    {
-        // Azure's own accounting: ~88 B of entity overhead plus 8 B per property, before values.
-        var bytes = 88L + (row.Count * 8L);
-        foreach (var key in row.Keys)
-        {
-            bytes += key.Length * 2L;
-            bytes += row[key] switch
-            {
-                byte[] binary => binary.Length,
-                BinaryData binary => binary.ToMemory().Length,
-                string text => text.Length * 2L,
-                _ => 8L,
-            };
-        }
-
-        return bytes;
-    }
-
     private async Task<int> WriteBatchAsync(
         IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
@@ -641,7 +579,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
                 // have already committed. BatchPlanner caps on both axes and refuses an
                 // unsendable entity up front. See BatchPlanner for the measured budget.
                 var groupRows = group.ToArray();
-                var plan = BatchPlanner.Plan([.. groupRows.Select(r => EstimateSize(r.Row))]);
+                var plan = BatchPlanner.Plan([.. groupRows.Select(r => TableRowSize.Estimate(r.Row))]);
                 foreach (var range in plan)
                 {
                     var chunk = new (string Partition, string Id, TableEntity Row)[range.Count];
