@@ -68,4 +68,18 @@ public sealed class UnifiedTableStorageOptions
 
     internal CachePolicy ResolveCachePolicy(Type entityType) =>
         overrides.TryGetValue(entityType, out var policy) ? policy : Cache;
+
+    /// <summary>
+    /// How <see cref="IPolymorphicStorage{TBase}"/> maps types to the stored discriminator. Null
+    /// selects <see cref="AssemblyQualifiedTypeDiscriminator"/>, which writes exactly what
+    /// <c>persistType: true</c> has always written — so an existing table is readable with no
+    /// migration. Prefer a <see cref="TypeDiscriminatorMap"/> for new tables; see
+    /// <see cref="ITypeDiscriminator"/> for why.
+    /// </summary>
+    public ITypeDiscriminator? TypeDiscriminator { get; set; }
+
+    // Null means "the legacy-compatible default", not "no discriminator" — a polymorphic store
+    // without one could not read or write a type at all.
+    internal ITypeDiscriminator ResolveTypeDiscriminator() =>
+        TypeDiscriminator ?? AssemblyQualifiedTypeDiscriminator.Instance;
 }
