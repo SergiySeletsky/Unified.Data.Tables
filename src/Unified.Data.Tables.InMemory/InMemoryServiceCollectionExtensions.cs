@@ -41,20 +41,53 @@ public static class InMemoryServiceCollectionExtensions
     /// drop-in replacement for <c>AddUnifiedPolymorphicTable</c>. The key is still the table name so
     /// a host swaps the registration line and nothing at the injection sites changes.
     /// </summary>
+    /// <remarks>
+    /// Pass <paramref name="configure"/> whenever production configures an
+    /// <see cref="UnifiedTableStorageOptions.TypeDiscriminator"/>. Without it the fake resolves the
+    /// registered <see cref="UnifiedTableStorageOptions"/>, and a test host that registers ONLY this
+    /// (no <see cref="AddUnifiedInMemoryStorage"/>) has none — so it silently falls back to
+    /// <c>AssemblyQualifiedTypeDiscriminator</c> while production uses a
+    /// <c>TypeDiscriminatorMap</c>. Nothing fails; the tokens simply differ, in the one place no
+    /// assertion looks.
+    /// </remarks>
     /// <typeparam name="TBase">The common base type the table's rows materialize as.</typeparam>
     /// <param name="services">The service collection.</param>
     /// <param name="tableName">The logical table name; also the DI key.</param>
+    /// <param name="configure">
+    /// Options for this table only. Null resolves the registered
+    /// <see cref="UnifiedTableStorageOptions"/>, or the defaults when none is registered.
+    /// </param>
     /// <returns>The service collection, for chaining.</returns>
     public static IServiceCollection AddUnifiedInMemoryPolymorphicTable<TBase>(
-        this IServiceCollection services, string tableName)
+        this IServiceCollection services,
+        string tableName,
+        Action<UnifiedTableStorageOptions>? configure = null)
         where TBase : class
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
 
+        var local = Configured(configure);
+
+        // The table name reaches the store, not just the DI key: it is what DuplicateKeyException
+        // names, and the fake must name the same string the Azure store would.
         services.TryAddKeyedSingleton<IPolymorphicStorage<TBase>>(tableName, (sp, _) =>
-            new InMemoryPolymorphicStorage<TBase>(sp.GetService<UnifiedTableStorageOptions>()));
+            new InMemoryPolymorphicStorage<TBase>(
+                tableName, local ?? sp.GetService<UnifiedTableStorageOptions>()));
 
         return services;
+    }
+
+    // A per-table options instance rather than a registration: the discriminator is the only setting
+    // a polymorphic store reads, and one table's type map has no business becoming the process-wide
+    // default that every IStorage<T> also resolves.
+    private static UnifiedTableStorageOptions? Configured(Action<UnifiedTableStorageOptions>? configure)
+    {
+        if (configure is null)
+            return null;
+
+        var options = new UnifiedTableStorageOptions();
+        configure(options);
+        return options;
     }
 }

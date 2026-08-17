@@ -20,7 +20,11 @@ existing behaviour untouched.
   duplicate key throws `DuplicateKeyException`), upsert, heterogeneous transactional batch, blind
   sentinel-column merge, key/partition/table reads, streaming reads, delete and count. The store
   **owns its table**: there is no server-side type filter, so every enumerating operation sees every
-  row in scope.
+  row in scope. `InsertBatchAsync` is strict the same way: a key that already exists (Azure 409) and
+  a key repeated *within one batch* (Azure 400 `InvalidDuplicateRow`) both throw
+  `DuplicateKeyException`, on both implementations. Merging a row that does not exist raises
+  `Azure.RequestFailedException` with `Status == 404` — from the fake too, which is why that one
+  provider type is documented on the contract.
 - **`TableKey`** — an explicit `(PartitionKey, RowKey)` pair, used **verbatim**. `IStorage<T>` derives
   keys from `Entity.Id`; a polymorphic table orders rows by things the object does not carry — an
   aggregate version, an inverted tick count, an ambient transaction id, a literal marker key — so the
@@ -51,29 +55,76 @@ existing behaviour untouched.
   back strictly (`Column<T>`, throws when absent) or tolerantly (`TryColumn<T>`), and patched with
   `MergeColumnsAsync` — a blind, unconditional server-side merge with no prior read and no
   `_TypeName` in the payload. This is the "mark as published / committed" primitive.
-- **`AddUnifiedPolymorphicTable<TBase>(tableName)`** and its in-memory mirror
-  `AddUnifiedInMemoryPolymorphicTable<TBase>(tableName)`, registering each store **keyed by table
-  name**. Keyed rather than open-generic because one base type routinely addresses several tables, and
-  an open-generic registration can only bind one. Resolve with
-  `[FromKeyedServices("StateEventStore")] IPolymorphicStorage<IEvent>`.
+- **`AddUnifiedPolymorphicTable<TBase>(tableName, configure?)`** and its in-memory mirror
+  `AddUnifiedInMemoryPolymorphicTable<TBase>(tableName, configure?)`, registering each store **keyed
+  by table name**. Keyed rather than open-generic because one base type routinely addresses several
+  tables, and an open-generic registration can only bind one. Resolve with
+  `[FromKeyedServices("StateEventStore")] IPolymorphicStorage<IEvent>` — or, for a table name only
+  known at runtime, `IServiceProvider.GetRequiredKeyedService<IPolymorphicStorage<IEvent>>(name)`,
+  since an attribute argument must be a compile-time constant.
+
+  The optional `configure` matters most in tests. Without it a store resolves the registered
+  `UnifiedTableStorageOptions`, and a test host that registers *only*
+  `AddUnifiedInMemoryPolymorphicTable` has none — so it would silently fall back to
+  `AssemblyQualifiedTypeDiscriminator` while production used a `TypeDiscriminatorMap`, producing
+  different tokens in the one place no assertion looks. Options passed this way apply to that table
+  only and are never registered, so one table's type map cannot become the process-wide default.
+  Note that stores which *do* share the registered options share **one `ITypeDiscriminator`, and so
+  one global token namespace**: `MapAssignableTo<IEvent>(asm).MapAssignableTo<ICommand>(asm)` throws
+  at startup on any simple name the two hierarchies share.
 
 ### Fixed
 
 - **A system column is no longer written into a property that happens to share its name.** Column
   parsing strips the leading `_` (`_TypeName` splits to path `["TypeName"]`), so a type declaring a
   `TypeName` property silently received an assembly-qualified name as its value; the same held for
-  any `_`-prefixed sentinel. A leading `_` now marks a **system column** on every read path: never
-  produced from a property, never fed to a property setter. This codifies existing reality rather
-  than inventing a rule — a property literally named `_Foo` already wrote to column `_Foo` and read
-  back into property `Foo`. Nothing this library has ever written produces a `_`-prefixed column
-  other than `_TypeName`, so no row it authored changes meaning; a **hand-authored** `_X` column that
-  relied on landing in property `X` no longer will.
+  any `_`-prefixed sentinel. A leading `_` now marks a **system column** on the read path: it is
+  never fed to a property setter.
+
+  **The rule is enforced on read only, and the write path is deliberately unchanged.** `Flatten`
+  names columns after `PropertyInfo.Name` verbatim, so a public settable property literally called
+  `_Foo` has always written — and still writes — a column called `_Foo`. What changes is the return
+  trip. Concretely: a type declaring **both** `_Legacy` and `Legacy` round-tripped `_Legacy`'s cell
+  into the `Legacy` property in ≤0.7.0; 0.8.0 skips that cell and `Legacy` keeps its default. A type
+  declaring `_Foo` with no matching `Foo` loses nothing, because that cell was already landing in a
+  property that does not exist. A **hand-authored** `_X` column that relied on being read into
+  property `X` no longer will. Keep `_` out of your property names; `SystemColumnNames` documents why
+  tightening the write path to match would be a larger break than the bug it tidies up after.
 
 ### Changed
 
 - `TableStorage<T>`'s row-size estimation and its coalesced lazy table creation moved to internal
   helpers (`TableRowSize`, `TableInitializer`) shared with the polymorphic store, so both measure and
   initialise identically instead of drifting. No public surface, no semantics, no test changes.
+
+### Changed — `TableEntitySerializer` row shape and diagnostics
+
+Making a root object reconstructible by the polymorphic read path changed how the serializer treats a
+**true root** (the object handed to `ToTableEntity`, not a nested property). Three behaviours differ
+from 0.7.0 for the same input:
+
+- **A root with no usable public parameterless constructor now flattens to real columns** instead of
+  becoming one `__Json` cell. That covers a positional record, a constructor-injected type, and a type
+  whose constructor carries `[JsonConstructor]`. **0.8.0 therefore writes a different row shape than
+  0.7.0 for the same object** — the columns are the object's properties, not a single blob. Rows
+  already written in the old shape are not migrated; see the third bullet for what reading one does.
+- **A root that is itself a collection now throws** `InvalidOperationException("Cannot flatten object
+  of type …")` where 0.7.0 wrote a `__Json` cell. A collection has no properties to flatten into, and
+  the alternative was a raw `TargetParameterCountException` leaking out of `List<T>`'s indexer.
+- **A column that is *exactly* a bare format suffix** — `__Json`, `__GZip` or `__Truncated`, with no
+  property name in front of it — **now throws `SerializationException` on read** instead of being
+  silently skipped. That column shape can only exist on a row an earlier version wrote under the
+  first two bullets, and the skip (an accident of the bare suffix starting with `_`) handed back an
+  empty, data-free object. Re-write such rows with the current serializer.
+
+**Who this reaches.** All three are on the standalone public `TableEntitySerializer` API —
+`ToTableEntity` / `FromTableEntity` called directly on an arbitrary object. `IStorage<T>` cannot
+reach the first or the third at all: `where T : class, IEntity, new()` excludes a root with no
+parameterless constructor, and a bare-suffix column can only come from a row written from one. The
+single theoretical exception is an entity type that itself derives from a collection
+(`class Basket : List<Item>, IEntity`) — legal under the constraint, and now a hard failure. It never
+round-tripped either: 0.7.0 stored it as one `__Json` cell that read back as an empty object, so the
+change converts silent data loss into a diagnosis.
 
 ### Known limitations
 
@@ -89,6 +140,19 @@ filter translator only admits persisted columns, and a type filter would have to
 mutable system columns. And note that batches are planned on payload bytes as well as entity count,
 so a set that a count-only chunker sends as one transaction may split into two; batches remain atomic
 per chunk only.
+
+**One unreadable row fails the whole read.** There is no skip-and-report policy. If any row in scope
+carries a discriminator that cannot be resolved, or one naming a type not assignable to `TBase`,
+materialization throws: `QueryAsync` gives the caller nothing at all — including the rows that were
+fine — and `QueryStreamAsync` throws mid-enumeration, after having yielded everything ahead of the
+bad row. (`CountAsync` and `DeletePartitionAsync` project keys only and never materialize, so they
+are unaffected.) That is the deliberate choice for now — absent and broken must not look alike, and
+silently dropping rows from a fact table is worse than failing — but one bad row can take a partition
+offline until it is fixed or deleted. A per-row skip-and-report callback is under consideration.
+
+**Write responses report no `Timestamp`.** `InsertAsync`/`UpsertAsync` return an entry whose `ETag`
+is the version the service reported and whose `Timestamp` is null — a write response carries no
+service last-write time. Read the row back if you need it. The in-memory fake matches.
 
 ### Note on `RowKeys.InvertedTicks`
 

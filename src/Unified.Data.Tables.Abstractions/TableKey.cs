@@ -45,6 +45,14 @@ public readonly record struct TableKey(string PartitionKey, string RowKey)
             ? PartitionKey
             : EntityId.Combine(PartitionKey, RowKey);
 
-    /// <inheritdoc />
-    public override string ToString() => ToId();
+    /// <summary>
+    /// The composite id, or <c>"(default)"</c> for an uninitialized key. A record struct's default
+    /// value has null keys, and <see cref="ToId"/> would hand that straight back — a null
+    /// <see cref="object.ToString"/> breaks the contract and NREs any caller interpolating a key
+    /// into a message (which is exactly what <c>PolymorphicMessages</c> and
+    /// <see cref="DuplicateKeyException"/> do).
+    /// </summary>
+    /// <returns>The composite id, or <c>"(default)"</c>.</returns>
+    public override string ToString() =>
+        PartitionKey is null && RowKey is null ? "(default)" : ToId();
 }

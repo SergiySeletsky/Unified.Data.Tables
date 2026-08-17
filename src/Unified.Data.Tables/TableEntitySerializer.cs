@@ -66,6 +66,15 @@ public static class TableEntitySerializer
     }
 
     /// <summary>Late-bound deserialize; requires the row to have been written with <c>persistType: true</c>.</summary>
+    /// <remarks>
+    /// This overload performs <b>no base-type check</b>: it resolves whatever assembly-qualified name
+    /// the row's <c>_TypeName</c> cell holds and materializes it, so the stored bytes choose the type
+    /// to construct. Prefer
+    /// <see cref="FromTableEntity{TBase}(TableEntity, ITypeDiscriminator)"/>, which resolves through
+    /// an <see cref="ITypeDiscriminator"/> and enforces assignability to <c>TBase</c> — a gate no
+    /// configuration can disable — or <see cref="TryFromTableEntity{TBase}"/> when the row may be a
+    /// typeless marker. Kept as-is for rows and call sites that predate the discriminator seam.
+    /// </remarks>
     public static object FromTableEntity(this TableEntity entity)
     {
         ArgumentNullException.ThrowIfNull(entity);

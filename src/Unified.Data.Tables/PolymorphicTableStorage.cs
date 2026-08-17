@@ -71,15 +71,17 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
         var row = ToRow(write);
         await initializer.EnsureAsync(ct);
 
+        Response response;
         try
         {
-            await client.AddEntityAsync(row, ct);
+            response = await client.AddEntityAsync(row, ct);
         }
         catch (RequestFailedException ex) when (ex.Status == 409)
         {
             throw new DuplicateKeyException(tableName, write.Key.ToId(), ex);
         }
 
+        row.ETag = ETagOf(response, row);
         return ToEntry(row);
     }
 
@@ -90,7 +92,8 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
         ArgumentNullException.ThrowIfNull(write);
         var row = ToRow(write);
         await initializer.EnsureAsync(ct);
-        await client.UpsertEntityAsync(row, TableUpdateMode.Replace, ct);
+        var response = await client.UpsertEntityAsync(row, TableUpdateMode.Replace, ct);
+        row.ETag = ETagOf(response, row);
         return ToEntry(row);
     }
 
@@ -125,7 +128,29 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
                 for (var i = range.Start; i < range.Start + range.Count; i++)
                     actions.Add(new TableTransactionAction(TableTransactionActionType.Add, groupRows[i]));
 
-                await client.SubmitTransactionAsync(actions, ct);
+                try
+                {
+                    await client.SubmitTransactionAsync(actions, ct);
+                }
+                catch (TableTransactionFailedException ex)
+                    when (ex.Status == 409 || string.Equals(ex.ErrorCode, "InvalidDuplicateRow", StringComparison.Ordinal))
+                {
+                    // 409 = a row already exists in the table; 400 InvalidDuplicateRow = the same key
+                    // twice WITHIN this transaction. Both are duplicate keys, both are what a single
+                    // InsertAsync surfaces as DuplicateKeyException, and the in-memory fake raises
+                    // DuplicateKeyException for both — leaving the raw transaction exception here
+                    // would make a green test against the fake say nothing about Azure. Ported
+                    // verbatim from TableStorage<T>.WriteBatchAsync, including the "{partition}|?"
+                    // fallback for a service response that names no failing action.
+                    var duplicate = ex.FailedTransactionActionIndex is int i && i >= 0 && i < range.Count
+                        ? new TableKey(
+                            groupRows[range.Start + i].PartitionKey,
+                            groupRows[range.Start + i].RowKey).ToId()
+                        : new TableKey(group.Key, "?").ToId();
+
+                    throw new DuplicateKeyException(tableName, duplicate, ex);
+                }
+
                 written += actions.Count;
             }
         }
@@ -298,6 +323,27 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
         }
 
         return row;
+    }
+
+    // The written row's version comes from the RESPONSE headers, not from the entity we handed the
+    // SDK: AddEntityAsync/UpsertEntityAsync do not mutate it, so ToEntry on the locally-built row
+    // returned PolymorphicEntry.ETag == null on every Azure write while the in-memory fake returned a
+    // real one. Copied from TableStorage<T>.CreateAsync, including the try/catch — a substitute
+    // Response whose Headers struct has no backing store throws on the property read.
+    private static ETag ETagOf(Response? response, TableEntity row)
+    {
+        ETag? fromHeaders = null;
+        try
+        {
+            fromHeaders = response?.Headers.ETag;
+        }
+        catch
+        {
+            // Test doubles may return a Response whose Headers struct has no backing store; fall
+            // through to the entity's own ETag.
+        }
+
+        return fromHeaders ?? row.ETag;
     }
 
     private PolymorphicEntry<TBase> ToEntry(TableEntity row)

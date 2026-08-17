@@ -53,6 +53,14 @@ public class TableKeyTests
     }
 
     [Fact]
+    public void ToString_DefaultValue_IsNotNull()
+    {
+        // default(TableKey) has null keys, so ToId() handed back null — a null ToString() breaks the
+        // object contract and NREs every message that interpolates a key.
+        Assert.Equal("(default)", default(TableKey).ToString());
+    }
+
+    [Fact]
     public void Equality_IsByValue()
     {
         Assert.Equal(new TableKey("a", "b"), new TableKey("a", "b"));

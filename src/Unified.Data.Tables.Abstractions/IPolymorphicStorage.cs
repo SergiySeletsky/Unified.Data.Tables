@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace Unified.Data.Tables;
 
 /// <summary>
@@ -39,6 +41,13 @@ public interface IPolymorphicStorage<TBase>
     /// <see cref="DuplicateKeyException"/>, because a polymorphic table is normally an append-only
     /// log whose de-duplication guarantee IS the insert.
     /// </summary>
+    /// <remarks>
+    /// The returned entry carries the <see cref="PolymorphicEntry{TBase}.ETag"/> the backend reported
+    /// for the write, but its <see cref="PolymorphicEntry{TBase}.Timestamp"/> is <b>null</b>: a write
+    /// response does not include the service's last-write time, so it is unknown until the row is
+    /// read back. Same doctrine as <see cref="IEntity.Timestamp"/> after <see cref="IStorage{T}"/>'s
+    /// <c>CreateAsync</c>.
+    /// </remarks>
     /// <param name="write">The row to write.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The written row, read back as an entry.</returns>
@@ -46,6 +55,10 @@ public interface IPolymorphicStorage<TBase>
     Task<PolymorphicEntry<TBase>> InsertAsync(PolymorphicWrite<TBase> write, CancellationToken ct = default);
 
     /// <summary>Insert-or-replace one row, unconditionally.</summary>
+    /// <remarks>
+    /// As with <see cref="InsertAsync"/>, the returned entry's
+    /// <see cref="PolymorphicEntry{TBase}.Timestamp"/> is null — a write does not report one.
+    /// </remarks>
     /// <param name="write">The row to write.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The written row, read back as an entry.</returns>
@@ -57,10 +70,21 @@ public interface IPolymorphicStorage<TBase>
     /// <see cref="BatchPlanner"/> on both entity count and payload bytes, so a batch is atomic
     /// <em>per chunk</em> only.
     /// </summary>
+    /// <remarks>
+    /// Strict, exactly like <see cref="InsertAsync"/>: a key that already exists in the table AND a
+    /// key repeated twice <em>within one batch</em> both throw <see cref="DuplicateKeyException"/>.
+    /// Azure reports the two differently (409 versus 400 <c>InvalidDuplicateRow</c>); both are
+    /// mapped, so the in-memory fake and the Azure store fail the same way rather than one storing a
+    /// single row and reporting two.
+    /// </remarks>
     /// <param name="writes">The rows to write.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>How many rows were written.</returns>
     /// <exception cref="BatchPayloadTooLargeException">One row is too large to batch at any size.</exception>
+    /// <exception cref="DuplicateKeyException">
+    /// A key already exists in the table, or the same key appears twice within
+    /// <paramref name="writes"/>.
+    /// </exception>
     Task<int> InsertBatchAsync(IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default);
 
     /// <summary>
@@ -71,12 +95,32 @@ public interface IPolymorphicStorage<TBase>
     /// Every column name must satisfy <see cref="SystemColumnNames.IsSystemColumn"/>, and
     /// <see cref="SystemColumnNames.TypeName"/> is rejected: re-typing a row would strand the
     /// previous type's data columns on it.
+    /// <para>
+    /// <b>Merging a row that does not exist throws <c>Azure.RequestFailedException</c> with
+    /// <c>Status == 404</c></b> — on the in-memory implementation too, which raises the same type so
+    /// a test written against the fake still describes production. This is the one place a provider
+    /// type surfaces through an otherwise provider-agnostic contract: there is no read to turn the
+    /// miss into a null, and inventing a provider-neutral exception here would make the two
+    /// implementations disagree with every other 404 in the library. Documented rather than wrapped;
+    /// catching it means referencing <c>Azure.Core</c>.
+    /// </para>
     /// </remarks>
     /// <param name="key">The row to patch.</param>
     /// <param name="columns">The system columns to set.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A task that completes when the merge is applied.</returns>
     /// <exception cref="ArgumentException">A column name is not a system column, or is the discriminator.</exception>
+    /// <exception cref="T:Azure.RequestFailedException">
+    /// No row exists at <paramref name="key"/> (<c>Status == 404</c>). Referenced by documentation ID
+    /// because this assembly deliberately takes no Azure dependency.
+    /// </exception>
+    // The "T:" prefix is the only way to put an <exception> element on the XML docs for a type this
+    // assembly cannot reference: an ordinary cref would be CS1574. CA1200 exists to catch a prefix
+    // used by accident, where the compiler would otherwise have validated the target — here there is
+    // deliberately nothing to validate against, and the alternative (dropping the tag) would hide the
+    // one provider exception that escapes this contract from every IntelliSense exception list.
+    [SuppressMessage("Documentation", "CA1200:Avoid using cref tags with a prefix",
+        Justification = "Azure.RequestFailedException is not referenceable from this dependency-free assembly.")]
     Task MergeColumnsAsync(TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default);
 
     /// <summary>Read one row, or null when it does not exist.</summary>

@@ -12,9 +12,12 @@ namespace Unified.Data.Tables.InMemory;
 /// </summary>
 /// <remarks>
 /// Semantics mirror <see cref="PolymorphicTableStorage{TBase}"/>: keys used verbatim and
-/// case-sensitively, 409 on duplicate insert surfaced as <see cref="DuplicateKeyException"/>, 404 on
-/// merging a missing row, idempotent delete, lexical (PartitionKey, RowKey) ordering, and
-/// byte-identical validation messages via <c>PolymorphicMessages</c>.
+/// case-sensitively, 409 on duplicate insert AND 400 <c>InvalidDuplicateRow</c> on a key repeated
+/// within one batch both surfaced as <see cref="DuplicateKeyException"/>, 404 on merging a missing
+/// row, idempotent delete, lexical (PartitionKey, RowKey) ordering, a null
+/// <see cref="PolymorphicEntry{TBase}.Timestamp"/> on the write paths, cancellation observed on every
+/// operation, and byte-identical validation and duplicate-key messages (which is why the store needs
+/// a table name).
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
 public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBase>
@@ -25,22 +28,47 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     private readonly Dictionary<(string PartitionKey, string RowKey), StoredRow> rows = [];
     private readonly object gate = new();
     private readonly ITypeDiscriminator discriminator;
+    private readonly string tableName;
     private long versionCounter;
 
-    /// <summary>Creates a store with the default options.</summary>
+    /// <summary>Creates a store with the default options and a <typeparamref name="TBase"/>-derived name.</summary>
     public InMemoryPolymorphicStorage()
-        : this(null)
+        : this(typeof(TBase).Name, null)
     {
     }
 
-    /// <summary>Creates a store with explicit options.</summary>
+    /// <summary>Creates a store with explicit options and a <typeparamref name="TBase"/>-derived name.</summary>
     /// <param name="options">Options; null selects the defaults.</param>
-    public InMemoryPolymorphicStorage(UnifiedTableStorageOptions? options) =>
+    public InMemoryPolymorphicStorage(UnifiedTableStorageOptions? options)
+        : this(typeof(TBase).Name, options)
+    {
+    }
+
+    /// <summary>Creates a store over one named table.</summary>
+    /// <remarks>
+    /// The name is not used to route anything — this store holds one dictionary — but it IS what
+    /// <see cref="DuplicateKeyException.EntityType"/> and the duplicate-key message report, and
+    /// <see cref="PolymorphicTableStorage{TBase}"/> reports its table name there. Without it the two
+    /// could never agree: a polymorphic table name is always explicit and
+    /// <typeparamref name="TBase"/> is always a base type, so <c>typeof(TBase).Name</c> is guaranteed
+    /// to be the wrong string. The two nameless overloads fall back to it for tests that never
+    /// compare the message.
+    /// </remarks>
+    /// <param name="tableName">The table this store stands in for; also what its errors name.</param>
+    /// <param name="options">Options; null selects the defaults.</param>
+    /// <exception cref="ArgumentException"><paramref name="tableName"/> is null, empty or whitespace.</exception>
+    public InMemoryPolymorphicStorage(string tableName, UnifiedTableStorageOptions? options = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
+
+        this.tableName = tableName;
+
         // UnifiedTableStorageOptions.ResolveTypeDiscriminator() is internal to Unified.Data.Tables,
         // which does not (and per the design must not) grant this project InternalsVisibleTo — so
         // the null-coalescing default is duplicated here against the public TypeDiscriminator
         // property instead of calling the internal helper.
         discriminator = options?.TypeDiscriminator ?? AssemblyQualifiedTypeDiscriminator.Instance;
+    }
 
     /// <summary>How many rows the store holds. For assertions.</summary>
     public int Count
@@ -73,19 +101,19 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         Guard.NotNull(write, nameof(write));
         var row = ToRow(write);
 
+        // The Azure store observes the token on its lazy table-create, AFTER argument validation and
+        // row building — so a buffered fake that never looked at it would let a cancelled operation
+        // succeed here and fail in production.
+        ct.ThrowIfCancellationRequested();
+
         lock (gate)
         {
             var key = (write.Key.PartitionKey, write.Key.RowKey);
             if (rows.ContainsKey(key))
-            {
-                throw new DuplicateKeyException(
-                    typeof(TBase).Name,
-                    write.Key.ToId(),
-                    new RequestFailedException(409, "The specified entity already exists."));
-            }
+                throw Duplicate(write.Key);
 
             rows[key] = Store(row);
-            return Task.FromResult(ToEntry(rows[key]));
+            return Task.FromResult(ToEntry(rows[key], timestampKnown: false));
         }
     }
 
@@ -95,12 +123,13 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     {
         Guard.NotNull(write, nameof(write));
         var row = ToRow(write);
+        ct.ThrowIfCancellationRequested();
 
         lock (gate)
         {
             var key = (write.Key.PartitionKey, write.Key.RowKey);
             rows[key] = Store(row);
-            return Task.FromResult(ToEntry(rows[key]));
+            return Task.FromResult(ToEntry(rows[key], timestampKnown: false));
         }
     }
 
@@ -113,19 +142,37 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
             return Task.FromResult(0);
 
         // Build every row before taking the lock, so validation failures cost nothing.
-        var built = writes.Select(w => (w.Key, Row: ToRow(w))).ToList();
+        var built = new List<(TableKey Key, TableEntity Row)>(writes.Count);
+        var withinBatch = new HashSet<(string, string)>();
+        foreach (var write in writes)
+        {
+            var row = ToRow(write);
+
+            // The same key TWICE in one batch. Azure rejects the whole transaction with 400
+            // InvalidDuplicateRow; without this check the dictionary would quietly collapse the pair
+            // into one row and report the full count, so the fake would return 2 for a batch Azure
+            // stores none of. Checked before the existing-row scan because it needs no lock.
+            if (!withinBatch.Add((write.Key.PartitionKey, write.Key.RowKey)))
+            {
+                throw new DuplicateKeyException(
+                    tableName,
+                    write.Key.ToId(),
+                    new RequestFailedException(
+                        400,
+                        $"InvalidDuplicateRow: duplicate key within the batch. Id: {write.Key.ToId()}"));
+            }
+
+            built.Add((write.Key, row));
+        }
+
+        ct.ThrowIfCancellationRequested();
 
         lock (gate)
         {
             foreach (var (key, _) in built)
             {
                 if (rows.ContainsKey((key.PartitionKey, key.RowKey)))
-                {
-                    throw new DuplicateKeyException(
-                        typeof(TBase).Name,
-                        key.ToId(),
-                        new RequestFailedException(409, "The specified entity already exists."));
-                }
+                    throw Duplicate(key);
             }
 
             foreach (var (key, row) in built)
@@ -151,6 +198,8 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         foreach (var column in columns)
             ValidateSystemColumn(column.Key);
 
+        ct.ThrowIfCancellationRequested();
+
         lock (gate)
         {
             if (!rows.TryGetValue((key.PartitionKey, key.RowKey), out var existing))
@@ -171,6 +220,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     public Task<PolymorphicEntry<TBase>?> GetAsync(TableKey key, CancellationToken ct = default)
     {
         ValidateKey(key);
+        ct.ThrowIfCancellationRequested();
 
         lock (gate)
         {
@@ -181,8 +231,16 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
 
     /// <inheritdoc />
     public Task<IReadOnlyList<PolymorphicEntry<TBase>>> QueryAsync(
-        string? partition = null, int? take = null, CancellationToken ct = default) =>
-        Task.FromResult<IReadOnlyList<PolymorphicEntry<TBase>>>(Snapshot(partition, take));
+        string? partition = null, int? take = null, CancellationToken ct = default)
+    {
+        // take <= 0 short-circuits BEFORE the token is looked at, because PolymorphicTableStorage's
+        // QueryStreamAsync yields break before its first (cancellable) service call on that path.
+        if (take is <= 0)
+            return Task.FromResult<IReadOnlyList<PolymorphicEntry<TBase>>>([]);
+
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<PolymorphicEntry<TBase>>>(Snapshot(partition, take));
+    }
 
     /// <inheritdoc />
     public async IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
@@ -190,6 +248,13 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         int? take = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (take is <= 0)
+            yield break;
+
+        // Azure observes the token on its lazy table-create, before the first row. The per-item check
+        // below never runs for an empty result, so without this an empty read ignores cancellation.
+        ct.ThrowIfCancellationRequested();
+
         foreach (var entry in Snapshot(partition, take))
         {
             ct.ThrowIfCancellationRequested();
@@ -203,6 +268,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     public Task DeleteAsync(TableKey key, CancellationToken ct = default)
     {
         ValidateKey(key);
+        ct.ThrowIfCancellationRequested();
 
         lock (gate)
         {
@@ -215,7 +281,10 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     /// <inheritdoc />
     public Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
     {
-        Guard.NotNull(partition, nameof(partition));
+        // Not Guard.NotNull: PolymorphicTableStorage uses ArgumentException.ThrowIfNullOrEmpty, so an
+        // EMPTY partition threw on Azure and silently deleted nothing here. Same API, same message.
+        ArgumentException.ThrowIfNullOrEmpty(partition);
+        ct.ThrowIfCancellationRequested();
 
         lock (gate)
         {
@@ -233,6 +302,8 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     /// <inheritdoc />
     public Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
+
         lock (gate)
         {
             return Task.FromResult(partition is null
@@ -288,7 +359,18 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         return row;
     }
 
-    private PolymorphicEntry<TBase> ToEntry(StoredRow stored)
+    // Duplicate-key errors name the TABLE, exactly as PolymorphicTableStorage does — the fake used
+    // typeof(TBase).Name, which can never coincide with a real polymorphic table name, so every
+    // DuplicateKeyException.Message and .EntityType diverged between the two implementations.
+    private DuplicateKeyException Duplicate(TableKey key) =>
+        new(tableName,
+            key.ToId(),
+            new RequestFailedException(409, "The specified entity already exists."));
+
+    // timestampKnown: false on the WRITE paths. A write response carries no service timestamp, so
+    // PolymorphicTableStorage returns a null one; a fake that filled it in would green-light a test
+    // asserting on a value Azure never sends.
+    private PolymorphicEntry<TBase> ToEntry(StoredRow stored, bool timestampKnown = true)
     {
         var row = CopyOf(stored.Data);
         row.Timestamp = stored.Timestamp;
@@ -317,7 +399,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
             item,
             storedDiscriminator,
             stored.ETagString(),
-            stored.Timestamp,
+            timestampKnown ? stored.Timestamp : null,
             columns);
     }
 

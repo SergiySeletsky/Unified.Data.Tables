@@ -1,4 +1,6 @@
+using Azure;
 using Azure.Data.Tables;
+using Azure.Data.Tables.Models;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -93,6 +95,91 @@ public class PolymorphicServiceCollectionTests
 
         Assert.IsType<InMemoryPolymorphicStorage<TestMessage>>(stateEvents);
         Assert.NotSame(stateEvents, transactions);
+    }
+
+    [Fact]
+    public async Task AddUnifiedInMemoryPolymorphicTable_Configure_AppliesTheDiscriminator_WithNoOtherRegistration()
+    {
+        // The exact host shape that used to silently default: ONLY the polymorphic fake is
+        // registered, so sp.GetService<UnifiedTableStorageOptions>() returns null and the store fell
+        // back to assembly-qualified tokens while production used a map. Nothing failed; the tokens
+        // just differed, invisibly.
+        var services = new ServiceCollection();
+        services.AddUnifiedInMemoryPolymorphicTable<TestMessage>(
+            "StateEventStore",
+            o => o.TypeDiscriminator = new TypeDiscriminatorMap().Map<TestCreatedEvent>("created"));
+
+        using var provider = services.BuildServiceProvider();
+        var store = provider.GetRequiredKeyedService<IPolymorphicStorage<TestMessage>>("StateEventStore");
+
+        var entry = await store.InsertAsync(
+            new TableKey("p", "r"), new TestCreatedEvent { Id = "e1" }, TestContext.Current.CancellationToken);
+
+        Assert.Equal("created", entry.Discriminator);
+    }
+
+    [Fact]
+    public async Task AddUnifiedInMemoryPolymorphicTable_NamesTheTableInItsDuplicateKeyError()
+    {
+        var services = new ServiceCollection();
+        services.AddUnifiedInMemoryPolymorphicTable<TestMessage>("StateEventStore");
+
+        using var provider = services.BuildServiceProvider();
+        var store = provider.GetRequiredKeyedService<IPolymorphicStorage<TestMessage>>("StateEventStore");
+        await store.InsertAsync(new TableKey("p", "r"), new TestCommand { Id = "c1" },
+            TestContext.Current.CancellationToken);
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => store.InsertAsync(
+            new TableKey("p", "r"), new TestCommand { Id = "c1" }, TestContext.Current.CancellationToken));
+
+        Assert.Equal("StateEventStore", ex.EntityType);
+    }
+
+    [Fact]
+    public async Task AddUnifiedPolymorphicTable_Configure_AppliesThatDiscriminatorToTheStore()
+    {
+        var table = Substitute.For<TableClient>();
+        table.CreateIfNotExistsAsync(Arg.Any<CancellationToken>())
+             .Returns(Task.FromResult<Response<TableItem>>(null!));
+        TableEntity? written = null;
+        table.AddEntityAsync(Arg.Do<TableEntity>(e => written = e), Arg.Any<CancellationToken>())
+             .Returns(Task.FromResult<Response>(new FakeResponse()));
+
+        var service = Substitute.For<TableServiceClient>();
+        service.GetTableClient("StateEventStore").Returns(table);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(service);
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddUnifiedTableStorage();
+        services.AddUnifiedPolymorphicTable<TestMessage>(
+            "StateEventStore",
+            o => o.TypeDiscriminator = new TypeDiscriminatorMap().Map<TestCreatedEvent>("created"));
+
+        using var provider = services.BuildServiceProvider();
+        var store = provider.GetRequiredKeyedService<IPolymorphicStorage<TestMessage>>("StateEventStore");
+
+        await store.InsertAsync(new TableKey("p", "r"), new TestCreatedEvent { Id = "e1" },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal("created", written![SystemColumnNames.TypeName]);
+    }
+
+    [Fact]
+    public void AddUnifiedPolymorphicTable_Configure_DoesNotBecomeTheProcessWideOptions()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(Substitute.For<TableServiceClient>());
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddUnifiedTableStorage();
+        services.AddUnifiedPolymorphicTable<TestMessage>(
+            "StateEventStore",
+            o => o.TypeDiscriminator = new TypeDiscriminatorMap().Map<TestCreatedEvent>("created"));
+
+        using var provider = services.BuildServiceProvider();
+
+        // One table's type map must not silently become the default every IStorage<T> resolves.
+        Assert.Null(provider.GetRequiredService<UnifiedTableStorageOptions>().TypeDiscriminator);
     }
 
     [Theory]

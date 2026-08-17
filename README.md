@@ -490,10 +490,12 @@ Customer     back = row.FromTableEntity<Customer>();
   deserializes into a `DateTimeOffset` (or `DateTime`) property without throwing.
 - Set `persistType: true` to embed the type name and use the late-bound `FromTableEntity()` overload.
 - `TableEntitySerializer.FlattenProperty` is public for alternative `IStorage<T>` implementations.
-- **A leading `_` is reserved.** `_`-prefixed columns belong to the storage layer: they are never
-  produced from a property and never written into one. Before 0.8.0, `_TypeName` was parsed as
-  property path `["TypeName"]`, so a type declaring a `TypeName` property silently received the
-  assembly-qualified name as its value — the same held for any `_`-prefixed sentinel.
+- **A leading `_` is reserved.** `_`-prefixed columns belong to the storage layer and are never
+  written into a property. Before 0.8.0, `_TypeName` was parsed as property path `["TypeName"]`, so a
+  type declaring a `TypeName` property silently received the assembly-qualified name as its value —
+  the same held for any `_`-prefixed sentinel. The rule is enforced on **read** only: flattening still
+  names columns after the property verbatim, so a property called `_Foo` does write a column `_Foo`
+  (which is then skipped on the way back). Keep `_` out of property names.
 - **`persistType: true` writes `_TypeName`** with `Type.AssemblyQualifiedName`. `FromTableEntity<TBase>(discriminator)`
   reads it back constrained to a base type, and `TryFromTableEntity<TBase>` additionally tolerates a
   row that carries no discriminator at all.
@@ -526,10 +528,15 @@ public sealed class StateEventStore(
     public async Task<IReadOnlyList<IEvent>> GetAsync(string aggregateId)
     {
         var entries = await storage.QueryAsync(aggregateId);
-        return [.. entries.Select(e => e.Value)];
+        // Item, not Value: a partition may hold marker rows (see below), and Value throws on one.
+        return [.. entries.Where(e => e.Item is not null).Select(e => e.Item!)];
     }
 }
 ```
+
+`[FromKeyedServices]` takes an attribute argument, so the table name has to be a compile-time
+constant; a name computed at runtime must be resolved imperatively with
+`serviceProvider.GetRequiredKeyedService<IPolymorphicStorage<IEvent>>(tableName)` instead.
 
 **Keys are explicit and verbatim.** `TableKey(PartitionKey, RowKey)` is passed on every operation and
 is never normalized — a polymorphic row key is usually a case-sensitive payload or a zero-padded
@@ -609,6 +616,20 @@ enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `
 `ConcurrencyConflictException` per `ConcurrencyMode`, deletes are idempotent,
 and results arrive in lexical key order — so a green test against the fake means the same code holds
 against Azure Tables.
+
+The polymorphic store has the same mirror, keyed the same way:
+
+```csharp
+services.AddUnifiedInMemoryPolymorphicTable<IEvent>("StateEventStore",
+    o => o.TypeDiscriminator = new TypeDiscriminatorMap().MapAssignableTo<IEvent>(asm));
+```
+
+Pass the **same discriminator configuration production uses**. Without it the fake resolves whatever
+`UnifiedTableStorageOptions` the container happens to hold — and a test host that registers only this
+line holds none, so it would quietly fall back to assembly-qualified tokens while production writes
+short ones. Nothing fails; the tokens simply differ, in the one place no assertion looks. The table
+name is passed through to the store too, not just used as the DI key, so `DuplicateKeyException`
+names the same table the Azure store would.
 
 ---
 

@@ -7,10 +7,14 @@ namespace Unified.Data.Tables;
 /// </summary>
 internal static class PolymorphicMessages
 {
+    // Deliberately says "no usable" rather than "no": an EMPTY or non-string '_TypeName' cell folds
+    // into the same marker branch, and the old wording ("carries system columns only and no
+    // '_TypeName'") was factually false for such a row — it names a column the row visibly has.
+    // Corrupt-versus-absent is still NOT distinguished here; that is a separate, deferred decision.
     internal static string MarkerHasNoValue(TableKey key) =>
-        $"Row '{key}' is a typeless marker row — it carries system columns only and no " +
-        $"'{SystemColumnNames.TypeName}', so it has no object to return. Read Item (which is null " +
-        "for a marker) or the raw Columns instead of Value.";
+        $"Row '{key}' is a typeless marker row — it carries no usable " +
+        $"'{SystemColumnNames.TypeName}' discriminator, so it has no object to return. Read Item " +
+        "(which is null for a marker) or the raw Columns instead of Value.";
 
     internal static string NotAssignable(string discriminator, Type baseType) =>
         $"Stored type '{discriminator}' is not assignable to '{baseType.FullName}'. A polymorphic " +

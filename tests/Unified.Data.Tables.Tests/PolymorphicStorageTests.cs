@@ -73,6 +73,108 @@ public class PolymorphicStorageTests
     }
 
     [Fact]
+    public async Task InsertAsync_ReturnsTheETagTheServiceReported_AndNoTimestamp()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupAdd();
+
+        var entry = await harness.Store.InsertAsync(
+            new TableKey("p", "r"), new TestCommand { Id = "c1" }, TestContext.Current.CancellationToken);
+
+        // The SDK does not mutate the entity we hand it — the version is on the response headers.
+        Assert.Equal("W/\"etag1\"", entry.ETag);
+        // A write response carries no service last-write time; it is only known after a read.
+        Assert.Null(entry.Timestamp);
+    }
+
+    [Fact]
+    public async Task UpsertAsync_ReturnsTheETagTheServiceReported()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupUpsert();
+
+        var entry = await harness.Store.UpsertAsync(
+            new TableKey("p", "r"), new TestCommand { Id = "c1" }, TestContext.Current.CancellationToken);
+
+        Assert.Equal("W/\"etag1\"", entry.ETag);
+        Assert.Null(entry.Timestamp);
+    }
+
+    [Fact]
+    public async Task InsertBatchAsync_ExistingKey409_ThrowsDuplicateKeyException()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.Table.SubmitTransactionAsync(
+                Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns<Response<IReadOnlyList<Response>>>(_ => throw new TableTransactionFailedException(
+                new RequestFailedException(409, "The specified entity already exists.")));
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => harness.Store.InsertBatchAsync(
+            [
+                new PolymorphicWrite<TestMessage>(new TableKey("t1", "001"), new TestCreatedEvent { Id = "e1" }),
+                new PolymorphicWrite<TestMessage>(new TableKey("t1", "002"), new TestCreatedEvent { Id = "e2" }),
+            ],
+            TestContext.Current.CancellationToken));
+
+        Assert.Equal("TestTable", ex.EntityType);
+        Assert.IsType<TableTransactionFailedException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task InsertBatchAsync_WithinBatchDuplicate400_ThrowsDuplicateKeyException()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        // A key repeated INSIDE one transaction is 400 InvalidDuplicateRow, not 409 — it must
+        // translate identically, or a green InMemory test says nothing about production.
+        harness.Table.SubmitTransactionAsync(
+                Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns<Response<IReadOnlyList<Response>>>(_ => throw new TableTransactionFailedException(
+                new RequestFailedException(400, "InvalidDuplicateRow", "InvalidDuplicateRow", null)));
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => harness.Store.InsertBatchAsync(
+            [
+                new PolymorphicWrite<TestMessage>(new TableKey("t1", "same"), new TestCreatedEvent { Id = "e1" }),
+                new PolymorphicWrite<TestMessage>(new TableKey("t1", "same"), new TestCreatedEvent { Id = "e2" }),
+            ],
+            TestContext.Current.CancellationToken));
+
+        // No FailedTransactionActionIndex on this response, so the id falls back to "{partition}|?" —
+        // still enough to say WHERE the duplicate landed. Mirrors TableStorage<T>.
+        Assert.Equal("t1|?", ex.Id);
+        Assert.IsType<TableTransactionFailedException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task InsertBatchAsync_NonDuplicateTransactionFailure_IsNotSwallowed()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.Table.SubmitTransactionAsync(
+                Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns<Response<IReadOnlyList<Response>>>(_ => throw new TableTransactionFailedException(
+                new RequestFailedException(413, "RequestBodyTooLarge", "RequestBodyTooLarge", null)));
+
+        await Assert.ThrowsAsync<TableTransactionFailedException>(() => harness.Store.InsertBatchAsync(
+            [new PolymorphicWrite<TestMessage>(new TableKey("t1", "001"), new TestCreatedEvent { Id = "e1" })],
+            TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task GetAsync_RowWithAnEmptyDiscriminator_ReadsAsAMarker_WithAMessageTrueOfThatRow()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupGet(new TableEntity("t1", "r") { [SystemColumnNames.TypeName] = "" });
+
+        var entry = await harness.Store.GetAsync(
+            new TableKey("t1", "r"), TestContext.Current.CancellationToken);
+
+        Assert.Null(entry!.Item);
+        var ex = Assert.Throws<InvalidOperationException>(() => entry.Value);
+        // The row DOES carry a _TypeName cell — the message must not claim it carries none.
+        Assert.DoesNotContain("system columns only", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no usable", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task InsertAsync_MarkerRow_WritesNoDiscriminator()
     {
         using var harness = new PolymorphicHarness<TestMessage>();

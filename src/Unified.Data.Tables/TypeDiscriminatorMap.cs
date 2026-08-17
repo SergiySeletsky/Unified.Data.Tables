@@ -23,6 +23,17 @@ namespace Unified.Data.Tables;
 /// <see cref="WithAssemblyQualifiedFallback"/>: reads accept both forms while writes always emit
 /// the short token, so the table converges in place as rows are rewritten.
 /// </para>
+/// <para>
+/// <b>Build once, then share — never mutate a map that is in use.</b> Configure it completely during
+/// host startup, before any store touches it, and treat it as frozen from then on. The registrations
+/// live in plain <see cref="Dictionary{TKey,TValue}"/> instances with no synchronization, while the
+/// instance itself is shared process-wide through the singleton
+/// <see cref="UnifiedTableStorageOptions.TypeDiscriminator"/> and read by <see cref="Resolve"/> and
+/// <see cref="ToDiscriminator"/> on <em>every row</em>. Calling <see cref="Map{T}"/> or
+/// <see cref="MapAssignableTo{TBase}"/> once the host is serving traffic races those reads: the
+/// failure is a corrupted dictionary or an infinite loop inside a lookup, not a clean exception, and
+/// it will not reproduce on demand. There is no freeze/seal API — this paragraph is the contract.
+/// </para>
 /// </remarks>
 public sealed class TypeDiscriminatorMap : ITypeDiscriminator
 {
@@ -75,11 +86,24 @@ public sealed class TypeDiscriminatorMap : ITypeDiscriminator
     /// is short and stable but collides across namespaces — a collision throws here, at
     /// registration, rather than surfacing as an ambiguous read later.
     /// </summary>
+    /// <remarks>
+    /// Two failure modes worth knowing before you scan a plugin or a lazily-loaded assembly.
+    /// <see cref="Assembly.GetTypes"/> throws <see cref="ReflectionTypeLoadException"/> if any type in
+    /// the assembly cannot be loaded — a missing transitive reference is enough, and the throw takes
+    /// the whole registration down even though the types you wanted may all have loaded fine. And a
+    /// token collision mid-scan throws from <see cref="Map(Type, string)"/> after the earlier types
+    /// are already registered, so the map is left <b>half-populated</b>: it is not transactional.
+    /// Discard it and rebuild rather than catching and continuing — a partially registered map writes
+    /// rows for the types it happened to reach and throws on the rest.
+    /// </remarks>
     /// <typeparam name="TBase">The base type to scan for.</typeparam>
     /// <param name="assembly">The assembly to scan.</param>
     /// <param name="naming">Token selector; defaults to the type's simple name.</param>
     /// <returns>This map, for chaining.</returns>
     /// <exception cref="ArgumentException">Two scanned types produce the same token.</exception>
+    /// <exception cref="ReflectionTypeLoadException">
+    /// <paramref name="assembly"/> contains a type that cannot be loaded.
+    /// </exception>
     public TypeDiscriminatorMap MapAssignableTo<TBase>(Assembly assembly, Func<Type, string>? naming = null)
     {
         ArgumentNullException.ThrowIfNull(assembly);
