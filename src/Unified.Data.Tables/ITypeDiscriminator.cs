@@ -8,7 +8,7 @@ namespace Unified.Data.Tables;
 /// name — welds stored rows to assembly identity: a rename, namespace move or strong-name change
 /// orphans every row that carries it. It also costs a few hundred bytes on <em>every</em> row,
 /// charged against the transaction byte budget that caps batch size. See
-/// <c>TypeDiscriminatorMap</c> for the recommended alternative.
+/// <see cref="TypeDiscriminatorMap"/> for the recommended alternative.
 /// <para>
 /// A resolver is NOT a security boundary. Every polymorphic read independently verifies that the
 /// resolved type is assignable to the store's base type, and no configuration can disable that

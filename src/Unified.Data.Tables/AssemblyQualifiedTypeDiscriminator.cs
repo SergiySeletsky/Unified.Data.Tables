@@ -9,7 +9,7 @@ namespace Unified.Data.Tables;
 /// </summary>
 /// <remarks>
 /// This is the default so that upgrading never orphans data, not because it is the best choice.
-/// Prefer <c>TypeDiscriminatorMap</c> for any new table: an assembly-qualified token breaks
+/// Prefer <see cref="TypeDiscriminatorMap"/> for any new table: an assembly-qualified token breaks
 /// on assembly rename and is large enough to measurably shrink the batch size a transaction can
 /// carry. The type is named for what it stores rather than left as an unmarked default so that the
 /// trade-off is visible at the call site.
