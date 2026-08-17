@@ -335,4 +335,52 @@ public class TableEntitySerializerTests
         Assert.NotNull(restored.OptionalDate);
         Assert.Equal(new DateTime(2024, 6, 15, 9, 0, 0), restored.OptionalDate!.Value);
     }
+
+    // ── Reserved '_' column prefix ────────────────────────────────────────────
+
+    [Fact]
+    public void FromTableEntity_SystemColumn_IsNotWrittenIntoMatchingProperty()
+    {
+        var row = new TableEntity("p", "r")
+        {
+            ["Name"] = "kept",
+            [SystemColumnNames.TypeName] = "Some.Assembly.Qualified.Name, Some.Assembly",
+        };
+
+        var result = row.FromTableEntity<MessageWithTypeNameProperty>();
+
+        Assert.Equal("kept", result.Name);
+        Assert.Equal("untouched", result.TypeName);
+    }
+
+    [Fact]
+    public void FromTableEntity_SentinelColumn_IsNotWrittenIntoMatchingProperty()
+    {
+        var row = new TableEntity("p", "r")
+        {
+            ["Name"] = "kept",
+            ["_IsPublished"] = true,
+        };
+
+        var result = row.FromTableEntity<MessageWithIsPublishedProperty>();
+
+        Assert.Equal("kept", result.Name);
+        Assert.False(result.IsPublished);
+    }
+
+    [Fact]
+    public void IsSystemColumn_LeadingUnderscore_IsReserved()
+    {
+        Assert.True(SystemColumnNames.IsSystemColumn("_TypeName"));
+        Assert.True(SystemColumnNames.IsSystemColumn("_IsCommitted"));
+        Assert.False(SystemColumnNames.IsSystemColumn("TypeName"));
+        Assert.False(SystemColumnNames.IsSystemColumn("Tags__Json"));
+        Assert.False(SystemColumnNames.IsSystemColumn(string.Empty));
+    }
+
+    [Fact]
+    public void TypeNameColumnName_HasExactlyOneDefinition()
+    {
+        Assert.Equal(SystemColumnNames.TypeName, TableEntitySerializer.TypeNameColumnName);
+    }
 }

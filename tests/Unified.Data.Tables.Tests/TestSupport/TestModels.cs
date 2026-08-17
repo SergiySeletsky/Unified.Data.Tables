@@ -255,3 +255,29 @@ public sealed class InterfaceOnlyEntity : DomainAggregate, IEntity
     public string Name { get; set; } = "";
     public int Value { get; set; }
 }
+
+/// <summary>
+/// Declares a property whose name collides with the discriminator column after the leading '_' is
+/// stripped. Pins that a system column is never written into a same-named property.
+/// </summary>
+public sealed class MessageWithTypeNameProperty
+{
+    /// <summary>Payload, to prove the rest of the row still deserializes.</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Collides with "_TypeName" once the prefix is stripped.</summary>
+    public string TypeName { get; set; } = "untouched";
+}
+
+/// <summary>
+/// Declares a property colliding with a sentinel column name. Pins the same rule for consumer-owned
+/// system columns, not just the discriminator.
+/// </summary>
+public sealed class MessageWithIsPublishedProperty
+{
+    /// <summary>Payload, to prove the rest of the row still deserializes.</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Collides with "_IsPublished" once the prefix is stripped.</summary>
+    public bool IsPublished { get; set; }
+}

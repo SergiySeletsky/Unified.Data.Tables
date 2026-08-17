@@ -24,8 +24,13 @@ namespace Unified.Data.Tables;
 /// </summary>
 public static class TableEntitySerializer
 {
-    /// <summary>Column that stores the assembly-qualified type name when <c>persistType</c> is used.</summary>
-    public const string TypeNameColumnName = "_TypeName";
+    /// <summary>
+    /// Column that stores the type discriminator when <c>persistType</c> is used. An alias for
+    /// <see cref="SystemColumnNames.TypeName"/>, which is the single definition — Abstractions
+    /// cannot reference this package, so the constant lives there and this is the historical name
+    /// for it.
+    /// </summary>
+    public const string TypeNameColumnName = SystemColumnNames.TypeName;
 
     /// <summary>
     /// Process-wide policy for payloads that exceed the 64 KB cell cap even compressed — see
@@ -66,6 +71,14 @@ public static class TableEntitySerializer
             // through SetProperty would drill into (and materialize) the property it describes.
             if (TableEntityValue.IsTruncationMarker(kv.Key))
                 continue;
+
+            // A leading '_' marks a column the storage layer owns. It must never reach a property
+            // setter: TableEntityValue.Create strips the prefix, so "_TypeName" resolves to path
+            // ["TypeName"] and "_IsPublished" to ["IsPublished"] — a stored type declaring either
+            // property was silently receiving the storage layer's value.
+            if (SystemColumnNames.IsSystemColumn(kv.Key))
+                continue;
+
             var val = TableEntityValue.Create(kv.Key, kv.Value);
             result = (T)SetProperty(result, val);
         }
@@ -90,8 +103,18 @@ public static class TableEntitySerializer
 
         foreach (var kv in entity)
         {
+            // A __Truncated marker is metadata about a trimmed/dropped cell, not data — feeding it
+            // through SetProperty would drill into (and materialize) the property it describes.
             if (TableEntityValue.IsTruncationMarker(kv.Key))
                 continue;
+
+            // A leading '_' marks a column the storage layer owns. It must never reach a property
+            // setter: TableEntityValue.Create strips the prefix, so "_TypeName" resolves to path
+            // ["TypeName"] and "_IsPublished" to ["IsPublished"] — a stored type declaring either
+            // property was silently receiving the storage layer's value.
+            if (SystemColumnNames.IsSystemColumn(kv.Key))
+                continue;
+
             var val = TableEntityValue.Create(kv.Key, kv.Value);
             result = SetProperty(result, val);
         }
