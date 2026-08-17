@@ -1,3 +1,4 @@
+using System.Globalization;
 using Azure;
 using Azure.Data.Tables;
 using NSubstitute;
@@ -198,5 +199,135 @@ public class PolymorphicStorageTests
         using var harness = new PolymorphicHarness<TestMessage>(tableName: "StateEventStore");
 
         harness.Service.Received(1).GetTableClient("StateEventStore");
+    }
+
+    [Fact]
+    public async Task InsertBatchAsync_HeterogeneousTypesPlusMarker_OneTransactionPerPartition()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupTransaction();
+
+        var written = await harness.Store.InsertBatchAsync(
+            [
+                new PolymorphicWrite<TestMessage>(new TableKey("t1", "001"), new TestCreatedEvent { Id = "e1" }),
+                new PolymorphicWrite<TestMessage>(new TableKey("t1", "002"), new TestArchivedEvent { Id = "e2" }),
+                new PolymorphicWrite<TestMessage>(new TableKey("t1", "003"), new TestIntegrationEvent { Id = "e3" }),
+                PolymorphicWrite<TestMessage>.Marker(
+                    new TableKey("t1", "FlagEntity"),
+                    new Dictionary<string, object>(StringComparer.Ordinal) { ["_IsCommitted"] = false }),
+            ],
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(4, written);
+        Assert.Single(harness.Transactions);
+
+        var actions = harness.Transactions[0];
+        Assert.Equal(4, actions.Count);
+        // TableTransactionAction.Entity is typed as ITableEntity (no indexer); the actual instances
+        // planted by the store are always TableEntity, so the cast is safe here.
+        Assert.Equal(3, actions.Count(a => ((TableEntity)a.Entity).ContainsKey(SystemColumnNames.TypeName)));
+        Assert.Single(actions, a => !((TableEntity)a.Entity).ContainsKey(SystemColumnNames.TypeName));
+        Assert.All(actions, a => Assert.Equal(TableTransactionActionType.Add, a.ActionType));
+    }
+
+    [Fact]
+    public async Task InsertBatchAsync_MultiplePartitions_GroupsIntoSeparateTransactions()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupTransaction();
+
+        await harness.Store.InsertBatchAsync(
+            [
+                new PolymorphicWrite<TestMessage>(new TableKey("agg-1", "001"), new TestCreatedEvent { Id = "e1" }),
+                new PolymorphicWrite<TestMessage>(new TableKey("agg-2", "001"), new TestCreatedEvent { Id = "e2" }),
+            ],
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, harness.Transactions.Count);
+    }
+
+    [Fact]
+    public async Task InsertBatchAsync_EmptyCollection_WritesNothing()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupTransaction();
+
+        Assert.Equal(0, await harness.Store.InsertBatchAsync([], TestContext.Current.CancellationToken));
+        Assert.Empty(harness.Transactions);
+    }
+
+    [Fact]
+    public async Task InsertBatchAsync_OverHundredRows_SplitsOnTheCountCap()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupTransaction();
+
+        var writes = Enumerable.Range(0, 150)
+            .Select(i => new PolymorphicWrite<TestMessage>(
+                new TableKey("t1", i.ToString("D5", CultureInfo.InvariantCulture)),
+                new TestCreatedEvent { Id = $"e{i}" }))
+            .ToArray();
+
+        Assert.Equal(150, await harness.Store.InsertBatchAsync(writes, TestContext.Current.CancellationToken));
+        Assert.Equal(2, harness.Transactions.Count);
+        Assert.Equal(100, harness.Transactions[0].Count);
+        Assert.Equal(50, harness.Transactions[1].Count);
+    }
+
+    [Fact]
+    public async Task MergeColumnsAsync_SentinelOnly_SendsMergeWithWildcardETagAndNoPriorRead()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupMerge();
+
+        await harness.Store.MergeColumnsAsync(
+            new TableKey("agg-1", "000000001"),
+            new Dictionary<string, object>(StringComparer.Ordinal) { ["_IsPublished"] = true },
+            TestContext.Current.CancellationToken);
+
+        await harness.Table.Received(1).UpdateEntityAsync(
+            Arg.Any<TableEntity>(), ETag.All, TableUpdateMode.Merge, Arg.Any<CancellationToken>());
+        await harness.Table.DidNotReceiveWithAnyArgs()
+            .GetEntityIfExistsAsync<TableEntity>(default!, default!, default, default);
+
+        var sent = harness.LastWrittenEntity!;
+        Assert.True((bool)sent["_IsPublished"]);
+        Assert.False(sent.ContainsKey(SystemColumnNames.TypeName));
+    }
+
+    [Fact]
+    public async Task MergeColumnsAsync_TypeNameColumn_Throws()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupMerge();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => harness.Store.MergeColumnsAsync(
+            new TableKey("p", "r"),
+            new Dictionary<string, object>(StringComparer.Ordinal) { [SystemColumnNames.TypeName] = "x" },
+            TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task MergeColumnsAsync_UnprefixedColumn_Throws()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupMerge();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => harness.Store.MergeColumnsAsync(
+            new TableKey("p", "r"),
+            new Dictionary<string, object>(StringComparer.Ordinal) { ["IsPublished"] = true },
+            TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task MergeColumnsAsync_EmptyColumns_Throws()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupMerge();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => harness.Store.MergeColumnsAsync(
+            new TableKey("p", "r"),
+            new Dictionary<string, object>(StringComparer.Ordinal),
+            TestContext.Current.CancellationToken));
     }
 }

@@ -90,14 +90,71 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     }
 
     /// <inheritdoc />
-    public Task<int> InsertBatchAsync(
-        IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    public async Task<int> InsertBatchAsync(
+        IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(writes);
+        if (writes.Count == 0)
+            return 0;
+
+        // Build every row first, so a validation failure costs nothing rather than surfacing after
+        // earlier partitions have already committed.
+        var rows = new List<TableEntity>(writes.Count);
+        foreach (var write in writes)
+            rows.Add(ToRow(write));
+
+        await initializer.EnsureAsync(ct);
+
+        var written = 0;
+
+        // Azure requires an Entity Group Transaction to be single-partition, so partition first and
+        // chunk within each group.
+        foreach (var group in rows.GroupBy(r => r.PartitionKey, StringComparer.Ordinal))
+        {
+            var groupRows = group.ToList();
+            var plan = BatchPlanner.Plan([.. groupRows.Select(TableRowSize.Estimate)]);
+
+            foreach (var range in plan)
+            {
+                var actions = new List<TableTransactionAction>(range.Count);
+                for (var i = range.Start; i < range.Start + range.Count; i++)
+                    actions.Add(new TableTransactionAction(TableTransactionActionType.Add, groupRows[i]));
+
+                await client.SubmitTransactionAsync(actions, ct);
+                written += actions.Count;
+            }
+        }
+
+        return written;
+    }
 
     /// <inheritdoc />
-    public Task MergeColumnsAsync(
-        TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    public async Task MergeColumnsAsync(
+        TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default)
+    {
+        ValidateKey(key);
+        ArgumentNullException.ThrowIfNull(columns);
+        if (columns.Count == 0)
+        {
+            throw new ArgumentException(
+                "A merge with no columns would be a network round trip that changes nothing.",
+                nameof(columns));
+        }
+
+        var patch = new TableEntity(key.PartitionKey, key.RowKey);
+        foreach (var column in columns)
+        {
+            ValidateSystemColumn(column.Key);
+            patch[column.Key] = column.Value;
+        }
+
+        await initializer.EnsureAsync(ct);
+
+        // Wildcard ETag and Merge mode: blind, unconditional, and no prior read. A sentinel flip is
+        // idempotent and order-independent, so optimistic concurrency here would only manufacture
+        // conflicts the caller would have to retry through.
+        await client.UpdateEntityAsync(patch, ETag.All, TableUpdateMode.Merge, ct);
+    }
 
     /// <inheritdoc />
     public async Task<PolymorphicEntry<TBase>?> GetAsync(TableKey key, CancellationToken ct = default)

@@ -25,6 +25,9 @@ public sealed class PolymorphicHarness<TBase> : IDisposable
     /// <summary>The last OData filter the store emitted — the read-side assertion hook.</summary>
     public string? LastQueryFilter { get; private set; }
 
+    /// <summary>Every transaction the store submitted, in order — the batch assertion hook.</summary>
+    public List<IReadOnlyList<TableTransactionAction>> Transactions { get; } = [];
+
     public PolymorphicHarness(string tableName = "TestTable", UnifiedTableStorageOptions? options = null)
     {
         Service = Substitute.For<TableServiceClient>();
@@ -77,6 +80,12 @@ public sealed class PolymorphicHarness<TBase> : IDisposable
                  Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
              .Returns(Task.FromResult(response));
     }
+
+    public void SetupTransaction() =>
+        Table.SubmitTransactionAsync(
+                 Arg.Do<IEnumerable<TableTransactionAction>>(a => Transactions.Add(a.ToList())),
+                 Arg.Any<CancellationToken>())
+             .Returns(Task.FromResult<Response<IReadOnlyList<Response>>>(null!));
 
     public void SetupDelete() =>
         Table.DeleteEntityAsync(
