@@ -1,4 +1,5 @@
-﻿using Azure.Data.Tables;
+﻿using System.Runtime.Serialization;
+using Azure.Data.Tables;
 using Unified.Data.Tables.Tests.TestSupport;
 
 namespace Unified.Data.Tables.Tests;
@@ -480,5 +481,75 @@ public class TableEntitySerializerTests
 
         Assert.Throws<InvalidOperationException>(() =>
             row.FromTableEntity<TestMessage>(AssemblyQualifiedTypeDiscriminator.Instance));
+    }
+
+    // ── I-1 follow-up: the root-flatten contract behind the ctor-less fix ──────
+
+    [Fact]
+    public void ToTableEntity_CtorlessRoot_FlattensToRealColumns_NotABareJsonCell()
+    {
+        // Pins the actual shape on the wire, not just that a round trip happens to work: a root type
+        // with no public parameterless ctor must produce ordinary "Payload"/"Id" columns, never a
+        // single bare "__Json" cell (which — before this fix — collided with the reserved '_'
+        // system-column prefix and got silently swallowed on read).
+        var row = new TestCtorlessEvent("payload") { Id = "e1" }.ToTableEntity("p", "r");
+
+        Assert.Contains("Payload", row.Keys);
+        Assert.Contains("Id", row.Keys);
+        Assert.DoesNotContain("__Json", row.Keys);
+        Assert.Equal("payload", row["Payload"]);
+    }
+
+    [Fact]
+    public void ToTableEntity_NestedPositionalRecord_StillEmitsOneJsonCell()
+    {
+        // Control for the Path.IsEmpty guard: it must change behaviour ONLY at the true root. A
+        // positional record NESTED under an entity (GeoPoint under EntityWithJsonNested.Location) is
+        // the pre-existing, pinned (B2 in Fixes052Tests) "one JSON cell, no flattened columns"
+        // contract, and this guard must not disturb it.
+        var row = new EntityWithJsonNested { Title = "t", Location = new GeoPoint(1, 2) }.ToTableEntity("p", "r");
+
+        Assert.Contains("Location__Json", row.Keys);
+        Assert.DoesNotContain("Location_Lat", row.Keys);
+        Assert.DoesNotContain("Location_Lng", row.Keys);
+    }
+
+    [Fact]
+    public void ToTableEntity_CollectionRoot_ThrowsCannotFlatten_InsteadOfLeakingReflectionException()
+    {
+        // Before this fix, a root IEnumerable (reachable via the public object.ToTableEntity(...) and
+        // via PolymorphicWrite<object>) hit List<T>'s Item indexer during property enumeration and
+        // leaked a raw TargetParameterCountException. It must now fail with the serializer's own
+        // (pre-existing but previously unreachable) diagnostic instead.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            new List<int> { 1, 2, 3 }.ToTableEntity("p", "r"));
+
+        Assert.Contains("Cannot flatten object of type", ex.Message, StringComparison.Ordinal);
+    }
+
+    // ── I-2 follow-up: legacy whole-root-blob rows must not silently read as empty ──
+
+    [Fact]
+    public void FromTableEntity_BareJsonColumn_ThrowsRatherThanSilentlyMaterializingEmpty()
+    {
+        // Simulates a row written by a version older than the Path.IsEmpty write-side fix: the whole
+        // root blobbed into one cell named merely by its format suffix. IsSystemColumn's leading-'_'
+        // check would otherwise swallow it silently, handing back an empty object with no error —
+        // exactly the silent-data-loss regression this pins against.
+        var row = new TableEntity("p", "r") { ["__Json"] = "{\"name\":\"legacy\"}" };
+
+        Assert.Throws<SerializationException>(() => row.FromTableEntity<TestEntity>());
+    }
+
+    [Fact]
+    public void FromTableEntity_BareTruncatedColumn_AlsoThrows()
+    {
+        // Same legacy shape, but the whole root was dropped entirely under TrimWithMarker (no cell at
+        // all, just the marker) rather than fitting compressed. Silently skipping this one via
+        // IsTruncationMarker would be worse than the __Json case: the data is permanently gone, so
+        // staying silent about it is never correct. Kept consistent with the __Json/__GZip case.
+        var row = new TableEntity("p", "r") { ["__Truncated"] = "property dropped: too large" };
+
+        Assert.Throws<SerializationException>(() => row.FromTableEntity<TestEntity>());
     }
 }

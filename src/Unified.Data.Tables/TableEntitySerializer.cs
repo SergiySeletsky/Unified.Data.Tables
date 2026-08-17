@@ -90,6 +90,10 @@ public static class TableEntitySerializer
     /// <param name="entity">The row to read.</param>
     /// <param name="discriminator">The resolver for the stored token.</param>
     /// <returns>The materialized object.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="entity"/> or <paramref name="discriminator"/> is null.
+    /// </exception>
+    /// <exception cref="TypeLoadException">The stored token could not be resolved.</exception>
     /// <exception cref="InvalidOperationException">
     /// The row carries no discriminator, or names a type not assignable to <typeparamref name="TBase"/>.
     /// </exception>
@@ -116,6 +120,9 @@ public static class TableEntitySerializer
     /// <param name="discriminator">The resolver for the stored token.</param>
     /// <param name="result">The materialized object, or null for a marker row.</param>
     /// <returns>True when the row carried a discriminator and materialized.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="entity"/> or <paramref name="discriminator"/> is null.
+    /// </exception>
     /// <exception cref="TypeLoadException">The stored token could not be resolved.</exception>
     /// <exception cref="InvalidOperationException">
     /// The resolved type is not assignable to <typeparamref name="TBase"/>.
@@ -147,9 +154,12 @@ public static class TableEntitySerializer
         return true;
     }
 
-    // The shared read loop behind all four FromTableEntity overloads. Extracted rather than copied a
-    // fourth time: the truncation-marker skip, the system-column skip and the alias pass must stay
-    // in lockstep, and three hand-maintained copies had already drifted once.
+    // The shared read loop behind all four FromTableEntity overloads (TryFromTableEntity<TBase> and
+    // the FromTableEntity<TBase> that delegates to it share ONE call here, not a loop each). Extracted
+    // rather than copied a third time: the truncation-marker skip, the system-column skip and the
+    // alias pass must stay in lockstep, and the two PRE-EXISTING copies had already drifted once (one
+    // loop's explanatory comment on the truncation-marker check was missing from the other, until an
+    // earlier fix resynced them).
     private static object Materialize(TableEntity entity, Type type, bool restoreId)
     {
         var meta = TypeMetadataCache.GetMetadata(type);
@@ -157,8 +167,25 @@ public static class TableEntitySerializer
 
         foreach (var kv in entity)
         {
-            // A __Truncated marker is metadata about a trimmed/dropped cell, not data — feeding it
-            // through SetProperty would drill into (and materialize) the property it describes.
+            // A column that is EXACTLY "__Json"/"__GZip"/"__Truncated" (no property name in front of
+            // it) can only be a legacy artifact: a version older than the write-side Path.IsEmpty
+            // guard blobbed (or trimmed/dropped) a whole root object with no usable ctor into a single
+            // cell. Neither this nor any prior skip below may treat it as ordinary metadata — that
+            // would silently hand back an empty, no-data object where every earlier release threw.
+            // Checked before IsTruncationMarker specifically so a bare "__Truncated" is caught here
+            // too, not silently skipped as if it were an ordinary per-property truncation note.
+            if (TableEntityValue.IsBareFormatColumn(kv.Key))
+            {
+                throw new SerializationException(
+                    $"Column '{kv.Key}' cannot be read: the row was written by a version that " +
+                    "serialized the whole object as a single cell instead of columns, and this " +
+                    "version has no properties to put that data back into. Re-write the row with the " +
+                    "current serializer.");
+            }
+
+            // A __Truncated marker (on a real property, e.g. "Tags__Truncated") is metadata about a
+            // trimmed/dropped cell, not data — feeding it through SetProperty would drill into (and
+            // materialize) the property it describes.
             if (TableEntityValue.IsTruncationMarker(kv.Key))
                 continue;
 
@@ -342,6 +369,18 @@ public static class TableEntitySerializer
             return true;
         }
 
+        // A collection at the TRUE root (empty Path) has no properties to flatten into. TrySerialize
+        // above declined to JSON-blob it (Path.IsEmpty), so without this check we'd fall through to
+        // "recurse into cached properties" below and hit List<T>'s Item INDEXER: it passes the
+        // CanRead/CanWrite filter in TypeMetadataCache, but PropertyInfo.GetValue with no index args
+        // throws TargetParameterCountException — a raw reflection leak, not a serializer diagnostic. A
+        // NESTED collection never reaches this line: its Path is non-empty, so TrySerialize's own
+        // IEnumerable branch already routed it to one JSON cell before this point. Fail the same way
+        // FlattenProperty already does for an unflattenable value — the caller (Flatten(object, bool))
+        // turns this into "Cannot flatten object of type ...".
+        if (value.Path.IsEmpty && value.Type != typeof(string) && typeof(IEnumerable).IsAssignableFrom(value.Type!))
+            return false;
+
         // cycle detection
         if (!value.Type!.IsValueType && !seen.Add(value.Value))
             throw new SerializationException($"Circular reference at '{value}'.");
@@ -521,6 +560,17 @@ internal sealed class TableEntityValue
     internal static bool IsTruncationMarker(string column) =>
         column.EndsWith(TruncatedSuffix, StringComparison.Ordinal);
 
+    /// <summary>
+    /// Whether a column name is EXACTLY a cell-format/truncation suffix, with no property name in
+    /// front of it. TrySerialize never produces this shape for a real property — a column is always
+    /// "PropertyName" plus, optionally, one of these suffixes — so the only way it reaches a row is a
+    /// pre-write-side-fix version that blobbed a whole root object (no usable ctor, or a bare
+    /// collection) into one cell. That row can never be read back into properties: Materialize must
+    /// diagnose it rather than let it collide with the (unrelated) '_' system-column prefix.
+    /// </summary>
+    internal static bool IsBareFormatColumn(string column) =>
+        column is JsonSuffix or GZipSuffix or TruncatedSuffix;
+
     public TableEntityValue(
         ImmutableList<string> path,
         object? value,
@@ -605,13 +655,16 @@ internal sealed class TableEntityValue
             return true;
         }
 
-        // A true root value (empty Path) must always flatten into row columns — a row's data IS its
-        // columns, so "the whole row is one JSON cell" is never a valid outcome, even for a root type
-        // with no public parameterless ctor (the exact shape a polymorphic base-constrained read
-        // reconstructs via the uninitialized-object fallback). Without this, such a root would fall
-        // to the JSON branch below and produce a column named by its bare "__Json"/"__GZip" suffix — a
-        // name that starts with the reserved '_' system-column prefix by sheer coincidence of string
-        // concatenation, so Materialize's system-column skip would silently swallow the whole object.
+        // A root value (empty Path) that reaches this point is neither a primitive nor an enum (both
+        // returned true above) — so it must never fall to the JSON branch below and become "the whole
+        // row is one cell", even when the root type has no public parameterless ctor (the exact shape
+        // a polymorphic base-constrained read reconstructs via the uninitialized-object fallback).
+        // Without this, such a root would produce a column named by its bare "__Json"/"__GZip" suffix
+        // — a name that starts with the reserved '_' system-column prefix by sheer coincidence of
+        // string concatenation, so Materialize's system-column skip would silently swallow the whole
+        // object. A root that is itself an IEnumerable (a collection) also lands here and is handled
+        // one level up, in Flatten: it cannot be flattened into properties either (see the comment
+        // there), so it must fail loudly rather than let this method's caller try.
         if (Path.IsEmpty || CanSerializeWithoutJson(Value))
             return false;
 
