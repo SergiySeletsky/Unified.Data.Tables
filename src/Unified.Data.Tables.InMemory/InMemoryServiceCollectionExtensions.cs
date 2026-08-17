@@ -34,4 +34,27 @@ public static class InMemoryServiceCollectionExtensions
         services.TryAddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>));
         return services;
     }
+
+    /// <summary>
+    /// Registers one <see cref="IPolymorphicStorage{TBase}"/> backed by
+    /// <see cref="InMemoryPolymorphicStorage{TBase}"/>, KEYED by <paramref name="tableName"/> — the
+    /// drop-in replacement for <c>AddUnifiedPolymorphicTable</c>. The key is still the table name so
+    /// a host swaps the registration line and nothing at the injection sites changes.
+    /// </summary>
+    /// <typeparam name="TBase">The common base type the table's rows materialize as.</typeparam>
+    /// <param name="services">The service collection.</param>
+    /// <param name="tableName">The logical table name; also the DI key.</param>
+    /// <returns>The service collection, for chaining.</returns>
+    public static IServiceCollection AddUnifiedInMemoryPolymorphicTable<TBase>(
+        this IServiceCollection services, string tableName)
+        where TBase : class
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
+
+        services.TryAddKeyedSingleton<IPolymorphicStorage<TBase>>(tableName, (sp, _) =>
+            new InMemoryPolymorphicStorage<TBase>(sp.GetService<UnifiedTableStorageOptions>()));
+
+        return services;
+    }
 }
