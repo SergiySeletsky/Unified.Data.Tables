@@ -281,3 +281,73 @@ public sealed class MessageWithIsPublishedProperty
     /// <summary>Collides with "_IsPublished" once the prefix is stripped.</summary>
     public bool IsPublished { get; set; }
 }
+
+/// <summary>
+/// A non-<see cref="IEntity"/> message base shaped like a real CQRS message: an <c>Id</c>, a
+/// protected-setter timestamp, and no CreatedAt/UpdatedAt/ETag/Timestamp. Exists to prove the
+/// polymorphic contract admits a base that <see cref="IStorage{T}"/> cannot.
+/// </summary>
+public abstract class TestMessage
+{
+    /// <summary>The message id.</summary>
+    public string Id { get; set; } = string.Empty;
+
+    /// <summary>Creation time. A protected setter, to pin that reflection still round-trips it.</summary>
+    public DateTimeOffset Created { get; protected set; } = DateTimeOffset.UnixEpoch;
+
+    /// <summary>Sets <see cref="Created"/> from a test.</summary>
+    /// <param name="value">The value to set.</param>
+    public void SetCreated(DateTimeOffset value) => Created = value;
+}
+
+/// <summary>Marks a message as an integration event, for runtime-subtype filtering tests.</summary>
+public interface ITestIntegrationEvent;
+
+/// <summary>A command in the shared hierarchy.</summary>
+public sealed class TestCommand : TestMessage
+{
+    /// <summary>Command-only payload, to prove derived data survives a base-typed read.</summary>
+    public string Operation { get; set; } = string.Empty;
+}
+
+/// <summary>A domain event in the shared hierarchy.</summary>
+public sealed class TestCreatedEvent : TestMessage
+{
+    /// <summary>Event-only payload, to prove derived data survives a base-typed read.</summary>
+    public int Version { get; set; }
+}
+
+/// <summary>A second domain event, so a partition can hold more than one derived type.</summary>
+public sealed class TestArchivedEvent : TestMessage
+{
+    /// <summary>Event-only payload.</summary>
+    public string Reason { get; set; } = string.Empty;
+}
+
+/// <summary>An integration event, to exercise runtime-interface filtering on read.</summary>
+public sealed class TestIntegrationEvent : TestMessage, ITestIntegrationEvent
+{
+    /// <summary>Event-only payload.</summary>
+    public string Topic { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// A derived type with no public parameterless constructor. Pins that the polymorphic read path
+/// falls back to uninitialized-object construction rather than throwing.
+/// </summary>
+public sealed class TestCtorlessEvent : TestMessage
+{
+    /// <summary>Creates the event.</summary>
+    /// <param name="payload">The required payload.</param>
+    public TestCtorlessEvent(string payload) => Payload = payload;
+
+    /// <summary>The payload.</summary>
+    public string Payload { get; set; }
+}
+
+/// <summary>Not part of the <see cref="TestMessage"/> hierarchy. Pins the assignability gate.</summary>
+public sealed class UnrelatedType
+{
+    /// <summary>Payload.</summary>
+    public string Name { get; set; } = string.Empty;
+}
