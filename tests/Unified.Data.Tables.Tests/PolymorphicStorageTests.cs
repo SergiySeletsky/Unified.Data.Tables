@@ -330,4 +330,153 @@ public class PolymorphicStorageTests
             new Dictionary<string, object>(StringComparer.Ordinal),
             TestContext.Current.CancellationToken));
     }
+
+    [Fact]
+    public async Task QueryStreamAsync_MultipleServerPages_YieldsEveryRow()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupPagedQuery(
+            [TypedRow("agg-1", "001", new TestCreatedEvent { Id = "e1" })],
+            [TypedRow("agg-1", "002", new TestArchivedEvent { Id = "e2" })]);
+
+        var seen = new List<PolymorphicEntry<TestMessage>>();
+        await foreach (var entry in harness.Store.QueryStreamAsync(
+                           "agg-1", ct: TestContext.Current.CancellationToken))
+        {
+            seen.Add(entry);
+        }
+
+        Assert.Equal(2, seen.Count);
+    }
+
+    [Fact]
+    public async Task QueryAsync_Partition_EmitsAPartitionKeyFilter()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery(TypedRow("agg-1", "001", new TestCreatedEvent { Id = "e1" }));
+
+        await harness.Store.QueryAsync("agg-1", ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal("PartitionKey eq 'agg-1'", harness.LastQueryFilter);
+    }
+
+    [Fact]
+    public async Task QueryAsync_NoPartition_EmitsNoFilter()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery(TypedRow("agg-1", "001", new TestCreatedEvent { Id = "e1" }));
+
+        await harness.Store.QueryAsync(ct: TestContext.Current.CancellationToken);
+
+        Assert.Null(harness.LastQueryFilter);
+    }
+
+    [Fact]
+    public async Task QueryAsync_PartitionWithApostrophe_IsEscaped()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery();
+
+        await harness.Store.QueryAsync("O'Brien", ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal("PartitionKey eq 'O''Brien'", harness.LastQueryFilter);
+    }
+
+    [Fact]
+    public async Task QueryAsync_MixedTypePartition_RuntimeSubtypeFilteringWorks()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery(
+            TypedRow("t1", "001", new TestCreatedEvent { Id = "e1" }),
+            TypedRow("t1", "002", new TestIntegrationEvent { Id = "e2", Topic = "t" }),
+            TypedRow("t1", "003", new TestArchivedEvent { Id = "e3" }));
+
+        var entries = await harness.Store.QueryAsync("t1", ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, entries.Count);
+        Assert.Single(entries, e => e.Item is ITestIntegrationEvent);
+        Assert.Single(entries.ItemsOfType<TestMessage, TestCreatedEvent>());
+    }
+
+    [Fact]
+    public async Task QueryAsync_Take_LimitsResults()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery(
+            TypedRow("t1", "001", new TestCreatedEvent { Id = "e1" }),
+            TypedRow("t1", "002", new TestCreatedEvent { Id = "e2" }),
+            TypedRow("t1", "003", new TestCreatedEvent { Id = "e3" }));
+
+        var entries = await harness.Store.QueryAsync("t1", take: 2, ct: TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, entries.Count);
+    }
+
+    [Fact]
+    public async Task QueryAsync_MarkerRowAmongTypedRows_MaterializesWithNullItem()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery(
+            TypedRow("t1", "001", new TestCreatedEvent { Id = "e1" }),
+            new TableEntity("t1", "FlagEntity") { ["_IsCommitted"] = true });
+
+        var entries = await harness.Store.QueryAsync("t1", ct: TestContext.Current.CancellationToken);
+
+        var marker = Assert.Single(entries, e => e.Item is null);
+        Assert.True(marker.Column<bool>("_IsCommitted"));
+    }
+
+    [Fact]
+    public async Task CountAsync_ProjectsKeysOnly()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery(
+            TypedRow("t1", "001", new TestCreatedEvent { Id = "e1" }),
+            TypedRow("t1", "002", new TestCreatedEvent { Id = "e2" }));
+
+        Assert.Equal(2, await harness.Store.CountAsync("t1", TestContext.Current.CancellationToken));
+
+        // QueryAsync<T> returns AsyncPageable<T>, not a Task, so the verification call is not
+        // itself awaitable — NSubstitute's Received() check runs synchronously regardless.
+        harness.Table.Received(1).QueryAsync<TableEntity>(
+            Arg.Any<string>(),
+            Arg.Any<int?>(),
+            Arg.Is<IEnumerable<string>>(s => s != null && s.Contains("PartitionKey") && s.Contains("RowKey")),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task DeletePartitionAsync_DeletesEveryRow_WhateverItsType()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery(
+            TypedRow("t1", "001", new TestCreatedEvent { Id = "e1" }),
+            TypedRow("t1", "002", new TestArchivedEvent { Id = "e2" }),
+            new TableEntity("t1", "FlagEntity") { ["_IsCommitted"] = true });
+        harness.SetupTransaction();
+
+        Assert.Equal(3, await harness.Store.DeletePartitionAsync("t1", TestContext.Current.CancellationToken));
+
+        var actions = Assert.Single(harness.Transactions);
+        Assert.All(actions, a => Assert.Equal(TableTransactionActionType.Delete, a.ActionType));
+    }
+
+    [Fact]
+    public async Task DeletePartitionAsync_EmptyPartition_ReturnsZeroWithoutATransaction()
+    {
+        using var harness = new PolymorphicHarness<TestMessage>();
+        harness.SetupQuery();
+        harness.SetupTransaction();
+
+        Assert.Equal(0, await harness.Store.DeletePartitionAsync("t1", TestContext.Current.CancellationToken));
+        Assert.Empty(harness.Transactions);
+    }
+
+    private static TableEntity TypedRow(string partition, string row, TestMessage item)
+    {
+        var entity = item.ToTableEntity(partition, row);
+        entity[SystemColumnNames.TypeName] =
+            AssemblyQualifiedTypeDiscriminator.Instance.ToDiscriminator(item.GetType());
+        return entity;
+    }
 }

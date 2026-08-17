@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Azure;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Logging;
@@ -25,6 +26,10 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     where TBase : class
 {
     private static readonly string[] ReservedCells = ["PartitionKey", "RowKey", "Timestamp", "odata.etag"];
+
+    // Counting and partition-deletion never need the payload; projecting keys only turns a full-row
+    // scan into a keys scan, which matters because Azure Tables has no server-side count.
+    private static readonly string[] KeysOnly = ["PartitionKey", "RowKey"];
 
     private readonly TableClient client;
     private readonly TableInitializer initializer;
@@ -169,14 +174,41 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<PolymorphicEntry<TBase>>> QueryAsync(
-        string? partition = null, int? take = null, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    public async Task<IReadOnlyList<PolymorphicEntry<TBase>>> QueryAsync(
+        string? partition = null, int? take = null, CancellationToken ct = default)
+    {
+        var results = new List<PolymorphicEntry<TBase>>();
+        await foreach (var entry in QueryStreamAsync(partition, take, ct))
+            results.Add(entry);
+
+        return results;
+    }
 
     /// <inheritdoc />
-    public IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
-        string? partition = null, int? take = null, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    public async IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
+        string? partition = null,
+        int? take = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (take is <= 0)
+            yield break;
+
+        await initializer.EnsureAsync(ct);
+
+        var yielded = 0;
+
+        // AsyncPageable follows continuation tokens internally. That is the whole reason streaming is
+        // the primitive here: a hand-rolled single-segment read silently truncates at one page, and
+        // the truncation looks exactly like an empty tail.
+        await foreach (var row in client.QueryAsync<TableEntity>(
+                           PartitionFilter(partition), maxPerPage: null, select: null, ct))
+        {
+            yield return ToEntry(row);
+
+            if (take is { } limit && ++yielded >= limit)
+                yield break;
+        }
+    }
 
     /// <inheritdoc />
     public async Task DeleteAsync(TableKey key, CancellationToken ct = default)
@@ -196,12 +228,51 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     }
 
     /// <inheritdoc />
-    public Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    public async Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(partition);
+        await initializer.EnsureAsync(ct);
+
+        var rows = new List<TableEntity>();
+        await foreach (var row in client.QueryAsync<TableEntity>(
+                           PartitionFilter(partition), maxPerPage: null, KeysOnly, ct))
+        {
+            rows.Add(row);
+        }
+
+        if (rows.Count == 0)
+            return 0;
+
+        var deleted = 0;
+
+        // Already single-partition by construction, so one plan covers it.
+        foreach (var range in BatchPlanner.Plan([.. rows.Select(TableRowSize.Estimate)]))
+        {
+            var actions = new List<TableTransactionAction>(range.Count);
+            for (var i = range.Start; i < range.Start + range.Count; i++)
+                actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, rows[i], ETag.All));
+
+            await client.SubmitTransactionAsync(actions, ct);
+            deleted += actions.Count;
+        }
+
+        return deleted;
+    }
 
     /// <inheritdoc />
-    public Task<int> CountAsync(string? partition = null, CancellationToken ct = default) =>
-        throw new NotImplementedException();
+    public async Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
+    {
+        await initializer.EnsureAsync(ct);
+
+        var count = 0;
+        await foreach (var _ in client.QueryAsync<TableEntity>(
+                           PartitionFilter(partition), maxPerPage: null, KeysOnly, ct))
+        {
+            count++;
+        }
+
+        return count;
+    }
 
     // Build the row: serialize the object with persistType FALSE, then stamp the discriminator
     // ourselves. Composing this way rather than extending ToTableEntity is what gives the
@@ -260,6 +331,14 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
             row.Timestamp,
             columns);
     }
+
+    // OData string literals escape an apostrophe by doubling it. Without this a partition key like
+    // "O'Brien" produces a malformed filter that the service rejects — or, worse, one that parses
+    // into a different query.
+    private static string? PartitionFilter(string? partition) =>
+        partition is null
+            ? null
+            : $"PartitionKey eq '{partition.Replace("'", "''", StringComparison.Ordinal)}'";
 
     private static void ValidateKey(TableKey key)
     {
