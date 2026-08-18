@@ -1,4 +1,4 @@
-using System.Collections;
+﻿using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Globalization;
@@ -398,6 +398,16 @@ public static class TableEntitySerializer
         var meta = TypeMetadataCache.GetMetadata(value.Type);
         foreach (var prop in meta.Properties)
         {
+            // '_' is the property-path delimiter: "Foo_Bar" writes the column "Foo_Bar", which reads
+            // back as the path ["Foo", "Bar"] — a nested property that does not exist — so the cell is
+            // silently dropped on the way in. There is no encoding that would disambiguate it after
+            // the fact, so the write fails loudly instead of the read losing data quietly.
+            if (TableEntityValue.ContainsPathDelimiter(prop.Name))
+                throw new SerializationException(
+                    $"Property '{value.Type.Name}.{prop.Name}' contains the property-path delimiter " +
+                    $"'{TableEntityValue.PathDelimiter}', which would make its column ambiguous with a " +
+                    "nested property. Rename the property or map it to another column name.");
+
             var childVal = prop.GetValue(value.Value);
             var childNode = new TableEntityValue(value.Path.Add(prop.Name), childVal!);
             if (!Flatten(dict, seen, childNode))
@@ -479,6 +489,12 @@ internal sealed class TableEntityValue
 {
     private const int MaxCellBytes = 65536;
     private const string Delim = "_";
+
+    /// <summary>The property-path delimiter, for callers that must reject it inside a name.</summary>
+    internal static string PathDelimiter => Delim;
+
+    /// <summary>True when <paramref name="name"/> would be ambiguous with a nested property path.</summary>
+    internal static bool ContainsPathDelimiter(string name) => name.Contains(Delim, StringComparison.Ordinal);
     private const string JsonSuffix = "__Json";
     private const string GZipSuffix = "__GZip";
     private const string TruncatedSuffix = "__Truncated";
@@ -798,14 +814,48 @@ internal sealed class TableEntityValue
         if (t == typeof(byte[]))
             return (byte[])val;
 
+        // A scalar byte is STORED as a one-element byte[] (Edm.Binary has no narrower form) — see
+        // the Primitives map. Without this inverse the write is one-way: the Convert.ChangeType
+        // fallback below throws "Object must implement IConvertible" for a byte[] source, so every
+        // byte property is writable and unreadable. `t` is already the underlying type, so this
+        // covers byte? too.
+        if (t == typeof(byte) && val is byte[] { Length: > 0 } singleByte)
+            return singleByte[0];
+
         if (t == typeof(decimal))
             return Convert.ToDecimal(val, CultureInfo.InvariantCulture);
 
         return Convert.ChangeType(val, t, CultureInfo.InvariantCulture);
     }
 
+    // Azure Tables cannot store a date below 1601-01-01, so the write side maps an unset date to
+    // that sentinel (see the DateTime/DateTimeOffset entries in the Primitives map). This is the
+    // inverse. Without it an unset date round-trips as 1601-01-01 and CHANGES VALUE on every save,
+    // which also makes "was this ever set?" unanswerable one write later.
+    //
+    // The cost is that 1601-01-01 cannot be stored as a genuine value — but the write side already
+    // made that true, since it has no way to distinguish the sentinel it wrote from a real one.
+    private static bool TryRestoreDefaultDate(Type t, out object restored)
+    {
+        if (t == typeof(DateTime))
+        {
+            restored = default(DateTime);
+            return true;
+        }
+
+        if (t == typeof(DateTimeOffset))
+        {
+            restored = default(DateTimeOffset);
+            return true;
+        }
+
+        restored = null!;
+        return false;
+    }
+
     private static object ConvertDateTimeOffset(Type t, DateTimeOffset dto)
     {
+        if (dto == MinDto && TryRestoreDefaultDate(t, out var restored)) return restored;
         if (t == typeof(DateTimeOffset)) return dto;
         if (t == typeof(DateTime)) return dto.DateTime;
         return Convert.ChangeType(dto, t, CultureInfo.InvariantCulture);
@@ -824,6 +874,8 @@ internal sealed class TableEntityValue
 
     private static object ConvertDateTime(Type t, DateTime dt)
     {
+        // DateTime equality ignores Kind, so this matches the sentinel however the backend surfaced it.
+        if (dt == MinDto.DateTime && TryRestoreDefaultDate(t, out var restored)) return restored;
         if (t == typeof(DateTime)) return dt;
         if (t == typeof(DateTimeOffset))
         {
