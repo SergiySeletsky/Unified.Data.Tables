@@ -511,7 +511,11 @@ internal sealed class TableEntityValue
         // both System.Text.Json and Newtonsoft.Json — so stored tokens stay stable and
         // byte-compatible with name-as-declared serializers. Reads remain case-insensitive, so
         // lowercase/camelCase tokens written by <= 0.5.0 still round-trip.
-        Converters = { new JsonStringEnumConverter() },
+        // JsonStringEnumConverter: see the comment above. AnnotatedConstructorConverterFactory
+        // restores construction of immutable types whose only constructor is private and carries a
+        // non-System.Text.Json JsonConstructorAttribute — the idiomatic Newtonsoft shape, and one
+        // that appears throughout rows written by the serializers this format is compatible with.
+        Converters = { new JsonStringEnumConverter(), new AnnotatedConstructorConverterFactory() },
         // Allow full Unicode so Cyrillic (and other) characters aren't \uXXXX escaped in stored JSON
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };

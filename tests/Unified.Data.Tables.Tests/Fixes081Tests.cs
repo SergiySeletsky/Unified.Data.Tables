@@ -1,4 +1,4 @@
-using System.Runtime.Serialization;
+﻿using System.Runtime.Serialization;
 using Azure.Data.Tables;
 
 namespace Unified.Data.Tables.Tests;
@@ -125,6 +125,95 @@ public class Fixes081Tests
         var restored = entity.FromTableEntity<ByteModel>();
 
         Assert.Equal(3, restored.ByteProperty);
+    }
+
+    /// <summary>
+    /// A nested immutable value object whose ONLY constructor is private and annotated with a
+    /// foreign <c>JsonConstructorAttribute</c> — the idiomatic Newtonsoft shape, and the shape found
+    /// throughout rows written by the serializers this cell format is compatible with. System.Text.Json
+    /// refuses to construct it on its own.
+    /// </summary>
+    [Fact]
+    public void PrivateAnnotatedConstructor_RoundTrips()
+    {
+        var source = new HolderModel
+        {
+            Name = "holder",
+            Location = ForeignAnnotatedModel.Create("Lviv", 7)
+        };
+
+        var entity = source.ToTableEntity(PartitionKey, RowKey);
+        var restored = entity.FromTableEntity<HolderModel>();
+
+        Assert.Equal("holder", restored.Name);
+        Assert.NotNull(restored.Location);
+        Assert.Equal("Lviv", restored.Location!.City);
+        Assert.Equal(7, restored.Location.Floor);
+    }
+
+    /// <summary>A collection of such objects goes through the same cell as one JSON blob.</summary>
+    [Fact]
+    public void CollectionOfPrivateAnnotatedConstructorObjects_RoundTrips()
+    {
+        var source = new HolderModel
+        {
+            Name = "holder",
+            Locations = [ForeignAnnotatedModel.Create("Kyiv", 1), ForeignAnnotatedModel.Create("Lviv", 2)]
+        };
+
+        var entity = source.ToTableEntity(PartitionKey, RowKey);
+        var restored = entity.FromTableEntity<HolderModel>();
+
+        Assert.Equal(2, restored.Locations!.Count);
+        Assert.Equal("Kyiv", restored.Locations[0].City);
+        Assert.Equal(2, restored.Locations[1].Floor);
+    }
+
+    /// <summary>
+    /// The converter must not take over a type System.Text.Json already handles: the written JSON has
+    /// to stay byte-for-byte what it was, or the cell format silently changes for everyone.
+    /// </summary>
+    [Fact]
+    public void OrdinaryTypes_AreUntouchedByTheConstructorConverter()
+    {
+        var source = new HolderModel { Name = "holder", Plain = new PlainModel { Value = "v" } };
+
+        var entity = source.ToTableEntity(PartitionKey, RowKey);
+        var restored = entity.FromTableEntity<HolderModel>();
+
+        Assert.Equal("v", restored.Plain!.Value);
+    }
+
+    private sealed class HolderModel
+    {
+        public string Name { get; set; } = "";
+
+        public ForeignAnnotatedModel? Location { get; set; }
+
+        public List<ForeignAnnotatedModel>? Locations { get; set; }
+
+        public PlainModel? Plain { get; set; }
+    }
+
+    private sealed class PlainModel
+    {
+        public string Value { get; set; } = "";
+    }
+
+    private sealed class ForeignAnnotatedModel
+    {
+        [Foreign.JsonConstructor]
+        private ForeignAnnotatedModel(string city, int floor)
+        {
+            City = city;
+            Floor = floor;
+        }
+
+        public string City { get; }
+
+        public int Floor { get; }
+
+        public static ForeignAnnotatedModel Create(string city, int floor) => new(city, floor);
     }
 
     private sealed class ByteModel

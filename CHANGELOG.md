@@ -25,6 +25,16 @@ the serializer's own fixtures.
   one round trip, "was this ever set?" became unanswerable. The inverse now runs on read. The cost is
   that `1601-01-01` cannot be stored as a genuine value, but the write side had already made that
   true: it cannot distinguish the sentinel it writes from a real one.
+- **An immutable type with a private, foreign-annotated constructor could not be read at all.** The
+  cell format this serializer preserves came from Newtonsoft-based Azure table serializers, whose
+  idiomatic shape for a getters-only value object is a *private* constructor marked
+  `[Newtonsoft.Json.JsonConstructor]`. System.Text.Json selects a constructor by its own attribute, a
+  public parameterless one, or a single public parameterized one — none of which such a type has —
+  and threw `NotSupportedException`. Rows holding those objects were therefore readable only by the
+  serializer that wrote them, which made the format-compatibility guarantee false for exactly the
+  types most likely to depend on it. The constructor is now matched by attribute NAME, so no
+  dependency on Newtonsoft is taken and any equivalent annotation works. Types System.Text.Json can
+  already construct are untouched, and the written JSON is unchanged.
 - **A property name containing `_` silently lost its value.** `_` is the property-path delimiter, so
   a property named `Foo_Bar` writes the column `Foo_Bar`, which reads back as the path
   `["Foo", "Bar"]` — a nested property that does not exist — and the cell is dropped. No encoding
