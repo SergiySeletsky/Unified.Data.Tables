@@ -14,6 +14,11 @@ namespace Unified.Data.Tables.Tests;
 /// Pins the registration shape. The case that drives it: two stores over the SAME base type and
 /// different tables, which an open-generic registration cannot express.
 /// </summary>
+// AddUnifiedTableStorage/AddUnifiedInMemoryStorage apply options.OversizedCells to the STATIC
+// serializer policy, so this class shares the collection with every other policy-sensitive test to
+// avoid parallel races. Without this, these registrations reset the policy to its default (Throw)
+// underneath a concurrently-running OversizedCellPolicyTests case that had set TrimWithMarker.
+[Collection("OversizedCellPolicy")]
 public class PolymorphicServiceCollectionTests
 {
     [Fact]
