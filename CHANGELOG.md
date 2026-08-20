@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-08-18
+
+Three write/read asymmetries in `TableEntitySerializer`, all of the same shape: the write side
+transformed a value and the read side had no inverse, so the round trip was lossy while every
+single-direction test passed. Found by round-tripping a real application's object shapes rather than
+the serializer's own fixtures.
+
+### Fixed
+
+- **A `byte` property was write-only.** A scalar `byte` is stored as a one-element `byte[]`
+  (Edm.Binary has no narrower form), but the read path had no matching case, so it fell through to
+  `Convert.ChangeType(byte[], typeof(byte))` and threw `Object must implement IConvertible`. Any type
+  with a `byte` property could be written and then never read back — including by
+  `IPolymorphicStorage<TBase>`, where one such property poisons the whole row. `byte?` is covered by
+  the same inverse; a genuine `byte[]` is unaffected.
+- **An unset date changed value on every save.** Azure Tables cannot store a date below
+  `1601-01-01`, so `default(DateTime)` and `default(DateTimeOffset)` are written as that sentinel.
+  Nothing mapped it back, so an unset date read as `1601-01-01` rather than `MinValue` — and after
+  one round trip, "was this ever set?" became unanswerable. The inverse now runs on read. The cost is
+  that `1601-01-01` cannot be stored as a genuine value, but the write side had already made that
+  true: it cannot distinguish the sentinel it writes from a real one.
+- **An immutable type with a private, foreign-annotated constructor could not be read at all.** The
+  cell format this serializer preserves came from Newtonsoft-based Azure table serializers, whose
+  idiomatic shape for a getters-only value object is a *private* constructor marked
+  `[Newtonsoft.Json.JsonConstructor]`. System.Text.Json selects a constructor by its own attribute, a
+  public parameterless one, or a single public parameterized one — none of which such a type has —
+  and threw `NotSupportedException`. Rows holding those objects were therefore readable only by the
+  serializer that wrote them, which made the format-compatibility guarantee false for exactly the
+  types most likely to depend on it. The constructor is now matched by attribute NAME, so no
+  dependency on Newtonsoft is taken and any equivalent annotation works. Types System.Text.Json can
+  already construct are untouched, and the written JSON is unchanged.
+- **A property name containing `_` silently lost its value.** `_` is the property-path delimiter, so
+  a property named `Foo_Bar` writes the column `Foo_Bar`, which reads back as the path
+  `["Foo", "Bar"]` — a nested property that does not exist — and the cell is dropped. No encoding
+  disambiguates this after the fact, so the write now throws `SerializationException` naming the
+  property instead of the read losing data quietly. **This is a behaviour change**: such a type
+  previously appeared to save and came back with the property unset.
+
 ## [0.8.0] — 2026-08-17
 
 Polymorphic storage: many concrete types in one table, discriminated by `_TypeName`, read back as a
