@@ -87,6 +87,30 @@ public class LegacyCompatTests
         Assert.Equal("kept", restored.Value);
     }
 
+    /// <summary>
+    /// A getter-only wrapper whose single constructor parameter IS the stored JSON — a bare array,
+    /// not an object. The historical Newtonsoft shape for collection wrappers (e.g. a
+    /// JobLevelCollection stored as Levels__Json). The converter must feed the array itself into
+    /// the parameter rather than default it to null.
+    /// </summary>
+    [Fact]
+    public void SingleParameterConstructorWithArrayRootedJson_RoundTrips()
+    {
+        var source = new CollectionWrapperHolder
+        {
+            Wrapper = CollectionWrapper.Create(new[] { new Item { Name = "a" }, new Item { Name = "b" } })
+        };
+
+        var entity = source.ToTableEntity(PartitionKey, RowKey);
+        Assert.True(entity.ContainsKey("Wrapper__Json"), "wrapper should be a __Json cell");
+
+        var restored = entity.FromTableEntity<CollectionWrapperHolder>();
+
+        Assert.Equal(2, restored.Wrapper.Count);
+        Assert.Equal("a", restored.Wrapper[0].Name);
+        Assert.Equal("b", restored.Wrapper[1].Name);
+    }
+
     /// <summary>An unregistered, unresolvable token still fails loudly.</summary>
     [Fact]
     public void UnknownToken_StillThrows()
@@ -166,5 +190,36 @@ public class LegacyCompatTests
         public string Name { get; }
 
         public int Count { get; }
+    }
+
+    private sealed class CollectionWrapperHolder
+    {
+        public CollectionWrapper Wrapper { get; set; } = null!;
+    }
+
+    /// <summary>Mirror of the production shape: private JsonConstructor taking the collection itself.</summary>
+    private sealed class CollectionWrapper
+    {
+        [Foreign.JsonConstructor]
+        private CollectionWrapper(IEnumerable<Item> items)
+        {
+            Items = ImmutableList<Item>.Empty.AddRange(items);
+        }
+
+        public ImmutableList<Item> Items { get; }
+
+        public int Count => Items.Count;
+
+        public Item this[int index] => Items[index];
+
+        public static CollectionWrapper Create(IEnumerable<Item> items)
+        {
+            return new CollectionWrapper(items);
+        }
+    }
+
+    private sealed class Item
+    {
+        public string Name { get; set; } = string.Empty;
     }
 }
