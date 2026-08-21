@@ -130,6 +130,17 @@ internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
         using var document = JsonDocument.ParseValue(ref reader);
         var root = document.RootElement;
 
+        // A single-parameter constructor whose JSON IS the parameter — the historical Newtonsoft
+        // shape for getter-only collection wrappers, stored as a bare JSON array (or scalar)
+        // rather than an object. Deserialize the whole document into that parameter; treating it
+        // as an object would leave the parameter at its default and feed null into a constructor
+        // that does e.g. ImmutableList.AddRange(levels).
+        if (root.ValueKind != JsonValueKind.Object && parameters.Length == 1)
+        {
+            var sole = new object?[] { root.Deserialize(parameters[0].ParameterType, options) };
+            return (T)constructor.Invoke(sole);
+        }
+
         var args = new object?[parameters.Length];
         for (var i = 0; i < parameters.Length; i++)
         {

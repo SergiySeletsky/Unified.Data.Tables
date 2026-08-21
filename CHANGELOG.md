@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] — 2026-08-21
+
+Another legacy-row read gap found by the production canary.
+
+### Fixed
+
+- **A getter-only wrapper whose single constructor parameter IS the stored JSON was unreadable.**
+  Such a type (e.g. a collection wrapper with a private `[JsonConstructor]` taking the collection
+  itself) is stored as a BARE JSON array. The constructor converter treated every root as an
+  object, found no property matching the parameter name, and fed the parameter's default (null)
+  into a constructor that does `ImmutableList.AddRange(items)` — `ArgumentNullException`. A
+  single-parameter constructor now receives the whole document when the root is not an object.
+  (Real-world shape: `JobLevelCollection` in `JobTrackCreatedStateEvent`; 21 rows in one
+  production event store, written 2019.)
+
 ## [0.8.2] — 2026-08-21
 
 Two more legacy-row read gaps found by running a read-only canary over a real staging storage
