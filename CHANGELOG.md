@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] — 2026-08-21
+
+Two more legacy-row read gaps found by running a read-only canary over a real staging storage
+account (millions of rows across six accounts). Both are the same class of defect as 0.8.1: rows
+written by the historical Newtonsoft-based serializers that the current read path could not
+reconstruct.
+
+### Fixed
+
+- **A getter-only type with a single public parameterized constructor whose parameters do not
+  exactly match the property types was unreadable.** System.Text.Json selects such a constructor
+  but validates that each parameter name AND type match a property exactly, so a shape like an
+  `IEnumerable<T>` parameter fed by an `ImmutableList<T>` property threw
+  `InvalidOperationException` ("Each parameter in the deserialization constructor ... must bind to
+  an object property or field"). Newtonsoft bound parameters by name and deserialized each argument
+  to the parameter's declared type. The serializer's constructor converter now takes over this case
+  and binds by name, deserializing each argument to the parameter type — the historical behaviour.
+  (Real-world shape: `PaceQuestionGroup`; ~5,200 rows in one production event store.)
+- **Rows whose `_TypeName` token names a type in a namespace that has since been renamed were
+  unreadable.** `AssemblyQualifiedTypeDiscriminator.RegisterLegacyTypeNamespace(legacy, current)`
+  registers a namespace rename; tokens whose type portion starts with the legacy prefix resolve by
+  substituting the current prefix. The untyped `TableEntitySerializer.FromTableEntity` read path
+  applies the same map, so a single registration covers every type moved in the same namespace
+  move. Writes are unaffected — new rows always carry the current assembly-qualified name.
+  (Real-world shape: `Notifications.Contracts` → `EmailNotifications.Contracts`; 42 of 45 rows in
+  one process-manager store.)
+
 ## [0.8.1] — 2026-08-18
 
 Three write/read asymmetries in `TableEntitySerializer`, all of the same shape: the write side

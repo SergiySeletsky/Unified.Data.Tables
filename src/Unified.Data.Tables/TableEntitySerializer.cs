@@ -84,7 +84,10 @@ public static class TableEntitySerializer
             throw new InvalidOperationException($"Missing '{TypeNameColumnName}' column.");
         }
 
-        var t = Type.GetType(asmQName)
+        // Resolve through the discriminator's resolver rather than a bare Type.GetType so the
+        // registered legacy namespace renames apply here too: a row whose type moved keeps reading
+        // through the same configuration the polymorphic stores use.
+        var t = AssemblyQualifiedTypeDiscriminator.ResolveTypeName(asmQName)
                 ?? throw new TypeLoadException($"Type '{asmQName}' not found.");
 
         return Materialize(entity, t, restoreId: true);
@@ -511,11 +514,12 @@ internal sealed class TableEntityValue
         // both System.Text.Json and Newtonsoft.Json — so stored tokens stay stable and
         // byte-compatible with name-as-declared serializers. Reads remain case-insensitive, so
         // lowercase/camelCase tokens written by <= 0.5.0 still round-trip.
-        // JsonStringEnumConverter: see the comment above. AnnotatedConstructorConverterFactory
-        // restores construction of immutable types whose only constructor is private and carries a
-        // non-System.Text.Json JsonConstructorAttribute — the idiomatic Newtonsoft shape, and one
-        // that appears throughout rows written by the serializers this format is compatible with.
-        Converters = { new JsonStringEnumConverter(), new AnnotatedConstructorConverterFactory() },
+        // JsonStringEnumConverter: see the comment above. ParameterizedConstructorConverterFactory
+        // restores construction of immutable types whose constructor System.Text.Json would not
+        // select (a private foreign-annotated one) or would bind too strictly (parameters that do
+        // not exactly match property names and types) — both idiomatic historical shapes, and ones
+        // that appear throughout rows written by the serializers this format is compatible with.
+        Converters = { new JsonStringEnumConverter(), new ParameterizedConstructorConverterFactory() },
         // Allow full Unicode so Cyrillic (and other) characters aren't \uXXXX escaped in stored JSON
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };
