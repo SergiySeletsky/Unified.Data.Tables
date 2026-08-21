@@ -6,34 +6,44 @@ using System.Text.Json.Serialization;
 namespace Unified.Data.Tables;
 
 /// <summary>
-/// Lets System.Text.Json construct an immutable type whose only constructor is non-public and
-/// marked with a <c>JsonConstructorAttribute</c> that is NOT
-/// <see cref="System.Text.Json.Serialization.JsonConstructorAttribute"/> — in practice
-/// <c>Newtonsoft.Json.JsonConstructorAttribute</c>.
+/// Lets System.Text.Json construct an immutable type through a constructor it would not have
+/// selected, or whose parameter binding it would have rejected. Two shapes are covered:
 /// </summary>
 /// <remarks>
 /// This is a WIRE-COMPATIBILITY concern, not a convenience. <see cref="TableEntitySerializer"/>
 /// deliberately preserves the cell format of the Newtonsoft-based Azure table serializers it
 /// replaces — the same <c>__Json</c> and <c>__GZip</c> suffixes over the same JSON. Rows written by
-/// those serializers routinely hold immutable value objects built through a private annotated
-/// constructor, which is the idiomatic Newtonsoft shape for a type with only getters. System.Text.Json
-/// picks a constructor by its OWN attribute, a public parameterless one, or a single public
-/// parameterized one; none of those exist on such a type, so it throws:
-/// <para>
-/// <c>NotSupportedException: Deserialization of types without a parameterless constructor, a singular
-/// parameterized constructor, or a parameterized constructor annotated with 'JsonConstructorAttribute'
-/// is not supported.</c>
-/// </para>
+/// those serializers routinely hold immutable value objects that System.Text.Json cannot
+/// reconstruct on its own:
+/// <list type="bullet">
+/// <item>
+/// A type whose ONLY constructor is non-public and marked with a <c>JsonConstructorAttribute</c>
+/// that is NOT <see cref="System.Text.Json.Serialization.JsonConstructorAttribute"/> — in practice
+/// <c>Newtonsoft.Json.JsonConstructorAttribute</c>. System.Text.Json throws
+/// <c>NotSupportedException</c> for such a type. The attribute is matched by NAME rather than by
+/// type so this assembly takes no dependency on Newtonsoft — and so any other library's equivalent
+/// annotation works too.
+/// </item>
+/// <item>
+/// A type whose single public parameterized constructor System.Text.Json WOULD select, but whose
+/// parameters do not exactly match the property names AND types on the object. Newtonsoft bound
+/// constructor parameters by name and deserialized each argument to the parameter's declared type,
+/// so shapes like an <c>IEnumerable&lt;T&gt;</c> parameter fed by an <c>ImmutableList&lt;T&gt;</c>
+/// property round-tripped fine. System.Text.Json validates that each parameter name and type match
+/// a property exactly and throws <c>InvalidOperationException</c> ("Each parameter in the
+/// deserialization constructor ... must bind to an object property or field") otherwise. Binding by
+/// name here, deserializing each argument to the parameter type, restores the historical behaviour.
+/// </item>
+/// </list>
 /// Without this converter those rows are readable only by the serializer that wrote them, which
 /// makes the format-compatibility guarantee false for exactly the types most likely to rely on it.
 /// <para>
-/// The attribute is matched by NAME rather than by type so this assembly takes no dependency on
-/// Newtonsoft — and so any other library's equivalent annotation works too. A type that System.Text.Json
-/// can already construct is never touched: <see cref="CanConvert"/> declines it, and the default
-/// behaviour (including source-generated contracts for other types) is left intact.
+/// A type that System.Text.Json can already construct without a constructor decision is never
+/// touched: <see cref="CanConvert"/> declines it, and the default behaviour (including
+/// source-generated contracts for other types) is left intact.
 /// </para>
 /// </remarks>
-internal sealed class AnnotatedConstructorConverterFactory : JsonConverterFactory
+internal sealed class ParameterizedConstructorConverterFactory : JsonConverterFactory
 {
     private static readonly ConcurrentDictionary<Type, ConstructorInfo?> Constructors = new();
 
@@ -43,7 +53,7 @@ internal sealed class AnnotatedConstructorConverterFactory : JsonConverterFactor
     /// <inheritdoc />
     public override JsonConverter CreateConverter(Type typeToConvert, JsonSerializerOptions options)
     {
-        var converterType = typeof(AnnotatedConstructorConverter<>).MakeGenericType(typeToConvert);
+        var converterType = typeof(ParameterizedConstructorConverter<>).MakeGenericType(typeToConvert);
         return (JsonConverter)Activator.CreateInstance(converterType, FindConstructor(typeToConvert)!)!;
     }
 
@@ -61,16 +71,10 @@ internal sealed class AnnotatedConstructorConverterFactory : JsonConverterFactor
 
             var all = t.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
 
-            // A public parameterless constructor, System.Text.Json's own attribute, or a single
-            // public parameterized constructor all mean System.Text.Json can cope on its own.
+            // A public parameterless constructor or System.Text.Json's own attribute mean
+            // System.Text.Json can cope on its own.
             if (all.Any(c => c.IsPublic && c.GetParameters().Length == 0)
                 || all.Any(c => c.GetCustomAttribute<JsonConstructorAttribute>() is not null))
-            {
-                return null;
-            }
-
-            var publicParameterized = all.Where(c => c.IsPublic && c.GetParameters().Length > 0).ToArray();
-            if (publicParameterized.Length == 1)
             {
                 return null;
             }
@@ -82,17 +86,27 @@ internal sealed class AnnotatedConstructorConverterFactory : JsonConverterFactor
 
             // Exactly one annotated constructor, or the intent is ambiguous and guessing would be
             // worse than the framework's own error.
-            return annotated.Length == 1 && annotated[0].GetParameters().Length > 0 ? annotated[0] : null;
+            if (annotated.Length == 1 && annotated[0].GetParameters().Length > 0)
+            {
+                return annotated[0];
+            }
+
+            // A single public parameterized constructor: System.Text.Json would select it, but only
+            // under its strict name+type parameter/property matching, which rejects the historical
+            // Newtonsoft shapes this converter exists for (see the type summary). Take the
+            // constructor over and bind by name instead.
+            var publicParameterized = all.Where(c => c.IsPublic && c.GetParameters().Length > 0).ToArray();
+            return publicParameterized.Length == 1 ? publicParameterized[0] : null;
         });
 }
 
 /// <summary>
 /// Reads <typeparamref name="T"/> by matching JSON properties to the parameters of a constructor
-/// System.Text.Json would not have selected. See <see cref="AnnotatedConstructorConverterFactory"/>
-/// for why this exists.
+/// System.Text.Json would not have selected, or would have bound too strictly. See
+/// <see cref="ParameterizedConstructorConverterFactory"/> for why this exists.
 /// </summary>
 /// <typeparam name="T">The type being constructed.</typeparam>
-internal sealed class AnnotatedConstructorConverter<T> : JsonConverter<T>
+internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
 {
     private static readonly ConcurrentDictionary<JsonSerializerOptions, JsonSerializerOptions> Delegating = new();
 
@@ -101,7 +115,7 @@ internal sealed class AnnotatedConstructorConverter<T> : JsonConverter<T>
 
     /// <summary>Creates the converter for one constructor.</summary>
     /// <param name="constructor">The constructor to invoke.</param>
-    public AnnotatedConstructorConverter(ConstructorInfo constructor)
+    public ParameterizedConstructorConverter(ConstructorInfo constructor)
     {
         this.constructor = constructor;
         parameters = constructor.GetParameters();
@@ -124,6 +138,8 @@ internal sealed class AnnotatedConstructorConverter<T> : JsonConverter<T>
             // Match on the parameter name as written and as the naming policy would render it, both
             // case-insensitively — the same latitude System.Text.Json gives its own constructor
             // binding, and what a camelCase-on-write / case-insensitive-on-read policy requires.
+            // Each argument deserializes to the PARAMETER's declared type, so a parameter typed
+            // IEnumerable<T> accepts JSON that was written from an ImmutableList<T> property.
             args[i] = TryGetProperty(root, parameter.Name!, options, out var value)
                 ? value.Deserialize(parameter.ParameterType, options)
                 : DefaultOf(parameter);
@@ -193,7 +209,7 @@ internal sealed class AnnotatedConstructorConverter<T> : JsonConverter<T>
             var copy = new JsonSerializerOptions(o);
             for (var i = copy.Converters.Count - 1; i >= 0; i--)
             {
-                if (copy.Converters[i] is AnnotatedConstructorConverterFactory)
+                if (copy.Converters[i] is ParameterizedConstructorConverterFactory)
                     copy.Converters.RemoveAt(i);
             }
 
