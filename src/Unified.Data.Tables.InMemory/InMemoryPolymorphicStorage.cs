@@ -1,6 +1,7 @@
 using System.Globalization;
 using Azure;
 using Azure.Data.Tables;
+using Unified.Data.Tables.Providers;
 
 namespace Unified.Data.Tables.InMemory;
 
@@ -343,6 +344,14 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         var row = write.Item is null
             ? new TableEntity(write.Key.PartitionKey, write.Key.RowKey)
             : write.Item.ToTableEntity(write.Key.PartitionKey, write.Key.RowKey);
+
+        // Parity with PolymorphicTableStorage: split values are refused, not stored half. The check
+        // is the main package's provider SPI (no InternalsVisibleTo across packages); the message is
+        // duplicated for the same reason and must stay equal to the main package's.
+        if (write.Item is not null && LargeValueRows.HasLargeValueCells(row))
+            throw new NotSupportedException(
+                $"{write.Item.GetType().Name} carries a value too large for one cell. Polymorphic stores cannot write " +
+                "split or offloaded values; store this type through IStorage<T> instead.");
 
         if (write.Item is not null)
             row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(write.Item.GetType());

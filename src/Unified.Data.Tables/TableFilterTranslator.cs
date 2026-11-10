@@ -273,6 +273,13 @@ public static class TableFilterTranslator
                     $"'{pi.Name}' on {ownerType.Name} is not a persisted column (it is computed, get-only, " +
                     "[IgnoreDataMember], or ETag/Timestamp) and cannot be filtered server-side.");
 
+            // A [TableValueSplit] member may be stored as split cells ("Body__c0", ...) rather than
+            // its own column, so a server-side comparison would silently miss those rows.
+            if (TypeMetadataCache.GetMetadata(ownerType).SplitOptions.ContainsKey(pi.Name))
+                throw new NotSupportedException(
+                    $"'{pi.Name}' on {ownerType.Name} is a large value ([TableValueSplit]) that may be stored " +
+                    "as split cells, so it cannot be filtered server-side.");
+
             // A NESTED owner (x.Owner.Child) only yields an "Owner_Child" column when the serializer
             // FLATTENS it. A JSON-blobbed owner (positional record, collection, [JsonConstructor]) is
             // stored as one cell, so no such column exists — the filter would match nothing on Azure

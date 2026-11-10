@@ -39,6 +39,12 @@ internal static class SplitCodec
     /// <summary>Largest binary cell this codec writes, in bytes (the service limit).</summary>
     internal const int MaxBinaryCellBytes = 65_536;
 
+    /// <summary>Suffix of the chunk-count cell.</summary>
+    internal const string ChunksSuffix = "__chunks";
+
+    /// <summary>Suffix of the blob-reference cell.</summary>
+    internal const string BlobSuffix = "__blob";
+
     /// <summary>A value as it is stored: encoded bytes, the <c>__enc</c> tag and the SHA-256 of the bytes.</summary>
     internal readonly record struct StoredPayload(byte[] Bytes, string Enc, string Sha256);
 

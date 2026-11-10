@@ -680,7 +680,8 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         var partial = new TableEntity(partitionKey, rowKey);
         foreach (var (name, value) in builder.Updates)
         {
-            foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(name, value))
+            // The typed overload refuses a [TableValueSplit] member: its cells must be replaced together.
+            foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(typeof(T), name, value))
             {
                 partial[col] = cell;
             }
