@@ -1,4 +1,7 @@
+using NSubstitute;
+using NSubstitute.ExceptionExtensions;
 using Unified.Data.Tables.InMemory;
+using Unified.Data.Tables.Providers;
 using static Unified.Data.Tables.Tests.LargeValues.OffloadTestSupport;
 
 namespace Unified.Data.Tables.Tests.LargeValues;
@@ -333,5 +336,59 @@ public class ValueOffloadCoordinatorTests
         Assert.Throws<TableValueIntegrityException>(() => Providers.BlobReference.Parse("Body", "not json"));
         Assert.Throws<TableValueIntegrityException>(() => Providers.BlobReference.Parse("Body", """{"path":"x"}"""));
         Assert.Throws<TableValueIntegrityException>(() => Providers.BlobReference.Parse("Body", """{"path":"x","sha256":"a","length":"1","contentType":"c","encoding":"text"}"""));
+    }
+
+    // A blob absent at first, a create-only upload that conflicts (the store reports the existing blob as
+    // unreadable), then a follow-up state read that finds the blob with the right hash, then a touch that finds it gone (a
+    // sweep deleted it in between). Each upload attempt records the stream it was given.
+    private static (IOffloadBlobStore Store, List<Stream> Uploads) VanishingAfterStateRead(int failingUploads)
+    {
+        var store = Substitute.For<IOffloadBlobStore>();
+        var uploads = new List<Stream>();
+        store.UploadCreateOnlyAsync(Arg.Any<string>(), Arg.Any<Stream>(), Arg.Any<BlobReference>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(c =>
+            {
+                uploads.Add(c.ArgAt<Stream>(1));
+                return uploads.Count <= failingUploads
+                    ? Task.FromException(new TableValueIntegrityException(c.ArgAt<string>(0), "the blob reported as existing could not be read."))
+                    : Task.CompletedTask;
+            });
+        // The blob is absent when the write starts, then each follow-up state read finds it.
+        var stateReads = 0;
+        store.GetStateAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(c => Task.FromResult<BlobState?>(++stateReads == 1 ? null : new BlobState(ShaOfName(c.ArgAt<string>(0)), 1, DateTimeOffset.UtcNow)));
+        store.TouchAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .ThrowsAsync(c => new TableValueIntegrityException(c.ArgAt<string>(0), "blob missing"));
+        return (store, uploads);
+
+        // Blobs are content-addressed: the last name segment is the SHA-256 of the stored bytes.
+        static string ShaOfName(string name) => name[(name.LastIndexOf('/') + 1)..];
+    }
+
+    [Fact]
+    public async Task Upload_BlobSweptBetweenRetryStateReadAndTouch_UploadsAgainFromAReopenedSource()
+    {
+        var (store, uploads) = VanishingAfterStateRead(failingUploads: 1);
+        var coordinator = new ValueOffloadCoordinator(store, new BlobOffloadOptions { ThresholdBytes = 1_000 }, "T");
+        var (_, _, pending) = coordinator.Serialize(new SplitTextEntity { Body = Ascii(40_000) }, Pk, Rk, 0);
+
+        await coordinator.UploadAsync(pending, CancellationToken.None);
+
+        Assert.Equal(2, uploads.Count);
+        Assert.NotSame(uploads[0], uploads[1]);
+        await store.Received(1).TouchAsync(Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Upload_BlobKeepsVanishingBeforeTheTouch_GivesUpAfterThreeUploads()
+    {
+        var (store, uploads) = VanishingAfterStateRead(failingUploads: int.MaxValue);
+        var coordinator = new ValueOffloadCoordinator(store, new BlobOffloadOptions { ThresholdBytes = 1_000 }, "T");
+        var (_, _, pending) = coordinator.Serialize(new SplitTextEntity { Body = Ascii(40_000) }, Pk, Rk, 0);
+
+        await Assert.ThrowsAsync<TableValueIntegrityException>(() => coordinator.UploadAsync(pending, CancellationToken.None));
+
+        Assert.Equal(ValueOffloadCoordinator.MaxUploadAttempts, uploads.Count);
+        Assert.Equal(3, uploads.Distinct().Count());
     }
 }

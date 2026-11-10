@@ -68,7 +68,8 @@ Lossless storage of large values, opt-in per property.
   `NotSupportedException` on first use of the type: such a value may flatten into columns at runtime, where
   the attribute was silently ignored.
 - A create-only blob upload that conflicts with an orphan which a sweep deletes before the follow-up state
-  read uploads again (three attempts in all) instead of failing the write with an integrity error.
+  read, or between that read and the touch, uploads again (three attempts in all) instead of failing the
+  write with an integrity error.
 - A read racing a concurrent replace or delete no longer fails with a false `TableValueIntegrityException`:
   when the continuation rows or a blob do not match, the main row is read again and, if its ETag changed,
   the read is retried from the new version (three attempts); a row deleted meanwhile reads as absent. The

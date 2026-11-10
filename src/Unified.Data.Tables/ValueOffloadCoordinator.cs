@@ -205,7 +205,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     // A create-only upload can conflict with an existing blob (an orphan of the same content) that an
     // orphan sweep then deletes before the store reads it back, so the store reports an integrity
     // failure for a blob that is simply gone. When the blob is indeed gone, upload again (from a newly
-    // opened source); a blob that exists with another hash, or any other failure, is not retried.
+    // opened source); a blob that exists with another hash, or any other failure, is not retried. The
+    // sweep can also delete the blob between this method's own state read and its touch: that, too, is
+    // a blob that is gone, and counts as one more attempt.
     private static async Task UploadWithRetryAsync(IOffloadBlobStore store, PendingBlob blob, CancellationToken ct)
     {
         for (var attempt = 1; ; attempt++)
@@ -218,16 +220,31 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             catch (TableValueIntegrityException) when (attempt < MaxUploadAttempts)
             {
                 // Swept between the conflict and the state read: try again. Re-created meanwhile with the
-                // same content: done. Otherwise (another hash, or a different failure) report it.
+                // same content: done once touched, or try again when it is swept before the touch.
+                // Otherwise (another hash, or a different failure) report it.
                 var state = await store.GetStateAsync(blob.Reference.Path, ct);
                 if (state is not null)
                 {
                     if (!string.Equals(state.Sha256, blob.Reference.Sha256, StringComparison.OrdinalIgnoreCase))
                         throw;
-                    await store.TouchAsync(blob.Reference.Path, ct);
-                    return;
+                    if (await TryTouchAsync(store, blob.Reference.Path, ct))
+                        return;
                 }
             }
+        }
+    }
+
+    // Refreshes an existing blob's Last-Modified so a pending sweep keeps it; false when it is gone.
+    private static async Task<bool> TryTouchAsync(IOffloadBlobStore store, string name, CancellationToken ct)
+    {
+        try
+        {
+            await store.TouchAsync(name, ct);
+            return true;
+        }
+        catch (TableValueIntegrityException)
+        {
+            return false;
         }
     }
 
