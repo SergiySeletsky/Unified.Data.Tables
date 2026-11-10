@@ -18,11 +18,15 @@ Lossless storage of large values, opt-in per property.
 - **`BlobOffload`**, **`BlobOffloadOptions`** (`ContainerName`, `ThresholdBytes`, `CleanupGrace`) and
   `UnifiedTableStorageOptions.BlobOffload`.
 - **`TableBlobContent`** for files: always offloaded, lazy `OpenReadAsync`, `FromBytes`/`FromStream`
-  (never buffers; leaves the caller's stream open), `Length`/`Sha256` known after the write.
+  (never buffers in memory; leaves the caller's stream open; a non-seekable stream is copied to a
+  delete-on-close temp file under `Path.GetTempPath()`, a seekable one is read twice and must not change
+  until the write completes), `Length`/`Sha256` known after the write.
 - **`IStorage<T>.SweepOrphanBlobsAsync(partitionKey, olderThan)`** deletes unreferenced blobs. Best-effort
   cleanup after replace/delete only removes blobs untouched for `CleanupGrace`, so schedule the sweep;
   `olderThan` must exceed the longest write duration.
-- **`TableValueIntegrityException`** and **`OversizedValueException`**.
+- **`TableValueIntegrityException`** and **`OversizedValueException`** (with `ColumnName`, `EncodedBytes`,
+  `Reason` and `OffloadForbiddenByProperty`, which is true when offload is configured but the property
+  sets `BlobOffload.Never`; the message names the matching fix).
 - A six-parameter `TableStorage<T>` constructor taking the `BlobServiceClient`, and a `BlobServiceClient`
   registration in the connection-string and credential `AddUnifiedTableStorage` overloads.
 - Storage-provider SPI in `Unified.Data.Tables.Providers` (`LargeValueRows`, `LargeValueTable`,

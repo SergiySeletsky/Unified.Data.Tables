@@ -530,7 +530,10 @@ public sealed class Document : Entity
 
 The attribute goes on a property, or on a class to cover every `string`/`byte[]` property of it.
 `Offload = BlobOffload.Never` forbids tier 3 below; a value that would need it throws
-`OversizedValueException`.
+`OversizedValueException` (a `SerializationException`). Its `ColumnName`, `EncodedBytes` and `Reason`
+describe the value, and `OffloadForbiddenByProperty` tells you which fix applies: `true` means blob offload
+is configured but this property forbids it (set its `Offload` to `BlobOffload.AboveThreshold`), `false`
+means no offload is configured (set `UnifiedTableStorageOptions.BlobOffload`). The message names that fix.
 
 ### Tiers
 
@@ -568,7 +571,8 @@ services.AddUnifiedTableStorage(o =>
 
 `TableStorage<T>` takes a `BlobServiceClient` from DI like it does `TableServiceClient`. The
 connection-string overload registers one from the same string only for Azure Storage hosts or
-`UseDevelopmentStorage=true`; the credential overload derives the blob endpoint for `*.table.*` hosts.
+`UseDevelopmentStorage=true`; the credential overload derives the blob endpoint only for `*.table.core.*` hosts (a Cosmos
+`.table.cosmos.azure.com` endpoint is not derived).
 For a custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a Cosmos Table API host,
 register your own `BlobServiceClient`. Without offload configured, tiers 1 and 2 still work and a value
 that needs tier 3 throws `OversizedValueException`.
@@ -577,7 +581,9 @@ that needs tier 3 throws `OversizedValueException`.
 
 A `TableBlobContent` property is always offloaded, whatever its size, and reading an entity never
 downloads it. `TableBlobContent.FromBytes(bytes, contentType)` and `FromStream(stream, contentType)` create
-one; `FromStream` never buffers the content in memory and leaves your stream open. `Length` and `Sha256`
+one; `FromStream` never buffers the content in memory and leaves your stream open. A non-seekable stream
+is copied to a delete-on-close temporary file under `Path.GetTempPath()` (so the host needs temp disk space
+and access); a seekable stream is read twice (hash, then upload) and must not change until the write completes. `Length` and `Sha256`
 are known after the write (immediately for `FromBytes`). On a loaded entity, `await content.OpenReadAsync()`
 streams the blob lazily and verifies the SHA-256 when the stream reaches its end.
 
