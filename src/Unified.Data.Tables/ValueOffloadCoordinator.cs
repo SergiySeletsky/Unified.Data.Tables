@@ -184,7 +184,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         {
             var name = blob.Reference.Path;
             var column = blob.Column;
-            blob.Content?.Bind(name, c => store.OpenReadAsync(column, name, c), column);
+            blob.Content?.Bind(name, c => OpenLazyAsync(store, column, name, c), column);
         }
     }
 
@@ -303,11 +303,28 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             lazy = (column, reference) => TableBlobContent.Bound(
                 reference.Length, reference.Sha256, reference.ContentType, reference.Path,
                 c => store is not null
-                    ? store.OpenReadAsync(column, reference.Path, c)
+                    ? OpenLazyAsync(store, column, reference.Path, c)
                     : throw new TableValueIntegrityException(column, "the value is stored in blob storage, but blob offload is not configured."),
                 column);
         }
         return new ValueReadContext(resolved ?? NothingResolved, lazy, projectedColumns);
+    }
+
+    // A lazy TableBlobContent opens its blob long after the row was read, perhaps from the entity cache:
+    // a replace or delete since then may have deleted the blob (blobs are content-addressed, so it can
+    // only be missing, never hold other bytes). Say so instead of reporting a bare missing blob.
+    private static async Task<Stream> OpenLazyAsync(IOffloadBlobStore store, string column, string path, CancellationToken ct)
+    {
+        try
+        {
+            return await store.OpenReadAsync(column, path, ct);
+        }
+        catch (TableValueIntegrityException ex)
+        {
+            throw new TableValueIntegrityException(column,
+                $"blob '{path}' could not be opened ({ex.Reason}). The row may have been replaced or deleted since this " +
+                "entity was read (a cached entity can outlive its blob): read the entity again.");
+        }
     }
 
     /// <summary>The most reference columns a sweep names in a projection before it reads whole rows instead.</summary>

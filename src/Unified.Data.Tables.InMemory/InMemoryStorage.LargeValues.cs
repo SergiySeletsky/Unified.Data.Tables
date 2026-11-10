@@ -281,8 +281,7 @@ public sealed partial class InMemoryStorage<T>
         {
             if (take is int t && results.Count >= t)
                 break;
-            var entity = await MaterializeAsync(row, ct);
-            if (matches(entity))
+            if (await MaterializeAsync(row, ct) is { } entity && matches(entity))
                 results.Add(entity);
         }
         return results;
@@ -361,19 +360,55 @@ public sealed partial class InMemoryStorage<T>
         return found.Count == 0 ? NoKeys : found;
     }
 
-    private async Task<T> MaterializeAsync(StoredRow row, CancellationToken ct)
+    /// <summary>
+    /// The entity an assembled row holds, its offloaded values downloaded outside the gate. A writer that
+    /// replaces or deletes the row meanwhile can delete a blob the snapshot references: as in
+    /// TableStorage, the row is then read again and, when its version changed, the read retries from the
+    /// new version (at most <see cref="MaxLargeReadAttempts"/> attempts); an unchanged version is a genuine
+    /// integrity failure; a row deleted meanwhile is null.
+    /// </summary>
+    private async Task<T?> MaterializeAsync(StoredRow row, CancellationToken ct)
     {
-        var entity = await large.ReadAsync<T>(CopyOf(row.Data), ct);
-        entity.ETag = row.ETagString();
-        entity.Timestamp = row.Timestamp;
-        return entity;
+        var keys = (row.Data.PartitionKey, row.Data.RowKey);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                var entity = await large.ReadAsync<T>(CopyOf(row.Data), ct);
+                entity.ETag = row.ETagString();
+                entity.Timestamp = row.Timestamp;
+                return entity;
+            }
+            catch (TableValueIntegrityException) when (attempt < MaxLargeReadAttempts)
+            {
+                StoredRow? current;
+                lock (gate)
+                {
+                    current = rows.TryGetValue(keys, out var stored) && !LargeValueTable.IsPartRow(stored.Data)
+                        ? Assembled(stored)
+                        : null;
+                }
+                if (current is null)
+                    return null;
+                if (current.Version == row.Version)
+                    throw;
+                row = current;
+            }
+        }
     }
+
+    /// <summary>How many times a read whose blobs belonged to another version of the row is attempted in all (as TableStorage).</summary>
+    private const int MaxLargeReadAttempts = 3;
 
     private async Task<List<T>> MaterializeAllAsync(List<StoredRow> source, CancellationToken ct)
     {
         var entities = new List<T>(source.Count);
         foreach (var row in source)
-            entities.Add(await MaterializeAsync(row, ct));
+        {
+            // Deleted while its blobs were read: no longer part of the result.
+            if (await MaterializeAsync(row, ct) is { } entity)
+                entities.Add(entity);
+        }
         return entities;
     }
 

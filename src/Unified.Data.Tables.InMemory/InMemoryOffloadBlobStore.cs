@@ -20,6 +20,9 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     /// <summary>Awaited before each upload stores anything (for tests that pause a write mid-flight).</summary>
     internal Func<string, CancellationToken, Task>? BeforeUpload { get; set; }
 
+    /// <summary>Awaited before each read opens a blob (for tests that change the store mid-read).</summary>
+    internal Func<string, CancellationToken, Task>? BeforeOpenRead { get; set; }
+
     /// <summary>The names of the stored blobs (for tests).</summary>
     internal IReadOnlyCollection<string> Names => blobs.Keys.ToArray();
 
@@ -72,11 +75,13 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     }
 
     /// <inheritdoc />
-    public Task<Stream> OpenReadAsync(string column, string name, CancellationToken ct)
+    public async Task<Stream> OpenReadAsync(string column, string name, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        if (BeforeOpenRead is { } hook)
+            await hook(name, ct);
         return blobs.TryGetValue(name, out var blob)
-            ? Task.FromResult<Stream>(new MemoryStream(blob.Bytes, writable: false))
+            ? new MemoryStream(blob.Bytes, writable: false)
             : throw new TableValueIntegrityException(column, "blob missing");
     }
 

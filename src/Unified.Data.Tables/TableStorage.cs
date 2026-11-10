@@ -304,8 +304,20 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         if (!response.HasValue || SplitRowLayout.IsPartRow(response.Value!))
             return null;
 
-        var row = LargeValueAware ? await AssembleAsync(response.Value!, ct) : response.Value!;
-        var entity = await ToEntityAsync(row, ct);
+        TableEntity row;
+        T entity;
+        if (LargeValueAware)
+        {
+            // Deleted while its parts or blobs were read: absent.
+            if (await ReadLargeAsync(response.Value!, ct) is not { } read)
+                return null;
+            (row, entity) = read;
+        }
+        else
+        {
+            row = response.Value!;
+            entity = row.FromTableEntity<T>();
+        }
         entity.ETag = row.ETag.ToString();
         entity.Timestamp = row.Timestamp;
         CacheEntity(id, entity, row.ETag);
@@ -380,8 +392,20 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         {
             if (SplitRowLayout.IsPartRow(queried))
                 continue;
-            var tableEntity = LargeValueAware ? await AssembleAsync(queried, ct) : queried;
-            var entity = await ToEntityAsync(tableEntity, ct);
+            TableEntity tableEntity;
+            T entity;
+            if (LargeValueAware)
+            {
+                // Deleted while its parts or blobs were read: no longer part of the result.
+                if (await ReadLargeAsync(queried, ct) is not { } read)
+                    continue;
+                (tableEntity, entity) = read;
+            }
+            else
+            {
+                tableEntity = queried;
+                entity = queried.FromTableEntity<T>();
+            }
             entity.ETag = tableEntity.ETag.ToString();
             entity.Timestamp = tableEntity.Timestamp;
             results.Add(entity);
@@ -513,10 +537,12 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
                 continue;
             if (assemble)
             {
-                // The whole row: its split values reassembled and its offloaded values resolved.
-                var row = await AssembleAsync(queried, ct);
-                var entity = Stamp(await ToEntityAsync(row, ct), row);
-                if (warmCache) CacheEntity(entity.Id, entity, row.ETag);
+                // The whole row: its split values reassembled and its offloaded values resolved (a row
+                // deleted while that was read is skipped).
+                if (await ReadLargeAsync(queried, ct) is not { } read)
+                    continue;
+                var entity = Stamp(read.Entity, read.Row);
+                if (warmCache) CacheEntity(entity.Id, entity, read.Row.ETag);
                 yield return entity;
             }
             else
@@ -574,9 +600,10 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
                 items.Add(Deserialize(queried, select));
             else if (assemble)
             {
-                var row = await AssembleAsync(queried, ct);
-                var entity = Stamp(await ToEntityAsync(row, ct), row);
-                CacheEntity(entity.Id, entity, row.ETag);
+                if (await ReadLargeAsync(queried, ct) is not { } read)
+                    continue;
+                var entity = Stamp(read.Entity, read.Row);
+                CacheEntity(entity.Id, entity, read.Row.ETag);
                 items.Add(entity);
             }
             else

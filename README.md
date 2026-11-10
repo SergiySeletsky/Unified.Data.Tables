@@ -613,6 +613,11 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
 - Reads reassemble or download eagerly (`string`, `byte[]`) and verify the SHA-256. A mismatch, a missing
   chunk, continuation row or blob throws `TableValueIntegrityException`; partial data is never returned.
   A transport that transparently decompresses `Content-Encoding: gzip` would break the hash check.
+- A read that races a replace or delete (the main row is read before its continuation rows and blobs) can
+  see parts or a missing blob of another version. On such a failure the main row is read again: if its
+  ETag changed, the whole read is retried from the new version (three attempts in all); a row deleted
+  meanwhile reads as absent (`OneAsync` returns null, a query skips it); only an unchanged ETag is reported
+  as `TableValueIntegrityException`. Data of two versions is never combined.
 - An offloaded value is never returned empty. Reading a row that holds a `{Prop}__blob` reference through
   something that cannot fetch it (the public `FromTableEntity<T>()`, a store whose type does not opt the
   property in, or no `BlobOffload` configured) throws `InvalidOperationException` naming the column, because
@@ -649,6 +654,10 @@ write that reuses an old orphan is never undercut.
   continuation rows; keep paging until the token is null.
 - Eager offloaded values download on every read, one blob per entity; the entity cache holds the full value.
   For types with very large eager values use `CacheFor<T>(CachePolicy.Disabled)`.
+- A `TableBlobContent` on an entity you hold (or one the entity cache returns) names the blob of the version
+  it was read from. Once a replace or delete has removed that blob (after `CleanupGrace`), `OpenReadAsync`
+  throws `TableValueIntegrityException` saying the row may have changed; read the entity again. It never
+  returns other bytes: blobs are named by their hash.
 - `IStorage<T>.SweepOrphanBlobsAsync` has a default implementation on `net10.0` that throws
   `NotSupportedException`; `netstandard2.0` implementers must provide it.
 - A projection of a plain type (one that does not opt the property in) that names a property another type
