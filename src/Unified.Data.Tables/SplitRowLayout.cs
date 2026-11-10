@@ -116,12 +116,16 @@ internal static class SplitRowLayout
         }
     }
 
-    /// <summary>True for a continuation row (it carries <c>_SplitOf</c>).</summary>
-    internal static bool IsPartRow(TableEntity row) => row.ContainsKey(SystemColumnNames.SplitOf);
+    /// <summary>
+    /// True for a continuation row (it carries a non-null <c>_SplitOf</c>). A projection that names
+    /// <c>_SplitOf</c> can return it as null on a row that lacks it, so null means "not a part".
+    /// </summary>
+    internal static bool IsPartRow(TableEntity row) =>
+        row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is not null;
 
     /// <summary>Number of continuation rows a primary declares (0 when none).</summary>
     internal static int PartCount(TableEntity primary) =>
-        primary.TryGetValue(SystemColumnNames.SplitParts, out var v)
+        primary.TryGetValue(SystemColumnNames.SplitParts, out var v) && v is not null
             ? (ToInt(v) is var n and >= 0
                 ? n
                 : throw new TableValueIntegrityException(SystemColumnNames.SplitParts, "the part count is not a non-negative integer"))

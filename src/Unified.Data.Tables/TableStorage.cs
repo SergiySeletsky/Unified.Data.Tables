@@ -20,7 +20,7 @@ namespace Unified.Data.Tables;
 /// <see cref="ServiceCollectionExtensions.AddUnifiedTableStorage(Microsoft.Extensions.DependencyInjection.IServiceCollection, Action{UnifiedTableStorageOptions})"/>.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
+public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 {
     private const char Separator = '|';
 
@@ -123,6 +123,12 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         entity.Id = NormalizeId(entity.Id);
 
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        if (LargeValueAware)
+        {
+            CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Create, ETag.All, ct));
+            return entity;
+        }
+
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
         Response addResponse;
         try
@@ -169,7 +175,10 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         await EnsureTableAsync(ct);
 
         var (partitionKey, rowKey) = GetEntityKeys(id);
-        await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
+        if (LargeValueAware)
+            await DeleteLargeAsync(partitionKey, rowKey, ct);
+        else
+            await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
 
         cache.Remove(EntityCacheKey(id));
         InvalidateQueryCache(partitionKey);
@@ -187,13 +196,15 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         var entities = new List<TableEntity>();
         await foreach (var entity in client.QueryAsync<TableEntity>(
             e => e.PartitionKey == partition,
-            select: ["PartitionKey", "RowKey"],
+            select: LargeValueAware ? ["PartitionKey", "RowKey", SystemColumnNames.SplitOf] : ["PartitionKey", "RowKey"],
             cancellationToken: ct))
         {
             entities.Add(entity);
         }
 
         if (entities.Count == 0) return 0;
+        // Every row goes, continuation rows included; only logical entities are counted.
+        var logicalCount = LargeValueAware ? entities.Count(e => !SplitRowLayout.IsPartRow(e)) : entities.Count;
 
         // Azure Table batch: max 100 entities per transaction, same partition
         foreach (var batch in entities.Chunk(100))
@@ -209,9 +220,9 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         InvalidateQueryCache(partition);
 
         logger.LogInformation("Batch-deleted {Count} {Type} entities from partition {Partition}",
-            entities.Count, typeName, partition);
+            logicalCount, typeName, partition);
 
-        return entities.Count;
+        return logicalCount;
     }
 
     /// <inheritdoc />
@@ -235,13 +246,14 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
 
-        if (!response.HasValue)
+        if (!response.HasValue || SplitRowLayout.IsPartRow(response.Value!))
             return null;
 
-        var entity = response.Value!.FromTableEntity<T>();
-        entity.ETag = response.Value!.ETag.ToString();
-        entity.Timestamp = response.Value!.Timestamp;
-        CacheEntity(id, entity, response.Value!.ETag);
+        var row = LargeValueAware ? await AssembleAsync(response.Value!, ct) : response.Value!;
+        var entity = row.FromTableEntity<T>();
+        entity.ETag = row.ETag.ToString();
+        entity.Timestamp = row.Timestamp;
+        CacheEntity(id, entity, row.ETag);
         // `entity` is now caller-private (CacheEntity snapshotted its own copy), so hand it back as-is.
         return entity;
     }
@@ -266,7 +278,11 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
 
-        if (response.HasValue)
+        if (response.HasValue && SplitRowLayout.IsPartRow(response.Value!))
+            return false;
+
+        // A split value is not assembled just to answer "does it exist" - it is simply not cached.
+        if (response.HasValue && (!LargeValueAware || SplitRowLayout.PartCount(response.Value!) == 0))
         {
             var entity = response.Value!.FromTableEntity<T>();
             entity.ETag = response.Value!.ETag.ToString();
@@ -300,8 +316,11 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             ? client.QueryAsync<TableEntity>(cancellationToken: ct)
             : client.QueryAsync<TableEntity>(x => x.PartitionKey == partition, cancellationToken: ct);
 
-        await foreach (var tableEntity in query.WithCancellation(ct))
+        await foreach (var queried in query.WithCancellation(ct))
         {
+            if (SplitRowLayout.IsPartRow(queried))
+                continue;
+            var tableEntity = LargeValueAware ? await AssembleAsync(queried, ct) : queried;
             var entity = tableEntity.FromTableEntity<T>();
             entity.ETag = tableEntity.ETag.ToString();
             entity.Timestamp = tableEntity.Timestamp;
@@ -366,7 +385,9 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         // A bounded query is the "never cached" read path — it does not warm the per-entity cache.
         // A PROJECTED row must never warm it either: a partial entity in the cache would be served
         // to a later caller that asked for every column.
-        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, BuildSelect(options));
+        // A projection that omits every large value is not assembled (its cells were not fetched).
+        var select = BuildSelect(options);
+        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, select, assemble: LargeValueAware && select is null);
     }
 
     /// <inheritdoc />
@@ -383,7 +404,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             ? predicateFilter
             : $"{TableClient.CreateQueryFilter($"PartitionKey eq {partition}")} and ({predicateFilter})";
 
-        return StreamAsync(filter, take, warmCache: true, ct);
+        return StreamAsync(filter, take, warmCache: true, ct, assemble: LargeValueAware);
     }
 
 
@@ -399,9 +420,12 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     internal static IEnumerable<string>? BuildSelect(QueryOptions? options)
     {
         if (options?.Select is not { Count: > 0 } requested) return null;
+        // A large value spans cells and continuation rows: naming it fetches (and assembles) the whole row.
+        if (LargeValueAware && SelectsLargeValue(requested)) return null;
 
-        var columns = new List<string>(requested.Count + SystemColumns.Length);
+        var columns = new List<string>(requested.Count + SystemColumns.Length + SplitSystemColumns.Length);
         columns.AddRange(SystemColumns);
+        if (LargeValueAware) columns.AddRange(SplitSystemColumns);
         foreach (var column in requested)
             if (!columns.Contains(column, StringComparer.Ordinal)) columns.Add(column);
 
@@ -414,7 +438,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     // Shared server-side streaming iterator. Validation lives in the public methods so it throws
     // eagerly rather than being deferred to the first MoveNext of the returned sequence.
     private async IAsyncEnumerable<T> StreamAsync(string? filter, int? take, bool warmCache,
-        [EnumeratorCancellation] CancellationToken ct, IEnumerable<string>? select = null)
+        [EnumeratorCancellation] CancellationToken ct, IEnumerable<string>? select = null, bool assemble = false)
     {
         await EnsureTableAsync(ct);
 
@@ -422,8 +446,12 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, select, ct);
 
         var yielded = 0;
-        await foreach (var row in pageable.WithCancellation(ct))
+        await foreach (var queried in pageable.WithCancellation(ct))
         {
+            // Continuation rows are not entities: they never count toward take, nor reach the cache.
+            if (SplitRowLayout.IsPartRow(queried))
+                continue;
+            var row = assemble ? await AssembleAsync(queried, ct) : queried;
             yield return warmCache ? Materialize(row) : Deserialize(row);
 
             if (take is int max && ++yielded >= max)
@@ -455,7 +483,9 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         await EnsureTableAsync(ct);
 
         var filter = BuildFilter(partition, rowKeyPrefix);
-        var pageable = client.QueryAsync<TableEntity>(filter, pageSize, BuildSelect(options), ct);
+        var select = BuildSelect(options);
+        var assemble = LargeValueAware && select is null;
+        var pageable = client.QueryAsync<TableEntity>(filter, pageSize, select, ct);
 
         // Take the first server page from the cursor position (one page per call).
         await using var pages = pageable.AsPages(innerToken, pageSize).GetAsyncEnumerator(ct);
@@ -463,7 +493,13 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             return new EntityPage<T>([], null);
 
         var page = pages.Current;
-        var items = page.Values.Select(Materialize).ToList();
+        var items = new List<T>(page.Values.Count);
+        foreach (var queried in page.Values)
+        {
+            if (SplitRowLayout.IsPartRow(queried))
+                continue;
+            items.Add(Materialize(assemble ? await AssembleAsync(queried, ct) : queried));
+        }
         var next = page.ContinuationToken is null ? null : PageCursor.Encode(fingerprint, page.ContinuationToken);
         return new EntityPage<T>(items, next);
     }
@@ -498,7 +534,9 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     private static T Clone(T entity)
     {
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-        var copy = entity.ToTableEntity(partitionKey, rowKey).FromTableEntity<T>();
+        // The clone context keeps a cached split value a plain in-process bag, never re-encoded for storage.
+        var copy = TableEntitySerializer.ToTableEntity(entity, partitionKey, rowKey, ValueWriteContext.ForClone, [])
+            .FromTableEntity<T>();
         copy.ETag = entity.ETag;
         copy.Timestamp = entity.Timestamp;
         return copy;
@@ -506,13 +544,17 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
     /// <inheritdoc />
     /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
-    /// the point of a batch) — treat them as trusted server-side paths.</remarks>
+    /// the point of a batch) — treat them as trusted server-side paths. For a type with a
+    /// <see cref="TableValueSplitAttribute"/> member the entities are written one by one (each atomic
+    /// with its own continuation rows), so a batch of such entities has no per-chunk atomicity.</remarks>
     public Task<int> CreateBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
         => WriteBatchAsync(entities, TableTransactionActionType.Add, ct);
 
     /// <inheritdoc />
     /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
-    /// the point of a batch) — treat them as trusted server-side paths.</remarks>
+    /// the point of a batch) — treat them as trusted server-side paths. For a type with a
+    /// <see cref="TableValueSplitAttribute"/> member the entities are written one by one (each atomic
+    /// with its own continuation rows), so a batch of such entities has no per-chunk atomicity.</remarks>
     public Task<int> UpsertBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
         => WriteBatchAsync(entities, TableTransactionActionType.UpsertReplace, ct);
 
@@ -529,11 +571,14 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             : TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
 
         // Keys-only projection keeps each page tiny; Azure Tables has no server-side count.
+        // A split-aware table also selects _SplitOf so continuation rows are not counted as entities.
         var count = 0;
-        await foreach (var _ in client.QueryAsync<TableEntity>(filter, select: ["PartitionKey"], cancellationToken: ct)
+        await foreach (var row in client.QueryAsync<TableEntity>(
+                               filter, select: LargeValueAware ? ["PartitionKey", SystemColumnNames.SplitOf] : ["PartitionKey"], cancellationToken: ct)
                            .WithCancellation(ct))
         {
-            count++;
+            if (!SplitRowLayout.IsPartRow(row))
+                count++;
         }
         return count;
     }
@@ -566,44 +611,16 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             entity.Id = NormalizeId(entity.Id);
 
             var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-            rows.Add((partitionKey, entity.Id, entity.ToTableEntity(partitionKey, rowKey)));
+            // A split-aware entity is serialized by its own per-entity write below.
+            rows.Add((partitionKey, entity.Id, LargeValueAware ? null! : entity.ToTableEntity(partitionKey, rowKey)));
         }
 
         try
         {
-            foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
-            {
-                // Azure Table transactions cap on BOTH entity count and payload size, and a
-                // count-only chunker sends a legal-looking 100-entity batch that the service
-                // rejects with 413 once the rows carry binary columns — after earlier chunks
-                // have already committed. BatchPlanner caps on both axes and refuses an
-                // unsendable entity up front. See BatchPlanner for the measured budget.
-                var groupRows = group.ToArray();
-                var plan = BatchPlanner.Plan([.. groupRows.Select(r => TableRowSize.Estimate(r.Row))]);
-                foreach (var range in plan)
-                {
-                    var chunk = new (string Partition, string Id, TableEntity Row)[range.Count];
-                    Array.Copy(groupRows, range.Start, chunk, 0, range.Count);
-
-                    var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
-                    try
-                    {
-                        await client.SubmitTransactionAsync(actions, ct);
-                    }
-                    catch (TableTransactionFailedException ex)
-                        when (actionType == TableTransactionActionType.Add
-                            && (ex.Status == 409 || ex.ErrorCode == "InvalidDuplicateRow"))
-                    {
-                        // 409 = a row already exists in the table; 400 InvalidDuplicateRow = the
-                        // same key twice WITHIN this transaction. Both are duplicate keys — and
-                        // InMemoryStorage translates both, so production must match the fake.
-                        var duplicateId = ex.FailedTransactionActionIndex is int i && i >= 0 && i < chunk.Length
-                            ? chunk[i].Id
-                            : chunk[0].Partition + Separator + "?";
-                        throw new DuplicateKeyException(typeName, duplicateId, ex);
-                    }
-                }
-            }
+            if (LargeValueAware)
+                await WriteBatchLargeAsync(entities, actionType, ct);
+            else
+                await SubmitBatchRowsAsync(rows, actionType, ct);
         }
         finally
         {
@@ -619,6 +636,44 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             actionType, rows.Count, typeName, rows.Select(r => r.Partition).Distinct(StringComparer.Ordinal).Count());
 
         return rows.Count;
+    }
+
+    private async Task SubmitBatchRowsAsync(
+        List<(string Partition, string Id, TableEntity Row)> rows, TableTransactionActionType actionType, CancellationToken ct)
+    {
+        foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
+        {
+            // Azure Table transactions cap on BOTH entity count and payload size, and a
+            // count-only chunker sends a legal-looking 100-entity batch that the service
+            // rejects with 413 once the rows carry binary columns — after earlier chunks
+            // have already committed. BatchPlanner caps on both axes and refuses an
+            // unsendable entity up front. See BatchPlanner for the measured budget.
+            var groupRows = group.ToArray();
+            var plan = BatchPlanner.Plan([.. groupRows.Select(r => TableRowSize.Estimate(r.Row))]);
+            foreach (var range in plan)
+            {
+                var chunk = new (string Partition, string Id, TableEntity Row)[range.Count];
+                Array.Copy(groupRows, range.Start, chunk, 0, range.Count);
+
+                var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
+                try
+                {
+                    await client.SubmitTransactionAsync(actions, ct);
+                }
+                catch (TableTransactionFailedException ex)
+                    when (actionType == TableTransactionActionType.Add
+                        && (ex.Status == 409 || ex.ErrorCode == "InvalidDuplicateRow"))
+                {
+                    // 409 = a row already exists in the table; 400 InvalidDuplicateRow = the
+                    // same key twice WITHIN this transaction. Both are duplicate keys — and
+                    // InMemoryStorage translates both, so production must match the fake.
+                    var duplicateId = ex.FailedTransactionActionIndex is int i && i >= 0 && i < chunk.Length
+                        ? chunk[i].Id
+                        : chunk[0].Partition + Separator + "?";
+                    throw new DuplicateKeyException(typeName, duplicateId, ex);
+                }
+            }
+        }
     }
 
     private static string? BuildFilter(string? partition, string? rowKeyPrefix)
@@ -809,6 +864,21 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        if (LargeValueAware)
+        {
+            try
+            {
+                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Replace, etag, ct));
+            }
+            catch (ConcurrencyConflictException)
+            {
+                cache.Remove(EntityCacheKey(entity.Id));
+                InvalidateQueryCache(partitionKey);
+                throw;
+            }
+            return entity;
+        }
+
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
 
         try
@@ -854,6 +924,21 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        if (LargeValueAware)
+        {
+            try
+            {
+                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Upsert, ETag.All, ct));
+            }
+            catch (ConcurrencyConflictException)
+            {
+                cache.Remove(EntityCacheKey(entity.Id));
+                InvalidateQueryCache(partitionKey);
+                throw;
+            }
+            return entity;
+        }
+
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
         var upsertResponse = await client.UpsertEntityAsync(dataEntity, TableUpdateMode.Replace, ct);
 
