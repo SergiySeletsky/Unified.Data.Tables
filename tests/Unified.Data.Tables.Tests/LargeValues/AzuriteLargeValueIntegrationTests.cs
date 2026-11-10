@@ -185,9 +185,29 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         return Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant();
     }
 
-    // Ages are measured on the service clock, whose Date header and Last-Modified have one-second
-    // resolution: a blob written this second is not yet older than zero. Wait for the next second.
-    private static Task PastTheServiceSecondAsync() => Task.Delay(TimeSpan.FromMilliseconds(1_100), Ct);
+    // A sweep measures ages on the service clock (the Date of a blob request), which, like Last-Modified,
+    // has one-second resolution, and keeps a blob that is not strictly older than the cutoff: with
+    // olderThan = 0, a blob stamped in the same service second as the sweep is kept. A fixed client-side
+    // delay does not guarantee the service second has moved on (the service clock, not the test's, decides),
+    // so poll the service until its own clock is past the newest stamp of T's blobs in this partition.
+    // The sweep reads the service time after this returns, so its cutoff is at least as late.
+    private async Task PastTheServiceSecondAsync<T>()
+    {
+        var blobs = await BlobsAsync<T>();
+        Assert.NotEmpty(blobs);
+        var newest = blobs.Max(b => b.Properties.LastModified ?? throw new InvalidOperationException($"'{b.Name}' has no Last-Modified."));
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(30);
+        while (true)
+        {
+            var serviceNow = (await container.GetPropertiesAsync(cancellationToken: Ct)).GetRawResponse().Headers.Date
+                ?? throw new InvalidOperationException("The blob service sent no Date header.");
+            if (serviceNow > newest)
+                return;
+            Assert.True(DateTimeOffset.UtcNow < deadline,
+                $"The blob service clock ({serviceNow:O}) did not pass the newest blob's Last-Modified ({newest:O}) within 30 s.");
+            await Task.Delay(TimeSpan.FromMilliseconds(200), Ct);
+        }
+    }
 
     private int BlobRequestCount()
     {
@@ -639,7 +659,7 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         Assert.Single(await BlobsAsync<SplitTextEntity>());
         Assert.Empty(await RawRowsAsync<SplitTextEntity>());
 
-        await PastTheServiceSecondAsync();
+        await PastTheServiceSecondAsync<SplitTextEntity>();
         Assert.Equal(1, await store.SweepOrphanBlobsAsync(pk, TimeSpan.Zero, Ct));
         Assert.Empty(await BlobsAsync<SplitTextEntity>());
     }
@@ -665,7 +685,7 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         var winnerName = $"SplitTextEntity/{pk}/w1/Body/{Sha(Utf8(winner))}";
         Assert.Equal(3, (await BlobsAsync<SplitTextEntity>()).Count); // original, winner, loser
 
-        await PastTheServiceSecondAsync();
+        await PastTheServiceSecondAsync<SplitTextEntity>();
         Assert.Equal(2, await Store<SplitTextEntity>().SweepOrphanBlobsAsync(pk, TimeSpan.Zero, Ct));
 
         Assert.Equal(winnerName, Assert.Single(await BlobsAsync<SplitTextEntity>()).Name);
