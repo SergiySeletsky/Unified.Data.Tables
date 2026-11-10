@@ -528,7 +528,11 @@ public sealed class Document : Entity
 }
 ```
 
-The attribute goes on a property, or on a class to cover every `string`/`byte[]` property of it.
+The attribute goes on a property, or on a class to cover every `string`/`byte[]` property of it. On a
+property it must be a `string`, a `byte[]` or a type stored as one JSON cell (a collection, or a concrete
+type that does not flatten into columns); on an interface or abstract type, which may flatten at runtime,
+it throws `NotSupportedException` on first use of the entity type, as it does on a native scalar or a type
+that flattens.
 `Offload = BlobOffload.Never` forbids tier 3 below; a value that would need it throws
 `OversizedValueException` (a `SerializationException`). Its `ColumnName`, `EncodedBytes` and `Reason`
 describe the value, and `OffloadForbiddenByProperty` tells you which fix applies: `true` means blob offload

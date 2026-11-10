@@ -1481,7 +1481,8 @@ internal static class TypeMetadataCache
     // every string, byte[] and JSON-stored property declared by the annotated class or a class
     // derived from it - not members inherited from its bases (Entity.Id stays an ordinary, filterable
     // key column). A property-level attribute on a scalar or on a concrete type that flattens into
-    // columns has nothing to split and fails on first use of the type.
+    // columns has nothing to split and fails on first use of the type; one on an interface or abstract
+    // type that may flatten at runtime cannot be honoured and fails (NotSupportedException) too.
     private static Dictionary<string, TableValueSplitAttribute> BuildSplitOptions(Type t, ImmutableList<PropertyInfo> props)
     {
         var options = new Dictionary<string, TableValueSplitAttribute>(StringComparer.Ordinal);
@@ -1513,6 +1514,13 @@ internal static class TypeMetadataCache
                     throw new InvalidOperationException(
                         $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is flattened into columns. " +
                         "Put [TableValueSplit] on its members instead.");
+                // An interface or abstract type flattens or not depending on the runtime value; a
+                // flattened value would silently ignore the attribute (and could then be trimmed).
+                if (!IsSplittable(type))
+                    throw new NotSupportedException(
+                        $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is an interface or abstract type, which may be " +
+                        "flattened into columns at runtime, so the attribute cannot be honoured. Declare the property as " +
+                        "string, byte[] or a concrete type stored as JSON, or put [TableValueSplit] on the members of its implementations.");
                 options[prop.Name] = own;
             }
             else if (classLevel is not null

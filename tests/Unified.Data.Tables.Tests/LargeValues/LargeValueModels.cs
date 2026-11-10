@@ -126,3 +126,35 @@ public class NeverOffloadWithFileEntity : Entity
 
     public TableBlobContent? File { get; set; }
 }
+
+/// <summary>A shape decided only at runtime (flattened or JSON): the attribute cannot be honoured.</summary>
+public interface ISplitShape
+{
+    string? Name { get; set; }
+}
+
+public abstract class SplitShapeBase
+{
+    public string? Name { get; set; }
+}
+
+/// <summary>Misuse: [TableValueSplit] on an interface-typed member that may flatten into columns.</summary>
+public class SplitOnInterfaceEntity : Entity
+{
+    [TableValueSplit(SplitEncoding.Text)]
+    public ISplitShape? Shape { get; set; }
+}
+
+/// <summary>Misuse: [TableValueSplit] on an abstract-typed member that may flatten into columns.</summary>
+public class SplitOnAbstractEntity : Entity
+{
+    [TableValueSplit(SplitEncoding.Text)]
+    public SplitShapeBase? Shape { get; set; }
+}
+
+/// <summary>An interface collection is always one JSON cell, so it can be split.</summary>
+public class SplitOnInterfaceListEntity : Entity
+{
+    [TableValueSplit(SplitEncoding.Text)]
+    public IList<string>? Items { get; set; }
+}

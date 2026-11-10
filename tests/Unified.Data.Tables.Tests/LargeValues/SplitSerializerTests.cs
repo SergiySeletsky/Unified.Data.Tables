@@ -321,6 +321,28 @@ public class SplitSerializerTests
         Assert.Contains("SplitOnScalarEntity.Number", ex.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(typeof(SplitOnInterfaceEntity), "SplitOnInterfaceEntity.Shape")]
+    [InlineData(typeof(SplitOnAbstractEntity), "SplitOnAbstractEntity.Shape")]
+    public void PropertyLevelAttribute_OnInterfaceOrAbstractType_IsRefused(Type type, string member)
+    {
+        // Such a member flattens or not depending on the runtime value; a flattened one would ignore the
+        // attribute, so an opted-in value could be trimmed under OversizedCells = Trim.
+        var ex = Assert.Throws<NotSupportedException>(() => TypeMetadataCache.GetMetadata(type));
+        Assert.Contains(member, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PropertyLevelAttribute_OnInterfaceCollection_IsAccepted()
+    {
+        var meta = TypeMetadataCache.GetMetadata(typeof(SplitOnInterfaceListEntity));
+        Assert.True(meta.SplitOptions.ContainsKey("Items"));
+        var items = Enumerable.Range(0, 5_000).Select(i => RandomText(20) + i).ToList();
+        var row = new SplitOnInterfaceListEntity { Items = items }.ToTableEntity(Pk, Rk);
+        Assert.True(row.ContainsKey("Items__chunks"));
+        Assert.Equal(items, row.FromTableEntity<SplitOnInterfaceListEntity>().Items);
+    }
+
     [Fact]
     public void HasLargeValueCells_DetectsSplitCellsOnly()
     {

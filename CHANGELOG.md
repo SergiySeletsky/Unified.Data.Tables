@@ -62,6 +62,9 @@ Lossless storage of large values, opt-in per property.
   instead of leaving the property null, which a later write would have turned into data loss. A projection
   that omits the property still leaves it at its default. `ExistsAsync` on a plain type does not cache an
   entity from a row with large-value cells.
+- `[TableValueSplit]` on a property of an interface or abstract (non-collection) type is refused with
+  `NotSupportedException` on first use of the type: such a value may flatten into columns at runtime, where
+  the attribute was silently ignored.
 
 ### Unchanged
 
