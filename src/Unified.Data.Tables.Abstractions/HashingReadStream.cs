@@ -33,6 +33,12 @@ internal sealed class HashingReadStream : Stream
     /// <summary>True once the end of the inner stream was reached and the content matched.</summary>
     internal bool Verified => verified;
 
+    /// <summary>
+    /// The exception the end-of-stream check raised, kept so a caller can report it even when the
+    /// consumer (an SDK pipeline) wrapped, retried past or swallowed it; null while no check failed.
+    /// </summary>
+    internal Exception? Mismatch { get; private set; }
+
     public override bool CanRead => true;
 
     public override bool CanSeek => false;
@@ -111,11 +117,13 @@ internal sealed class HashingReadStream : Stream
     private void Verify()
     {
         if (verified) return;
+        // The hash is consumed by the first check: report that outcome again rather than a new one.
+        if (Mismatch is not null) throw Mismatch;
         var actual = Hex.Lower(hash.GetHashAndReset());
         if (expectedLength is long length && read != length)
-            throw onMismatch($"read {read} bytes, expected {length}");
+            throw Mismatch = onMismatch($"read {read} bytes, expected {length}");
         if (expectedSha256 is not null && !string.Equals(actual, expectedSha256, StringComparison.OrdinalIgnoreCase))
-            throw onMismatch($"SHA-256 mismatch (expected {expectedSha256}, computed {actual})");
+            throw Mismatch = onMismatch($"SHA-256 mismatch (expected {expectedSha256}, computed {actual})");
         verified = true;
     }
 

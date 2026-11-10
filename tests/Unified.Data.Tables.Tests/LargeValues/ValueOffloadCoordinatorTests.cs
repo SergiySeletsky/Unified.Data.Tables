@@ -65,6 +65,130 @@ public class ValueOffloadCoordinatorTests
         Assert.Null(entity.Content.BoundPath);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Upload_SourceChanged_StoreWrapsOrSwallowsTheError_StillThrowsInvalidOperation(bool swallow)
+    {
+        // A real SDK pipeline wraps (or retries past) whatever the content stream throws; the coordinator
+        // must still report the changed source, not the transport's wrapper or a silent success.
+        var store = new WrappingStore(swallow);
+        var coordinator = new ValueOffloadCoordinator(store, new BlobOffloadOptions(), "T");
+        var data = RandomBytes(50_000);
+        var entity = new BlobEntity { Content = TableBlobContent.FromStream(new MemoryStream(data), "application/octet-stream") };
+
+        await coordinator.PrepareAsync(entity, CancellationToken.None);
+        data[100] ^= 0xFF;
+        var (_, _, blobs) = coordinator.Serialize(entity, Pk, Rk, 0);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.UploadAsync(blobs, CancellationToken.None));
+        Assert.Contains("changed after it was prepared", ex.Message, StringComparison.Ordinal);
+        Assert.Null(entity.Content.BoundPath);
+    }
+
+    [Fact]
+    public async Task Upload_TwoPropertiesShareOneNonSeekableContent_BindsOnlyAfterEveryUpload()
+    {
+        var store = new CountingOffloadBlobStore(new InMemoryOffloadBlobStore());
+        var coordinator = new ValueOffloadCoordinator(store, new BlobOffloadOptions(), "T");
+        var data = RandomBytes(20_000);
+        var shared = TableBlobContent.FromStream(new GeneratedStreamView(data), "application/octet-stream");
+        var entity = new TwoBlobEntity { First = shared, Second = shared };
+
+        await coordinator.PrepareAsync(entity, CancellationToken.None);
+        var (_, _, blobs) = coordinator.Serialize(entity, Pk, Rk, 0);
+        await coordinator.UploadAsync(blobs, CancellationToken.None);
+
+        Assert.Equal(2, store.UploadCalls);
+        foreach (var blob in blobs)
+        {
+            await using var stream = await store.Inner.OpenReadAsync(blob.Column, blob.Reference.Path, CancellationToken.None);
+            Assert.Equal(data, await ReadAllAsync(stream));
+        }
+    }
+
+    [Fact]
+    public async Task ReleasePrepared_DisposesTheTemporaryCopy()
+    {
+        var coordinator = new ValueOffloadCoordinator(new InMemoryOffloadBlobStore(), new BlobOffloadOptions(), "T");
+        var content = TableBlobContent.FromStream(new GeneratedStreamView(RandomBytes(1_000)), "application/octet-stream");
+        var entity = new BlobEntity { Content = content };
+        await coordinator.PrepareAsync(entity, CancellationToken.None);
+        var spool = Assert.IsType<FileStream>(content.Source);
+        var path = spool.Name;
+        Assert.True(File.Exists(path));
+
+        ValueOffloadCoordinator.ReleasePrepared(entity);
+
+        Assert.Null(content.Source);
+        Assert.False(File.Exists(path));
+    }
+
+    /// <summary>A forward-only stream over fixed bytes.</summary>
+    private sealed class GeneratedStreamView(byte[] data) : Stream
+    {
+        private readonly MemoryStream inner = new(data, writable: false);
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void Flush()
+        {
+        }
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>A store whose transport wraps every content-stream failure, or swallows it and reports success.</summary>
+    private sealed class WrappingStore(bool swallow) : Providers.IOffloadBlobStore
+    {
+        private readonly InMemoryOffloadBlobStore inner = new();
+
+        public Task<Providers.BlobState?> GetStateAsync(string name, CancellationToken ct) => inner.GetStateAsync(name, ct);
+
+        public async Task UploadCreateOnlyAsync(string name, Stream content, Providers.BlobReference reference, string? contentEncoding, CancellationToken ct)
+        {
+            try
+            {
+                await content.CopyToAsync(Stream.Null, ct);
+            }
+            catch (Exception ex) when (!swallow)
+            {
+                throw new IOException("transport failed", ex);
+            }
+            catch (Exception) when (swallow)
+            {
+                // a retrying transport that gave up quietly
+            }
+        }
+
+        public Task TouchAsync(string name, CancellationToken ct) => inner.TouchAsync(name, ct);
+
+        public Task<Stream> OpenReadAsync(string column, string name, CancellationToken ct) => inner.OpenReadAsync(column, name, ct);
+
+        public Task<bool> DeleteIfUnmodifiedAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct) =>
+            inner.DeleteIfUnmodifiedAsync(name, unmodifiedSince, ct);
+
+        public IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(string prefix, CancellationToken ct) => inner.ListAsync(prefix, ct);
+    }
+
     [Fact]
     public async Task Upload_BindsContentToItsBlob()
     {

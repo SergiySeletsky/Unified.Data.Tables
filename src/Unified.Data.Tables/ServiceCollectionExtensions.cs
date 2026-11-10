@@ -1,5 +1,6 @@
 using Azure.Core;
 using Azure.Data.Tables;
+using Azure.Storage.Blobs;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
@@ -15,7 +16,10 @@ public static class ServiceCollectionExtensions
     /// Registers the in-memory cache, the configured <see cref="UnifiedTableStorageOptions"/>, and
     /// the open-generic <see cref="IStorage{T}"/> → <see cref="TableStorage{T}"/> mapping. The
     /// caller must separately register a <see cref="TableServiceClient"/> (and, if protected
-    /// properties are used, an <see cref="IProtectedPropertyAuthorizer"/>).
+    /// properties are used, an <see cref="IProtectedPropertyAuthorizer"/>). A host that sets
+    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> registers a <see cref="BlobServiceClient"/>
+    /// the same way it registers its <see cref="TableServiceClient"/>; without one, resolving a store
+    /// throws <see cref="InvalidOperationException"/>.
     /// </summary>
     public static IServiceCollection AddUnifiedTableStorage(
         this IServiceCollection services, Action<UnifiedTableStorageOptions>? configure = null)
@@ -40,8 +44,11 @@ public static class ServiceCollectionExtensions
     }
 
     /// <summary>
-    /// Registers a <see cref="TableServiceClient"/> built from <paramref name="connectionString"/>
-    /// alongside the cache, options, and the open-generic <see cref="IStorage{T}"/> mapping.
+    /// Registers a <see cref="TableServiceClient"/> and a <see cref="BlobServiceClient"/> (used only by
+    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/>) built from <paramref name="connectionString"/>
+    /// alongside the cache, options, and the open-generic <see cref="IStorage{T}"/> mapping. A client
+    /// already registered is kept, and no blob client is registered for a connection string that has
+    /// no blob endpoint (a table-only endpoint with a SAS).
     /// </summary>
     public static IServiceCollection AddUnifiedTableStorage(
         this IServiceCollection services, string connectionString,
@@ -51,13 +58,21 @@ public static class ServiceCollectionExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
 
         services.TryAddSingleton(_ => new TableServiceClient(connectionString));
+        // Only a connection string a blob client can be built from: a table-only one (an endpoint and a
+        // SAS, no account) must keep resolving its stores exactly as before.
+        if (CanBuildBlobClient(connectionString))
+            services.TryAddSingleton(_ => new BlobServiceClient(connectionString));
         return services.AddUnifiedTableStorage(configure);
     }
 
     /// <summary>
     /// Registers a <see cref="TableServiceClient"/> authenticated with a <see cref="TokenCredential"/>
     /// (e.g. a managed identity via <c>DefaultAzureCredential</c>) alongside the cache, options,
-    /// and the open-generic <see cref="IStorage{T}"/> mapping.
+    /// and the open-generic <see cref="IStorage{T}"/> mapping. When the endpoint's host is an Azure
+    /// Storage table host (it contains <c>.table.</c>), a <see cref="BlobServiceClient"/> for the same
+    /// account (<c>.blob.</c>) and credential is registered too, for
+    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/>; for any other host (an emulator, a custom
+    /// domain) register the <see cref="BlobServiceClient"/> yourself. A client already registered is kept.
     /// </summary>
     /// <param name="services">The service collection.</param>
     /// <param name="endpoint">The table endpoint, e.g. <c>https://{account}.table.core.windows.net</c>.</param>
@@ -72,7 +87,38 @@ public static class ServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(credential);
 
         services.TryAddSingleton(_ => new TableServiceClient(endpoint, credential));
+        if (BlobEndpointFor(endpoint) is { } blobEndpoint)
+            services.TryAddSingleton(_ => new BlobServiceClient(blobEndpoint, credential));
         return services.AddUnifiedTableStorage(configure);
+    }
+
+    // Building the client parses the connection string and makes no call.
+    private static bool CanBuildBlobClient(string connectionString)
+    {
+        try
+        {
+            _ = new BlobServiceClient(connectionString);
+            return true;
+        }
+#pragma warning disable CA1031 // the SDK throws several types (even NullReferenceException) for a string without a blob endpoint
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return false;
+        }
+    }
+
+    // https://{account}.table.core.windows.net -> https://{account}.blob.core.windows.net; null for a host
+    // that is not an Azure Storage table host, whose blob endpoint cannot be derived.
+    private static Uri? BlobEndpointFor(Uri tableEndpoint)
+    {
+        const string table = ".table.";
+        var host = tableEndpoint.Host;
+        var at = host.IndexOf(table, StringComparison.OrdinalIgnoreCase);
+        if (at < 0)
+            return null;
+        var builder = new UriBuilder(tableEndpoint) { Host = host[..at] + ".blob." + host[(at + table.Length)..] };
+        return builder.Uri;
     }
 
     /// <summary>

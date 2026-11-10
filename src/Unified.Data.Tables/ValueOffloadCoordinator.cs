@@ -176,10 +176,27 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
             if (!exists)
                 await UploadOneAsync(store, blob, ct);
+        }
 
+        // Bind only once every blob exists: one content assigned to two properties is uploaded twice
+        // from the same prepared source, and binding releases that source.
+        foreach (var blob in pending)
+        {
+            var name = blob.Reference.Path;
             var column = blob.Column;
             blob.Content?.Bind(name, c => store.OpenReadAsync(column, name, c), column);
         }
+    }
+
+    /// <summary>
+    /// Releases the temporary copies <see cref="PrepareAsync"/> made for the contents of
+    /// <paramref name="entity"/> that were not bound to a blob (the write failed before uploading them).
+    /// </summary>
+    internal static void ReleasePrepared(object entity)
+    {
+        ArgumentNullException.ThrowIfNull(entity);
+        foreach (var (_, content) in TableEntitySerializer.FindBlobContents(entity))
+            content.ReleasePrepared();
     }
 
     private static async Task UploadOneAsync(IOffloadBlobStore store, PendingBlob blob, CancellationToken ct)
@@ -190,8 +207,19 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             reason => new InvalidOperationException(
                 $"The content of '{column}' changed after it was prepared for writing ({reason})."),
             leaveOpen: false);
-        await store.UploadCreateOnlyAsync(blob.Reference.Path, verified, blob.Reference, blob.ContentEncoding, ct);
-        // A store that stopped reading before the end still gets the content checked.
+        try
+        {
+            await store.UploadCreateOnlyAsync(blob.Reference.Path, verified, blob.Reference, blob.ContentEncoding, ct);
+        }
+        catch when (verified.Mismatch is not null)
+        {
+            // The SDK pipeline wraps (or retries past) what the content stream throws: report the cause.
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(verified.Mismatch).Throw();
+            throw;
+        }
+        // A store that swallowed the failure, or stopped reading before the end, still gets the content checked.
+        if (verified.Mismatch is { } mismatch)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(mismatch).Throw();
         await verified.DrainAndVerifyAsync(ct);
     }
 

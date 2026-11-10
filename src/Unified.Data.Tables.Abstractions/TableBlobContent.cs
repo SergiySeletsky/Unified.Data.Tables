@@ -84,8 +84,9 @@ public sealed class TableBlobContent
         if (bytes is not null)
             return new MemoryStream(bytes, writable: false);
         if (open is null)
-            throw new InvalidOperationException(
-                "A TableBlobContent created from a stream can be read once the entity has been written.");
+            throw new InvalidOperationException(Abandoned
+                ? "This TableBlobContent was created from a non-seekable stream, and its temporary copy was released when a write failed before uploading it. Create it again from the source."
+                : "A TableBlobContent created from a stream can be read once the entity has been written.");
 
         var name = column ?? BoundPath!;
         var expectedLength = length;
@@ -142,6 +143,7 @@ public sealed class TableBlobContent
         Guard.NotNull(open, nameof(open));
         BoundPath = path;
         this.open = open;
+        Abandoned = false;
         column = columnName;
         ReleaseSpool();
         Source = null;
@@ -156,6 +158,23 @@ public sealed class TableBlobContent
         result.Bind(path, open, columnName);
         return result;
     }
+
+    /// <summary>
+    /// Deletes the temporary copy a write made of a non-seekable source, when the write failed before
+    /// the content was bound to its blob. The content stays sealed: a later write finds its blob if the
+    /// upload got that far, and otherwise reports that the content can no longer be read.
+    /// </summary>
+    internal void ReleasePrepared()
+    {
+        if (OwnsSource)
+        {
+            ReleaseSpool();
+            Abandoned = true;
+        }
+    }
+
+    /// <summary>True when the temporary copy of a non-seekable source was released before being uploaded.</summary>
+    internal bool Abandoned { get; private set; }
 
     private void ReleaseSpool()
     {

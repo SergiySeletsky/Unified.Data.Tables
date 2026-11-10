@@ -4,8 +4,10 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
 using Azure;
 using Azure.Data.Tables;
+using Azure.Storage.Blobs;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
+using Unified.Data.Tables.Providers;
 
 namespace Unified.Data.Tables;
 
@@ -49,6 +51,14 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
 
     private readonly TableInitializer tableInitializer;
 
+    // The resolved table name (also the first segment of every offloaded blob name).
+    private readonly string tableName;
+
+    // The blob store for offloaded values; null when blob offload is not configured (or T cannot use it).
+    private readonly IOffloadBlobStore? offloadBlobs;
+
+    private readonly ValueOffloadCoordinator offload;
+
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger)
         : this(serviceClient, cache, logger, authorizer: null, options: null)
@@ -68,11 +78,35 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
     /// <summary>
     /// Creates a store with an <see cref="UnifiedTableStorageOptions"/> (cache policy etc.) and an
     /// optional <see cref="IProtectedPropertyAuthorizer"/>. Null options fall back to the defaults
-    /// (sliding 1&#160;hour cache — the 0.2.x behaviour). The trailing defaults let the DI
-    /// container select this constructor even when neither optional service is registered.
+    /// (sliding 1&#160;hour cache — the 0.2.x behaviour). Blob offload needs a
+    /// <see cref="BlobServiceClient"/>: use the constructor that takes one.
     /// </summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
-        IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
+        IProtectedPropertyAuthorizer? authorizer, UnifiedTableStorageOptions? options)
+        : this(serviceClient, cache, logger, authorizer, options, blobServiceClient: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a store with an <see cref="UnifiedTableStorageOptions"/>, an optional
+    /// <see cref="IProtectedPropertyAuthorizer"/> and an optional <see cref="BlobServiceClient"/> for
+    /// blob offload (<see cref="UnifiedTableStorageOptions.BlobOffload"/>). The trailing defaults let the
+    /// DI container select this constructor whichever of the optional services are registered. No call
+    /// is made to either service here; the table and the blob container are created on first use.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set and <paramref name="blobServiceClient"/> is null.
+    /// </exception>
+    public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
+        IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null,
+        BlobServiceClient? blobServiceClient = null)
+        : this(serviceClient, cache, logger, authorizer, options, OffloadStore(options, blobServiceClient))
+    {
+    }
+
+    /// <summary>Creates a store over an explicit offload blob store (tests and other providers).</summary>
+    internal TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
+        IProtectedPropertyAuthorizer? authorizer, UnifiedTableStorageOptions? options, IOffloadBlobStore? blobs)
     {
         ArgumentNullException.ThrowIfNull(serviceClient);
         this.cache = cache;
@@ -82,10 +116,25 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         cachePolicy = opts.ResolveCachePolicy(typeof(T));
         idNormalization = opts.IdNormalization;
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
-        client = serviceClient.GetTableClient(ResolveTableName(opts));
+        tableName = ResolveTableName(opts);
+        client = serviceClient.GetTableClient(tableName);
         tableInitializer = new TableInitializer(client);
+        offloadBlobs = opts.BlobOffload is null ? null : blobs;
+        offload = new ValueOffloadCoordinator(offloadBlobs, opts.BlobOffload, tableName);
     }
 
+    // The Azure blob container for this store's offloaded values. Built only for a type that can carry
+    // them (no client call either way); a plain type never touches the blob service.
+    private static AzureOffloadBlobStore? OffloadStore(UnifiedTableStorageOptions? options, BlobServiceClient? blobServiceClient)
+    {
+        if (options?.BlobOffload is not { } offload)
+            return null;
+        if (blobServiceClient is null)
+            throw new InvalidOperationException(
+                $"UnifiedTableStorageOptions.BlobOffload is set, but no {nameof(BlobServiceClient)} was supplied. " +
+                $"Register a {nameof(BlobServiceClient)} (the connection-string overload of AddUnifiedTableStorage does) or pass one to the constructor.");
+        return LargeValueAware ? new AzureOffloadBlobStore(blobServiceClient.GetBlobContainerClient(offload.ContainerName)) : null;
+    }
 
     /// <summary>
     /// The table this store reads and writes. Defaults to <c>typeof(T).Name</c>; see
@@ -204,7 +253,11 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
             entities.Add(entity);
         }
 
-        if (entities.Count == 0) return 0;
+        if (entities.Count == 0)
+        {
+            await DeletePartitionBlobsAsync(partition, ct);
+            return 0;
+        }
         // Every row goes, continuation rows included; only logical entities are counted.
         var logicalCount = LargeValueAware ? entities.Count(e => !SplitRowLayout.IsPartRow(e)) : entities.Count;
 
@@ -224,6 +277,8 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         logger.LogInformation("Batch-deleted {Count} {Type} entities from partition {Partition}",
             logicalCount, typeName, partition);
 
+        // The rows are gone: so are the blobs stored under the partition (best effort).
+        await DeletePartitionBlobsAsync(partition, ct);
         return logicalCount;
     }
 
@@ -252,7 +307,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
             return null;
 
         var row = LargeValueAware ? await AssembleAsync(response.Value!, ct) : response.Value!;
-        var entity = row.FromTableEntity<T>();
+        var entity = await ToEntityAsync(row, ct);
         entity.ETag = row.ETag.ToString();
         entity.Timestamp = row.Timestamp;
         CacheEntity(id, entity, row.ETag);
@@ -283,8 +338,10 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         if (response.HasValue && SplitRowLayout.IsPartRow(response.Value!))
             return false;
 
-        // A split value is not assembled just to answer "does it exist" - it is simply not cached.
-        if (response.HasValue && (!LargeValueAware || SplitRowLayout.PartCount(response.Value!) == 0))
+        // A split or offloaded value is not assembled or downloaded just to answer "does it exist" - it
+        // is simply not cached.
+        if (response.HasValue && (!LargeValueAware
+            || (SplitRowLayout.PartCount(response.Value!) == 0 && !HasBlobReference(response.Value!))))
         {
             var entity = response.Value!.FromTableEntity<T>();
             entity.ETag = response.Value!.ETag.ToString();
@@ -323,7 +380,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
             if (SplitRowLayout.IsPartRow(queried))
                 continue;
             var tableEntity = LargeValueAware ? await AssembleAsync(queried, ct) : queried;
-            var entity = tableEntity.FromTableEntity<T>();
+            var entity = await ToEntityAsync(tableEntity, ct);
             entity.ETag = tableEntity.ETag.ToString();
             entity.Timestamp = tableEntity.Timestamp;
             results.Add(entity);
@@ -453,8 +510,19 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
             // Continuation rows are not entities: they never count toward take, nor reach the cache.
             if (SplitRowLayout.IsPartRow(queried))
                 continue;
-            var row = assemble ? await AssembleAsync(queried, ct) : queried;
-            yield return warmCache ? Materialize(row) : Deserialize(row);
+            if (assemble)
+            {
+                // The whole row: its split values reassembled and its offloaded values resolved.
+                var row = await AssembleAsync(queried, ct);
+                var entity = Stamp(await ToEntityAsync(row, ct), row);
+                if (warmCache) CacheEntity(entity.Id, entity, row.ETag);
+                yield return entity;
+            }
+            else
+            {
+                // A projection that omits every large value: nothing outside the row is read.
+                yield return warmCache ? Materialize(queried) : Deserialize(queried);
+            }
 
             if (take is int max && ++yielded >= max)
                 yield break;
@@ -503,8 +571,15 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
             // A projected row is a partial entity: it must never warm the per-entity cache.
             if (select is not null)
                 items.Add(Deserialize(queried));
+            else if (assemble)
+            {
+                var row = await AssembleAsync(queried, ct);
+                var entity = Stamp(await ToEntityAsync(row, ct), row);
+                CacheEntity(entity.Id, entity, row.ETag);
+                items.Add(entity);
+            }
             else
-                items.Add(Materialize(assemble ? await AssembleAsync(queried, ct) : queried));
+                items.Add(Materialize(queried));
         }
         var next = page.ContinuationToken is null ? null : PageCursor.Encode(fingerprint, page.ContinuationToken);
         return new EntityPage<T>(items, next);
@@ -518,9 +593,11 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
     }
 
     // Deserialize a queried row and stamp its ETag/Timestamp (no caching).
-    private static T Deserialize(TableEntity row)
+    private static T Deserialize(TableEntity row) => Stamp(row.FromTableEntity<T>(), row);
+
+    // Stamp the row's version and service write time on the entity it holds.
+    private static T Stamp(T entity, TableEntity row)
     {
-        var entity = row.FromTableEntity<T>();
         entity.ETag = row.ETag.ToString();
         entity.Timestamp = row.Timestamp;
         return entity;
