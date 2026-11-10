@@ -106,6 +106,13 @@ public static class TableEntitySerializer
         return false;
     }
 
+    /// <summary>The message for a read of an offloaded value that nothing resolved.</summary>
+    internal static string UnresolvedOffloadMessage(string column) =>
+        $"Column '{column}' holds a value offloaded to blob storage ('{column}{SplitCodec.BlobSuffix}'), and this read " +
+        "cannot fetch it. Read the row through an IStorage<T> whose entity type marks the property " +
+        "[TableValueSplit] (or declares it as TableBlobContent), with UnifiedTableStorageOptions.BlobOffload " +
+        "configured. Returning the property empty would let the next write drop the reference.";
+
     /// <summary>The message for a polymorphic write of an item that needs large-value cells.</summary>
     internal static string PolymorphicWriteRefusal(Type itemType) =>
         $"{itemType.Name} carries a value too large for one cell or a TableBlobContent. Polymorphic stores cannot write " +
@@ -288,8 +295,10 @@ public static class TableEntitySerializer
     // Reassembles every split value (verifying its SHA-256) and sets it on its property. A value whose
     // property no longer exists on the type is skipped unread, like any other unknown column. A group
     // holding a blob reference takes its value from what the read resolved outside the row: a
-    // downloaded value, or a lazy TableBlobContent; with no resolution (a projection omitted it, or a
-    // plain FromTableEntity) the property keeps its default.
+    // downloaded value, or a lazy TableBlobContent. A reference the read's projection excludes keeps
+    // the property's default; any other unresolved one (a plain FromTableEntity, or a store whose type
+    // is not large-value-aware) throws, because an entity with the property silently empty would drop
+    // the reference on its next write and the orphan sweep would then delete the value.
     private static object ApplyLargeValues(
         object result, Type type, Dictionary<string, Dictionary<string, object>> largeValues, ValueReadContext ctx)
     {
@@ -317,9 +326,13 @@ public static class TableEntitySerializer
                     result = SetProperty(result, new TableEntityValue(path, lazy(baseColumn, parsed)));
                     continue;
                 }
-                else
+                else if (ctx.Projection is { } projected && !ValueOffloadCoordinator.Projects(projected, baseColumn))
                 {
                     continue;
+                }
+                else
+                {
+                    throw new InvalidOperationException(UnresolvedOffloadMessage(baseColumn));
                 }
             }
             else

@@ -609,6 +609,13 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
 - Reads reassemble or download eagerly (`string`, `byte[]`) and verify the SHA-256. A mismatch, a missing
   chunk, continuation row or blob throws `TableValueIntegrityException`; partial data is never returned.
   A transport that transparently decompresses `Content-Encoding: gzip` would break the hash check.
+- An offloaded value is never returned empty. Reading a row that holds a `{Prop}__blob` reference through
+  something that cannot fetch it (the public `FromTableEntity<T>()`, a store whose type does not opt the
+  property in, or no `BlobOffload` configured) throws `InvalidOperationException` naming the column, because
+  writing such an entity back would drop the reference and let the sweep delete the value. Only a
+  projection (`QueryOptions.Select`) that omits the property leaves it at its default. Split cells are
+  reassembled by any reader; a plain reader that sees a split row without its continuation rows throws
+  `TableValueIntegrityException`.
 
 ### Sweeping orphans
 
@@ -640,6 +647,9 @@ write that reuses an old orphan is never undercut.
   For types with very large eager values use `CacheFor<T>(CachePolicy.Disabled)`.
 - `IStorage<T>.SweepOrphanBlobsAsync` has a default implementation on `net10.0` that throws
   `NotSupportedException`; `netstandard2.0` implementers must provide it.
+- A projection of a plain type (one that does not opt the property in) that names a property another type
+  stored split or offloaded reads it as null: the plain store neither fetches nor recognises the value's
+  cells. Read such rows through the opted-in type.
 - Storage-provider SPI types (namespace `Unified.Data.Tables.Providers`) are public only so other
   providers, such as the in-memory package, can share the implementation. They are hidden from
   IntelliSense and not for application code.

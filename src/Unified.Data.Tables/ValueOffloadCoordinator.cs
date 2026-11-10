@@ -275,7 +275,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                     : throw new TableValueIntegrityException(column, "the value is stored in blob storage, but blob offload is not configured."),
                 column);
         }
-        return new ValueReadContext(resolved ?? NothingResolved, lazy);
+        return new ValueReadContext(resolved ?? NothingResolved, lazy, projectedColumns);
     }
 
     /// <summary>The most reference columns a sweep names in a projection before it reads whole rows instead.</summary>
@@ -449,7 +449,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     }
 
     // A projection names the column itself, or an object that owns it (the same rule BuildSelect uses).
-    private static bool Projects(IReadOnlyCollection<string> projected, string column)
+    internal static bool Projects(IReadOnlyCollection<string> projected, string column)
     {
         foreach (var name in projected)
         {

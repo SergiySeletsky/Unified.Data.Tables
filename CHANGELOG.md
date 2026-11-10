@@ -57,6 +57,11 @@ Lossless storage of large values, opt-in per property.
   keep each row's request body within 1 MB. Escaped text that would overflow is offloaded (or throws
   `OversizedValueException`) instead of failing with HTTP 413 or `EntityTooLarge`. The plain batch
   planner is unchanged.
+- Reading a row with an offloaded value through a path that cannot fetch it (`FromTableEntity<T>()`, a
+  store whose type does not opt the property in) throws `InvalidOperationException` naming the column
+  instead of leaving the property null, which a later write would have turned into data loss. A projection
+  that omits the property still leaves it at its default. `ExistsAsync` on a plain type does not cache an
+  entity from a row with large-value cells.
 
 ### Unchanged
 

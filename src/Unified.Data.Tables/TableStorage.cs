@@ -338,8 +338,11 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
 
         // A split or offloaded value is not assembled or downloaded just to answer "does it exist" - it
         // is simply not cached.
-        if (response.HasValue && (!LargeValueAware
-            || (SplitRowLayout.PartCount(response.Value!) == 0 && !HasBlobReference(response.Value!))))
+        // A plain type over a row another type wrote with large-value cells is not cached either: its
+        // read would throw for an offloaded value, and existence needs no value.
+        if (response.HasValue && (LargeValueAware
+            ? SplitRowLayout.PartCount(response.Value!) == 0 && !HasBlobReference(response.Value!)
+            : !TableEntitySerializer.HasLargeValueCells(response.Value!)))
         {
             var entity = response.Value!.FromTableEntity<T>();
             entity.ETag = response.Value!.ETag.ToString();
@@ -519,7 +522,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
             else
             {
                 // A projection that omits every large value: nothing outside the row is read.
-                yield return warmCache ? Materialize(queried) : Deserialize(queried);
+                yield return warmCache ? Materialize(queried) : Deserialize(queried, select);
             }
 
             if (take is int max && ++yielded >= max)
@@ -568,7 +571,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
                 continue;
             // A projected row is a partial entity: it must never warm the per-entity cache.
             if (select is not null)
-                items.Add(Deserialize(queried));
+                items.Add(Deserialize(queried, select));
             else if (assemble)
             {
                 var row = await AssembleAsync(queried, ct);
@@ -591,7 +594,13 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
     }
 
     // Deserialize a queried row and stamp its ETag/Timestamp (no caching).
-    private static T Deserialize(TableEntity row) => Stamp(row.FromTableEntity<T>(), row);
+    // A projected row: an offloaded value the projection omits keeps its default instead of throwing.
+    private static T Deserialize(TableEntity row, IEnumerable<string>? select = null) =>
+        Stamp(select is null
+            ? row.FromTableEntity<T>()
+            : TableEntitySerializer.FromTableEntity<T>(row, new ValueReadContext(NothingResolved, null, [.. select])), row);
+
+    private static readonly Dictionary<string, object> NothingResolved = new(StringComparer.Ordinal);
 
     // Stamp the row's version and service write time on the entity it holds.
     private static T Stamp(T entity, TableEntity row)

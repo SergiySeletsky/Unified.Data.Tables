@@ -443,6 +443,25 @@ public class TableStorageOffloadTests
     }
 
     [Fact]
+    public async Task PlainStore_ReadingAnOffloadedRow_Throws_InsteadOfReturningItEmpty()
+    {
+        // A store whose type does not opt in (another type wrote the row) cannot resolve the reference.
+        var inner = new InMemoryOffloadBlobStore();
+        var row = await WrittenRow(inner, new SplitTextEntity { Id = Id, Body = BigText, Title = "t" });
+        using var plain = new StorageHarness<PlainEntity>();
+        plain.SetupGet(Pk, Rk, row);
+        plain.SetupQueryByFilter(row);
+
+        var one = await Assert.ThrowsAsync<InvalidOperationException>(() => plain.Store.OneAsync(Id, Ct));
+        Assert.Contains("'Body'", one.Message, StringComparison.Ordinal);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => plain.Store.QueryAsync(new QueryOptions { Partition = Pk }, Ct));
+
+        // Existence needs no value: it answers without materializing (or caching) the entity.
+        Assert.True(await plain.Store.ExistsAsync(Id, Ct));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => plain.Store.OneAsync(Id, Ct));
+    }
+
+    [Fact]
     public async Task Projection_NamingOffloadedProperty_ReturnsWholeValue()
     {
         var inner = new InMemoryOffloadBlobStore();

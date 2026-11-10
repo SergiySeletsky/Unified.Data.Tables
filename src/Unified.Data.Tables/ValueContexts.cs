@@ -33,11 +33,20 @@ internal sealed class ValueReadContext
 {
     private static readonly IReadOnlyDictionary<string, object> Nothing = new Dictionary<string, object>(StringComparer.Ordinal);
 
-    internal ValueReadContext(IReadOnlyDictionary<string, object> resolved, Func<string, BlobReference, TableBlobContent>? lazyContent)
+    internal ValueReadContext(
+        IReadOnlyDictionary<string, object> resolved, Func<string, BlobReference, TableBlobContent>? lazyContent,
+        IReadOnlyCollection<string>? projection = null)
     {
         Resolved = resolved ?? throw new ArgumentNullException(nameof(resolved));
         LazyContent = lazyContent;
+        Projection = projection;
     }
+
+    /// <summary>
+    /// The caller's projection, or null for the whole entity. An offloaded value the projection does not
+    /// name was deliberately not resolved and keeps its default; any other unresolved one is an error.
+    /// </summary>
+    public IReadOnlyCollection<string>? Projection { get; }
 
     /// <summary>A read with nothing resolved outside the row.</summary>
     public static ValueReadContext None { get; } = new(Nothing, null);

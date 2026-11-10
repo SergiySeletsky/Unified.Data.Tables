@@ -219,16 +219,67 @@ public class OffloadSerializerTests
     }
 
     [Fact]
-    public void Materialize_ReferenceWithoutResolution_LeavesDefault()
+    public void Materialize_ReferenceWithoutResolution_Throws_NamingTheColumn()
+    {
+        // A read that cannot resolve an offloaded value must not hand back the property empty: an
+        // upsert of that entity would drop the reference and the sweep would then delete the blob.
+        var entity = new TextAndBlobEntity { Body = Ascii(200_000) };
+        var (row, _, _) = Coordinator().Serialize(entity, Pk, Rk, 0);
+        Assert.True(row.ContainsKey("Body__blob"));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => row.FromTableEntity<TextAndBlobEntity>());
+        Assert.Contains("'Body'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("BlobOffload", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Materialize_BlobContentWithoutResolution_Throws()
+    {
+        var entity = new TextAndBlobEntity { Content = TableBlobContent.FromBytes([9], "application/octet-stream") };
+        var (row, _, _) = Coordinator().Serialize(entity, Pk, Rk, 0);
+        Assert.True(row.ContainsKey("Content__blob"));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => row.FromTableEntity<TextAndBlobEntity>());
+        Assert.Contains("'Content'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Materialize_ReferenceInAPlainType_Throws()
+    {
+        // A type that is not large-value-aware reading a row another (aware) type wrote.
+        var (row, _, _) = Coordinator().Serialize(new TextAndBlobEntity { Body = Ascii(200_000) }, Pk, Rk, 0);
+        Assert.Throws<InvalidOperationException>(() => row.FromTableEntity<PlainEntity>());
+    }
+
+    [Fact]
+    public void Materialize_ReferenceAProjectionExcluded_LeavesDefault()
     {
         var entity = new TextAndBlobEntity { Body = Ascii(200_000), Content = TableBlobContent.FromBytes([9], "application/octet-stream") };
         var (row, _, _) = Coordinator().Serialize(entity, Pk, Rk, 0);
-        Assert.True(row.ContainsKey("Body__blob"));
-        Assert.True(row.ContainsKey("Content__blob"));
 
-        var back = row.FromTableEntity<TextAndBlobEntity>();
+        var ctx = new ValueReadContext(new Dictionary<string, object>(StringComparer.Ordinal), null, projection: ["Id"]);
+        var back = TableEntitySerializer.FromTableEntity<TextAndBlobEntity>(row, ctx);
         Assert.Null(back.Body);
         Assert.Null(back.Content);
+    }
+
+    [Fact]
+    public void Materialize_SplitCellsInAPlainType_AreReassembled_NotDropped()
+    {
+        var text = Ascii(100_000);
+        var (row, plan, _) = Coordinator(threshold: 10_000_000).Serialize(new TextAndBlobEntity { Body = text }, Pk, Rk, 0);
+        Assert.Empty(plan.Parts);
+        Assert.True(row.ContainsKey("Body__chunks"));
+        Assert.Equal(text, row.FromTableEntity<PlainEntity>().Body);
+    }
+
+    [Fact]
+    public void Materialize_SplitPrimaryWithoutItsParts_Throws()
+    {
+        // A plain read sees only the primary: the chunks on its continuation rows are missing.
+        var (row, plan, _) = Coordinator(threshold: 10_000_000).Serialize(new TextAndBlobEntity { Body = Ascii(900_000) }, Pk, Rk, 0);
+        Assert.NotEmpty(plan.Parts);
+        Assert.Throws<TableValueIntegrityException>(() => plan.Primary.FromTableEntity<PlainEntity>());
     }
 
     [Fact]
