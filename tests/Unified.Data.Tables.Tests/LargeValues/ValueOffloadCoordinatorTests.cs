@@ -187,6 +187,8 @@ public class ValueOffloadCoordinatorTests
             inner.DeleteIfUnmodifiedAsync(name, unmodifiedSince, ct);
 
         public IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(string prefix, CancellationToken ct) => inner.ListAsync(prefix, ct);
+
+        public Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct) => inner.GetServiceTimeAsync(ct);
     }
 
     [Fact]

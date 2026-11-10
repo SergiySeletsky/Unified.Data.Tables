@@ -72,6 +72,12 @@ Lossless storage of large values, opt-in per property.
   the read is retried from the new version (three attempts); a row deleted meanwhile reads as absent. The
   in-memory store does the same for blobs. A lazy `TableBlobContent` whose blob is gone says the row may
   have changed since it was read.
+- Blob cleanup and sweep cutoffs are taken from the storage service's clock (the commit response's
+  `Date`, or the blob service's time before listing) instead of the client clock, which could make a
+  freshly touched blob look old when it ran ahead; the cleanup cutoff is taken from the commit, before the
+  post-commit re-read. Without a service time the client clock is used less a further 5 minutes. The
+  provider SPI `IOffloadBlobStore` gains `GetServiceTimeAsync`, and `LargeValueTable.DeleteReleasedBlobsAsync`
+  takes the commit's service time.
 - `BlobOffloadOptions.ThresholdBytes` is validated: between 1 and `BlobOffloadOptions.MaxThresholdBytes`
   (4,194,304, one transaction's payload limit); anything else throws `ArgumentOutOfRangeException`.
 

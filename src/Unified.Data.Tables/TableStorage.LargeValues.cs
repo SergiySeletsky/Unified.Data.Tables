@@ -34,11 +34,13 @@ public partial class TableStorage<T>
     private static readonly string[] PartKeys = ["PartitionKey", "RowKey", SystemColumnNames.SplitOf];
 
     /// <summary>
-    /// The version a split-aware write produced, and whether the written entity may be cached under it.
-    /// A transaction's version comes from a separate re-read that may already see another writer's row,
-    /// so only a single call's own response version is cacheable.
+    /// The version a split-aware write produced, whether the written entity may be cached under it, and
+    /// the service time of the commit (its response <c>Date</c>; null when unknown). A transaction's
+    /// version comes from a separate re-read that may already see another writer's row, so only a single
+    /// call's own response version is cacheable. The cleanup of released blobs is timed by the commit,
+    /// not by that later re-read or the client clock.
     /// </summary>
-    private readonly record struct LargeWriteResult(ETag ETag, bool Cacheable);
+    private readonly record struct LargeWriteResult(ETag ETag, bool Cacheable, DateTimeOffset? CommittedAt);
 
     /// <summary>
     /// What a write or delete needs to know about the stored row: its version, its continuation rows and
@@ -139,7 +141,7 @@ public partial class TableStorage<T>
             // The swap committed: the blobs only the replaced row referenced can go (the same content
             // written again maps to the same name, which the new row still references).
             if (prior is { Blobs.Count: > 0 })
-                await DeleteBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), ct);
+                await DeleteBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), result.CommittedAt, ct);
             return result;
         }
 
@@ -159,7 +161,7 @@ public partial class TableStorage<T>
             var response = condition is ETag c
                 ? await client.UpdateEntityAsync(plan.Primary, c, TableUpdateMode.Replace, ct)
                 : await client.AddEntityAsync(plan.Primary, ct);
-            return new LargeWriteResult(HeaderETag(response) ?? plan.Primary.ETag, Cacheable: true);
+            return new LargeWriteResult(HeaderETag(response) ?? plan.Primary.ETag, Cacheable: true, HeaderDate(response));
         }
 
         var actions = new List<TableTransactionAction>(1 + plan.Parts.Count + stale.Count)
@@ -173,9 +175,11 @@ public partial class TableStorage<T>
         foreach (var partKey in stale)
             actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, partKey), ETag.All));
 
-        await client.SubmitTransactionAsync(actions, ct);
+        var committed = await client.SubmitTransactionAsync(actions, ct);
+        // Taken from the commit itself, before the (slower) re-read below.
+        var committedAt = HeaderDate(RawResponse(committed));
         // Transaction sub-responses are not correlated back to their actions: re-read the version.
-        return new LargeWriteResult(await ReadETagAsync(pk, rk, ct), Cacheable: false);
+        return new LargeWriteResult(await ReadETagAsync(pk, rk, ct), Cacheable: false, committedAt);
     }
 
     /// <summary>
@@ -184,8 +188,8 @@ public partial class TableStorage<T>
     /// writer that reuses the same content touches the blob before committing its row; the orphan sweep
     /// collects a blob that really is unreferenced). Best effort: a failure is logged, never thrown.
     /// </summary>
-    private Task DeleteBlobsAsync(IEnumerable<string> paths, CancellationToken ct) =>
-        large.DeleteReleasedBlobsAsync(paths, LogBlobDeleteFailure, ct);
+    private Task DeleteBlobsAsync(IEnumerable<string> paths, DateTimeOffset? committedAt, CancellationToken ct) =>
+        large.DeleteReleasedBlobsAsync(paths, committedAt, LogBlobDeleteFailure, ct);
 
     private void LogBlobDeleteFailure(string path, Exception ex) =>
         logger.LogWarning(ex, "{Type}: could not delete blob {Blob}; an orphan sweep will remove it", typeName, path);
@@ -263,6 +267,31 @@ public partial class TableStorage<T>
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, KeysOnly, ct);
         return response is { HasValue: true, Value: not null } ? response.Value.ETag : default;
+    }
+
+    // The service time of a response (its Date header), tolerating test doubles that have none.
+    private static DateTimeOffset? HeaderDate(Response? response)
+    {
+        try
+        {
+            return response?.Headers.Date;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Response? RawResponse(Response<IReadOnlyList<Response>>? response)
+    {
+        try
+        {
+            return response?.GetRawResponse();
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // Same header-first, tolerate-test-doubles read the single-row Create and Upsert paths use.
@@ -383,12 +412,13 @@ public partial class TableStorage<T>
             if (prior is null)
                 return;
 
+            DateTimeOffset? committedAt;
             try
             {
                 var parts = prior.Parts == 0 ? [] : await QueryPartsAsync(pk, rk, PartKeys, ct);
                 if (parts.Count == 0)
                 {
-                    await client.DeleteEntityAsync(pk, rk, prior.ETag, ct);
+                    committedAt = HeaderDate(await client.DeleteEntityAsync(pk, rk, prior.ETag, ct));
                 }
                 else
                 {
@@ -398,7 +428,7 @@ public partial class TableStorage<T>
                     };
                     foreach (var part in parts)
                         actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), ETag.All));
-                    await client.SubmitTransactionAsync(actions, ct);
+                    committedAt = HeaderDate(RawResponse(await client.SubmitTransactionAsync(actions, ct)));
                 }
             }
             catch (RequestFailedException ex) when (ex.Status is 412 or 404)
@@ -408,7 +438,7 @@ public partial class TableStorage<T>
             }
 
             // The entity is gone: the blobs it referenced follow (best effort).
-            await DeleteBlobsAsync(prior.Blobs, ct);
+            await DeleteBlobsAsync(prior.Blobs, committedAt, ct);
             return;
         }
 

@@ -101,6 +101,18 @@ internal sealed class RecordingBlobStore(List<string> log, InMemoryOffloadBlobSt
         return deleted;
     }
 
+    /// <summary>Replaces the service time the wrapped store reports (null keeps it); not recorded in the log.</summary>
+    public Func<DateTimeOffset?>? ServiceTime { get; set; }
+
+    /// <summary>How many times the service time was asked for.</summary>
+    public int ServiceTimeCalls { get; private set; }
+
+    public Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct)
+    {
+        ServiceTimeCalls++;
+        return ServiceTime is { } time ? Task.FromResult(time()) : Inner.GetServiceTimeAsync(ct);
+    }
+
     public async IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(string prefix, [EnumeratorCancellation] CancellationToken ct)
     {
         Record("list", prefix);

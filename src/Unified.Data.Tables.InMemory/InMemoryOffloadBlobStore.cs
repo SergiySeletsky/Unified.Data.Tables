@@ -97,6 +97,14 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     }
 
     /// <inheritdoc />
+    /// <remarks>The clock that stamps <c>Last-Modified</c>: never behind any time it has stamped.</remarks>
+    public Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult<DateTimeOffset?>(Now());
+    }
+
+    /// <inheritdoc />
     public async IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(
         string prefix, [EnumeratorCancellation] CancellationToken ct)
     {

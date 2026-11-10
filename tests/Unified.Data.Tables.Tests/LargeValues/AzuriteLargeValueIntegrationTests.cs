@@ -206,6 +206,10 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         return Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant();
     }
 
+    // Ages are measured on the service clock, whose Date header and Last-Modified have one-second
+    // resolution: a blob written this second is not yet older than zero. Wait for the next second.
+    private static Task PastTheServiceSecondAsync() => Task.Delay(TimeSpan.FromMilliseconds(1_100), Ct);
+
     private int BlobRequestCount()
     {
         lock (requests) return requests.Count(r => r.Service == "blob");
@@ -656,6 +660,7 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         Assert.Single(await BlobsAsync<SplitTextEntity>());
         Assert.Empty(await RawRowsAsync<SplitTextEntity>());
 
+        await PastTheServiceSecondAsync();
         Assert.Equal(1, await store.SweepOrphanBlobsAsync(pk, TimeSpan.Zero, Ct));
         Assert.Empty(await BlobsAsync<SplitTextEntity>());
     }
@@ -681,6 +686,7 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         var winnerName = $"SplitTextEntity/{pk}/w1/Body/{Sha(Utf8(winner))}";
         Assert.Equal(3, (await BlobsAsync<SplitTextEntity>()).Count); // original, winner, loser
 
+        await PastTheServiceSecondAsync();
         Assert.Equal(2, await Store<SplitTextEntity>().SweepOrphanBlobsAsync(pk, TimeSpan.Zero, Ct));
 
         Assert.Equal(winnerName, Assert.Single(await BlobsAsync<SplitTextEntity>()).Name);

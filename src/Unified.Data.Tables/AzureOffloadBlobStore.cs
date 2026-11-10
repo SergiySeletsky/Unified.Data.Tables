@@ -129,6 +129,22 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     }
 
     /// <inheritdoc />
+    /// <remarks>The <c>Date</c> header of a container properties request (the 404 of a container not yet
+    /// created carries one too); null when the service sent none.</remarks>
+    public async Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct)
+    {
+        try
+        {
+            var response = await container.GetPropertiesAsync(conditions: null, ct).ConfigureAwait(false);
+            return response?.GetRawResponse()?.Headers.Date;
+        }
+        catch (RequestFailedException ex)
+        {
+            return ex.GetRawResponse()?.Headers.Date;
+        }
+    }
+
+    /// <inheritdoc />
     public async IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(
         string prefix, [EnumeratorCancellation] CancellationToken ct)
     {

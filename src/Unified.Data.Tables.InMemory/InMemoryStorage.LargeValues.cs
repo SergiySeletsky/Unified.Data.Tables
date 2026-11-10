@@ -142,7 +142,7 @@ public sealed partial class InMemoryStorage<T>
             // The swap committed: the blobs only the replaced row referenced can go (the same content
             // written again maps to the same name, which the new row still references).
             if (prior is { Blobs.Count: > 0 })
-                await large.DeleteReleasedBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), onFailure: null, ct);
+                await large.DeleteReleasedBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), serviceNow: null, onFailure: null, ct);
             entity.ETag = ETagOf(version);
             return entity;
         }
@@ -212,7 +212,7 @@ public sealed partial class InMemoryStorage<T>
             released = prior.Blobs;
         }
 
-        await large.DeleteReleasedBlobsAsync(released, onFailure: null, ct);
+        await large.DeleteReleasedBlobsAsync(released, serviceNow: null, onFailure: null, ct);
     }
 
     private async Task<int> DeletePartitionLargeAsync(string partition, CancellationToken ct)

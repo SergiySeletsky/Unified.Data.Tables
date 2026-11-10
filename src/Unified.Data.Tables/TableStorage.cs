@@ -58,6 +58,13 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
     // providers through the storage-provider SPI so they run the same code.
     private readonly LargeValueTable large;
 
+    /// <summary>The client clock blob cleanup falls back to when no service time is known (for tests).</summary>
+    internal TimeProvider LargeValueClock
+    {
+        get => large.Clock;
+        set => large.Clock = value;
+    }
+
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger)
         : this(serviceClient, cache, logger, authorizer: null, options: null)

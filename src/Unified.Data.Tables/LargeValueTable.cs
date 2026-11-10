@@ -20,6 +20,17 @@ public sealed class LargeValueTable
     private readonly string tableName;
 
     /// <summary>
+    /// Storage-provider SPI, not for application code. How much further back a cleanup or sweep cutoff
+    /// is set when no service time is available and the client's clock is used instead: that clock may
+    /// run ahead of the one that stamps blob <c>Last-Modified</c> times.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static readonly TimeSpan ClientClockMargin = TimeSpan.FromMinutes(5);
+
+    /// <summary>The client clock, used only when the service time is unknown (replaced by tests).</summary>
+    internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
+    /// <summary>
     /// Storage-provider SPI, not for application code. Creates the large-value rules of the table
     /// <paramref name="tableName"/>.
     /// </summary>
@@ -247,21 +258,31 @@ public sealed class LargeValueTable
     /// <summary>
     /// Storage-provider SPI, not for application code. Deletes blobs no row references any more, after
     /// the write or delete that released them has committed. Each delete is conditional on the blob not
-    /// having been modified within <see cref="BlobOffloadOptions.CleanupGrace"/>, so a blob a concurrent
-    /// writer has just touched survives. Best effort: a failure goes to <paramref name="onFailure"/>.
+    /// having been modified within <see cref="BlobOffloadOptions.CleanupGrace"/> before
+    /// <paramref name="serviceNow"/>, so a blob a concurrent writer has just touched survives. Best
+    /// effort: a failure goes to <paramref name="onFailure"/>.
     /// </summary>
     /// <param name="paths">The released blob names.</param>
+    /// <param name="serviceNow">
+    /// The storage service's time of the commit that released them (its response <c>Date</c>), or null
+    /// to ask the blob store (<see cref="IOffloadBlobStore.GetServiceTimeAsync"/>); only when neither is
+    /// known is the client clock used, less <see cref="ClientClockMargin"/>.
+    /// </param>
     /// <param name="onFailure">Called with the blob name and the error of each failed delete.</param>
     /// <param name="ct">Cancels the deletes.</param>
     /// <returns>A task that completes when every delete was attempted.</returns>
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public async Task DeleteReleasedBlobsAsync(IEnumerable<string> paths, Action<string, Exception>? onFailure, CancellationToken ct)
+    public async Task DeleteReleasedBlobsAsync(
+        IEnumerable<string> paths, DateTimeOffset? serviceNow, Action<string, Exception>? onFailure, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(paths);
         if (blobs is null)
             return;
-        var unmodifiedSince = CleanupCutoff();
-        foreach (var path in paths)
+        var released = paths.ToList();
+        if (released.Count == 0)
+            return;
+        var unmodifiedSince = (serviceNow ?? await ServiceNowAsync(ct)) - cleanupGrace;
+        foreach (var path in released)
             await DeleteBlobAsync(path, unmodifiedSince, onFailure, ct);
     }
 
@@ -283,6 +304,8 @@ public sealed class LargeValueTable
         if (blobs is null)
             return;
         var prefix = ValueOffloadCoordinator.PartitionPrefix(tableName, partitionKey);
+        // The service time before the listing: no later than any time the listing could report.
+        var cutoff = await ServiceNowAsync(ct) - cleanupGrace;
         var listed = new List<(string Name, DateTimeOffset LastModified)>();
         try
         {
@@ -296,7 +319,6 @@ public sealed class LargeValueTable
             onListFailure?.Invoke(ex);
             return;
         }
-        var cutoff = CleanupCutoff();
         foreach (var (name, lastModified) in listed)
             await DeleteBlobAsync(name, lastModified < cutoff ? lastModified : cutoff, onFailure, ct);
     }
@@ -331,10 +353,18 @@ public sealed class LargeValueTable
         ArgumentNullException.ThrowIfNull(partitionRows);
         if (blobs is null)
             return Task.FromResult(0);
+        return SweepCoreAsync(partitionKey, olderThan, entityType, partitionRows, ct);
+    }
+
+    private async Task<int> SweepCoreAsync(
+        string partitionKey, TimeSpan olderThan, Type entityType,
+        Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
+    {
+        // Ages are measured on the service clock, read before the listing (so never later than it).
+        var now = await ServiceNowAsync(ct);
         // An age beyond the start of the calendar makes no blob old enough (instead of overflowing).
-        var now = DateTimeOffset.UtcNow;
         var cutoff = olderThan >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - olderThan;
-        return coordinator.SweepAsync(partitionKey, cutoff, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, ct);
+        return await coordinator.SweepAsync(partitionKey, cutoff, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, ct);
     }
 
     /// <summary>
@@ -353,8 +383,24 @@ public sealed class LargeValueTable
         ArgumentOutOfRangeException.ThrowIfLessThan(olderThan, TimeSpan.Zero);
     }
 
-    // Blobs modified after this instant may be about to be referenced by a concurrent write: keep them.
-    private DateTimeOffset CleanupCutoff() => DateTimeOffset.UtcNow - cleanupGrace;
+    // "Now" on the clock that stamps blob Last-Modified times: the blob store's service time or, when it
+    // cannot tell, the client clock moved back by ClientClockMargin (it may run ahead of the service).
+    // Blobs modified after (now - grace) may be about to be referenced by a concurrent write: kept.
+    private async Task<DateTimeOffset> ServiceNowAsync(CancellationToken ct)
+    {
+        try
+        {
+            if (await blobs!.GetServiceTimeAsync(ct) is { } serviceNow)
+                return serviceNow;
+        }
+#pragma warning disable CA1031 // an unknown service time falls back to the (margined) client clock
+        catch (Exception ex) when (ex is not OperationCanceledException)
+#pragma warning restore CA1031
+        {
+        }
+        var client = Clock.GetUtcNow();
+        return client - DateTimeOffset.MinValue > ClientClockMargin ? client - ClientClockMargin : DateTimeOffset.MinValue;
+    }
 
     private async Task DeleteBlobAsync(string path, DateTimeOffset? unmodifiedSince, Action<string, Exception>? onFailure, CancellationToken ct)
     {

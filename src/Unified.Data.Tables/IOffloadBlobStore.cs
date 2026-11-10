@@ -59,6 +59,16 @@ public interface IOffloadBlobStore
     /// <returns>True when deleted; false when it did not exist (404) or was modified since (412).</returns>
     Task<bool> DeleteIfUnmodifiedAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct);
 
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The storage service's current time (for Azure,
+    /// the <c>Date</c> header of a response), or null when it cannot be told. Cleanup and orphan-sweep
+    /// cutoffs are compared with blob <c>Last-Modified</c> times, which the service stamps, so they are
+    /// taken from this clock rather than from the client's, which may run ahead.
+    /// </summary>
+    /// <param name="ct">Cancels the call.</param>
+    /// <returns>The service time, or null.</returns>
+    Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct);
+
     /// <summary>Storage-provider SPI, not for application code. Lists the blobs whose name starts with <paramref name="prefix"/>.</summary>
     /// <param name="prefix">The name prefix.</param>
     /// <param name="ct">Cancels the listing.</param>

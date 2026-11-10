@@ -632,6 +632,14 @@ Lost races, crashes and failed deletes leave unreferenced blobs. Best-effort cle
 delete only removes blobs untouched for `BlobOffloadOptions.CleanupGrace` (default 5 minutes); younger ones
 are left for the sweep. The library does not schedule anything, so run it yourself:
 
+Both ages are measured on the storage service's clock, the one that stamps a blob's `Last-Modified`: the
+cleanup after a write or delete uses the `Date` of the commit response, and the sweep and the cleanup after
+a partition delete ask the blob service for its time (one container properties request) before listing.
+A client clock that runs ahead therefore cannot make a freshly touched blob look old. Only when no service
+time is available is the client clock used, moved back by a further 5 minutes
+(`LargeValueTable.ClientClockMargin`). The service clock has one-second resolution, so a blob written in
+the current second is not yet older than `TimeSpan.Zero`.
+
 ```csharp
 int deleted = await storage.SweepOrphanBlobsAsync("tenant-a", olderThan: TimeSpan.FromHours(1));
 ```

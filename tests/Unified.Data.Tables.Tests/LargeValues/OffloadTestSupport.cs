@@ -79,6 +79,8 @@ internal sealed class CountingOffloadBlobStore(InMemoryOffloadBlobStore inner) :
 
     public IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(string prefix, CancellationToken ct) =>
         Inner.ListAsync(prefix, ct);
+
+    public Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct) => Inner.GetServiceTimeAsync(ct);
 }
 
 /// <summary>A deterministic, allocation-free generated stream (optionally non-seekable).</summary>
