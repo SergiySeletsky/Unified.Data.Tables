@@ -47,6 +47,9 @@ Lossless storage of large values, opt-in per property.
 - `QueryPageAsync` can return a page with no items and a non-null continuation token when it held only
   continuation rows; keep paging until the token is null.
 - A projected `QueryPageAsync` no longer warms the entity cache for any type.
+- Polymorphic stores (`PolymorphicTableStorage<TBase>`, `InMemoryPolymorphicStorage<TBase>`) now throw
+  `InvalidOperationException` naming the column when they read a row holding an offloaded reference
+  (`{Prop}__blob`), instead of returning the property as null; they cannot fetch blobs.
 - Corrected the `UnifiedTableStorageOptions.OversizedCells` comment: the default is `Throw`, not trim.
 
 ### Fixed (before release)

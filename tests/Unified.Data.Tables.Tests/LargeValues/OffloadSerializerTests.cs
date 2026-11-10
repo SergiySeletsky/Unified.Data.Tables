@@ -244,6 +244,18 @@ public class OffloadSerializerTests
     }
 
     [Fact]
+    public void PolymorphicRead_OfARowWithAReference_Throws_InsteadOfReturningItNull()
+    {
+        // The read path of PolymorphicTableStorage / InMemoryPolymorphicStorage resolves no blob.
+        var discriminator = AssemblyQualifiedTypeDiscriminator.Instance;
+        var (row, _, _) = Coordinator().Serialize(new TextAndBlobEntity { Body = Ascii(200_000) }, Pk, Rk, 0);
+        row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(typeof(TextAndBlobEntity));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => row.TryFromTableEntity<TextAndBlobEntity>(discriminator, out _));
+        Assert.Contains("'Body'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Materialize_ReferenceInAPlainType_Throws()
     {
         // A type that is not large-value-aware reading a row another (aware) type wrote.
