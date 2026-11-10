@@ -67,6 +67,8 @@ Lossless storage of large values, opt-in per property.
   the attribute was silently ignored.
 - A create-only blob upload that conflicts with an orphan which a sweep deletes before the follow-up state
   read uploads again (three attempts in all) instead of failing the write with an integrity error.
+- `BlobOffloadOptions.ThresholdBytes` is validated: between 1 and `BlobOffloadOptions.MaxThresholdBytes`
+  (4,194,304, one transaction's payload limit); anything else throws `ArgumentOutOfRangeException`.
 
 ### Unchanged
 

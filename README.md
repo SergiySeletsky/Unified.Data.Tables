@@ -576,7 +576,7 @@ services.AddUnifiedTableStorage(o =>
     o.BlobOffload = new BlobOffloadOptions
     {
         ContainerName = "unified-tables-values",   // default
-        ThresholdBytes = 3_145_728,                // default
+        ThresholdBytes = 3_145_728,                // default; 1 to 4,194,304
         CleanupGrace = TimeSpan.FromMinutes(5),    // default
     };
 });

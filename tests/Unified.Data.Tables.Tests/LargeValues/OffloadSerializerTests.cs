@@ -267,7 +267,7 @@ public class OffloadSerializerTests
     public void Materialize_SplitCellsInAPlainType_AreReassembled_NotDropped()
     {
         var text = Ascii(100_000);
-        var (row, plan, _) = Coordinator(threshold: 10_000_000).Serialize(new TextAndBlobEntity { Body = text }, Pk, Rk, 0);
+        var (row, plan, _) = Coordinator(threshold: 4_000_000).Serialize(new TextAndBlobEntity { Body = text }, Pk, Rk, 0);
         Assert.Empty(plan.Parts);
         Assert.True(row.ContainsKey("Body__chunks"));
         Assert.Equal(text, row.FromTableEntity<PlainEntity>().Body);
@@ -277,7 +277,7 @@ public class OffloadSerializerTests
     public void Materialize_SplitPrimaryWithoutItsParts_Throws()
     {
         // A plain read sees only the primary: the chunks on its continuation rows are missing.
-        var (row, plan, _) = Coordinator(threshold: 10_000_000).Serialize(new TextAndBlobEntity { Body = Ascii(900_000) }, Pk, Rk, 0);
+        var (row, plan, _) = Coordinator(threshold: 4_000_000).Serialize(new TextAndBlobEntity { Body = Ascii(900_000) }, Pk, Rk, 0);
         Assert.NotEmpty(plan.Parts);
         Assert.Throws<TableValueIntegrityException>(() => plan.Primary.FromTableEntity<PlainEntity>());
     }

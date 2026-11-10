@@ -10,12 +10,25 @@ public sealed class BlobOffloadOptions
     /// <summary>The blob container that holds offloaded values. Defaults to <c>unified-tables-values</c>.</summary>
     public string ContainerName { get; set; } = "unified-tables-values";
 
+    /// <summary>The largest <see cref="ThresholdBytes"/>: the 4 MiB payload limit of one entity-group transaction.</summary>
+    public const long MaxThresholdBytes = 4_194_304;
+
+    private long thresholdBytes = 3_145_728;
+
     /// <summary>
     /// A split value whose stored (encoded) form is larger than this many bytes moves to blob storage.
-    /// Defaults to 3,145,728 (3 MiB). A smaller value also moves there when its row and continuation
-    /// rows would not fit one entity-group transaction.
+    /// Defaults to 3,145,728 (3 MiB); between 1 and <see cref="MaxThresholdBytes"/>. A smaller value
+    /// also moves there when its row and continuation rows would not fit one entity-group transaction.
     /// </summary>
-    public long ThresholdBytes { get; set; } = 3_145_728;
+    /// <exception cref="ArgumentOutOfRangeException">The value is below 1 or above <see cref="MaxThresholdBytes"/>.</exception>
+    public long ThresholdBytes
+    {
+        get => thresholdBytes;
+        set => thresholdBytes = value is >= 1 and <= MaxThresholdBytes
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), value,
+                $"ThresholdBytes must be between 1 and {MaxThresholdBytes:N0} (one transaction's payload limit).");
+    }
 
     private TimeSpan cleanupGrace = TimeSpan.FromMinutes(5);
 
