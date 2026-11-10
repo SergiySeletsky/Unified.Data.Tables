@@ -424,11 +424,12 @@ public partial class TableStorage<T>
     /// Deletes a split-aware entity and its continuation rows: one conditional delete when it has none,
     /// otherwise one transaction over the parts that exist (found by a range query, so a primary that
     /// declares a part already gone can still be deleted). A missing row is a no-op; a lost race
-    /// re-reads and retries. Once the entity is deleted, the blobs it referenced are deleted (best effort).
+    /// re-reads and retries. Any row key is accepted. Once the entity is deleted, the blobs it referenced are deleted (best effort).
     /// </summary>
     private async Task DeleteLargeAsync(string pk, string rk, CancellationToken ct)
     {
-        SplitRowLayout.ValidateRowKey(rk);
+        // No row-key check: a row written before the type opted in may carry any key and stays
+        // deletable; a continuation row addressed by id reads as missing below, so it is never deleted.
         RequestFailedException? lost = null;
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {

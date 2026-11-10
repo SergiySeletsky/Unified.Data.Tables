@@ -46,8 +46,9 @@ Lossless storage of large values, opt-in per property.
   `UseDevelopmentStorage=true`. A custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a
   Cosmos Table API host, must register its own `BlobServiceClient`.
 - Split-aware writes do one point read first. A `LastWriterWins` `UpdateAsync` on such a type can throw
-  `ConcurrencyConflictException` after three lost races. All writes and partial updates refuse a `~` RowKey
-  for split-aware types.
+  `ConcurrencyConflictException` after three lost races. For split-aware types, writes and partial updates
+  refuse only a RowKey ending with `~` and four digits (the continuation-row shape, e.g. `r~0001`); any
+  other `~` is allowed, and deletes accept every key (deleting a continuation row's id is a no-op).
 - `QueryPageAsync` can return a page with no items and a non-null continuation token when it held only
   continuation rows; keep paging until the token is null.
 - A projected `QueryPageAsync` no longer warms the entity cache for any type.

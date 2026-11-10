@@ -671,8 +671,12 @@ together as an `AggregateException` whose message says how many blobs were delet
 
 ### Limitations
 
-- `~` is reserved in RowKeys of split-aware types (the continuation separator); writes and partial updates
-  refuse it. The escaped blob name must fit 1,024 characters.
+- In RowKeys of split-aware types, only the continuation-row shape is reserved: a key ending with `~`
+  and exactly four digits (`r~0001`, `a~b~0042`). Writes, batch writes and partial updates refuse it with
+  `ArgumentException`; every other `~` is allowed (`a~b`, `x~12`, `a~0001x`, append-log keys). Deletes
+  accept any key, so a row written before the type opted in stays deletable; deleting a continuation row's
+  id is a no-op. A row from before the opt-in keyed `{RowKey}~0001` is overwritten when `{RowKey}` gets
+  continuation rows. The escaped blob name must fit 1,024 characters.
 - No LINQ filter and no partial update (`UpdateAsync(id, builder)`) on a large property; not supported by
   `IPolymorphicStorage`.
 - Batch writes of these types keep the batch contract: per partition, each entity's rows (main row,

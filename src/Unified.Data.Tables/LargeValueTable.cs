@@ -66,7 +66,9 @@ public sealed class LargeValueTable
     /// overflow, the continuation-row key space.
     /// </summary>
     /// <param name="rowKey">The row key of a split-aware entity.</param>
-    /// <exception cref="ArgumentException">The key contains <c>'~'</c> or is too long.</exception>
+    /// <exception cref="ArgumentException">
+    /// The key ends with <c>'~'</c> followed by exactly four digits (a continuation row's shape) or is too long.
+    /// </exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public static void ValidateRowKey(string rowKey)
     {

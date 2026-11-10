@@ -226,8 +226,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             throw new ArgumentNullException(nameof(id));
         }
         id = NormalizeId(id);
-        RefuseReservedRowKey(id);
-
+        // Any key is deletable (a row written before the type opted in may have any shape); a
+        // continuation row addressed by id is not an entity, so the split-aware delete finds nothing.
         await EnsureTableAsync(ct);
 
         var (partitionKey, rowKey) = GetEntityKeys(id);

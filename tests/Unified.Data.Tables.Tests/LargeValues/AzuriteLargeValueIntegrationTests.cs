@@ -734,6 +734,107 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         Assert.Single(await BlobsAsync<SplitTextEntity>());
     }
 
+    // ── '~' in row keys ────────────────────────────────────────────────────
+
+    public static TheoryData<string, int> TildeKeys => new()
+    {
+        { "a~b", 600_000 },
+        { "a~b", 3_200_000 },
+        { "~h0000000000000000001", 600_000 },
+        { "x~12", 600_000 },
+        { "a~0001x", 600_000 },
+        { "a~0001x", 3_200_000 },
+        { "chat~" + RowKeys.InvertedTicks(new DateTimeOffset(2026, 11, 10, 0, 0, 0, TimeSpan.Zero)), 600_000 },
+    };
+
+    [Theory]
+    [MemberData(nameof(TildeKeys))]
+    public async Task TildeOutsideTheContinuationSuffix_RoundTrips(string rk, int size)
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var store = Store<SplitTextEntity>(Offload(TimeSpan.Zero));
+        var text = Ascii(size, seed: 31);
+        var entity = new SplitTextEntity { Id = Id(rk), Body = text, Title = "t" };
+        await store.CreateAsync(entity, Ct);
+        Assert.Equal(text, (await Store<SplitTextEntity>().OneAsync(Id(rk), Ct))!.Body, StringComparer.Ordinal);
+
+        await store.UpsertAsync(entity, Ct);
+        await store.UpdateAsync(Id(rk), b => b.SetProperty(x => x.Title, "t2"), Ct);
+        var read = await Store<SplitTextEntity>().OneAsync(Id(rk), Ct);
+        Assert.Equal("t2", read!.Title);
+        Assert.Equal(text, read.Body, StringComparer.Ordinal);
+
+        await store.DeleteAsync(Id(rk), Ct);
+        Assert.Empty(await RawRowsAsync<SplitTextEntity>());
+    }
+
+    [Fact]
+    public async Task TildeKeys_NextToASplitEntity_AreNeverTakenForItsParts()
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var store = Store<SplitTextEntity>(Offload(TimeSpan.Zero));
+        var keys = new[] { "a", "a~b", "a~0001x", "a~b~c", "b" };
+        var bodies = new Dictionary<string, string>();
+        foreach (var (rk, i) in keys.Select((k, i) => (k, i)))
+        {
+            bodies[rk] = Ascii(600_000 + i, seed: 40 + i);
+            await store.CreateAsync(new SplitTextEntity { Id = Id(rk), Body = bodies[rk], Title = rk }, Ct);
+        }
+        Assert.True((await RawRowsAsync<SplitTextEntity>()).Count > keys.Length);
+
+        var reader = Store<SplitTextEntity>();
+        var all = (await reader.QueryAsync(pk, Ct)).Select(e => e.Id).ToList();
+        Assert.Equal(keys.Select(Id).Order(StringComparer.Ordinal), all);
+        var prefixed = await reader.QueryAsync(new QueryOptions { Partition = pk, RowKeyPrefix = "a" }, Ct);
+        Assert.Equal([Id("a"), Id("a~0001x"), Id("a~b"), Id("a~b~c")], prefixed.Select(e => e.Id));
+        Assert.All(prefixed, e => Assert.Equal(bodies[e.Id[(pk.Length + 1)..]], e.Body, StringComparer.Ordinal));
+        Assert.Equal(keys.Length, await reader.CountAsync(pk, Ct));
+
+        // Deleting the split entity leaves its '~' neighbours whole.
+        await store.DeleteAsync(Id("a"), Ct);
+        foreach (var rk in keys.Skip(1))
+            Assert.Equal(bodies[rk], (await Store<SplitTextEntity>().OneAsync(Id(rk), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Equal(keys.Length - 1, await reader.CountAsync(pk, Ct));
+    }
+
+    [Fact]
+    public async Task ReservedSuffix_IsRefusedWithAClearMessage_AndAPartIdIsNotDeletable()
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var store = Store<SplitTextEntity>();
+        var reserved = new SplitTextEntity { Id = Id("a~b~0042"), Body = "x" };
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => store.CreateAsync(reserved, Ct));
+        Assert.Contains("'~' followed by exactly 4 digits", ex.Message, StringComparison.Ordinal);
+        await Assert.ThrowsAsync<ArgumentException>(() => store.UpsertAsync(reserved, Ct));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.UpsertBatchAsync([reserved], Ct));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.UpdateAsync(Id("a~b~0042"), b => b.SetProperty(x => x.Title, "t"), Ct));
+
+        // A continuation row is not an entity: deleting it by id is a no-op and the entity stays whole.
+        var text = Ascii(600_000, seed: 33);
+        await store.CreateAsync(new SplitTextEntity { Id = Id("s"), Body = text }, Ct);
+        await store.DeleteAsync(Id("s~0001"), Ct);
+        Assert.Equal(2, (await RawRowsAsync<SplitTextEntity>()).Count);
+        Assert.Equal(text, (await Store<SplitTextEntity>().OneAsync(Id("s"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task LegacyRowWithTheReservedShape_StaysDeletable()
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var store = Store<SplitTextEntity>();
+        await Table<SplitTextEntity>().CreateIfNotExistsAsync(Ct);
+        await Table<SplitTextEntity>().AddEntityAsync(new TableEntity(pk, "legacy~0001") { ["Title"] = "old" }, Ct);
+        await Table<SplitTextEntity>().AddEntityAsync(new TableEntity(pk, new string('k', 500)) { ["Title"] = "old" }, Ct);
+
+        Assert.Equal("old", (await store.OneAsync(Id("legacy~0001"), Ct))!.Title);
+        await store.DeleteAsync(Id("legacy~0001"), Ct);
+        await store.DeleteAsync(Id(new string('k', 500)), Ct);
+
+        Assert.Empty(await RawRowsAsync<SplitTextEntity>());
+    }
+
     /// <summary>Records every request a client sends, in order, labelled with the service.</summary>
     private sealed class RequestRecorder(string service, List<(string Service, string Method, string Path)> log) : HttpPipelineSynchronousPolicy
     {

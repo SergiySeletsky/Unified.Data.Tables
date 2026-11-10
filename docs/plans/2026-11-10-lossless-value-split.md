@@ -232,7 +232,7 @@ Rules the implementer cannot infer:
     - `static bool IsPartRow(TableEntity row)`; `static int PartCount(TableEntity primary)`.
     - `static string PartRangeLower(string rowKey) => rowKey + "~"; static string PartRangeUpper(string rowKey) => rowKey + "\u007f";`
     - `static TableEntity Assemble(TableEntity primary, IEnumerable<TableEntity> candidateParts)` — keeps parts with `_SplitOf == primary.RowKey` and `_SplitIndex` in `1.._SplitParts` (ignores higher indices); requires every index, else `TableValueIntegrityException("_SplitParts", "part 3 of 5 missing")`; returns a bag with the primary's keys/ETag/Timestamp, its columns, and every part's non-`_Split*` columns.
-    - `static void ValidateRowKey(string rowKey)` — `ArgumentException` when the key contains `~` or exceeds `MaxRowKeyLength`.
+    - `static void ValidateRowKey(string rowKey)` — `ArgumentException` when the key ends with `~` and exactly four digits (a part key's shape) or exceeds `MaxRowKeyLength`; deletes do not call it.
 
 - [ ] **Step 1: Write the failing tests** (bags built with `SplitCodec.Encode`):
   - `NoSplitCells_IsSingleRow_AndUnchanged` — reference-equal, no `_Split*`.
@@ -421,7 +421,7 @@ Write and read rules (extends Task 4's `WriteLargeAsync`):
 - Consumes: `SplitRowLayout`, `ValueOffloadCoordinator`, `InMemoryOffloadBlobStore` (Tasks 3, 5).
 - Produces: `public IReadOnlyList<string> OffloadedBlobNames()` (test convenience beside `Count`/`Snapshot`), `internal InMemoryOffloadBlobStore Blobs`, `internal int PhysicalRowCount`, `internal void SeedPhysicalRow(TableEntity row)`.
 
-Rules: `options.BlobOffload` non-null gives the store its own `InMemoryOffloadBlobStore` (no `BlobServiceClient`); the table segment is `options.TableNameResolver?.Invoke(typeof(T))` or `typeof(T).Name`, exactly as `TableStorage<T>.ResolveTableName` (`TableStorage.cs:96`). For split-aware `T`: `PrepareAsync`, `Serialize` and `UploadAsync` run outside `gate`; the prior check, primary + parts + stale-row removal happen atomically under `gate`; old-blob deletes run after it. Failed writes delete no blob. Reads skip part rows, assemble, and resolve through the coordinator. `Count`, `Snapshot`, `CountAsync` and `DeletePartitionAsync`'s return value count logical rows. Exceptions match Task 4 (`DuplicateKeyException`, `ConcurrencyConflictException`, `RequestFailedException(404)`, `ArgumentException` for `~`, `OversizedValueException`).
+Rules: `options.BlobOffload` non-null gives the store its own `InMemoryOffloadBlobStore` (no `BlobServiceClient`); the table segment is `options.TableNameResolver?.Invoke(typeof(T))` or `typeof(T).Name`, exactly as `TableStorage<T>.ResolveTableName` (`TableStorage.cs:96`). For split-aware `T`: `PrepareAsync`, `Serialize` and `UploadAsync` run outside `gate`; the prior check, primary + parts + stale-row removal happen atomically under `gate`; old-blob deletes run after it. Failed writes delete no blob. Reads skip part rows, assemble, and resolve through the coordinator. `Count`, `Snapshot`, `CountAsync` and `DeletePartitionAsync`'s return value count logical rows. Exceptions match Task 4 (`DuplicateKeyException`, `ConcurrencyConflictException`, `RequestFailedException(404)`, `ArgumentException` for a part-shaped RowKey (`~` and four digits at the end), `OversizedValueException`).
 
 - [ ] **Step 1: Write the failing tests** — one `[Theory]` per behaviour over Text sizes `{ 100, 32_001, 600_000, 2_000_000, 3_200_000 }` chars and `byte[]` sizes `{ 70_000, 3_145_729 }`, with `BlobOffload = new()`:
   - `RoundTrip_Create_One_Query` — equal values; `QueryAsync(partition)` yields 1; `Count == 1`; `OffloadedBlobNames()` has one entry exactly when the size is offloaded.
@@ -546,7 +546,7 @@ touches rows.
 6. **`OversizedValueException` lives in Abstractions**, next to `TableValueIntegrityException`, so IntelliSpec's
    Abstractions-only `IntelliSpec.Data` can catch both without a new package reference. The spec does not fix its
    assembly.
-7. **`~` is reserved in RowKeys of split-aware tables**, and the escaped blob name must fit 1,024 chars. P1 already
+7. **A RowKey ending with `~` and four digits is reserved in split-aware tables** (any other `~` is allowed), and the escaped blob name must fit 1,024 chars. P1 already
    percent-encodes `~` in `LlmRecordIds.EscapeKeyValue`, and `LlmRecordKeyEntity` has no large property.
 8. **Doc mismatch fixed in passing.** `UnifiedTableStorageOptions.cs:157-158` says the default policy trims; the code
    default is `Throw` (`:161`, `TableEntitySerializer.cs:41`). Task 10 corrects the comment only.

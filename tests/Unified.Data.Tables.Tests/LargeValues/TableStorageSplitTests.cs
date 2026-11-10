@@ -296,7 +296,7 @@ public class TableStorageSplitTests
         await Assert.ThrowsAsync<ArgumentException>(() => h.Store.CreateBatchAsync(
         [
             new SplitTextEntity { Id = "p|ok", Body = "x" },
-            new SplitTextEntity { Id = "p|bad~1", Body = "x" },
+            new SplitTextEntity { Id = "p|bad~0001", Body = "x" },
         ], Ct));
 
         await h.Table.DidNotReceiveWithAnyArgs().AddEntityAsync<TableEntity>(default!, default);
@@ -696,19 +696,74 @@ public class TableStorageSplitTests
     // ── review fix round 1 ─────────────────────────────────────────────────
 
     [Fact]
-    public async Task Delete_PartRowId_IsRefused_PrimaryIntact()
+    public async Task Delete_PartRowId_IsNoOp_PrimaryIntact()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r~0001", PartRow("p", "r", 1));
         h.SetupDelete();
         h.SetupTransaction();
 
-        await Assert.ThrowsAsync<ArgumentException>(() => h.Store.DeleteAsync("p|r~0001", Ct));
+        // A continuation row is not an entity: deleting it by id finds nothing and removes nothing.
+        await h.Store.DeleteAsync("p|r~0001", Ct);
 
-        await h.Table.DidNotReceiveWithAnyArgs().CreateIfNotExistsAsync(default);
-        await h.Table.DidNotReceiveWithAnyArgs().GetEntityIfExistsAsync<TableEntity>(default!, default!, default, default);
         await h.Table.DidNotReceiveWithAnyArgs().DeleteEntityAsync(default!, default!, default, default);
         await h.Table.DidNotReceiveWithAnyArgs().SubmitTransactionAsync(default!, default);
+    }
+
+    [Theory]
+    [InlineData("r~0001")]
+    [InlineData("a~b~9999")]
+    public async Task Delete_LegacyRowWithTheReservedShape_IsDeleted(string rk)
+    {
+        // A row written before the type opted in may carry any key; it must stay deletable.
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", rk, PriorPrimary("p", rk, 0, "W/\"legacy\""));
+        h.SetupDelete();
+        h.SetupTransaction();
+
+        await h.Store.DeleteAsync("p|" + rk, Ct);
+
+        await h.Table.Received(1).DeleteEntityAsync("p", rk, new ETag("W/\"legacy\""), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Delete_LegacyRowWithAnOverlongKey_IsDeleted()
+    {
+        var rk = new string('k', 500);
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", rk, PriorPrimary("p", rk, 0, "W/\"legacy\""));
+        h.SetupDelete();
+
+        await h.Store.DeleteAsync("p|" + rk, Ct);
+
+        await h.Table.Received(1).DeleteEntityAsync("p", rk, new ETag("W/\"legacy\""), Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData("a~b")]
+    [InlineData("x~12")]
+    [InlineData("a~0001x")]
+    [InlineData("~h0000000000000000001")]
+    public async Task Create_TildeOutsideTheContinuationSuffix_IsWritten(string rk)
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupAdd();
+
+        await h.Store.CreateAsync(new SplitTextEntity { Id = "p|" + rk, Body = "x" }, Ct);
+
+        await h.Table.Received(1).AddEntityAsync(Arg.Is<TableEntity>(e => e.RowKey == rk), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task PartialUpdate_TildeOutsideTheContinuationSuffix_IsMerged()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupUpdate();
+
+        await h.Store.UpdateAsync("p|a~b", b => b.SetProperty(x => x.Title, "t"), Ct);
+
+        await h.Table.Received(1).UpdateEntityAsync(
+            Arg.Is<TableEntity>(e => e.RowKey == "a~b"), Arg.Any<ETag>(), TableUpdateMode.Merge, Arg.Any<CancellationToken>());
     }
 
     [Fact]

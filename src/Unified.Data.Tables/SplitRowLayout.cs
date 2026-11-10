@@ -27,6 +27,12 @@ internal static class SplitRowLayout
     internal const long MaxEntityWireBytes = 1_000_000;
     internal const int MaxRowKeyLength = 480;
 
+    /// <summary>Separates an entity's row key from a continuation row's index.</summary>
+    internal const char PartSeparator = '~';
+
+    /// <summary>Fixed width of a continuation row's index (<c>~0001</c>).</summary>
+    internal const int PartIndexDigits = 4;
+
     private static bool IsSystemKey(string key) =>
         key is "PartitionKey" or "RowKey" or "Timestamp" or "odata.etag";
 
@@ -169,7 +175,7 @@ internal static class SplitRowLayout
         internal static TransactionCost Of(SplitRowPlan plan, int extraActions)
         {
             // A stale delete carries no body, but its keys and framing still count toward the payload.
-            var staleKey = plan.Primary.RowKey + "~0000";
+            var staleKey = PartRowKey(plan.Primary.RowKey, 0);
             var bytes = TableRowSize.Estimate(plan.Primary)
                 + (extraActions * TableRowSize.Estimate(new TableEntity(plan.Primary.PartitionKey, staleKey)));
             var wire = TableRowSize.ActionWireSize(plan.Primary)
@@ -202,7 +208,7 @@ internal static class SplitRowLayout
             : 0;
 
     /// <summary>Inclusive lower bound of the continuation-row range of <paramref name="rowKey"/>.</summary>
-    internal static string PartRangeLower(string rowKey) => rowKey + "~";
+    internal static string PartRangeLower(string rowKey) => rowKey + PartSeparator;
 
     /// <summary>Exclusive upper bound of the continuation-row range of <paramref name="rowKey"/>.</summary>
     internal static string PartRangeUpper(string rowKey) => rowKey + "\u007f";
@@ -241,17 +247,40 @@ internal static class SplitRowLayout
         return result;
     }
 
+    /// <summary>
+    /// True when <paramref name="rowKey"/> has the shape of a continuation row's key: it ends with
+    /// <see cref="PartSeparator"/> followed by exactly <see cref="PartIndexDigits"/> ASCII digits. Only
+    /// such a key can collide with a part (every part key is <c>{RowKey}~{index:D4}</c>, and an entity
+    /// has at most 99 parts, one transaction's worth); any other <c>'~'</c> is an ordinary character.
+    /// </summary>
+    internal static bool IsReservedRowKey(string rowKey)
+    {
+        var separator = rowKey.Length - PartIndexDigits - 1;
+        if (separator < 0 || rowKey[separator] != PartSeparator)
+            return false;
+        for (var i = separator + 1; i < rowKey.Length; i++)
+            if (!char.IsAsciiDigit(rowKey[i]))
+                return false;
+        return true;
+    }
+
     /// <summary>Rejects row keys that would collide with, or overflow, the continuation-row key space.</summary>
     internal static void ValidateRowKey(string rowKey)
     {
-        if (rowKey.Contains('~', StringComparison.Ordinal))
-            throw new ArgumentException("A row key must not contain '~', which is reserved for continuation rows.", nameof(rowKey));
+        if (IsReservedRowKey(rowKey))
+            throw new ArgumentException(
+                $"The row key '{rowKey}' ends with '~' followed by exactly {PartIndexDigits} digits, the shape reserved for "
+                + "continuation rows of split values; any other '~' is allowed.", nameof(rowKey));
         if (rowKey.Length > MaxRowKeyLength)
             throw new ArgumentException($"A row key must not exceed {MaxRowKeyLength} characters.", nameof(rowKey));
     }
 
+    /// <summary>The key of continuation row <paramref name="index"/> of the entity at <paramref name="rowKey"/>.</summary>
+    internal static string PartRowKey(string rowKey, int index) =>
+        rowKey + PartSeparator + index.ToString("D" + PartIndexDigits.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
+
     private static TableEntity NewPart(string pk, string rk, int index) =>
-        new(pk, rk + "~" + index.ToString("D4", CultureInfo.InvariantCulture))
+        new(pk, PartRowKey(rk, index))
         {
             [SystemColumnNames.SplitOf] = rk,
             [SystemColumnNames.SplitIndex] = index,

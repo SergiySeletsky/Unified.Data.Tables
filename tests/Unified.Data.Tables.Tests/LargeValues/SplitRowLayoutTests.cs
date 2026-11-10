@@ -122,11 +122,62 @@ public class SplitRowLayoutTests
     }
 
     [Fact]
-    public void ValidateRowKey_RejectsTilde_AndOverlongKeys()
+    public void ValidateRowKey_RejectsOverlongKeys()
     {
         SplitRowLayout.ValidateRowKey(new string('k', 480));
-        Assert.Throws<ArgumentException>(() => SplitRowLayout.ValidateRowKey("a~b"));
         Assert.Throws<ArgumentException>(() => SplitRowLayout.ValidateRowKey(new string('k', 481)));
+    }
+
+    [Theory]
+    [InlineData("a~b")]
+    [InlineData("~h0000000000000000001")]
+    [InlineData("x~12")]
+    [InlineData("x~123")]
+    [InlineData("x~12345")]
+    [InlineData("a~0001x")]
+    [InlineData("a~000a")]
+    [InlineData("a~")]
+    [InlineData("~")]
+    [InlineData("a~~b")]
+    [InlineData("a٠١٢٣")]
+    [InlineData("a~٠١٢٣")] // non-ASCII digits are not a part index
+    [InlineData("0001")]
+    public void ValidateRowKey_AllowsTildeOutsideTheContinuationSuffix(string rowKey)
+    {
+        Assert.False(SplitRowLayout.IsReservedRowKey(rowKey));
+        SplitRowLayout.ValidateRowKey(rowKey);
+    }
+
+    [Fact]
+    public void ValidateRowKey_AllowsAppendLogKeys()
+    {
+        var at = new DateTimeOffset(2026, 11, 10, 12, 0, 0, TimeSpan.Zero);
+        SplitRowLayout.ValidateRowKey(RowKeys.AppendKey(at, subStream: "chat"));
+        SplitRowLayout.ValidateRowKey(RowKeys.AppendKey(at, subStream: "chat~7", uniquifier: "0001"));
+    }
+
+    [Theory]
+    [InlineData("r~0001")]
+    [InlineData("r~0000")]
+    [InlineData("r~9999")]
+    [InlineData("~0001")]
+    [InlineData("a~b~0042")]
+    public void ValidateRowKey_RejectsTheContinuationSuffix_WithAClearMessage(string rowKey)
+    {
+        Assert.True(SplitRowLayout.IsReservedRowKey(rowKey));
+        var ex = Assert.Throws<ArgumentException>(() => SplitRowLayout.ValidateRowKey(rowKey));
+        Assert.Contains("'~' followed by exactly 4 digits", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(rowKey, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EveryPartKeyThePlannerWrites_HasTheReservedShape()
+    {
+        var plan = SplitRowLayout.Plan(Bag("a~b", ("Body", new string('a', 1_300_000))));
+
+        Assert.NotEmpty(plan.Parts);
+        Assert.False(SplitRowLayout.IsReservedRowKey(plan.Primary.RowKey));
+        Assert.All(plan.Parts, p => Assert.True(SplitRowLayout.IsReservedRowKey(p.RowKey)));
     }
 
     [Fact]

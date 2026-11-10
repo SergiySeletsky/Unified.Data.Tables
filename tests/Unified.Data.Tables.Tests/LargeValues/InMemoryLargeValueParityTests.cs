@@ -275,10 +275,13 @@ public class InMemoryLargeValueParityTests
         reserved.Id = "p|r~0001";
         await Assert.ThrowsAsync<ArgumentException>(() => store.CreateAsync(reserved, Ct));
         await Assert.ThrowsAsync<ArgumentException>(() => store.UpsertAsync(reserved, Ct));
-        await Assert.ThrowsAsync<ArgumentException>(() => store.DeleteAsync("p|r~0001", Ct));
-        // A continuation row is not an entity: addressing it by id finds nothing.
+        // A continuation row is not an entity: addressing it by id finds nothing, and deleting it is a no-op.
         Assert.Null(await store.OneAsync("p|r~0001", Ct));
         Assert.False(await store.ExistsAsync("p|r~0001", Ct));
+        var physical = store.PhysicalRowCount;
+        await store.DeleteAsync("p|r~0001", Ct);
+        Assert.Equal(physical, store.PhysicalRowCount);
+        Assert.NotNull(await store.OneAsync(Id, Ct));
     }
 
     [Fact]
@@ -326,6 +329,97 @@ public class InMemoryLargeValueParityTests
         await store.CreateAsync(Make("text", 3_200_000), Ct);
 
         Assert.StartsWith("Custom/p/r/Body/", Assert.Single(store.OffloadedBlobNames()), StringComparison.Ordinal);
+    }
+
+    // ── '~' in row keys ────────────────────────────────────────────────────
+
+    public static TheoryData<string, int> TildeKeys => new()
+    {
+        { "a~b", 600_000 },
+        { "a~b", 3_200_000 },
+        { "~h0000000000000000001", 600_000 },
+        { "x~12", 600_000 },
+        { "a~0001x", 600_000 },
+        { "a~0001x", 3_200_000 },
+        { "chat~" + RowKeys.InvertedTicks(new DateTimeOffset(2026, 11, 10, 0, 0, 0, TimeSpan.Zero)), 600_000 },
+    };
+
+    [Theory]
+    [MemberData(nameof(TildeKeys))]
+    public async Task TildeOutsideTheContinuationSuffix_RoundTrips(string rk, int size)
+    {
+        var store = Store<ParityEntity>();
+        var entity = Make("text", size);
+        entity.Id = "p|" + rk;
+        await store.CreateAsync(entity, Ct);
+
+        var read = await store.OneAsync("p|" + rk, Ct);
+        Assert.NotNull(read);
+        Assert.Equal(entity.Body, read.Body);
+        await store.UpsertAsync(entity, Ct);
+        await store.UpdateAsync("p|" + rk, b => b.SetProperty(x => x.Title, "t2"), Ct);
+        Assert.Equal("t2", (await store.OneAsync("p|" + rk, Ct))!.Title);
+
+        await store.DeleteAsync("p|" + rk, Ct);
+        Assert.Equal(0, store.PhysicalRowCount);
+    }
+
+    [Fact]
+    public async Task TildeKeys_NextToASplitEntity_AreNeverTakenForItsParts()
+    {
+        var store = Store<ParityEntity>(grace: TimeSpan.Zero);
+        var keys = new[] { "a", "a~b", "a~0001x", "a~b~c", "b" };
+        var bodies = new Dictionary<string, string>();
+        foreach (var (rk, i) in keys.Select((k, i) => (k, i)))
+        {
+            var e = new ParityEntity { Id = "p|" + rk, Title = rk, Body = Ascii(600_000 + i, seed: i) };
+            bodies[rk] = e.Body!;
+            await store.CreateAsync(e, Ct);
+        }
+        Assert.True(store.PhysicalRowCount > keys.Length);
+
+        var all = (await store.QueryAsync("p", Ct)).Select(e => e.Id).ToList();
+        Assert.Equal(keys.Select(k => "p|" + k).Order(StringComparer.Ordinal), all.Order(StringComparer.Ordinal));
+        var prefixed = await store.QueryAsync(new QueryOptions { Partition = "p", RowKeyPrefix = "a" }, Ct);
+        Assert.Equal(["p|a", "p|a~0001x", "p|a~b", "p|a~b~c"], prefixed.Select(e => e.Id));
+        Assert.All(prefixed, e => Assert.Equal(bodies[e.Id[2..]], e.Body));
+        Assert.Equal(keys.Length, await store.CountAsync("p", Ct));
+
+        // Deleting the split entity leaves its '~' neighbours whole.
+        await store.DeleteAsync("p|a", Ct);
+        foreach (var rk in keys.Skip(1))
+            Assert.Equal(bodies[rk], (await store.OneAsync("p|" + rk, Ct))!.Body);
+        Assert.Equal(keys.Length - 1, await store.CountAsync("p", Ct));
+    }
+
+    [Fact]
+    public async Task ReservedSuffix_IsRefusedWithAClearMessage()
+    {
+        var store = Store<ParityEntity>();
+        var reserved = Make("text", 10);
+        reserved.Id = "p|a~b~0042";
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => store.CreateAsync(reserved, Ct));
+        Assert.Contains("'~' followed by exactly 4 digits", ex.Message, StringComparison.Ordinal);
+        await Assert.ThrowsAsync<ArgumentException>(() => store.UpsertAsync(reserved, Ct));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.UpsertBatchAsync([reserved], Ct));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.UpdateAsync("p|a~b~0042", b => b.SetProperty(x => x.Title, "t"), Ct));
+        Assert.Equal(0, store.PhysicalRowCount);
+    }
+
+    [Fact]
+    public async Task LegacyRowWithTheReservedShape_StaysDeletable()
+    {
+        var store = Store<ParityEntity>();
+        store.SeedPhysicalRow(new TableEntity(Pk, "legacy~0001") { ["Title"] = "old" });
+        store.SeedPhysicalRow(new TableEntity(Pk, new string('k', 500)) { ["Title"] = "old" });
+
+        Assert.Equal("old", (await store.OneAsync("p|legacy~0001", Ct))!.Title);
+        await store.DeleteAsync("p|legacy~0001", Ct);
+        await store.DeleteAsync("p|" + new string('k', 500), Ct);
+
+        Assert.Equal(0, store.PhysicalRowCount);
     }
 
     // ── review fix round 1 ─────────────────────────────────────────────────

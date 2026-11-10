@@ -301,7 +301,8 @@ public sealed partial class InMemoryStorage<T>
     /// </summary>
     private async Task DeleteLargeAsync((string PartitionKey, string RowKey) keys, CancellationToken ct)
     {
-        LargeValueTable.ValidateRowKey(keys.RowKey);
+        // No row-key check: a row written before the type opted in may carry any key and stays
+        // deletable; a continuation row addressed by id reads as missing below, so it is never deleted.
         IReadOnlyList<string> released;
         lock (gate)
         {
