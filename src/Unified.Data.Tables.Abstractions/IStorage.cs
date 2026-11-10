@@ -188,4 +188,32 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <param name="partition">Optional partition key to scope the count.</param>
     /// <param name="ct">Cancellation token.</param>
     Task<int> CountAsync(string? partition = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes blobs offloaded under <c>{table}/{partitionKey}/</c> that no row of the partition
+    /// references and whose Last-Modified is older than <paramref name="olderThan"/>. Returns the number
+    /// deleted. Returns 0 when blob offload is not configured.
+    /// </summary>
+    /// <remarks>
+    /// A write uploads (or touches) its blobs before it writes the row that references them, and a
+    /// failed write never deletes them, so a crash between the two leaves an orphan blob that only this
+    /// sweep removes. Each delete is conditional on the blob not having been modified since it was
+    /// listed, so a blob a concurrent write touches to reuse it survives. Choose
+    /// <paramref name="olderThan"/> longer than any write takes from its blob upload to its row write:
+    /// a younger blob may belong to a write still in flight. Rows are never read beyond the partition's
+    /// keys and blob references, and never changed.
+    /// </remarks>
+    /// <param name="partitionKey">The partition whose blobs to sweep (normalized like <see cref="DeletePartitionAsync"/>).</param>
+    /// <param name="olderThan">Only blobs last modified longer ago than this are deleted; must not be negative.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The number of blobs deleted.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null, empty or whitespace.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="olderThan"/> is negative.</exception>
+    /// <exception cref="NotSupportedException">The implementation does not support blob offload (the default implementation).</exception>
+#if NET
+    Task<int> SweepOrphanBlobsAsync(string partitionKey, TimeSpan olderThan, CancellationToken ct = default) =>
+        throw new NotSupportedException($"{GetType().FullName} does not implement {nameof(SweepOrphanBlobsAsync)}.");
+#else
+    Task<int> SweepOrphanBlobsAsync(string partitionKey, TimeSpan olderThan, CancellationToken ct = default);
+#endif
 }

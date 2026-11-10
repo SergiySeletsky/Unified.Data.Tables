@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Azure;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Logging;
@@ -201,6 +202,25 @@ public partial class TableStorage<T>
         return large.DeletePartitionBlobsAsync(partition,
             ex => logger.LogWarning(ex, "{Type}: could not list the blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition),
             LogBlobDeleteFailure, ct);
+    }
+
+    /// <inheritdoc />
+    public Task<int> SweepOrphanBlobsAsync(string partitionKey, TimeSpan olderThan, CancellationToken ct = default)
+    {
+        LargeValueTable.ValidateSweep(partitionKey, olderThan);
+        var partition = NormalizeId(partitionKey); // match stored (normalized) PartitionKeys, as DeletePartitionAsync
+        return large.SweepOrphanBlobsAsync(partition, olderThan, typeof(T),
+            (select, c) => PartitionRowsAsync(partition, select, c), ct);
+    }
+
+    // Every stored row of the partition (continuation rows included), in one query projected onto select.
+    private async IAsyncEnumerable<TableEntity> PartitionRowsAsync(
+        string partition, IReadOnlyList<string>? select, [EnumeratorCancellation] CancellationToken ct)
+    {
+        await EnsureTableAsync(ct);
+        var filter = TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
+        await foreach (var row in client.QueryAsync<TableEntity>(filter, maxPerPage: null, select, ct).WithCancellation(ct))
+            yield return row;
     }
 
     /// <summary>

@@ -282,7 +282,7 @@ public sealed class LargeValueTable
         ArgumentNullException.ThrowIfNull(partitionKey);
         if (blobs is null)
             return;
-        var prefix = Uri.EscapeDataString(tableName) + "/" + Uri.EscapeDataString(partitionKey) + "/";
+        var prefix = ValueOffloadCoordinator.PartitionPrefix(tableName, partitionKey);
         var listed = new List<(string Name, DateTimeOffset LastModified)>();
         try
         {
@@ -299,6 +299,58 @@ public sealed class LargeValueTable
         var cutoff = CleanupCutoff();
         foreach (var (name, lastModified) in listed)
             await DeleteBlobAsync(name, lastModified < cutoff ? lastModified : cutoff, onFailure, ct);
+    }
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The core of
+    /// <see cref="IStorage{T}.SweepOrphanBlobsAsync"/>: deletes the blobs offloaded under
+    /// <c>{table}/{partitionKey}/</c> that no row of the partition references and whose Last-Modified
+    /// is older than <paramref name="olderThan"/>, each on condition that it was not modified since it
+    /// was listed. The blobs are listed first; the rows are read (once, through
+    /// <paramref name="partitionRows"/>) only when some blob is old enough. Rows are never changed.
+    /// <see cref="BlobOffloadOptions.CleanupGrace"/> does not apply: <paramref name="olderThan"/> is the age.
+    /// </summary>
+    /// <param name="partitionKey">The partition, already normalized as the store stores it.</param>
+    /// <param name="olderThan">The minimum age of a deleted blob; not negative.</param>
+    /// <param name="entityType">The store's entity type (its large-value columns are always read).</param>
+    /// <param name="partitionRows">
+    /// Returns every stored row of the partition, continuation rows included, projected onto the given
+    /// columns, or whole when the projection is null.
+    /// </param>
+    /// <param name="ct">Cancels the listing, the read and the deletes.</param>
+    /// <returns>The number of blobs deleted; 0 when blob offload is not configured.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null or whitespace.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="olderThan"/> is negative.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<int> SweepOrphanBlobsAsync(
+        string partitionKey, TimeSpan olderThan, Type entityType,
+        Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
+    {
+        ValidateSweep(partitionKey, olderThan);
+        ArgumentNullException.ThrowIfNull(entityType);
+        ArgumentNullException.ThrowIfNull(partitionRows);
+        if (blobs is null)
+            return Task.FromResult(0);
+        // An age beyond the start of the calendar makes no blob old enough (instead of overflowing).
+        var now = DateTimeOffset.UtcNow;
+        var cutoff = olderThan >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - olderThan;
+        return coordinator.SweepAsync(partitionKey, cutoff, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, ct);
+    }
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The argument checks of
+    /// <see cref="IStorage{T}.SweepOrphanBlobsAsync"/>, for a store to run before it normalizes the partition.
+    /// </summary>
+    /// <param name="partitionKey">The partition argument.</param>
+    /// <param name="olderThan">The age argument.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null or whitespace.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="olderThan"/> is negative.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static void ValidateSweep(string partitionKey, TimeSpan olderThan)
+    {
+        if (string.IsNullOrWhiteSpace(partitionKey))
+            throw new ArgumentNullException(nameof(partitionKey));
+        ArgumentOutOfRangeException.ThrowIfLessThan(olderThan, TimeSpan.Zero);
     }
 
     // Blobs modified after this instant may be about to be referenced by a concurrent write: keep them.

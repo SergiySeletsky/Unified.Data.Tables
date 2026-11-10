@@ -36,6 +36,9 @@ internal sealed class RecordingBlobStore(List<string> log, InMemoryOffloadBlobSt
     /// <summary>Thrown by every state read when set.</summary>
     public Exception? GetStateFailure { get; set; }
 
+    /// <summary>Runs before each delete is forwarded (lets a test touch a blob between listing and deleting).</summary>
+    public Func<string, Task>? BeforeDelete { get; set; }
+
     /// <summary>Runs before each state read (lets a test change a source between prepare and upload).</summary>
     public Action<string>? OnGetState { get; set; }
 
@@ -92,6 +95,7 @@ internal sealed class RecordingBlobStore(List<string> log, InMemoryOffloadBlobSt
         Record("delete", name);
         lock (DeleteConditions) DeleteConditions.Add(unmodifiedSince);
         if (DeleteFailure is { } failure) throw failure;
+        if (BeforeDelete is { } before) await before(name);
         var deleted = await Inner.DeleteIfUnmodifiedAsync(name, unmodifiedSince, ct);
         lock (DeleteResults) DeleteResults.Add(deleted);
         return deleted;

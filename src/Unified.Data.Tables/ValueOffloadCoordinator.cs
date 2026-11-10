@@ -278,6 +278,131 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         return new ValueReadContext(resolved ?? NothingResolved, lazy);
     }
 
+    /// <summary>The most reference columns a sweep names in a projection before it reads whole rows instead.</summary>
+    internal const int MaxSweepSelectColumns = 200;
+
+    /// <summary>The service limit on a property name.</summary>
+    private const int MaxPropertyNameLength = 255;
+
+    /// <summary><c>{table}/{partitionKey}/</c>, each segment escaped: the prefix of every blob of a partition.</summary>
+    internal static string PartitionPrefix(string table, string pk) =>
+        Uri.EscapeDataString(table) + "/" + Uri.EscapeDataString(pk) + "/";
+
+    /// <summary>
+    /// Deletes the blobs under <paramref name="pk"/> that no row of the partition references and whose
+    /// Last-Modified is before <paramref name="cutoff"/>; returns how many were deleted (0 when blob
+    /// offload is not configured). The blobs are listed first and the table is read only when some are
+    /// old enough. Each delete is conditional on the blob not having been modified since it was listed,
+    /// so a blob a concurrent write touches to reuse it (before writing its row) is kept.
+    /// </summary>
+    /// <param name="pk">The (normalized) partition key.</param>
+    /// <param name="cutoff">Only blobs last modified before this instant are candidates.</param>
+    /// <param name="declaredColumns">The large-value columns of the store's entity type.</param>
+    /// <param name="partitionRows">
+    /// Every row of the partition (continuation rows included), projected onto the given columns, or
+    /// whole when the projection is null. Called at most once.
+    /// </param>
+    /// <param name="ct">Cancels the listing, the read and the deletes.</param>
+    internal async Task<int> SweepAsync(
+        string pk, DateTimeOffset cutoff, IReadOnlyList<string> declaredColumns,
+        Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(pk);
+        ArgumentNullException.ThrowIfNull(declaredColumns);
+        ArgumentNullException.ThrowIfNull(partitionRows);
+        if (blobs is null)
+            return 0;
+
+        // (1) The candidates: the partition's blobs that are old enough, with the time they were listed at.
+        var prefix = PartitionPrefix(tableName, pk);
+        var candidates = new List<(string Name, DateTimeOffset LastModified)>();
+        await foreach (var (name, lastModified) in blobs.ListAsync(prefix, ct).WithCancellation(ct))
+        {
+            if (lastModified < cutoff)
+                candidates.Add((name, lastModified));
+        }
+        if (candidates.Count == 0)
+            return 0;
+
+        // (2) The references: one read of the partition's keys and reference cells.
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        var guarded = new List<string>();
+        await foreach (var row in partitionRows(SweepSelect(prefix, candidates, declaredColumns), ct).WithCancellation(ct))
+        {
+            foreach (var (key, value) in row)
+            {
+                if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
+                    continue;
+                try
+                {
+                    referenced.Add(BlobReference.Parse(column,
+                        value as string ?? throw new TableValueIntegrityException(column, "the blob reference is not a string.")).Path);
+                }
+                catch (TableValueIntegrityException)
+                {
+                    // An unreadable reference names no blob, but it may have named one this cell wrote:
+                    // keep every blob of the cell rather than delete one a repair could still recover.
+                    guarded.Add(prefix + Uri.EscapeDataString(row.RowKey ?? string.Empty) + "/" + Uri.EscapeDataString(column) + "/");
+                }
+            }
+        }
+
+        // (3) The orphans, each deleted only if it was not modified since it was listed.
+        var deleted = 0;
+        foreach (var (name, lastModified) in candidates)
+        {
+            if (referenced.Contains(name) || guarded.Exists(g => name.StartsWith(g, StringComparison.Ordinal)))
+                continue;
+            if (await blobs.DeleteIfUnmodifiedAsync(name, lastModified, ct))
+                deleted++;
+        }
+        return deleted;
+    }
+
+    // The projection that reads every cell that could reference a candidate. A blob is named after the
+    // row and the column whose cell references it ({table}/{pk}/{rk}/{column}/{sha256}), so each
+    // candidate's own name says which {column}__blob cell to read, whatever entity type wrote it (another
+    // type sharing the table, or a runtime subtype of a member the store's type declares as a base,
+    // abstract or interface type). The type's declared columns are read as well. A candidate whose name
+    // does not follow that shape, or too many columns, reads whole rows (null) instead.
+    private static List<string>? SweepSelect(
+        string prefix, List<(string Name, DateTimeOffset LastModified)> candidates, IReadOnlyList<string> declaredColumns)
+    {
+        var columns = new List<string>(declaredColumns);
+        var seen = new HashSet<string>(declaredColumns, StringComparer.Ordinal);
+        foreach (var (name, _) in candidates)
+        {
+            var segments = name[prefix.Length..].Split('/');
+            if (segments.Length != 3)
+                return null;
+            var column = Uri.UnescapeDataString(segments[1]);
+            if (!IsReferenceColumn(column))
+                return null;
+            if (seen.Add(column))
+                columns.Add(column);
+        }
+        if (columns.Count > MaxSweepSelectColumns)
+            return null;
+
+        var select = new List<string>(3 + columns.Count) { "PartitionKey", "RowKey", SystemColumnNames.SplitOf };
+        select.AddRange(columns.Select(c => c + SplitCodec.BlobSuffix));
+        return select;
+    }
+
+    // A column whose reference cell is a valid table property name (letters, digits and '_', not
+    // starting with a digit); any other segment cannot be a column this library wrote.
+    private static bool IsReferenceColumn(string column)
+    {
+        if (column.Length == 0 || column.Length + SplitCodec.BlobSuffix.Length > MaxPropertyNameLength || char.IsDigit(column[0]))
+            return false;
+        foreach (var c in column)
+        {
+            if (!char.IsLetterOrDigit(c) && c != '_')
+                return false;
+        }
+        return true;
+    }
+
     /// <summary>Every blob reference of <paramref name="row"/>.</summary>
     /// <exception cref="TableValueIntegrityException">A reference cell is malformed.</exception>
     internal static IReadOnlyList<BlobReference> References(TableEntity row)

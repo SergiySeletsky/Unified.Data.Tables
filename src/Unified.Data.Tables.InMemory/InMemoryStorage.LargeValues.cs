@@ -231,6 +231,30 @@ public sealed partial class InMemoryStorage<T>
         return logical;
     }
 
+    // ── Orphan sweep (any T: blobs under the partition may come from any type sharing the table) ──
+
+    /// <inheritdoc />
+    public Task<int> SweepOrphanBlobsAsync(string partitionKey, TimeSpan olderThan, CancellationToken ct = default)
+    {
+        LargeValueTable.ValidateSweep(partitionKey, olderThan);
+        var partition = NormalizeId(partitionKey); // match stored (normalized) PartitionKeys, as DeletePartitionAsync
+        return large.SweepOrphanBlobsAsync(partition, olderThan, typeof(T), (_, _) => PartitionRowsAsync(partition), ct);
+    }
+
+    // A snapshot of every stored row of the partition (continuation rows included), taken under the gate.
+    // The projection is not applied: a whole row holds every cell the sweep would have selected.
+    private async IAsyncEnumerable<TableEntity> PartitionRowsAsync(string partition)
+    {
+        List<TableEntity> snapshot;
+        lock (gate)
+        {
+            snapshot = rows.Where(kv => kv.Key.PartitionKey == partition).Select(kv => CopyOf(kv.Value.Data)).ToList();
+        }
+        foreach (var row in snapshot)
+            yield return row;
+        await Task.CompletedTask;
+    }
+
     // ── Reads ───────────────────────────────────────────────────────────────
 
     private async Task<T?> OneLargeAsync((string PartitionKey, string RowKey) keys, CancellationToken ct)
