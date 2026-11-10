@@ -1,11 +1,19 @@
 namespace Unified.Data.Tables;
 
-/// <summary>Blob offload configuration (the offload tier makes this public and wires it to the options).</summary>
-internal sealed class BlobOffloadOptions
+/// <summary>
+/// Blob offload for large values: where values that are too large for table rows are stored, and
+/// when a value marked <see cref="TableValueSplitAttribute"/> moves there. A <see cref="TableBlobContent"/>
+/// property is always stored there. Set <see cref="UnifiedTableStorageOptions.BlobOffload"/> to enable it.
+/// </summary>
+public sealed class BlobOffloadOptions
 {
-    /// <summary>The blob container that holds offloaded values.</summary>
+    /// <summary>The blob container that holds offloaded values. Defaults to <c>unified-tables-values</c>.</summary>
     public string ContainerName { get; set; } = "unified-tables-values";
 
-    /// <summary>Encoded values larger than this many bytes move to blob storage.</summary>
+    /// <summary>
+    /// A split value whose stored (encoded) form is larger than this many bytes moves to blob storage.
+    /// Defaults to 3,145,728 (3 MiB). A smaller value also moves there when its row and continuation
+    /// rows would not fit one entity-group transaction.
+    /// </summary>
     public long ThresholdBytes { get; set; } = 3_145_728;
 }

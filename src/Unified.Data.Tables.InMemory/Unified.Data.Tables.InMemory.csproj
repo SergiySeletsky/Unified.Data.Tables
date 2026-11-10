@@ -17,6 +17,11 @@
     <ProjectReference Include="..\Unified.Data.Tables\Unified.Data.Tables.csproj" />
   </ItemGroup>
 
+  <!-- InMemoryOffloadBlobStore's Seed/Tamper/Remove/Names let the tests stage blob states directly. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
+  </ItemGroup>
+
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <None Include="..\..\icon.png" Pack="true" PackagePath="\" />

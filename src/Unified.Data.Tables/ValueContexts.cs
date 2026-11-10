@@ -1,3 +1,5 @@
+using Unified.Data.Tables.Providers;
+
 namespace Unified.Data.Tables;
 
 /// <summary>
@@ -19,28 +21,45 @@ internal sealed record ValueWriteContext(
     /// <summary>The public serializer API: no offload, not a clone; split values form an unbounded bag.</summary>
     public static ValueWriteContext Public { get; } = new(null, null, NoColumns, false);
 
-    /// <summary>An in-process copy of an entity (the offload fields are filled by the offload tier).</summary>
+    /// <summary>An in-process copy of an entity: split values stay a bag, <see cref="TableBlobContent"/> is kept by reference.</summary>
     public static ValueWriteContext ForClone { get; } = new(null, null, NoColumns, true);
 }
 
 /// <summary>
-/// What a read has already resolved outside the row (downloaded or lazy blob values). Empty until
-/// blob offload exists; split cells inside the row need no context.
+/// What a read has already resolved outside the row: decoded values of offloaded columns, and how to
+/// build a lazy <see cref="TableBlobContent"/> for a reference. Split cells inside the row need neither.
 /// </summary>
 internal sealed class ValueReadContext
 {
-    private ValueReadContext()
+    private static readonly IReadOnlyDictionary<string, object> Nothing = new Dictionary<string, object>(StringComparer.Ordinal);
+
+    internal ValueReadContext(IReadOnlyDictionary<string, object> resolved, Func<string, BlobReference, TableBlobContent>? lazyContent)
     {
+        Resolved = resolved ?? throw new ArgumentNullException(nameof(resolved));
+        LazyContent = lazyContent;
     }
 
     /// <summary>A read with nothing resolved outside the row.</summary>
-    public static ValueReadContext None { get; } = new();
+    public static ValueReadContext None { get; } = new(Nothing, null);
+
+    /// <summary>Flattened base column to its downloaded, verified value (<c>string</c> or <c>byte[]</c>).</summary>
+    public IReadOnlyDictionary<string, object> Resolved { get; }
+
+    /// <summary>Builds the lazy content of a <see cref="TableBlobContent"/> column from its reference; null when none is in scope.</summary>
+    public Func<string, BlobReference, TableBlobContent>? LazyContent { get; }
 }
 
-/// <summary>A blob the serializer asked to be uploaded before the entity write (filled by the offload tier).</summary>
-internal sealed class PendingBlob
+/// <summary>A blob the serializer asked to be uploaded before the entity write.</summary>
+/// <param name="Column">The flattened base column (<c>Inner_Body</c>).</param>
+/// <param name="Reference">The reference the row holds; its path is the blob name.</param>
+/// <param name="ContentEncoding">The blob's <c>Content-Encoding</c> (<c>gzip</c>), or null.</param>
+/// <param name="OpenSource">Opens the bytes to upload; the stream is disposed after the upload.</param>
+internal sealed record PendingBlob(
+    string Column,
+    BlobReference Reference,
+    string? ContentEncoding,
+    Func<CancellationToken, Task<Stream>> OpenSource)
 {
-    private PendingBlob()
-    {
-    }
+    /// <summary>The <see cref="TableBlobContent"/> to bind to the blob once uploaded; null for a split value.</summary>
+    public TableBlobContent? Content { get; init; }
 }

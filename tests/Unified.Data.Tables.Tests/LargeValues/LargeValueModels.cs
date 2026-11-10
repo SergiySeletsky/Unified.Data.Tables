@@ -73,3 +73,33 @@ public class SplitGzipJsonEntity : Entity
     [TableValueSplit(SplitEncoding.Gzip)]
     public List<string>? Items { get; set; }
 }
+
+public class BlobEntity : Entity
+{
+    public TableBlobContent? Content { get; set; }
+
+    public string? Title { get; set; }
+}
+
+public class NestedBlobHolder
+{
+    public TableBlobContent? Content { get; set; }
+}
+
+public class NestedBlobEntity : Entity
+{
+    public NestedBlobHolder? Inner { get; set; }
+}
+
+public class BlobListEntity : Entity
+{
+    public List<TableBlobContent>? Contents { get; set; }
+}
+
+public class TextAndBlobEntity : Entity
+{
+    [TableValueSplit(SplitEncoding.Text)]
+    public string? Body { get; set; }
+
+    public TableBlobContent? Content { get; set; }
+}

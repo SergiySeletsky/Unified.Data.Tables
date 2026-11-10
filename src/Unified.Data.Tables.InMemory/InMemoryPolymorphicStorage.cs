@@ -341,6 +341,10 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     {
         ValidateKey(write.Key);
 
+        // Parity with PolymorphicTableStorage: a TableBlobContent is refused before serializing.
+        if (write.Item is not null && LargeValueRows.CarriesBlobContent(write.Item))
+            throw new NotSupportedException(LargeValueRows.PolymorphicWriteRefusal(write.Item.GetType()));
+
         var row = write.Item is null
             ? new TableEntity(write.Key.PartitionKey, write.Key.RowKey)
             : write.Item.ToTableEntity(write.Key.PartitionKey, write.Key.RowKey);

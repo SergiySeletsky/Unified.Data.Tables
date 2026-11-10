@@ -42,6 +42,13 @@ public sealed class UnifiedTableStorageOptions
     public bool ImplicitLastWriterWins { get; set; }
 
     /// <summary>
+    /// Blob offload for large values (<see cref="TableValueSplitAttribute"/> values too large for table
+    /// rows, and every <see cref="TableBlobContent"/>). <c>null</c> (the default) disables it: such a
+    /// value throws <see cref="OversizedValueException"/> instead. Types with neither are unaffected.
+    /// </summary>
+    public BlobOffloadOptions? BlobOffload { get; set; }
+
+    /// <summary>
     /// Overrides the table name, which otherwise defaults to <c>typeof(T).Name</c>.
     ///
     /// Two cases the default cannot serve. A multi-tenant host that wants a table per tenant has no

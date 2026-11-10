@@ -158,9 +158,12 @@ internal static class SplitCodec
     /// Cuts the value into chunk cells and appends <c>__chunks</c>, <c>__sha256</c>, <c>__enc</c> and
     /// <c>__len</c>. At least one chunk is always written.
     /// </summary>
-    internal static IReadOnlyList<KeyValuePair<string, object>> Encode(string column, object payload, SplitEncoding encoding)
+    internal static IReadOnlyList<KeyValuePair<string, object>> Encode(string column, object payload, SplitEncoding encoding) =>
+        Encode(column, payload, ToStored(payload, encoding));
+
+    /// <summary><see cref="Encode(string, object, SplitEncoding)"/> for a value already encoded by <see cref="ToStored"/>.</summary>
+    internal static IReadOnlyList<KeyValuePair<string, object>> Encode(string column, object payload, StoredPayload stored)
     {
-        var stored = ToStored(payload, encoding);
         var cells = new List<KeyValuePair<string, object>>();
         if (stored.Enc == "text")
         {

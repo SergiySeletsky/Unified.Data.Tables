@@ -280,6 +280,11 @@ public static class TableFilterTranslator
                     $"'{pi.Name}' on {ownerType.Name} is a large value ([TableValueSplit]) that may be stored " +
                     "as split cells, so it cannot be filtered server-side.");
 
+            // A TableBlobContent lives in blob storage; the row only holds a reference to it.
+            if (pi.PropertyType == typeof(TableBlobContent))
+                throw new NotSupportedException(
+                    $"'{pi.Name}' on {ownerType.Name} is a TableBlobContent stored in blob storage, so it cannot be filtered server-side.");
+
             // A NESTED owner (x.Owner.Child) only yields an "Owner_Child" column when the serializer
             // FLATTENS it. A JSON-blobbed owner (positional record, collection, [JsonConstructor]) is
             // stored as one cell, so no such column exists — the filter would match nothing on Azure

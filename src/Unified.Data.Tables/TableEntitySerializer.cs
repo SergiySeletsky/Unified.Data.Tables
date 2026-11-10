@@ -70,7 +70,7 @@ public static class TableEntitySerializer
         var entity = new TableEntity(partitionKey, rowKey);
         if (root == null) return entity;
 
-        var flat = Flatten(root, persistType, new FlattenState(ctx, pending, Partial: false));
+        var flat = Flatten(root, persistType, new FlattenState(ctx, pending, Partial: false, partitionKey, rowKey));
         foreach (var kv in flat)
             entity[kv.Key] = kv.Value;
 
@@ -88,7 +88,7 @@ public static class TableEntitySerializer
     {
         ArgumentNullException.ThrowIfNull(entity);
         ArgumentNullException.ThrowIfNull(ctx);
-        return (T)Materialize(entity, typeof(T), restoreId: true);
+        return (T)Materialize(entity, typeof(T), restoreId: true, ctx);
     }
 
     /// <summary>
@@ -108,7 +108,7 @@ public static class TableEntitySerializer
 
     /// <summary>The message for a polymorphic write of an item that needs large-value cells.</summary>
     internal static string PolymorphicWriteRefusal(Type itemType) =>
-        $"{itemType.Name} carries a value too large for one cell. Polymorphic stores cannot write " +
+        $"{itemType.Name} carries a value too large for one cell or a TableBlobContent. Polymorphic stores cannot write " +
         "split or offloaded values; store this type through IStorage<T> instead.";
 
     /// <summary>The message for a large value reached by a partial (Merge) update.</summary>
@@ -140,7 +140,7 @@ public static class TableEntitySerializer
         var t = AssemblyQualifiedTypeDiscriminator.ResolveTypeName(asmQName)
                 ?? throw new TypeLoadException($"Type '{asmQName}' not found.");
 
-        return Materialize(entity, t, restoreId: true);
+        return Materialize(entity, t, restoreId: true, ValueReadContext.None);
     }
 
     /// <summary>
@@ -212,7 +212,7 @@ public static class TableEntitySerializer
         if (!typeof(TBase).IsAssignableFrom(type))
             throw new InvalidOperationException(PolymorphicMessages.NotAssignable(token, typeof(TBase)));
 
-        result = (TBase)Materialize(entity, type, restoreId: false);
+        result = (TBase)Materialize(entity, type, restoreId: false, ValueReadContext.None);
         return true;
     }
 
@@ -222,7 +222,7 @@ public static class TableEntitySerializer
     // alias pass must stay in lockstep, and the two PRE-EXISTING copies had already drifted once (one
     // loop's explanatory comment on the truncation-marker check was missing from the other, until an
     // earlier fix resynced them).
-    private static object Materialize(TableEntity entity, Type type, bool restoreId)
+    private static object Materialize(TableEntity entity, Type type, bool restoreId, ValueReadContext ctx)
     {
         var meta = TypeMetadataCache.GetMetadata(type);
         var result = meta.Creator();
@@ -276,7 +276,7 @@ public static class TableEntitySerializer
         }
 
         if (largeValues is not null)
-            result = ApplyLargeValues(result, type, largeValues);
+            result = ApplyLargeValues(result, type, largeValues, ctx);
 
         result = ApplyColumnAliases(result, entity, meta);
 
@@ -286,22 +286,47 @@ public static class TableEntitySerializer
     }
 
     // Reassembles every split value (verifying its SHA-256) and sets it on its property. A value whose
-    // property no longer exists on the type is skipped unread, like any other unknown column. A
-    // group holding a blob reference belongs to the offload tier and is not handled here.
+    // property no longer exists on the type is skipped unread, like any other unknown column. A group
+    // holding a blob reference takes its value from what the read resolved outside the row: a
+    // downloaded value, or a lazy TableBlobContent; with no resolution (a projection omitted it, or a
+    // plain FromTableEntity) the property keeps its default.
     private static object ApplyLargeValues(
-        object result, Type type, Dictionary<string, Dictionary<string, object>> largeValues)
+        object result, Type type, Dictionary<string, Dictionary<string, object>> largeValues, ValueReadContext ctx)
     {
         foreach (var (baseColumn, cells) in largeValues)
         {
-            // A blob reference is the offload tier's; a '_' base is a storage-layer column, never a property.
-            if (cells.ContainsKey(baseColumn + SplitCodec.BlobSuffix) || SystemColumnNames.IsSystemColumn(baseColumn))
+            // A '_' base is a storage-layer column, never a property.
+            if (SystemColumnNames.IsSystemColumn(baseColumn))
                 continue;
 
             var path = TableEntityValue.Create(baseColumn, string.Empty).Path;
             if (TypeMetadataCache.ResolvePath(type, path) is not { } target)
                 continue;
 
-            var decoded = SplitCodec.Decode(baseColumn, cells);
+            object decoded;
+            if (cells.TryGetValue(baseColumn + SplitCodec.BlobSuffix, out var reference))
+            {
+                if (ctx.Resolved.TryGetValue(baseColumn, out var resolved))
+                {
+                    decoded = resolved;
+                }
+                else if (target.PropertyType == typeof(TableBlobContent) && ctx.LazyContent is { } lazy)
+                {
+                    var parsed = Providers.BlobReference.Parse(baseColumn,
+                        reference as string ?? throw new TableValueIntegrityException(baseColumn, "the blob reference is not a string."));
+                    result = SetProperty(result, new TableEntityValue(path, lazy(baseColumn, parsed)));
+                    continue;
+                }
+                else
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                decoded = SplitCodec.Decode(baseColumn, cells);
+            }
+
             var fmt = target.PropertyType == typeof(string) || target.PropertyType == typeof(byte[])
                 ? TableEntityValueFormat.Raw
                 : TableEntityValueFormat.Json;
@@ -367,7 +392,9 @@ public static class TableEntitySerializer
                     break;
                 }
             }
-            if (hasCanonical || entity.ContainsKey(property.Name + SplitCodec.ChunksSuffix))
+            if (hasCanonical
+                || entity.ContainsKey(property.Name + SplitCodec.ChunksSuffix)
+                || entity.ContainsKey(property.Name + SplitCodec.BlobSuffix))
                 continue;
 
             foreach (var suffix in AliasSuffixes)
@@ -405,7 +432,7 @@ public static class TableEntitySerializer
 
         var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
         var node = new TableEntityValue(ImmutableList<string>.Empty.Add(propertyName), value);
-        var state = new FlattenState(ValueWriteContext.Public, [], Partial: true);
+        var state = new FlattenState(ValueWriteContext.Public, [], Partial: true, string.Empty, string.Empty);
         if (!Flatten(dict, seen, node, state, split: null))
             throw new InvalidOperationException($"Cannot flatten property '{propertyName}' of type {value.GetType()}.");
 
@@ -429,6 +456,8 @@ public static class TableEntitySerializer
                 throw new NotSupportedException(PartialUpdateRefusal(columnPath));
             if (!meta.PropertyMap.TryGetValue(segment, out var prop))
                 break;
+            if (prop.PropertyType == typeof(TableBlobContent))
+                throw new NotSupportedException(PartialUpdateRefusal(columnPath));
             owner = prop.PropertyType;
         }
         return FlattenProperty(columnPath, value);
@@ -466,10 +495,6 @@ public static class TableEntitySerializer
 
     //───────────────────────────────────────────────────────────────────────────
 
-    // One flatten pass: the write context, the blobs it collects, and whether it serves a partial
-    // (Merge) update, which must refuse large values.
-    private readonly record struct FlattenState(ValueWriteContext Ctx, List<PendingBlob> Pending, bool Partial);
-
     private static Dictionary<string, object> Flatten(object root, bool persistType, FlattenState state)
     {
         var dict = new Dictionary<string, object>();
@@ -498,7 +523,7 @@ public static class TableEntitySerializer
         // primitive/json/gzip cell (a null cell means the property was dropped because even its
         // compressed form exceeds the 64 KB cell cap — omit the column, keep the row). An opted-in
         // value too large for one cell comes back as its split cells instead.
-        if (value.TrySerialize(out var col, out var cell, out var largeCells, split))
+        if (value.TrySerialize(out var col, out var cell, out var largeCells, split, state))
         {
             if (largeCells != null)
             {
@@ -545,11 +570,11 @@ public static class TableEntitySerializer
                     "nested property. Rename the property or map it to another column name.");
 
             meta.SplitOptions.TryGetValue(prop.Name, out var childSplit);
-            if (state.Partial && childSplit != null)
+            var childVal = prop.GetValue(value.Value);
+            if (state.Partial && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
                 throw new NotSupportedException(
                     PartialUpdateRefusal(string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name))));
 
-            var childVal = prop.GetValue(value.Value);
             var childNode = new TableEntityValue(value.Path.Add(prop.Name), childVal!);
             if (!Flatten(dict, seen, childNode, state, childSplit))
                 return false;
@@ -559,6 +584,67 @@ public static class TableEntitySerializer
             seen.Remove(value.Value);
 
         return true;
+    }
+
+    /// <summary>
+    /// Every <see cref="TableBlobContent"/> reachable through the columns <paramref name="root"/>
+    /// flattens into, with its flattened base column (<c>Inner_Content</c>). Contents inside
+    /// collections or JSON-stored objects are not listed: the write refuses those.
+    /// </summary>
+    internal static List<(string Column, TableBlobContent Content)> FindBlobContents(object root)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        var found = new List<(string, TableBlobContent)>();
+        CollectBlobContents(root, string.Empty, new HashSet<object>(ReferenceEqualityComparer.Instance), found);
+        return found;
+    }
+
+    /// <summary>True when <paramref name="item"/> holds a <see cref="TableBlobContent"/> in a flattened column.</summary>
+    /// <remarks>
+    /// The cached type check keeps every plain type off the reflection walk. A content reachable only
+    /// through a runtime subtype is missed here, but the write still refuses it (OversizedValueException).
+    /// </remarks>
+    internal static bool CarriesBlobContent(object item)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        return TypeMetadataCache.IsLargeValueAware(item.GetType()) && FindBlobContents(item).Count > 0;
+    }
+
+    // Mirrors Flatten: recurse exactly where Flatten recurses (a non-primitive, non-enum object that is
+    // not JSON-stored); a TableBlobContent is a leaf.
+    private static void CollectBlobContents(object owner, string prefix, HashSet<object> seen, List<(string, TableBlobContent)> found)
+    {
+        var isReference = !owner.GetType().IsValueType;
+        if (isReference && !seen.Add(owner))
+            return;
+        foreach (var prop in TypeMetadataCache.GetMetadata(owner.GetType()).Properties)
+        {
+            var value = prop.GetValue(owner);
+            if (value is null) continue;
+            var column = prefix + prop.Name;
+            if (value is TableBlobContent content)
+                found.Add((column, content));
+            else if (value is not string && !TableEntityValue.IsPrimitive(value.GetType()) && !value.GetType().IsEnum
+                     && TableEntityValue.CanSerializeWithoutJson(value))
+                CollectBlobContents(value, column + TableEntityValue.PathDelimiter, seen, found);
+        }
+        if (isReference)
+            seen.Remove(owner);
+    }
+
+    /// <summary>The <see cref="TableValueSplitAttribute"/> of a flattened base column of <paramref name="type"/>, or null.</summary>
+    internal static TableValueSplitAttribute? SplitOptionFor(Type type, string baseColumn)
+    {
+        var path = TableEntityValue.Create(baseColumn, string.Empty).Path;
+        if (path.Count == 0) return null;
+        var owner = type;
+        for (var i = 0; i < path.Count - 1; i++)
+        {
+            if (!TypeMetadataCache.GetMetadata(owner).PropertyMap.TryGetValue(path[i], out var prop))
+                return null;
+            owner = prop.PropertyType;
+        }
+        return TypeMetadataCache.GetMetadata(owner).SplitOptions.TryGetValue(path[^1], out var split) ? split : null;
     }
 
     private static object SetProperty(object root, TableEntityValue val)
@@ -624,6 +710,13 @@ public static class TableEntitySerializer
     }
 }
 
+/// <summary>
+/// One flatten pass: the write context, the blobs it collects, whether it serves a partial (Merge)
+/// update (which must refuse large values), and the row keys blob names are built from.
+/// </summary>
+internal readonly record struct FlattenState(
+    ValueWriteContext Ctx, List<PendingBlob> Pending, bool Partial, string PartitionKey, string RowKey);
+
 internal enum TableEntityValueFormat { Raw, Json, GZip }
 
 internal sealed class TableEntityValue
@@ -657,7 +750,7 @@ internal sealed class TableEntityValue
         // select (a private foreign-annotated one) or would bind too strictly (parameters that do
         // not exactly match property names and types) — both idiomatic historical shapes, and ones
         // that appear throughout rows written by the serializers this format is compatible with.
-        Converters = { new JsonStringEnumConverter(), new ParameterizedConstructorConverterFactory() },
+        Converters = { new RefuseBlobContentConverter(), new JsonStringEnumConverter(), new ParameterizedConstructorConverterFactory() },
         // Allow full Unicode so Cyrillic (and other) characters aren't \uXXXX escaped in stored JSON
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };
@@ -791,18 +884,23 @@ internal sealed class TableEntityValue
     /// single cell. Null otherwise.
     /// </param>
     /// <param name="split">The property's <see cref="TableValueSplitAttribute"/>; null takes today's path.</param>
+    /// <param name="state">The flatten pass (write context and pending blobs); null behaves as the public serializer.</param>
     public bool TrySerialize(
         out string columnName,
         out object? value,
         out IReadOnlyList<KeyValuePair<string, object>>? largeCells,
-        TableValueSplitAttribute? split = null)
+        TableValueSplitAttribute? split = null,
+        FlattenState? state = null)
     {
         columnName = string.Join(Delim, Path);
         value = null;
         largeCells = null;
         if (Value == null) return false;
 
-        if (split is not null && TrySerializeLarge(split, ref columnName, out value, out largeCells))
+        if (Value is TableBlobContent blob)
+            return SerializeBlobContent(blob, state, columnName, out value, out largeCells);
+
+        if (split is not null && TrySerializeLarge(split, state, ref columnName, out value, out largeCells))
             return true;
 
         var vt = Value.GetType();
@@ -905,6 +1003,7 @@ internal sealed class TableEntityValue
     // flattens into columns) — it takes the ordinary path.
     private bool TrySerializeLarge(
         TableValueSplitAttribute split,
+        FlattenState? state,
         ref string columnName,
         out object? value,
         out IReadOnlyList<KeyValuePair<string, object>>? largeCells)
@@ -940,8 +1039,112 @@ internal sealed class TableEntityValue
             return true;
         }
 
+        // Tier 3 (blob offload): only for a storage write, never for a clone or the public serializer.
+        if (state is { Ctx: { IsClone: false } ctx } st && (ctx.Offload is not null || ctx.ForceOffload.Count > 0))
+        {
+            var stored = SplitCodec.ToStored(payload, split.Encoding);
+            var forced = ctx.ForceOffload.Contains(columnName);
+            if (forced && split.Offload == BlobOffload.Never)
+                throw new OversizedValueException(columnName, stored.Bytes.Length,
+                    "the row does not fit one entity-group transaction and the property does not allow blob offload",
+                    offloadForbiddenByProperty: ctx.Offload is not null);
+            if (forced && ctx.Offload is null)
+                throw new OversizedValueException(columnName, stored.Bytes.Length,
+                    "the row does not fit one entity-group transaction and blob offload is not configured");
+            if (split.Offload != BlobOffload.Never && (forced || (ctx.Offload is not null && stored.Bytes.Length > ctx.Offload.ThresholdBytes)))
+            {
+                var contentType = stored.Enc switch
+                {
+                    "text" or "gzip" => "text/plain; charset=utf-8",
+                    "utf16le" => "text/plain; charset=utf-16le",
+                    _ => "application/octet-stream",
+                };
+                var bytes = stored.Bytes;
+                var reference = new Providers.BlobReference(
+                    BlobName(ctx, st, columnName, stored.Sha256), stored.Sha256, bytes.Length, contentType, stored.Enc);
+                st.Pending.Add(new PendingBlob(columnName, reference, stored.Enc == "gzip" ? "gzip" : null,
+                    _ => Task.FromResult<Stream>(new MemoryStream(bytes, writable: false))));
+                largeCells = [new(columnName + SplitCodec.BlobSuffix, reference.ToJson())];
+                return true;
+            }
+            largeCells = SplitCodec.Encode(columnName, payload, stored);
+            return true;
+        }
+
         largeCells = SplitCodec.Encode(columnName, payload, split.Encoding);
         return true;
+    }
+
+    private static string BlobName(ValueWriteContext ctx, FlattenState state, string columnName, string sha256) =>
+        ValueOffloadCoordinator.BlobName(
+            ctx.TableName ?? throw new InvalidOperationException("A blob offload write needs the table name."),
+            state.PartitionKey, state.RowKey, columnName, sha256);
+
+    // A TableBlobContent is always one blob reference cell. A clone keeps the instance itself; a write
+    // without blob offload, a partial update, or content that is not prepared cannot store it.
+    private bool SerializeBlobContent(
+        TableBlobContent blob,
+        FlattenState? state,
+        string columnName,
+        out object? value,
+        out IReadOnlyList<KeyValuePair<string, object>>? largeCells)
+    {
+        value = null;
+        largeCells = null;
+        if (Path.IsEmpty)
+            throw new NotSupportedException("A TableBlobContent cannot be serialized as a whole entity.");
+        if (state is { Partial: true })
+            throw new NotSupportedException(TableEntitySerializer.PartialUpdateRefusal(columnName));
+        var ctx = state?.Ctx ?? ValueWriteContext.Public;
+        if (ctx.IsClone)
+        {
+            value = blob;
+            return true;
+        }
+        if (ctx.Offload is null)
+            throw new OversizedValueException(columnName, blob.IsSealed ? blob.Length : 0,
+                "a TableBlobContent is always stored in blob storage and blob offload is not configured");
+        if (!blob.IsSealed)
+            throw new InvalidOperationException(
+                $"The TableBlobContent of '{columnName}' was not prepared for writing (its length and hash are unknown).");
+
+        var st = state!.Value;
+        var reference = new Providers.BlobReference(
+            BlobName(ctx, st, columnName, blob.Sha256), blob.Sha256, blob.Length, blob.ContentType, "binary");
+        st.Pending.Add(new PendingBlob(columnName, reference, null, OpenSource(blob)) { Content = blob });
+        largeCells = [new(columnName + SplitCodec.BlobSuffix, reference.ToJson())];
+        return true;
+    }
+
+    // The bytes of in-memory content, the (rewound) prepared stream, or the blob the content is bound to.
+    private static Func<CancellationToken, Task<Stream>> OpenSource(TableBlobContent blob)
+    {
+        if (blob.Bytes is { } bytes)
+            return _ => Task.FromResult<Stream>(new MemoryStream(bytes, writable: false));
+        if (blob.Source is { } source)
+        {
+            var origin = blob.SourceOrigin;
+            return _ =>
+            {
+                if (source.CanSeek) source.Position = origin;
+                // The caller (or the content's spool) owns the stream: hand out a non-closing view.
+                return Task.FromResult<Stream>(new HashingReadStream(source, null, null, r => new InvalidOperationException(r), leaveOpen: true));
+            };
+        }
+        return blob.OpenReadAsync;
+    }
+
+    // A TableBlobContent is stored as its own blob, never inside a collection or a JSON-stored object.
+    private sealed class RefuseBlobContentConverter : JsonConverter<TableBlobContent>
+    {
+        private const string Message =
+            "A TableBlobContent cannot be stored inside a collection or a JSON-stored object; make it a property of the entity or of a flattened object.";
+
+        public override TableBlobContent Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            throw new NotSupportedException(Message);
+
+        public override void Write(Utf8JsonWriter writer, TableBlobContent value, JsonSerializerOptions options) =>
+            throw new NotSupportedException(Message);
     }
 
     public void SetTo(PropertyInfo prop, object owner)
@@ -966,7 +1169,7 @@ internal sealed class TableEntityValue
         prop.SetValue(owner, conv);
     }
 
-    private static bool CanSerializeWithoutJson(object val)
+    internal static bool CanSerializeWithoutJson(object val)
     {
         if (val is IEnumerable) return false;
         var ctors = val.GetType().GetConstructors();
@@ -980,6 +1183,8 @@ internal sealed class TableEntityValue
     private static object? ConvertTo(Type tgt, object? val)
     {
         if (val == null) return null;
+        // An in-process clone carries a TableBlobContent cell by reference.
+        if (val is TableBlobContent) return val;
         var t = Nullable.GetUnderlyingType(tgt) ?? tgt;
 
         if (t.IsEnum)
@@ -1174,14 +1379,14 @@ internal static class TypeMetadataCache
 
     /// <summary>
     /// True when <paramref name="t"/>, or any nested type it flattens into columns, has a
-    /// <see cref="TableValueSplitAttribute"/> property. Such a type may produce split cells; any other
-    /// type takes none of the large-value branches.
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property. Such a type may
+    /// produce split cells or blob references; any other type takes none of the large-value branches.
     /// </summary>
     internal static bool IsLargeValueAware(Type t) => LargeValueColumns(t).Count > 0;
 
     /// <summary>
-    /// Every flattened base column of <paramref name="t"/> that can carry split cells
-    /// (<c>"Body"</c>, <c>"Inner_Body"</c>).
+    /// Every flattened base column of <paramref name="t"/> that can carry split cells or a blob
+    /// reference (<c>"Body"</c>, <c>"Inner_Body"</c>, <c>"Content"</c>).
     /// </summary>
     internal static IReadOnlyList<string> LargeValueColumns(Type t)
     {
@@ -1205,7 +1410,7 @@ internal static class TypeMetadataCache
         var meta = GetMetadata(type);
         foreach (var prop in meta.Properties)
         {
-            if (meta.SplitOptions.ContainsKey(prop.Name))
+            if (meta.SplitOptions.ContainsKey(prop.Name) || prop.PropertyType == typeof(TableBlobContent))
                 columns.Add(prefix + prop.Name);
             else if (FlattensIntoColumns(prop.PropertyType))
                 CollectLargeValueColumns(prop.PropertyType, prefix + prop.Name + TableEntityValue.PathDelimiter, visiting, columns);
@@ -1284,6 +1489,9 @@ internal static class TypeMetadataCache
             var type = prop.PropertyType;
             if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
             {
+                if (type == typeof(TableBlobContent))
+                    throw new InvalidOperationException(
+                        $"[TableValueSplit] on {t.Name}.{prop.Name}: a TableBlobContent is always stored in blob storage. Remove the attribute.");
                 if (IsScalar(type) && type != typeof(string) && type != typeof(byte[]))
                     throw new InvalidOperationException(
                         $"[TableValueSplit] on {t.Name}.{prop.Name}: a {type.Name} is a native cell and cannot be split. " +
@@ -1307,7 +1515,7 @@ internal static class TypeMetadataCache
 
     // string, byte[], or a type the serializer stores as one JSON cell.
     private static bool IsSplittable(Type type) =>
-        type == typeof(string) || type == typeof(byte[]) || (!IsScalar(type) && !TableEntitySerializer.FlattensToColumns(type));
+        type != typeof(TableBlobContent) && (type == typeof(string) || type == typeof(byte[]) || (!IsScalar(type) && !TableEntitySerializer.FlattensToColumns(type)));
 
     // Collect [ColumnAlias] declarations — property-level for owned properties, class-level
     // (inherited) for properties on base types the annotating class doesn't own — and validate

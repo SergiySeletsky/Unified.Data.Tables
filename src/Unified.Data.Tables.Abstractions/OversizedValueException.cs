@@ -15,17 +15,25 @@ public sealed class OversizedValueException : SerializationException
     /// <summary>Creates the exception.</summary>
     /// <param name="columnName">The column whose value is too large.</param>
     /// <param name="encodedBytes">Size of the stored (encoded) value in bytes.</param>
-    /// <param name="reason">Why the value cannot be stored; also decides which fix the message names.</param>
-    public OversizedValueException(string columnName, long encodedBytes, string reason)
+    /// <param name="reason">Why the value cannot be stored.</param>
+    /// <param name="offloadForbiddenByProperty">
+    /// True when blob offload is configured but the property forbids it (<see cref="BlobOffload.Never"/>);
+    /// decides which fix the message names.
+    /// </param>
+    public OversizedValueException(string columnName, long encodedBytes, string reason, bool offloadForbiddenByProperty = false)
         : base($"Property '{columnName}' encodes to {encodedBytes:N0} B and cannot be stored: {reason}. "
-            + (reason.Contains("BlobOffload.Never")
+            + (offloadForbiddenByProperty
                 ? "Set the property's Offload to BlobOffload.AboveThreshold and configure UnifiedTableStorageOptions.BlobOffload."
                 : "Configure UnifiedTableStorageOptions.BlobOffload so large values can be stored in blob storage."))
     {
         ColumnName = columnName;
         EncodedBytes = encodedBytes;
         Reason = reason;
+        OffloadForbiddenByProperty = offloadForbiddenByProperty;
     }
+
+    /// <summary>True when the property's <see cref="TableValueSplitAttribute.Offload"/> forbids blob offload.</summary>
+    public bool OffloadForbiddenByProperty { get; }
 
     /// <summary>The column whose value is too large.</summary>
     public string ColumnName { get; }
