@@ -108,4 +108,37 @@ public class SplitRowLayoutTests
         Assert.Throws<ArgumentException>(() => SplitRowLayout.ValidateRowKey("a~b"));
         Assert.Throws<ArgumentException>(() => SplitRowLayout.ValidateRowKey(new string('k', 481)));
     }
+
+    [Fact]
+    public void LargePrimary_FirstChunkMovesToPart_EveryRowWithinByteBudget()
+    {
+        var bag = new TableEntity("pk", "rk");
+        for (var i = 0; i < 15; i++) bag[$"O{i}"] = new string('o', 32_000); // ~960,000 B ordinary
+        bag["Extra"] = new string('e', 14_000);                                // ~990,000 B total
+        for (var i = 0; i < 4; i++) bag[$"V__c{i}"] = new byte[65_536];
+        bag["V__chunks"] = 4;
+        var plan = SplitRowLayout.Plan(bag);
+        Assert.NotEmpty(plan.Parts);
+        Assert.True(TableRowSize.Estimate(plan.Primary) <= SplitRowLayout.MaxEntityBytes);
+        foreach (var p in plan.Parts) Assert.True(TableRowSize.Estimate(p) <= SplitRowLayout.MaxEntityBytes);
+    }
+
+    [Theory]
+    [InlineData("x")]
+    [InlineData(-1)]
+    public void Assemble_GarbledSplitParts_Throws(object garbled)
+    {
+        var primary = new TableEntity("pk", "rk") { ["_SplitParts"] = garbled };
+        var ex = Assert.Throws<TableValueIntegrityException>(() => SplitRowLayout.Assemble(primary, []));
+        Assert.Equal("_SplitParts", ex.ColumnName);
+    }
+
+    [Fact]
+    public void Plan_NonSplittableCellsOverLimit_ThrowsOversized()
+    {
+        var bag = new TableEntity("pk", "rk");
+        for (var i = 0; i < 40; i++) bag[$"O{i}"] = new string('o', 32_000); // 2.5 MB ordinary
+        var ex = Assert.Throws<OversizedValueException>(() => SplitRowLayout.Plan(bag));
+        Assert.Equal("rk", ex.ColumnName);
+    }
 }

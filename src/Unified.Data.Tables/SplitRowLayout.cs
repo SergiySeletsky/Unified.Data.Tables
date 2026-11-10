@@ -69,20 +69,26 @@ internal static class SplitRowLayout
         var bytes = TableRowSize.Estimate(primary);
         var placedInRow = 0;
 
+        if (props > MaxPropertiesPerRow || bytes > MaxEntityBytes)
+            throw new OversizedValueException(
+                logical.RowKey ?? "(row)",
+                bytes,
+                "the cells that cannot be split onto continuation rows exceed the entity limit of "
+                + $"{MaxPropertiesPerRow} properties and {MaxEntityBytes:N0} estimated bytes");
+
         foreach (var (key, value) in chunks)
         {
             var cost = CellCost(key, value);
-            // A row that holds no chunk yet always takes one, so every part makes progress.
-            if (props + 1 > MaxPropertiesPerRow || (bytes + cost > MaxEntityBytes && (placedInRow > 0 || !ReferenceEquals(row, primary))))
+            // Only a fresh continuation row (one that holds nothing yet) may exceed its budget; the
+            // primary must always open a part instead.
+            var freshPart = !ReferenceEquals(row, primary) && placedInRow == 0;
+            if (!freshPart && (props + 1 > MaxPropertiesPerRow || bytes + cost > MaxEntityBytes))
             {
-                if (placedInRow > 0 || ReferenceEquals(row, primary))
-                {
-                    row = NewPart(logical.PartitionKey, logical.RowKey, parts.Count + 1);
-                    parts.Add(row);
-                    props = 2;
-                    bytes = TableRowSize.Estimate(row);
-                    placedInRow = 0;
-                }
+                row = NewPart(logical.PartitionKey, logical.RowKey, parts.Count + 1);
+                parts.Add(row);
+                props = 2;
+                bytes = TableRowSize.Estimate(row);
+                placedInRow = 0;
             }
             row[key] = value;
             props++;
@@ -115,7 +121,11 @@ internal static class SplitRowLayout
 
     /// <summary>Number of continuation rows a primary declares (0 when none).</summary>
     internal static int PartCount(TableEntity primary) =>
-        primary.TryGetValue(SystemColumnNames.SplitParts, out var v) ? Math.Max(0, ToInt(v)) : 0;
+        primary.TryGetValue(SystemColumnNames.SplitParts, out var v)
+            ? (ToInt(v) is var n and >= 0
+                ? n
+                : throw new TableValueIntegrityException(SystemColumnNames.SplitParts, "the part count is not a non-negative integer"))
+            : 0;
 
     /// <summary>Inclusive lower bound of the continuation-row range of <paramref name="rowKey"/>.</summary>
     internal static string PartRangeLower(string rowKey) => rowKey + "~";
