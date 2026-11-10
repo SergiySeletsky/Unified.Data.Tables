@@ -16,6 +16,15 @@ internal static class SplitRowLayout
 {
     internal const int MaxPropertiesPerRow = 252;
     internal const long MaxEntityBytes = 1_000_000;
+
+    /// <summary>
+    /// The budget of one row's JSON body (<see cref="TableRowSize.WireSize"/>) when split cells are
+    /// placed on it. The service limits an entity by its stored size, which <see cref="MaxEntityBytes"/>
+    /// bounds; the storage emulator limits it by its request body instead, where escaped text is up to
+    /// six bytes per character and binary is base64. Split cells are placed within both, so a split row
+    /// is accepted by either. Cells that cannot be split are still held only to <see cref="MaxEntityBytes"/>.
+    /// </summary>
+    internal const long MaxEntityWireBytes = 1_000_000;
     internal const int MaxRowKeyLength = 480;
 
     private static bool IsSystemKey(string key) =>
@@ -44,7 +53,8 @@ internal static class SplitRowLayout
     /// <summary>Plans <paramref name="logical"/>; returns it unchanged (no parts) when it fits one row.</summary>
     internal static SplitRowPlan Plan(TableEntity logical)
     {
-        if (CustomCount(logical) <= MaxPropertiesPerRow && TableRowSize.Estimate(logical) <= MaxEntityBytes)
+        if (CustomCount(logical) <= MaxPropertiesPerRow && TableRowSize.Estimate(logical) <= MaxEntityBytes
+            && (TableRowSize.WireSize(logical) <= MaxEntityWireBytes || !logical.Keys.Any(IsChunk)))
             return new SplitRowPlan(logical, []);
 
         var primary = new TableEntity(logical.PartitionKey, logical.RowKey)
@@ -67,6 +77,7 @@ internal static class SplitRowLayout
         var row = primary;
         var props = CustomCount(primary);
         var bytes = TableRowSize.Estimate(primary);
+        var wire = TableRowSize.WireSize(primary);
         var placedInRow = 0;
 
         if (props > MaxPropertiesPerRow || bytes > MaxEntityBytes)
@@ -79,20 +90,23 @@ internal static class SplitRowLayout
         foreach (var (key, value) in chunks)
         {
             var cost = CellCost(key, value);
+            var wireCost = TableRowSize.PropertyWireSize(key, value);
             // Only a fresh continuation row (one that holds nothing yet) may exceed its budget; the
             // primary must always open a part instead.
             var freshPart = !ReferenceEquals(row, primary) && placedInRow == 0;
-            if (!freshPart && (props + 1 > MaxPropertiesPerRow || bytes + cost > MaxEntityBytes))
+            if (!freshPart && (props + 1 > MaxPropertiesPerRow || bytes + cost > MaxEntityBytes || wire + wireCost > MaxEntityWireBytes))
             {
                 row = NewPart(logical.PartitionKey, logical.RowKey, parts.Count + 1);
                 parts.Add(row);
                 props = 2;
                 bytes = TableRowSize.Estimate(row);
+                wire = TableRowSize.WireSize(row);
                 placedInRow = 0;
             }
             row[key] = value;
             props++;
             bytes += cost;
+            wire += wireCost;
             placedInRow++;
         }
 
@@ -100,20 +114,35 @@ internal static class SplitRowLayout
         return new SplitRowPlan(primary, parts);
     }
 
-    /// <summary>True when primary plus parts plus <paramref name="extraActions"/> fit one entity-group transaction.</summary>
+    /// <summary>
+    /// True when primary plus parts plus <paramref name="extraActions"/> (deletes of stale continuation
+    /// rows) fit one entity-group transaction: within <see cref="BatchPlanner.DefaultMaxCount"/> actions,
+    /// within <see cref="BatchPlanner.DefaultMaxBytes"/> as <see cref="TableRowSize.Estimate"/> measures,
+    /// and within <see cref="TableRowSize.MaxTransactionWireBytes"/> as the SDK will actually send it
+    /// (JSON-escaped text is up to six bytes per character on the wire).
+    /// </summary>
     internal static bool FitsOneTransaction(SplitRowPlan plan, int extraActions)
     {
         if (1 + plan.Parts.Count + extraActions > BatchPlanner.DefaultMaxCount) return false;
-        var sizes = new List<long>(1 + plan.Parts.Count) { TableRowSize.Estimate(plan.Primary) };
+        // A stale delete carries no body, but its keys and framing still count toward the payload.
+        var staleKey = plan.Primary.RowKey + "~0000";
+        var deleteEstimate = TableRowSize.Estimate(new TableEntity(plan.Primary.PartitionKey, staleKey));
+        var sizes = new List<long>(1 + plan.Parts.Count + extraActions) { TableRowSize.Estimate(plan.Primary) };
         foreach (var part in plan.Parts) sizes.Add(TableRowSize.Estimate(part));
+        for (var i = 0; i < extraActions; i++) sizes.Add(deleteEstimate);
         try
         {
-            return BatchPlanner.Plan(sizes).Count == 1;
+            if (BatchPlanner.Plan(sizes).Count != 1) return false;
         }
         catch (BatchPayloadTooLargeException)
         {
             return false;
         }
+
+        var wire = TableRowSize.ActionWireSize(plan.Primary)
+            + (extraActions * TableRowSize.DeleteActionWireSize(plan.Primary.PartitionKey, staleKey));
+        foreach (var part in plan.Parts) wire += TableRowSize.ActionWireSize(part);
+        return wire <= TableRowSize.MaxTransactionWireBytes;
     }
 
     /// <summary>

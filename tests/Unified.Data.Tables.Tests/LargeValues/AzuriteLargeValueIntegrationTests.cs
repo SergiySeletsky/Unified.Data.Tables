@@ -269,6 +269,51 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
         }
     }
 
+    // Text the SDK JSON-escapes character by character (\uXXXX, six bytes each on the wire): Cyrillic,
+    // and the HTML-sensitive ASCII '<', '>', '&'. Sized by the storage estimate alone, 700K of either
+    // was planned into one transaction and the service refused it (HTTP 413).
+    [Theory]
+    [InlineData("cyrillic", 600_000, false)]  // 3.6 MB on the wire: continuation rows, one transaction
+    [InlineData("cyrillic", 700_000, true)]   // 4.2 MB on the wire: offloaded although below the byte threshold
+    [InlineData("cyrillic", 1_200_000, true)]
+    [InlineData("markup", 600_000, false)]
+    [InlineData("markup", 700_000, true)]
+    [InlineData("markup", 1_200_000, true)]
+    public async Task EscapedText_RoundTripsExactly_SplitOrOffloaded(string alphabet, int length, bool offloaded)
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var letters = alphabet == "cyrillic" ? "абвгдежзийклмнопрстуфхцчшщъыьэюяЖЁ" : "<<<<>&";
+        var random = new Random(length);
+        var text = string.Create(length, letters, (span, set) =>
+        {
+            for (var i = 0; i < span.Length; i++) span[i] = set[random.Next(set.Length)];
+        });
+        Assert.True(Utf8(text).Length < DefaultThreshold, "below the byte threshold: only the wire size decides");
+
+        await Store<SplitTextEntity>().CreateAsync(new SplitTextEntity { Id = Id("x1"), Body = text, Title = "t" }, Ct);
+        var read = await Store<SplitTextEntity>().OneAsync(Id("x1"), Ct);
+
+        Assert.Equal(text, read!.Body, StringComparer.Ordinal);
+        var raw = await RawRowsAsync<SplitTextEntity>();
+        var blobs = await BlobsAsync<SplitTextEntity>();
+        if (offloaded)
+        {
+            Assert.Single(raw);
+            Assert.Equal(Sha(Utf8(text)), Reference(raw[0], "Body").Sha256);
+            Assert.Single(blobs);
+        }
+        else
+        {
+            Assert.True(raw.Count > 1, $"{raw.Count} rows");
+            Assert.Empty(blobs);
+            Assert.Equal(text, JoinTextChunks(raw, "Body"), StringComparer.Ordinal);
+        }
+
+        // An upsert of the same value takes the same tier, and so does a replace that grows it.
+        await Store<SplitTextEntity>().UpsertAsync(new SplitTextEntity { Id = Id("x1"), Body = text + text[..1000] }, Ct);
+        Assert.Equal(text + text[..1000], (await Store<SplitTextEntity>().OneAsync(Id("x1"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
     [Fact]
     public async Task FullTransaction_StaysInTables_OneMoreCharIsOffloaded()
     {
