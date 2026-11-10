@@ -1,4 +1,3 @@
-using System.Globalization;
 using Azure;
 using Azure.Data.Tables;
 
@@ -16,16 +15,27 @@ public partial class TableStorage<T>
     /// <summary>How many times a write that lost its condition to a concurrent writer re-reads and retries.</summary>
     private const int MaxLargeWriteAttempts = 3;
 
-    // _SplitParts says how many continuation rows the stored row owns; the __blob reference columns are
-    // selected now so the offload tier can read them from the same point read.
+    // _SplitParts says how many continuation rows the stored row owns, _SplitOf marks the row itself as
+    // one; the __blob reference columns are selected now so the offload tier can read them from the same
+    // point read.
     private static readonly string[] PriorSelect =
     [
         SystemColumnNames.SplitParts,
+        SystemColumnNames.SplitOf,
         "odata.etag",
         .. TypeMetadataCache.LargeValueColumns(typeof(T)).Select(c => c + SplitCodec.BlobSuffix),
     ];
 
     private static readonly string[] KeysOnly = ["PartitionKey", "RowKey"];
+
+    private static readonly string[] PartKeys = ["PartitionKey", "RowKey", SystemColumnNames.SplitOf];
+
+    /// <summary>
+    /// The version a split-aware write produced, and whether the written entity may be cached under it.
+    /// A transaction's version comes from a separate re-read that may already see another writer's row,
+    /// so only a single call's own response version is cacheable.
+    /// </summary>
+    private readonly record struct LargeWriteResult(ETag ETag, bool Cacheable);
 
     /// <summary>What a write or delete needs to know about the stored row: its version and its continuation rows.</summary>
     private sealed record PriorRow(ETag ETag, int Parts);
@@ -41,7 +51,8 @@ public partial class TableStorage<T>
     private async Task<PriorRow?> ReadPriorAsync(string pk, string rk, CancellationToken ct)
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, PriorSelect, ct);
-        if (!response.HasValue || response.Value is null)
+        // A continuation row is not an entity: addressing one by id finds nothing.
+        if (!response.HasValue || response.Value is null || SplitRowLayout.IsPartRow(response.Value))
             return null;
         return new PriorRow(response.Value.ETag, SplitRowLayout.PartCount(response.Value));
     }
@@ -49,9 +60,10 @@ public partial class TableStorage<T>
     /// <summary>
     /// Writes a split-aware entity: one SDK call when the value fits one row and no continuation rows
     /// must go, otherwise one transaction holding the primary, its parts and the deletes of stale parts.
-    /// Returns the new ETag, or <c>default</c> when it could not be read back.
+    /// Returns the new ETag (<c>default</c> when it could not be read back) and whether it is the
+    /// write's own response version.
     /// </summary>
-    private async Task<ETag> WriteLargeAsync(T entity, LargeWriteKind kind, ETag ifMatch, CancellationToken ct)
+    private async Task<LargeWriteResult> WriteLargeAsync(T entity, LargeWriteKind kind, ETag ifMatch, CancellationToken ct)
     {
         var (pk, rk) = GetEntityKeys(entity.Id);
         SplitRowLayout.ValidateRowKey(rk);
@@ -74,9 +86,12 @@ public partial class TableStorage<T>
 
             var row = TableEntitySerializer.ToTableEntity(entity, pk, rk, ValueWriteContext.Public, []);
             var plan = SplitRowLayout.Plan(row);
-            var staleFrom = plan.Parts.Count + 1;
-            var staleTo = prior?.Parts ?? 0;
-            var staleCount = Math.Max(0, staleTo - staleFrom + 1);
+            // A shrink deletes the continuation rows that actually exist beyond the new plan, found by the
+            // range query rather than trusted from _SplitParts, so a part already gone is never required.
+            var stale = prior is not null && prior.Parts > plan.Parts.Count
+                ? StaleParts(await QueryPartsAsync(pk, rk, PartKeys, ct), plan)
+                : [];
+            var staleCount = stale.Count;
             // null = insert (no stored row); otherwise replace conditional on the version just read.
             ETag? condition = prior is null ? null : strict ? ifMatch : prior.ETag;
 
@@ -87,7 +102,7 @@ public partial class TableStorage<T>
                     var response = condition is ETag c
                         ? await client.UpdateEntityAsync(plan.Primary, c, TableUpdateMode.Replace, ct)
                         : await client.AddEntityAsync(plan.Primary, ct);
-                    return HeaderETag(response) ?? plan.Primary.ETag;
+                    return new LargeWriteResult(HeaderETag(response) ?? plan.Primary.ETag, Cacheable: true);
                 }
 
                 if (!SplitRowLayout.FitsOneTransaction(plan, staleCount))
@@ -104,20 +119,21 @@ public partial class TableStorage<T>
                 };
                 foreach (var part in plan.Parts)
                     actions.Add(new TableTransactionAction(TableTransactionActionType.UpsertReplace, part));
-                for (var i = staleFrom; i <= staleTo; i++)
-                    actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, PartRowKey(rk, i)), ETag.All));
+                foreach (var part in stale)
+                    actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), ETag.All));
 
                 await client.SubmitTransactionAsync(actions, ct);
                 // Transaction sub-responses are not correlated back to their actions: re-read the version.
-                return await ReadETagAsync(pk, rk, ct);
+                return new LargeWriteResult(await ReadETagAsync(pk, rk, ct), Cacheable: false);
             }
             catch (RequestFailedException ex) when (LostCondition(ex, kind))
             {
                 if (kind == LargeWriteKind.Create)
                     throw new DuplicateKeyException(typeName, entity.Id, ex);
-                // A strict replace may not retry; a vanished row surfaces as the service's own 404.
-                if (strict)
-                    throw IsPrimaryFailure(ex) && ex.Status == 404 ? ex : new ConcurrencyConflictException(typeName, entity.Id, ex);
+                // A strict replace may not retry its own condition; a vanished row surfaces as the service's
+                // own 404. A stale part removed meanwhile (404 past action 0) is re-planned by any write.
+                if (strict && IsPrimaryFailure(ex))
+                    throw ex.Status == 404 ? ex : new ConcurrencyConflictException(typeName, entity.Id, ex);
                 lost = ex;
             }
         }
@@ -126,7 +142,8 @@ public partial class TableStorage<T>
     }
 
     // The failures a concurrent writer causes: the insert found a row (409), the conditional replace
-    // found another version (412), or a row the write expected (the primary or a stale part) is gone (404).
+    // found another version (412), or a row the write expected (the primary or a stale part) is gone (404);
+    // a retry re-reads the primary and re-queries the parts, so a part that is gone is not required again.
     private static bool LostCondition(RequestFailedException ex, LargeWriteKind kind) => kind switch
     {
         LargeWriteKind.Create => ex.Status == 409 && IsPrimaryFailure(ex),
@@ -157,24 +174,51 @@ public partial class TableStorage<T>
         }
     }
 
-    private static string PartRowKey(string rk, int index) => rk + "~" + index.ToString("D4", CultureInfo.InvariantCulture);
+    // The existing continuation rows the new plan no longer writes.
+    private static List<TableEntity> StaleParts(List<TableEntity> existing, SplitRowPlan plan)
+    {
+        var kept = new HashSet<string>(plan.Parts.Select(p => p.RowKey), StringComparer.Ordinal);
+        return existing.Where(p => !kept.Contains(p.RowKey)).ToList();
+    }
+
+    /// <summary>The continuation rows of <paramref name="rk"/> that exist now (one range query).</summary>
+    private async Task<List<TableEntity>> QueryPartsAsync(string pk, string rk, IEnumerable<string>? select, CancellationToken ct)
+    {
+        var lower = SplitRowLayout.PartRangeLower(rk);
+        var upper = SplitRowLayout.PartRangeUpper(rk);
+        var filter = TableClient.CreateQueryFilter(
+            $"PartitionKey eq {pk} and RowKey ge {lower} and RowKey lt {upper} and _SplitOf eq {rk}");
+
+        var parts = new List<TableEntity>();
+        await foreach (var part in client.QueryAsync<TableEntity>(filter, maxPerPage: null, select, ct).WithCancellation(ct))
+        {
+            // Guard against a row in the range that belongs elsewhere (the filter already demands _SplitOf == rk).
+            if (part.TryGetValue(SystemColumnNames.SplitOf, out var of) && string.Equals(of as string, rk, StringComparison.Ordinal))
+                parts.Add(part);
+        }
+        return parts;
+    }
+
+    /// <summary>For a split-aware <typeparamref name="T"/>, refuses a row key reserved for continuation rows, before any SDK call.</summary>
+    private void RefuseReservedRowKey(string id)
+    {
+        if (LargeValueAware)
+            SplitRowLayout.ValidateRowKey(GetEntityKeys(NormalizeId(id)).RowKey);
+    }
 
     /// <summary>
     /// Stamps the outcome of a split-aware write on <paramref name="entity"/> and keeps the caches
-    /// coherent. An unknown version (the row vanished after the write) is never cached.
+    /// coherent. Only a single call's own response version is cached; a transaction's re-read version
+    /// (which may already be another writer's) and an unknown version evict the entry instead, so the
+    /// next read goes to the store.
     /// </summary>
-    private void CommitLargeWrite(T entity, string partitionKey, ETag etag)
+    private void CommitLargeWrite(T entity, string partitionKey, LargeWriteResult result)
     {
-        if (etag == default)
-        {
-            entity.ETag = null;
-            cache.Remove(EntityCacheKey(entity.Id));
-        }
+        entity.ETag = result.ETag == default ? null : result.ETag.ToString();
+        if (result.Cacheable && result.ETag != default)
+            CacheEntity(entity.Id, entity, result.ETag);
         else
-        {
-            entity.ETag = etag.ToString();
-            CacheEntity(entity.Id, entity, etag);
-        }
+            cache.Remove(EntityCacheKey(entity.Id));
         InvalidateQueryCache(partitionKey);
     }
 
@@ -187,25 +231,19 @@ public partial class TableStorage<T>
         if (SplitRowLayout.PartCount(primary) == 0)
             return primary;
 
-        var pk = primary.PartitionKey;
-        var rk = primary.RowKey;
-        var lower = SplitRowLayout.PartRangeLower(rk);
-        var upper = SplitRowLayout.PartRangeUpper(rk);
-        var filter = TableClient.CreateQueryFilter(
-            $"PartitionKey eq {pk} and RowKey ge {lower} and RowKey lt {upper} and _SplitOf eq {rk}");
-
-        var parts = new List<TableEntity>();
-        await foreach (var part in client.QueryAsync<TableEntity>(filter, maxPerPage: null, select: null, ct).WithCancellation(ct))
-            parts.Add(part);
+        var parts = await QueryPartsAsync(primary.PartitionKey, primary.RowKey, select: null, ct);
         return SplitRowLayout.Assemble(primary, parts);
     }
 
     /// <summary>
     /// Deletes a split-aware entity and its continuation rows: one conditional delete when it has none,
-    /// otherwise one transaction. A missing row is a no-op; a lost race re-reads and retries.
+    /// otherwise one transaction over the parts that exist (found by a range query, so a primary that
+    /// declares a part already gone can still be deleted). A missing row is a no-op; a lost race
+    /// re-reads and retries.
     /// </summary>
     private async Task DeleteLargeAsync(string pk, string rk, CancellationToken ct)
     {
+        SplitRowLayout.ValidateRowKey(rk);
         RequestFailedException? lost = null;
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
@@ -215,18 +253,19 @@ public partial class TableStorage<T>
 
             try
             {
-                if (prior.Parts == 0)
+                var parts = prior.Parts == 0 ? [] : await QueryPartsAsync(pk, rk, PartKeys, ct);
+                if (parts.Count == 0)
                 {
                     await client.DeleteEntityAsync(pk, rk, prior.ETag, ct);
                     return;
                 }
 
-                var actions = new List<TableTransactionAction>(1 + prior.Parts)
+                var actions = new List<TableTransactionAction>(1 + parts.Count)
                 {
                     new(TableTransactionActionType.Delete, new TableEntity(pk, rk), prior.ETag),
                 };
-                for (var i = 1; i <= prior.Parts; i++)
-                    actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, PartRowKey(rk, i)), ETag.All));
+                foreach (var part in parts)
+                    actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), ETag.All));
                 await client.SubmitTransactionAsync(actions, ct);
                 return;
             }
@@ -271,8 +310,8 @@ public partial class TableStorage<T>
             SplitRowLayout.ValidateRowKey(GetEntityKeys(entity.Id).RowKey);
         foreach (var entity in entities)
         {
-            var etag = await WriteLargeAsync(entity, kind, ETag.All, ct);
-            entity.ETag = etag == default ? null : etag.ToString();
+            var result = await WriteLargeAsync(entity, kind, ETag.All, ct);
+            entity.ETag = result.ETag == default ? null : result.ETag.ToString();
         }
     }
 }

@@ -43,6 +43,9 @@ public class TableStorageSplitTests
         return row;
     }
 
+    private static TableEntity PartRow(string pk, string rk, int index) =>
+        new(pk, $"{rk}~{index:D4}") { ETag = new ETag("W/\"part\""), [SystemColumnNames.SplitOf] = rk, [SystemColumnNames.SplitIndex] = index };
+
     private static void CaptureTransactions(StorageHarness<SplitTextEntity> h, List<List<TableTransactionAction>> sink)
     {
         var resp = Substitute.For<Response<IReadOnlyList<Response>>>();
@@ -166,7 +169,13 @@ public class TableStorageSplitTests
 
         await Assert.ThrowsAsync<ArgumentException>(
             () => h.Store.CreateAsync(new SplitTextEntity { Id = "p|r~0001", Body = "x" }, Ct));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r~0001", Body = "x" }, Ct));
+        await Assert.ThrowsAsync<ArgumentException>(() => h.Store.UpdateAsync(
+            new SplitTextEntity { Id = "p|r~0001", Body = "x", ETag = "W/\"e\"" }, ConcurrencyMode.Strict, Ct));
 
+        await h.Table.DidNotReceiveWithAnyArgs().CreateIfNotExistsAsync(default);
+        await h.Table.DidNotReceiveWithAnyArgs().GetEntityIfExistsAsync<TableEntity>(default!, default!, default, default);
         await h.Table.DidNotReceiveWithAnyArgs().AddEntityAsync<TableEntity>(default!, default);
         await h.Table.DidNotReceiveWithAnyArgs().SubmitTransactionAsync(default!, default);
     }
@@ -176,6 +185,7 @@ public class TableStorageSplitTests
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r", PriorPrimary("p", "r", 2, "W/\"prior\""));
+        h.SetupQueryByFilter(PartRow("p", "r", 1), PartRow("p", "r", 2));
         var tx = new List<List<TableTransactionAction>>();
         CaptureTransactions(h, tx);
 
@@ -251,6 +261,7 @@ public class TableStorageSplitTests
         var withoutParts = Mocks.Found(PriorPrimary("p", "r", 0, "W/\"v2\""));
         h.Table.GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
             .Returns(withParts, withoutParts);
+        h.SetupQueryByFilter(PartRow("p", "r", 1), PartRow("p", "r", 2));
         var failure = TxFailed(404, index: 1);
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
@@ -521,6 +532,7 @@ public class TableStorageSplitTests
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r", PriorPrimary("p", "r", 2, "W/\"prior\""));
+        h.SetupQueryByFilter(PartRow("p", "r", 1), PartRow("p", "r", 2));
         var tx = new List<List<TableTransactionAction>>();
         CaptureTransactions(h, tx);
         h.SetupDelete();
@@ -560,6 +572,92 @@ public class TableStorageSplitTests
 
         await h.Table.DidNotReceiveWithAnyArgs().DeleteEntityAsync(default!, default!, default, default);
         await h.Table.DidNotReceiveWithAnyArgs().SubmitTransactionAsync(default!, default);
+    }
+
+    // ── review fix round 1 ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Delete_PartRowId_IsRefused_PrimaryIntact()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r~0001", PartRow("p", "r", 1));
+        h.SetupDelete();
+        h.SetupTransaction();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => h.Store.DeleteAsync("p|r~0001", Ct));
+
+        await h.Table.DidNotReceiveWithAnyArgs().CreateIfNotExistsAsync(default);
+        await h.Table.DidNotReceiveWithAnyArgs().GetEntityIfExistsAsync<TableEntity>(default!, default!, default, default);
+        await h.Table.DidNotReceiveWithAnyArgs().DeleteEntityAsync(default!, default!, default, default);
+        await h.Table.DidNotReceiveWithAnyArgs().SubmitTransactionAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task Delete_PrimaryWithMissingPart_Succeeds()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        // The primary declares two parts, but only the first exists: delete what exists, once.
+        h.SetupGet("p", "r", PriorPrimary("p", "r", 2, "W/\"prior\""));
+        h.SetupQueryByFilter(PartRow("p", "r", 1));
+        var tx = new List<List<TableTransactionAction>>();
+        CaptureTransactions(h, tx);
+
+        await h.Store.DeleteAsync("p|r", Ct);
+
+        var actions = Assert.Single(tx);
+        Assert.Equal(["r", "r~0001"], actions.Select(a => a.Entity.RowKey));
+    }
+
+    [Fact]
+    public async Task Upsert_ShrinkWithMissingPart_DeletesOnlyExistingParts()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", PriorPrimary("p", "r", 2, "W/\"prior\""));
+        h.SetupQueryByFilter(PartRow("p", "r", 2));
+        var tx = new List<List<TableTransactionAction>>();
+        CaptureTransactions(h, tx);
+
+        await h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = "now small" }, Ct);
+
+        var actions = Assert.Single(tx);
+        Assert.Equal(["r", "r~0002"], actions.Select(a => a.Entity.RowKey));
+    }
+
+    [Fact]
+    public async Task Transaction_Write_EvictsCache_NextReadHitsStore()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        var rows = StoredRows("p", "r", TwoRowText);
+        h.SetupGet("p", "r", rows[0]);
+        h.SetupQueryByFilter([.. rows]);
+        CaptureTransactions(h, []);
+
+        Assert.NotNull(await h.Store.OneAsync("p|r", Ct));          // warms the cache
+        var written = await h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText + "b" }, Ct);
+        Assert.Equal("W/\"stored\"", written.ETag);               // the re-read version is still reported
+
+        Assert.NotNull(await h.Store.OneAsync("p|r", Ct));          // not served from the cache
+        await h.Table.Received(2).GetEntityIfExistsAsync<TableEntity>("p", "r", null, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task QueryPage_Projection_DoesNotCacheIncompleteEntity()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        var projected = new TableEntity("p", "a") { ETag = new ETag("W/\"e\""), ["Title"] = "t-a", [SystemColumnNames.SplitParts] = 1 };
+        h.Table.QueryAsync<TableEntity>(Arg.Any<string?>(), Arg.Any<int?>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Mocks.Pageable(projected));
+
+        var page = await h.Store.QueryPageAsync(new QueryOptions { Partition = "p", Select = ["Title"] }, Ct);
+        Assert.Null(Assert.Single(page.Items).Body);
+
+        var full = StoredRows("p", "a", TwoRowText);
+        h.SetupGet("p", "a", full[0]);
+        h.SetupQueryByFilter([.. full]);
+        var read = await h.Store.OneAsync("p|a", Ct);
+
+        Assert.Equal(TwoRowText, read!.Body);
+        await h.Table.Received(1).GetEntityIfExistsAsync<TableEntity>("p", "a", null, Arg.Any<CancellationToken>());
     }
 
     // ── plain types are untouched ──────────────────────────────────────────

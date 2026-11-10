@@ -114,6 +114,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        RefuseReservedRowKey(entity.Id);
 
         await EnsureTableAsync(ct);
 
@@ -171,6 +172,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
             throw new ArgumentNullException(nameof(id));
         }
         id = NormalizeId(id);
+        RefuseReservedRowKey(id);
 
         await EnsureTableAsync(ct);
 
@@ -498,7 +500,11 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         {
             if (SplitRowLayout.IsPartRow(queried))
                 continue;
-            items.Add(Materialize(assemble ? await AssembleAsync(queried, ct) : queried));
+            // A projected row is a partial entity: it must never warm the per-entity cache.
+            if (select is not null)
+                items.Add(Deserialize(queried));
+            else
+                items.Add(Materialize(assemble ? await AssembleAsync(queried, ct) : queried));
         }
         var next = page.ContinuationToken is null ? null : PageCursor.Encode(fingerprint, page.ContinuationToken);
         return new EntityPage<T>(items, next);
@@ -825,6 +831,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        RefuseReservedRowKey(entity.Id);
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
@@ -911,6 +918,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        RefuseReservedRowKey(entity.Id);
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
