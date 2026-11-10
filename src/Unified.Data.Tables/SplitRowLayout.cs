@@ -275,6 +275,26 @@ internal static class SplitRowLayout
             throw new ArgumentException($"A row key must not exceed {MaxRowKeyLength} characters.", nameof(rowKey));
     }
 
+    /// <summary>
+    /// Rejects the keys of a split-aware write: the row key as <see cref="ValidateRowKey"/> does, and either
+    /// key when it is not well-formed UTF-16. A key names the entity's blobs, and an unpaired surrogate
+    /// escapes to the same blob-name segment as U+FFFD, so two such keys would share blobs.
+    /// </summary>
+    internal static void ValidateKeys(string partitionKey, string rowKey)
+    {
+        RefuseUnpairedSurrogate(partitionKey, nameof(partitionKey));
+        RefuseUnpairedSurrogate(rowKey, nameof(rowKey));
+        ValidateRowKey(rowKey);
+    }
+
+    private static void RefuseUnpairedSurrogate(string key, string paramName)
+    {
+        if (!SplitCodec.IsWellFormedUtf16(key))
+            throw new ArgumentException(
+                $"The {(paramName == "rowKey" ? "row" : "partition")} key of an entity with split or offloaded values must be well-formed UTF-16: "
+                + "it has an unpaired surrogate, which would name the same blobs as a key with U+FFFD in its place.", paramName);
+    }
+
     /// <summary>The key of continuation row <paramref name="index"/> of the entity at <paramref name="rowKey"/>.</summary>
     internal static string PartRowKey(string rowKey, int index) =>
         rowKey + PartSeparator + index.ToString("D" + PartIndexDigits.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);

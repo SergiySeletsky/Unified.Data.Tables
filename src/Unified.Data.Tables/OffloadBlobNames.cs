@@ -13,8 +13,10 @@ namespace Unified.Data.Tables.Providers;
 /// outside the table's prefix. A <c>'%'</c> in a name, on the other hand, is sent escaped and stored as
 /// written. So a segment is <see cref="Uri.EscapeDataString(string)"/> of its value with every
 /// <c>'.'</c> also escaped (<c>%2E</c>), and an empty value is the segment <c>%</c>, which escaping
-/// never produces. No segment is then empty, <c>.</c>, <c>..</c> or ends with a dot, and the
-/// encoding is injective: <see cref="TryUnescapeSegment"/> accepts exactly the segments
+/// never produces. No segment is then empty, <c>.</c>, <c>..</c> or ends with a dot. Only
+/// well-formed UTF-16 is escaped: <see cref="Uri.EscapeDataString(string)"/> writes an unpaired surrogate
+/// as U+FFFD, the same segment as a real U+FFFD, so <see cref="EscapeSegment"/> refuses one. The encoding
+/// is then injective: <see cref="TryUnescapeSegment"/> accepts exactly the segments
 /// <see cref="EscapeSegment"/> writes.
 /// </para>
 /// </remarks>
@@ -29,9 +31,14 @@ public static class OffloadBlobNames
     /// <summary>Storage-provider SPI, not for application code. The blob-name segment of <paramref name="value"/>.</summary>
     /// <param name="value">The key, column or table name.</param>
     /// <returns>The escaped segment.</returns>
+    /// <exception cref="ArgumentException"><paramref name="value"/> has an unpaired surrogate (it is not well-formed UTF-16).</exception>
     public static string EscapeSegment(string value)
     {
         ArgumentNullException.ThrowIfNull(value);
+        if (!SplitCodec.IsWellFormedUtf16(value))
+            throw new ArgumentException(
+                "A blob-name segment must be well-formed UTF-16: this value has an unpaired surrogate, which would be escaped as U+FFFD and name another value's blob.",
+                nameof(value));
         return value.Length == 0
             ? EmptySegment
             : Uri.EscapeDataString(value).Replace(".", "%2E", StringComparison.Ordinal);
@@ -49,7 +56,8 @@ public static class OffloadBlobNames
     {
         ArgumentNullException.ThrowIfNull(segment);
         value = segment == EmptySegment ? string.Empty : Uri.UnescapeDataString(segment);
-        if (segment.Length > 0 && string.Equals(EscapeSegment(value), segment, StringComparison.Ordinal))
+        if (segment.Length > 0 && SplitCodec.IsWellFormedUtf16(value)
+            && string.Equals(EscapeSegment(value), segment, StringComparison.Ordinal))
             return true;
         value = string.Empty;
         return false;

@@ -94,6 +94,50 @@ public class OffloadRegistrationTests
         Assert.IsType<TableStorage<PlainEntity>>(provider.GetRequiredService<IStorage<PlainEntity>>());
     }
 
+    [Theory]
+    [InlineData("BlobEndpoint=not a uri;AccountName=acct;AccountKey=YWJj")]
+    [InlineData("BlobEndpoint=ftp//broken;SharedAccessSignature=sv=2020&sig=abc")]
+    public void ConnectionStringOverload_MalformedBlobEndpoint_WithOffload_FailsRegistration(string connectionString)
+    {
+        var services = Services(tableClient: false);
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => services.AddUnifiedTableStorage(connectionString, o => o.BlobOffload = new BlobOffloadOptions()));
+
+        Assert.Contains("BlobOffloadOptions.ServiceClient", ex.Message, StringComparison.Ordinal);
+        Assert.Equal("connectionString", ex.ParamName);
+    }
+
+    [Theory]
+    [InlineData("BlobEndpoint=not a uri;AccountName=acct;AccountKey=YWJj;TableEndpoint=https://acct.table.core.windows.net/")]
+    [InlineData("BlobEndpoint=ftp//broken;TableEndpoint=https://acct.table.core.windows.net/;SharedAccessSignature=sv=2020&sig=abc")]
+    public void ConnectionStringOverload_MalformedBlobEndpoint_WithoutOffload_RegistersAsBefore(string connectionString)
+    {
+        var services = Services();
+
+        services.AddUnifiedTableStorage(connectionString);
+        using var provider = services.BuildServiceProvider();
+
+        Assert.Null(OffloadClient(provider));
+        Assert.IsType<TableStorage<PlainEntity>>(provider.GetRequiredService<IStorage<PlainEntity>>());
+    }
+
+    [Theory]
+    [InlineData("UseDevelopmentStorage=true", true)]
+    [InlineData("usedevelopmentstorage=TRUE", true)]
+    [InlineData("UseDevelopmentStorage=false;TableEndpoint=https://t.example.com/", false)]
+    [InlineData("AccountName=acct;AccountKey=YWJj", true)]
+    [InlineData("AccountName=acct;AccountKey=YWJj;TableEndpoint=https://acct.table.core.windows.net/", true)]
+    [InlineData("AccountName=acct;AccountKey=YWJj;TableEndpoint=https://acct.table.cosmos.azure.com:443/", false)]
+    [InlineData("AccountName=;TableEndpoint=https://acct.table.core.windows.net/;SharedAccessSignature=sv=2020", false)]
+    [InlineData("BlobEndpoint=;TableEndpoint=https://acct.table.core.windows.net/;SharedAccessSignature=sv=2020", false)]
+    [InlineData("BlobEndpoint=https://acct.blob.core.windows.net/;SharedAccessSignature=sv=2020", true)]
+    [InlineData("TableEndpoint=https://acct.table.core.windows.net/;SharedAccessSignature=sv=2020", false)]
+    public void HasBlobEndpoint_ParsesTheConnectionString(string connectionString, bool expected)
+    {
+        Assert.Equal(expected, ServiceCollectionExtensions.HasBlobEndpoint(connectionString));
+    }
+
     [Fact]
     public void Constructors_BindAsBefore()
     {

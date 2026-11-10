@@ -97,7 +97,7 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task Create_TwoEntityValue_IsOneTransaction_PrimaryAddPartUpsert()
+    public async Task Create_TwoEntityValue_IsOneTransaction_PrimaryAndPartAdded()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         var tx = new List<List<TableTransactionAction>>();
@@ -110,7 +110,8 @@ public class TableStorageSplitTests
         Assert.Equal(2, actions.Count);
         Assert.Equal(TableTransactionActionType.Add, actions[0].ActionType);
         Assert.Equal("r", actions[0].Entity.RowKey);
-        Assert.Equal(TableTransactionActionType.UpsertReplace, actions[1].ActionType);
+        // A new continuation row is an insert: a foreign row at its key fails the transaction, never is replaced.
+        Assert.Equal(TableTransactionActionType.Add, actions[1].ActionType);
         Assert.Equal("r~0001", actions[1].Entity.RowKey);
         await h.Table.DidNotReceiveWithAnyArgs().AddEntityAsync<TableEntity>(default!, default);
         // The transaction's sub-responses are not correlated, so the ETag comes from a keys-only re-read.
@@ -274,17 +275,18 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task Create_PartFailure_IsNotADuplicateKey()
+    public async Task Create_PartFailure_IsNotADuplicateKey_ItNamesTheOccupiedKey()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         var failure = TxFailed(409, index: 1);
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
 
-        var ex = await Assert.ThrowsAsync<TableTransactionFailedException>(
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => h.Store.CreateAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct));
 
-        Assert.Same(failure, ex);
+        Assert.Contains("'r~0001'", ex.Message, StringComparison.Ordinal);
+        Assert.Same(failure, ex.InnerException);
     }
 
     [Fact]
@@ -320,7 +322,7 @@ public class TableStorageSplitTests
         var actions = Assert.Single(tx);
         Assert.Equal(["r1", "r2", "r2~0001"], actions.Select(a => a.Entity.RowKey));
         Assert.Equal(
-            [TableTransactionActionType.Add, TableTransactionActionType.Add, TableTransactionActionType.UpsertReplace],
+            [TableTransactionActionType.Add, TableTransactionActionType.Add, TableTransactionActionType.Add],
             actions.Select(a => a.ActionType));
         await h.Table.DidNotReceiveWithAnyArgs().AddEntityAsync<TableEntity>(default!, default);
         // A create batch reads nothing back: like a plain batch, it reports no version.
@@ -348,18 +350,153 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task CreateBatch_ConflictOnAContinuationRow_IsNotADuplicateKey()
+    public async Task CreateBatch_ConflictOnAContinuationRow_IsNotADuplicateKey_ItNamesTheOccupiedKey()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         var failure = TxFailed(409, index: 1);
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
 
-        var ex = await Assert.ThrowsAsync<TableTransactionFailedException>(() => h.Store.CreateBatchAsync(
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Store.CreateBatchAsync(
             [new SplitTextEntity { Id = "p|r1", Body = TwoRowText }], Ct));
 
-        Assert.Same(failure, ex);
+        Assert.Contains("'r1~0001'", ex.Message, StringComparison.Ordinal);
+        Assert.Same(failure, ex.InnerException);
     }
+
+    [Fact]
+    public async Task Upsert_ContinuationRowsTheStoredRowDeclares_AreReplaced_NewOnesAdded()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", PriorPrimary("p", "r", 1, "W/\"v1\""));
+        h.SetupGet("p", "s", PriorPrimary("p", "s", 0, "W/\"v1\""));
+        var tx = new List<List<TableTransactionAction>>();
+        CaptureTransactions(h, tx);
+
+        await h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct);
+        await h.Store.UpsertAsync(new SplitTextEntity { Id = "p|s", Body = TwoRowText }, Ct);
+
+        Assert.Equal(2, tx.Count);
+        // r owns r~0001 (its stored row declares one part): rewritten in place.
+        Assert.Equal(TableTransactionActionType.UpsertReplace, tx[0][1].ActionType);
+        // s declares none: s~0001 is new, and a row already there is not s's to replace.
+        Assert.Equal(TableTransactionActionType.Add, tx[1][1].ActionType);
+        Assert.Equal("s~0001", tx[1][1].Entity.RowKey);
+    }
+
+    [Fact]
+    public async Task Upsert_PartConflict_IsNotRetried_ItNamesTheOccupiedKey()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", PriorPrimary("p", "r", 0, "W/\"v1\""));
+        var failure = TxFailed(409, index: 1);
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct));
+
+        Assert.Contains("'r~0001'", ex.Message, StringComparison.Ordinal);
+        await h.Table.ReceivedWithAnyArgs(1).SubmitTransactionAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task UpsertBatch_PartConflict_IsNotRetried_ItNamesTheOccupiedKey()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet(null);
+        // Actions: r1, r2, r2~0001: the service fails action 2, r2's new continuation row.
+        var failure = TxFailed(409, index: 2);
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Store.UpsertBatchAsync(
+        [
+            new SplitTextEntity { Id = "p|r1", Body = "a" },
+            new SplitTextEntity { Id = "p|r2", Body = TwoRowText },
+        ], Ct));
+
+        Assert.Contains("'r2~0001'", ex.Message, StringComparison.Ordinal);
+        Assert.Same(failure, ex.InnerException);
+        await h.Table.ReceivedWithAnyArgs(1).SubmitTransactionAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task UpsertBatch_ConcurrentCreateOfAnAbsentKey_PlansAgainAsAReplace()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        // Absent when first read; another writer creates it before the commit (409 on the insert).
+        var absent = Mocks.NotFound();
+        var created = Mocks.Found(PriorPrimary("p", "r1", 0, "W/\"theirs\""));
+        h.Table.GetEntityIfExistsAsync<TableEntity>("p", "r1", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+            .Returns(absent, created);
+        var tx = new List<List<TableTransactionAction>>();
+        var ok = Substitute.For<Response<IReadOnlyList<Response>>>();
+        var failure = TxFailed(409, index: 0);
+        h.Table.SubmitTransactionAsync(Arg.Do<IEnumerable<TableTransactionAction>>(a => tx.Add(a.ToList())), Arg.Any<CancellationToken>())
+            .Returns(_ => throw failure, _ => ok);
+
+        await h.Store.UpsertBatchAsync([new SplitTextEntity { Id = "p|r1", Body = TwoRowText }], Ct);
+
+        Assert.Equal(2, tx.Count);
+        Assert.Equal(TableTransactionActionType.Add, tx[0][0].ActionType);
+        Assert.Equal(TableTransactionActionType.UpdateReplace, tx[1][0].ActionType);
+        Assert.Equal(new ETag("W/\"theirs\""), tx[1][0].ETag);
+    }
+
+    [Fact]
+    public async Task UpsertBatch_StalePartAlreadyGone_PlansAgainWithoutThatDelete()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        // First read: one part to delete. The transaction fails at action 1 (that part, removed by another
+        // writer meanwhile); the re-read row declares none, so the retry deletes nothing.
+        var withPart = Mocks.Found(PriorPrimary("p", "r1", 1, "W/\"v1\""));
+        var withoutParts = Mocks.Found(PriorPrimary("p", "r1", 0, "W/\"v2\""));
+        h.Table.GetEntityIfExistsAsync<TableEntity>("p", "r1", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+            .Returns(withPart, withoutParts);
+        h.SetupQueryByFilter(PartRow("p", "r1", 1));
+        var tx = new List<List<TableTransactionAction>>();
+        var ok = Substitute.For<Response<IReadOnlyList<Response>>>();
+        var failure = TxFailed(404, index: 1);
+        h.Table.SubmitTransactionAsync(Arg.Do<IEnumerable<TableTransactionAction>>(a => tx.Add(a.ToList())), Arg.Any<CancellationToken>())
+            .Returns(_ => throw failure, _ => ok);
+
+        await h.Store.UpsertBatchAsync([new SplitTextEntity { Id = "p|r1", Body = "small" }], Ct);
+
+        Assert.Equal(2, tx.Count);
+        Assert.Equal(["r1", "r1~0001"], tx[0].Select(a => a.Entity.RowKey));
+        Assert.Equal(TableTransactionActionType.Delete, tx[0][1].ActionType);
+        var retry = Assert.Single(tx[1]);
+        Assert.Equal(TableTransactionActionType.UpdateReplace, retry.ActionType);
+        Assert.Equal(new ETag("W/\"v2\""), retry.ETag);
+    }
+
+    [Fact]
+    public async Task UpsertBatch_BlobsAreUploadedPerTransaction_JustBeforeIt()
+    {
+        var log = new List<string>();
+        var blobs = new RecordingBlobStore(log);
+        using var h = new StorageHarness<SplitTextEntity>(
+            options: new UnifiedTableStorageOptions { BlobOffload = new BlobOffloadOptions { ThresholdBytes = 1_000, CleanupGrace = TimeSpan.Zero } },
+            blobs: blobs);
+        h.SetupGet(null);
+        var ok = Substitute.For<Response<IReadOnlyList<Response>>>();
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                lock (log) log.Add("table:tx");
+                return ok;
+            });
+        // 100 one-action rows, then an offloaded one: two transactions, the blob belongs to the second.
+        var batch = Enumerable.Range(0, 100).Select(i => new SplitTextEntity { Id = $"p|r{i:D3}", Body = "v" })
+            .Append(new SplitTextEntity { Id = "p|r100", Body = new string('x', 40_000) }).ToList();
+
+        await h.Store.UpsertBatchAsync(batch, Ct);
+
+        var order = log.Where(l => l is "table:tx" or "blob:upload").ToList();
+        Assert.Equal(["table:tx", "blob:upload", "table:tx"], order);
+    }
+
 
     [Fact]
     public async Task UpsertBatch_ConditionalOnTheVersionsRead_AndDeletesStaleParts()

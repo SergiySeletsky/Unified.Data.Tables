@@ -55,6 +55,24 @@ public abstract class LargeBatchContract : IAsyncLifetime
     /// <summary>The offload blob store's service time, asked with <paramref name="ct"/>.</summary>
     protected abstract Task<DateTimeOffset?> ServiceTimeAsync(CancellationToken ct);
 
+    /// <summary>
+    /// Stores a plain row (no split cells, no <c>_SplitOf</c>) at <paramref name="rk"/> in this test's partition
+    /// of <typeparamref name="T"/>'s table, as a type that never opted in, or an older version, would have written it.
+    /// </summary>
+    protected abstract Task SeedForeignRowAsync<T>(string rk, string title) where T : class, IEntity, new();
+
+    /// <summary>The raw <c>Title</c> cell of the stored row at <paramref name="rk"/>; null when the row or the cell is absent.</summary>
+    protected abstract Task<string?> PhysicalTitleAsync<T>(string rk) where T : class, IEntity, new();
+
+    /// <summary>
+    /// From now on, records after each committed large-value batch transaction how many blobs of this test's
+    /// partition exist (<see cref="BlobsAtCommits"/>).
+    /// </summary>
+    protected abstract void RecordBlobsAtEachCommit<T>() where T : class, IEntity, new();
+
+    /// <summary>The blob counts <see cref="RecordBlobsAtEachCommit{T}"/> recorded, one per committed transaction.</summary>
+    protected abstract IReadOnlyList<int> BlobsAtCommits { get; }
+
     private string Id(string rk) => Pk + "|" + rk;
 
     private SplitTextEntity Text(string rk, string body) => new() { Id = Id(rk), Body = body, Title = "t-" + rk };
@@ -176,15 +194,131 @@ public abstract class LargeBatchContract : IAsyncLifetime
         SkipUnlessAvailable();
         var store = Store<SplitTextEntity>();
         ResetTransactions();
-        // Each 600,000-char value is two rows of ~1.2 MB on the wire: three fit one transaction's budget, six do not.
+        // Each 600,000-char value is two rows of 1.2 MB of payload: two fit one transaction's 3,000,000-byte budget, three do not.
         var batch = Enumerable.Range(0, 6).Select(i => Text($"r{i}", new string((char)('a' + i), 600_000))).ToList();
 
         await store.CreateBatchAsync(batch, Ct);
 
-        Assert.True(Transactions >= 2, $"expected the batch to span transactions, saw {Transactions}");
+        // Packed by unit: r0 and r1 with their parts, r2 and r3, r4 and r5 (one transaction per entity would be 6).
+        Assert.Equal(3, Transactions);
         for (var i = 0; i < 6; i++)
             Assert.Equal(batch[i].Body, (await store.OneAsync(Id($"r{i}"), Ct))!.Body, StringComparer.Ordinal);
         Assert.Equal(12, (await PhysicalRowKeysAsync<SplitTextEntity>()).Count);
+    }
+
+    [Fact]
+    public async Task CreateBatch_SecondTransactionFails_TheFirstKeepsWholeUnits_AndTheSecondLeavesNoRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r3", "original"), Ct);
+        ResetTransactions();
+        var batch = Enumerable.Range(0, 6).Select(i => Text($"r{i}", new string((char)('a' + i), 600_000))).ToList();
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => store.CreateBatchAsync(batch, Ct));
+
+        Assert.Equal(Id("r3"), ex.Id);
+        Assert.Equal(2, Transactions);
+        // The first transaction committed r0 and r1, each with its continuation row; the second (r2, r3)
+        // failed as a whole: no primary and no orphan continuation row of r2, r3 untouched, and the third
+        // transaction (r4, r5) was never sent.
+        Assert.Equal(["r0", "r0~0001", "r1", "r1~0001", "r3"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        for (var i = 0; i < 2; i++)
+            Assert.Equal(batch[i].Body, (await store.OneAsync(Id($"r{i}"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Equal("original", (await store.OneAsync(Id("r3"), Ct))!.Body);
+    }
+
+    [Fact]
+    public async Task UpsertBatch_BlobsOfALaterTransaction_AreUploadedOnlyAfterTheEarlierOneCommits()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        // 100 one-action rows fill the first transaction; the offloaded row is the second one's.
+        var batch = Enumerable.Range(0, 100).Select(i => Text($"r{i:D3}", "v" + i)).Append(Text("r100", OffloadText)).ToList();
+        RecordBlobsAtEachCommit<SplitTextEntity>();
+
+        await store.UpsertBatchAsync(batch, Ct);
+
+        // A blob's age is measured from its upload: uploading it before the first commit would widen the
+        // window in which an orphan sweep can delete it before the row that references it exists.
+        Assert.Equal([0, 1], BlobsAtCommits);
+        Assert.Equal(OffloadText, (await store.OneAsync(Id("r100"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    // ── foreign rows at a continuation key ────────────────────────────────
+
+    [Fact]
+    public async Task Upsert_NewValueNeedsAContinuationRowWhereAForeignRowIs_Throws_AndKeepsThatRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedForeignRowAsync<SplitTextEntity>("r1~0001", "foreign");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.UpsertAsync(Text("r1", SplitText), Ct));
+
+        Assert.Contains("r1~0001", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(["r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal("foreign", await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+    }
+
+    [Fact]
+    public async Task Upsert_GrowingAStoredRowOntoAForeignRow_Throws_AndKeepsBothRows()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r1", "small"), Ct);
+        await SeedForeignRowAsync<SplitTextEntity>("r1~0001", "foreign");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.UpsertAsync(Text("r1", SplitText), Ct));
+
+        Assert.Equal(["r1", "r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal("small", (await store.OneAsync(Id("r1"), Ct))!.Body);
+        Assert.Equal("foreign", await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+    }
+
+    [Fact]
+    public async Task UpsertBatch_ContinuationRowOnAForeignRow_FailsItsTransaction_AndKeepsThatRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedForeignRowAsync<SplitTextEntity>("r2~0001", "foreign");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.UpsertBatchAsync([Text("r1", "a"), Text("r2", SplitText)], Ct));
+
+        Assert.Contains("r2~0001", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(["r2~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal("foreign", await PhysicalTitleAsync<SplitTextEntity>("r2~0001"));
+    }
+
+    [Fact]
+    public async Task Create_ContinuationRowOnAForeignRow_Throws_AndKeepsThatRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedForeignRowAsync<SplitTextEntity>("r1~0001", "foreign");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.CreateAsync(Text("r1", SplitText), Ct));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.CreateBatchAsync([Text("r1", SplitText)], Ct));
+
+        Assert.Equal(["r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal("foreign", await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+    }
+
+    [Fact]
+    public async Task Upsert_RewritingItsOwnContinuationRows_StillReplacesThem()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r1", SplitText), Ct);
+        var other = new string('z', 600_000);
+
+        await store.UpsertAsync(Text("r1", other), Ct);
+        Assert.Equal(other, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+        await store.UpsertBatchAsync([Text("r1", SplitText)], Ct);
+
+        Assert.Equal(["r1", "r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
     }
 
     [Fact]
@@ -318,6 +452,40 @@ public abstract class LargeBatchContract : IAsyncLifetime
         Assert.Empty(await PhysicalRowKeysAsync<SplitTextEntity>());
         Assert.Empty(await BlobNamesAsync<SplitTextEntity>());
     }
+
+    [Fact]
+    public async Task DeletePartition_TokenCancelledAfterTheCommit_StillCleansUp()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r1", OffloadText), Ct);
+        await store.CreateAsync(Text("r2", SplitText), Ct);
+        Assert.Single(await BlobNamesAsync<SplitTextEntity>());
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        CancelAfterNextCommit<SplitTextEntity>(cts);
+
+        Assert.Equal(2, await store.DeletePartitionAsync(Pk, cts.Token));
+
+        Assert.True(cts.IsCancellationRequested);
+        Assert.Empty(await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Empty(await BlobNamesAsync<SplitTextEntity>());
+    }
+
+    [Fact]
+    public async Task CancelAfterNextCommit_IsNotTriggeredByAFailedTransaction()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r2", "original"), Ct);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        CancelAfterNextCommit<SplitTextEntity>(cts);
+
+        await Assert.ThrowsAsync<DuplicateKeyException>(() => store.CreateBatchAsync([Text("r1", SplitText), Text("r2", "b")], cts.Token));
+
+        // The failed transaction committed nothing, so the request after it is not cancelled.
+        Assert.Equal(1, await store.CountAsync(Pk, cts.Token));
+        Assert.False(cts.IsCancellationRequested);
+    }
 }
 
 /// <summary>The batch contract on <see cref="InMemoryStorage{T}"/>.</summary>
@@ -374,6 +542,28 @@ public sealed class InMemoryLargeBatchContractTests : LargeBatchContract
             cts.Cancel();
         };
     }
+
+    protected override Task SeedForeignRowAsync<T>(string rk, string title)
+    {
+        Store<T>();
+        Typed<T>().SeedPhysicalRow(new TableEntity(Pk, rk) { ["Title"] = title });
+        return Task.CompletedTask;
+    }
+
+    protected override Task<string?> PhysicalTitleAsync<T>(string rk) =>
+        Task.FromResult(Typed<T>().PhysicalRow(Pk, rk) is { } row && row.TryGetValue("Title", out var title) ? title as string : null);
+
+    private readonly List<int> blobsAtCommits = [];
+
+    protected override IReadOnlyList<int> BlobsAtCommits => blobsAtCommits;
+
+    protected override void RecordBlobsAtEachCommit<T>()
+    {
+        Store<T>();
+        var store = Typed<T>();
+        var prefix = $"{typeof(T).Name}/{Pk}/";
+        store.AfterLargeCommit = () => blobsAtCommits.Add(store.OffloadedBlobNames().Count(n => n.StartsWith(prefix, StringComparison.Ordinal)));
+    }
 }
 
 /// <summary>The batch contract on <see cref="TableStorage{T}"/> against a local Azurite (self-skips as the other Azurite suites do).</summary>
@@ -415,6 +605,8 @@ public sealed class AzuriteLargeBatchContractTests : LargeBatchContract
 
     public override async ValueTask DisposeAsync()
     {
+        // A token a test armed and disposed must not be cancelled by the cleanup below.
+        observer.CancelAfterNextCommit = null;
         foreach (var cache in caches) cache.Dispose();
         if (!available) return;
         foreach (var table in tables)
@@ -481,16 +673,59 @@ public sealed class AzuriteLargeBatchContractTests : LargeBatchContract
     protected override Task<DateTimeOffset?> ServiceTimeAsync(CancellationToken ct) =>
         new AzureOffloadBlobStore(container).GetServiceTimeAsync(ct);
 
+    protected override async Task SeedForeignRowAsync<T>(string rk, string title)
+    {
+        tables.Add(typeof(T).Name);
+        var client = tableService.GetTableClient(typeof(T).Name);
+        await client.CreateIfNotExistsAsync(Ct);
+        await client.AddEntityAsync(new TableEntity(Pk, rk) { ["Title"] = title }, Ct);
+    }
+
+    protected override async Task<string?> PhysicalTitleAsync<T>(string rk)
+    {
+        var row = await tableService.GetTableClient(typeof(T).Name).GetEntityIfExistsAsync<TableEntity>(Pk, rk, cancellationToken: Ct);
+        return row.HasValue && row.Value!.TryGetValue("Title", out var title) ? title as string : null;
+    }
+
+    protected override IReadOnlyList<int> BlobsAtCommits => observer.BlobsAtCommits;
+
+    protected override void RecordBlobsAtEachCommit<T>() => observer.RecordBlobsUnder = "/" + typeof(T).Name + "/" + Pk + "/";
+
     /// <summary>
     /// Shared by the table and the blob pipelines: counts the entity-group transactions sent
-    /// (<c>POST .../$batch</c>) and, once armed, waits for the first successful table write (a batch, an
-    /// insert, an update or a delete) and cancels the token when the NEXT request (table or blob) is sent,
-    /// so the commit itself completes and only what follows it sees the cancelled token.
+    /// (<c>POST .../$batch</c>) and, once armed, waits for the first successful table write (a batch whose
+    /// changeset succeeded, an insert, an update or a delete; not a table creation) and cancels the token
+    /// when the NEXT request (table or blob) is sent, so the commit itself completes and only what follows
+    /// it sees the cancelled token. A <c>$batch</c> answers 202 even when its changeset failed (the failure
+    /// is an inner status of the multipart body), so its body decides whether it committed.
     /// </summary>
     private sealed class CommitObserver
     {
         private int batches;
         private bool committed;
+        private readonly HashSet<string> uploaded = new(StringComparer.Ordinal);
+
+        /// <summary>When set, the blob paths containing it that were written are counted at each committed transaction.</summary>
+        public string? RecordBlobsUnder { get; set; }
+
+        public List<int> BlobsAtCommits { get; } = [];
+
+        // Only for a response the transport has buffered (every response a per-call policy sees).
+        private static bool Committed(HttpMessage message)
+        {
+            var request = message.Request;
+            if (message.Response.Status is < 200 or >= 300)
+                return false;
+            if (request.Method != RequestMethod.Post && request.Method != RequestMethod.Put && request.Method != RequestMethod.Delete)
+                return false;
+            var path = request.Uri.Path;
+            if (request.Method == RequestMethod.Post && path.EndsWith("/Tables", StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (!path.EndsWith("$batch", StringComparison.Ordinal))
+                return true;
+            var statuses = System.Text.RegularExpressions.Regex.Matches(message.Response.Content.ToString(), @"HTTP/1\.1 (\d{3})");
+            return statuses.Count > 0 && statuses.All(m => m.Groups[1].Value[0] == '2');
+        }
 
         public int Batches
         {
@@ -523,13 +758,23 @@ public sealed class AzuriteLargeBatchContractTests : LargeBatchContract
 
             public override void OnReceivedResponse(HttpMessage message)
             {
-                var method = message.Request.Method;
                 lock (owner)
                 {
-                    if (table && owner.CancelAfterNextCommit is not null
-                        && message.Response.Status is >= 200 and < 300
-                        && (method == RequestMethod.Post || method == RequestMethod.Put || method == RequestMethod.Delete))
+                    if (!table)
+                    {
+                        if (owner.RecordBlobsUnder is { } under
+                            && message.Request.Method == RequestMethod.Put
+                            && message.Response.Status is >= 200 and < 300
+                            && message.Request.Uri.Path.Contains(under, StringComparison.Ordinal))
+                            owner.uploaded.Add(message.Request.Uri.Path);
+                        return;
+                    }
+                    if (!Committed(message))
+                        return;
+                    if (owner.CancelAfterNextCommit is not null)
                         owner.committed = true;
+                    if (owner.RecordBlobsUnder is not null && message.Request.Uri.Path.EndsWith("$batch", StringComparison.Ordinal))
+                        owner.BlobsAtCommits.Add(owner.uploaded.Count);
                 }
             }
         }

@@ -66,7 +66,8 @@ Lossless storage of large values, opt-in per property.
   chosen only when `BlobOffload` is set: `BlobOffloadOptions.ServiceClient`, else the host's registered
   `BlobServiceClient` when `UseRegisteredServiceClient` is true, else the one the connection-string or
   credential overload derives. The library keeps that client under its own key and never registers or
-  takes the host's unkeyed `BlobServiceClient`.
+  takes the host's unkeyed `BlobServiceClient`. A store constructed directly uses
+  `BlobOffloadOptions.ServiceClient` only when no client is passed to the constructor.
 - Storage-provider SPI in `Unified.Data.Tables.Providers` (`LargeValueRows`, `LargeValueTable`,
   `LargeValueWritePlan`, `IOffloadBlobStore`, `BlobState`, `BlobReference`), hidden from IntelliSense, for
   provider implementations such as the in-memory package. The in-memory store supports all of the above.
@@ -90,7 +91,18 @@ Lossless storage of large values, opt-in per property.
 - Split-aware writes do one point read first. A `LastWriterWins` `UpdateAsync` on such a type can throw
   `ConcurrencyConflictException` after three lost races. For split-aware types, writes and partial updates
   refuse only a RowKey ending with `~` and four digits (the continuation-row shape, e.g. `r~0001`); any
-  other `~` is allowed, and deletes accept every key (deleting a continuation row's id is a no-op).
+  other `~` is allowed, and deletes accept every key (deleting a continuation row's id is a no-op). They
+  also refuse, with `ArgumentException`, a partition or row key that is not well-formed UTF-16 (an
+  unpaired surrogate escapes to the same blob name as U+FFFD), so two keys never share a blob and the
+  table-wide sweep never reads the wrong partition. A split-aware `UpsertBatchAsync` replaces each row
+  conditionally on the version it read and can throw `ConcurrencyConflictException` after three lost
+  races.
+- A split-aware write that needs a new continuation row at a key another row already holds (one written
+  before the type opted in, or by another type in the table) fails as a whole with
+  `InvalidOperationException` naming that key, instead of overwriting the row: new continuation rows are
+  inserted, and only those the stored row declares are replaced. The provider SPI gains
+  `LargeValueWritePlan.StoredPartCount`/`IsNewPart`, `LargeValueTable.ValidateKeys` and
+  `LargeValueTable.ContinuationKeyTaken`.
 - `QueryPageAsync` can return a page with no items and a non-null continuation token when it held only
   continuation rows; keep paging until the token is null.
 - A projected `QueryPageAsync` no longer warms the entity cache for any type.
@@ -140,8 +152,11 @@ Lossless storage of large values, opt-in per property.
 - `CreateBatchAsync` and `UpsertBatchAsync` of a split-aware type are transactional again, with the plain
   batch contract: per partition, each entity's rows (main row, continuation rows, stale-part deletes) are
   one unit packed into entity-group transactions (at most 100 actions, within the byte and 4 MiB wire
-  budgets), atomic per transaction; an entity's rows never straddle two transactions. Blobs are uploaded
-  before the transactions and released ones deleted after each commit. Two small rows in one partition
+  budgets), atomic per transaction; an entity's rows never straddle two transactions. Each transaction's
+  blobs are uploaded just before it (so a blob waits for its row no longer than in a single write, and the
+  sweep's `OlderThan` need only exceed one transaction) and released ones are deleted after it commits. An
+  upsert transaction that loses a race (409, 412, or a stale part already gone) is re-read, planned again
+  and retried. Two small rows in one partition
   are one transaction, not two separate writes. A key repeated in a create batch throws
   `DuplicateKeyException` before anything is written; in an upsert batch its last occurrence wins. An
   existing key fails its create transaction as a whole; earlier transactions stay committed. The
@@ -151,6 +166,8 @@ Lossless storage of large values, opt-in per property.
   is cancelled, or the version re-read fails, after the commit: the re-read and the blob cleanup run without
   the caller's token, and a failed re-read leaves `ETag` null. Previously the cleanup was skipped too,
   leaving the old blobs to the sweep. The same holds for the blob cleanup after `DeletePartitionAsync`.
+  Once the token is cancelled, the cleanup runs for at most 5 more seconds and then leaves the rest to the
+  sweep, so a cancelled partition delete with many blobs does not hold a shutting-down host.
 - With `BlobOffload` set and no blob client, every `IStorage<T>` failed to resolve; now only a type with
   `[TableValueSplit]` or `TableBlobContent` members does, as `UnifiedTableStorageOptions.BlobOffload`
   documents. The overloads no longer build a throwaway `BlobServiceClient` (swallowing every exception) to

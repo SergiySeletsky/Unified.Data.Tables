@@ -427,7 +427,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 {
                     // An unreadable reference names no blob, but it may have named one this cell wrote:
                     // keep every blob of the cell rather than delete one a repair could still recover.
-                    guarded.Add(prefix + OffloadBlobNames.EscapeSegment(row.RowKey ?? string.Empty) + "/" + OffloadBlobNames.EscapeSegment(column) + "/");
+                    // A key with an unpaired surrogate never names a blob (writes refuse one): nothing to keep.
+                    if (SplitCodec.IsWellFormedUtf16(row.RowKey ?? string.Empty))
+                        guarded.Add(prefix + OffloadBlobNames.EscapeSegment(row.RowKey ?? string.Empty) + "/" + OffloadBlobNames.EscapeSegment(column) + "/");
                 }
             }
         }

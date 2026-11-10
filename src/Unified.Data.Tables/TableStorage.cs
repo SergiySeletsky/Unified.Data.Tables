@@ -291,8 +291,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         logger.LogInformation("Batch-deleted {Count} {Type} entities from partition {Partition}",
             logicalCount, typeName, partition);
 
-        // The rows are gone: so are the blobs stored under the partition (best effort, whatever the token).
-        await DeletePartitionBlobsAsync(partition, CancellationToken.None);
+        // The rows are gone: so are the blobs stored under the partition (best effort; a cancelled token
+        // only bounds how long that may take, the rest is left to the orphan sweep).
+        await DeletePartitionBlobsAsync(partition, ct);
         return logicalCount;
     }
 

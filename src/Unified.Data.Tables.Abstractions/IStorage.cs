@@ -182,7 +182,10 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// transaction. Last writer wins per row. Every entity's <see cref="Entity.ETag"/> is reset to
     /// <c>null</c> — re-read before optimistic updates. For a type with large values each entity's rows
     /// (including deletes of stale continuation rows) are one unit that never straddles two chunks, and a
-    /// key repeated within the batch is written once, with its last occurrence.
+    /// key repeated within the batch is written once, with its last occurrence. Such a type reads each row
+    /// first and replaces it conditionally: a chunk that loses a race to another writer is re-read and
+    /// retried, and after three lost races the call throws <see cref="ConcurrencyConflictException"/>
+    /// (chunks already written stay written).
     /// </summary>
     /// <param name="entities">The entities to upsert.</param>
     /// <param name="ct">Cancellation token.</param>

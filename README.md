@@ -596,7 +596,8 @@ services.AddUnifiedTableStorage(o =>
 The blob client is chosen only when `BlobOffload` is set, in this order, and the library never registers
 or replaces the host's own `BlobServiceClient` service:
 
-1. `BlobOffloadOptions.ServiceClient`, when set (also honoured by the `TableStorage<T>` constructors);
+1. `BlobOffloadOptions.ServiceClient`, when set (a `TableStorage<T>` constructed directly uses it only
+   when no `BlobServiceClient` is passed to the constructor: an explicit constructor argument wins);
 2. the `BlobServiceClient` the host registers in DI, only when `BlobOffloadOptions.UseRegisteredServiceClient`
    is `true` (resolved lazily, so it may be registered before or after `AddUnifiedTableStorage`);
 3. one the overload derives, kept to the library: the connection-string overload builds it from the same
@@ -668,7 +669,9 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
 Lost races, crashes and failed deletes leave unreferenced blobs. Best-effort cleanup after a replace or
 delete only removes blobs untouched for `BlobOffloadOptions.CleanupGrace` (default 5 minutes); younger ones
 are left for the sweep, which must be scheduled: call it yourself, or register the
-[hosted sweep](#hosted-sweep).
+[hosted sweep](#hosted-sweep). A committed write or delete is never reported as failed because its token
+was cancelled: its cleanup runs on for at most 5 more seconds, then stops and leaves the rest of the blobs
+(a large partition's, say, during a host shutdown) to the sweep.
 
 Both ages are measured on the storage service's clock, the one that stamps a blob's `Last-Modified`: the
 cleanup after a write or delete uses the `Date` of the commit response, and the sweep and the cleanup after
@@ -684,7 +687,8 @@ int all = await storage.SweepOrphanBlobsAsync(olderThan: TimeSpan.FromHours(1));
 ```
 
 `olderThan` must exceed the longest write (blob upload to entity commit): a younger blob may belong to
-a write still in flight. Each delete is conditional on the blob being unmodified since it was listed, so a
+a write still in flight. In a batch write that is one transaction's duration, not the whole batch's: each
+transaction's blobs are uploaded just before it. Each delete is conditional on the blob being unmodified since it was listed, so a
 write that reuses an old orphan is never undercut. Only names of the exact offload shape
 `{table}/{partitionKey}/{rowKey}/{property}/{64 lower-hex sha256}` are ever deleted.
 
@@ -751,18 +755,26 @@ so a scaled-out app may register it in one instance only.
   and exactly four digits (`r~0001`, `a~b~0042`). Writes, batch writes and partial updates refuse it with
   `ArgumentException`; every other `~` is allowed (`a~b`, `x~12`, `a~0001x`, append-log keys). Deletes
   accept any key, so a row written before the type opted in stays deletable; deleting a continuation row's
-  id is a no-op. A row from before the opt-in keyed `{RowKey}~0001` is overwritten when `{RowKey}` gets
-  continuation rows. The escaped blob name must fit 1,024 characters.
+  id is a no-op. A row from before the opt-in (or of another type sharing the table) keyed
+  `{RowKey}~0001` is never overwritten: a write of `{RowKey}` that needs that key for a new continuation
+  row fails as a whole with `InvalidOperationException` naming the key, and stores nothing. The escaped
+  blob name must fit 1,024 characters.
+- Keys of split-aware types must be well-formed UTF-16: a partition or row key with an unpaired surrogate
+  (`"a\uD800"`) would name the same blobs as one with U+FFFD in its place, so writes refuse it with
+  `ArgumentException`. Plain types are unaffected.
 - No LINQ filter and no partial update (`UpdateAsync(id, builder)`) on a large property; not supported by
   `IPolymorphicStorage`.
 - Batch writes of these types keep the batch contract: per partition, each entity's rows (main row,
   continuation rows, deletes of stale ones) are one unit, units are packed in order into entity-group
   transactions (at most 100 actions and the same byte and 4&nbsp;MiB wire budgets as a single write), and
   each transaction is atomic; an entity's rows never straddle two. Atomicity is per transaction only: a
-  failing transaction leaves earlier ones committed. Blobs are uploaded before the transactions and
-  released ones deleted after each commit. A key repeated in `CreateBatchAsync` throws
+  failing transaction leaves earlier ones committed. Each transaction's blobs are uploaded just before it
+  and released ones deleted after it commits. A key repeated in `CreateBatchAsync` throws
   `DuplicateKeyException` before anything is written; in `UpsertBatchAsync` its last occurrence is
-  written. Upserts do one point read per entity first.
+  written. Upserts do one point read per entity first, and each replace is conditional on the version
+  read: a transaction that loses a race is planned again and retried, and after three lost races
+  `UpsertBatchAsync` throws `ConcurrencyConflictException` naming the entity (earlier transactions stay
+  committed).
 - Split-aware writes do one point read first (to find stale parts and old blobs): order is table get,
   blob get, blob upload, table update. A `LastWriterWins` `UpdateAsync` can therefore throw
   `ConcurrencyConflictException` after three lost races.
