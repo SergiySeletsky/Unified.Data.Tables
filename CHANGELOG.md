@@ -49,6 +49,15 @@ Lossless storage of large values, opt-in per property.
 - A projected `QueryPageAsync` no longer warms the entity cache for any type.
 - Corrected the `UnifiedTableStorageOptions.OversizedCells` comment: the default is `Throw`, not trim.
 
+### Fixed (before release)
+
+- Large-value transactions are planned on the size the SDK actually sends: JSON-escaped text (`\uXXXX`,
+  six bytes per character, for non-ASCII and `< > & ' +` and the like) and base64 binary, within the
+  4 MiB payload limit, with stale continuation-row deletes counted toward the byte budget. Split cells
+  keep each row's request body within 1 MB. Escaped text that would overflow is offloaded (or throws
+  `OversizedValueException`) instead of failing with HTTP 413 or `EntityTooLarge`. The plain batch
+  planner is unchanged.
+
 ### Unchanged
 
 - Types that opt into nothing produce the same columns and make the same SDK calls as 0.8.3.

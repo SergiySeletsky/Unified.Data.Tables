@@ -549,6 +549,15 @@ For each opted-in property the smallest tier that fits is used:
    3,145,728) or the row would not fit one transaction, the row holds only `{Prop}__blob` (reference
    JSON: path, sha256, length, content type, encoding) and the bytes live in an Azure Blob.
 
+"Fits one transaction" is measured as the SDK sends it, not only as the service stores it: the SDK
+JSON-escapes every non-ASCII character and `"`, `\`, `<`, `>`, `&`, `'`, `+` and `` ` `` as `\uXXXX`, so
+such text is up to six bytes per character on the wire (and base64 binary four bytes per three). A
+transaction is planned within the 4&nbsp;MiB payload limit (less 64&nbsp;KiB for framing), and the deletes
+of stale continuation rows count toward it; split cells are placed so that each row's request body also
+stays within 1&nbsp;MB, which the storage emulator enforces. So 700,000 characters of Cyrillic text
+(1.4&nbsp;MB as UTF-8, 4.2&nbsp;MB on the wire) is offloaded, or throws `OversizedValueException` when
+offload is not configured, instead of failing with HTTP 413.
+
 `__enc` is `text`, `gzip`, `binary` or `utf16le`. `SplitEncoding.Text` stores UTF-8; `SplitEncoding.Gzip`
 gzips first and stores binary cells (a blob carries `Content-Encoding: gzip`), which suits compressible
 text. A string that is not well-formed UTF-16 (an unpaired surrogate) cannot survive UTF-8, so it ignores
