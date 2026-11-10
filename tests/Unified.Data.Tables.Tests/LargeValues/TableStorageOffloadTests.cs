@@ -462,6 +462,36 @@ public class TableStorageOffloadTests
     }
 
     [Fact]
+    public async Task OptedInStore_WithoutBlobOffload_ReadingAnOffloadedRow_ThrowsIntegrity()
+    {
+        // The type opts the property in, but this store has no BlobOffload: the reference is recognized
+        // and cannot be fetched, which is an integrity failure (never an empty value).
+        var inner = new InMemoryOffloadBlobStore();
+        var row = await WrittenRow(inner, new SplitTextEntity { Id = Id, Body = BigText, Title = "t" });
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet(Pk, Rk, row);
+
+        var ex = await Assert.ThrowsAsync<TableValueIntegrityException>(() => h.Store.OneAsync(Id, Ct));
+        Assert.Contains("blob offload is not configured", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Body", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TableBlobContentStore_WithoutBlobOffload_ReadsLazily_ThrowsIntegrityWhenOpened()
+    {
+        var inner = new InMemoryOffloadBlobStore();
+        var row = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1, 2, 3], "image/png"), Title = "t" });
+        using var h = new StorageHarness<FileEntity>();
+        h.SetupGet(Pk, Rk, row);
+
+        var read = await h.Store.OneAsync(Id, Ct);
+
+        Assert.NotNull(read?.File);
+        var ex = await Assert.ThrowsAsync<TableValueIntegrityException>(() => read!.File!.OpenReadAsync(Ct));
+        Assert.Contains("blob offload is not configured", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Projection_NamingOffloadedProperty_ReturnsWholeValue()
     {
         var inner = new InMemoryOffloadBlobStore();

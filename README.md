@@ -618,11 +618,16 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
   ETag changed, the whole read is retried from the new version (three attempts in all); a row deleted
   meanwhile reads as absent (`OneAsync` returns null, a query skips it); only an unchanged ETag is reported
   as `TableValueIntegrityException`. Data of two versions is never combined.
-- An offloaded value is never returned empty. Reading a row that holds a `{Prop}__blob` reference through
-  something that cannot fetch it (the public `FromTableEntity<T>()`, a store whose type does not opt the
-  property in, or no `BlobOffload` configured) throws `InvalidOperationException` naming the column, because
-  writing such an entity back would drop the reference and let the sweep delete the value. Only a
-  projection (`QueryOptions.Select`) that omits the property leaves it at its default. Split cells are
+- An offloaded value is never returned empty: writing such an entity back would drop the reference and let
+  the sweep delete the value. Reading a row that holds a `{Prop}__blob` reference through something that
+  cannot fetch it throws, naming the column:
+  - the public `FromTableEntity<T>()`, or a store whose type has no `[TableValueSplit]` or
+    `TableBlobContent` property, throws `InvalidOperationException`;
+  - a store whose type has such properties but no `BlobOffload` configured throws
+    `TableValueIntegrityException` ("blob offload is not configured") from the read. A `TableBlobContent`
+    property is still read lazily, and throws that `TableValueIntegrityException` when it is opened.
+
+  Only a projection (`QueryOptions.Select`) that omits the property leaves it at its default. Split cells are
   reassembled by any reader; a plain reader that sees a split row without its continuation rows throws
   `TableValueIntegrityException`.
 
