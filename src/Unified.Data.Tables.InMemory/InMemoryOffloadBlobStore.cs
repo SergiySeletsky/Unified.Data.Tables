@@ -17,6 +17,9 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     private readonly object clock = new();
     private DateTimeOffset last = DateTimeOffset.MinValue;
 
+    /// <summary>Awaited before each upload stores anything (for tests that pause a write mid-flight).</summary>
+    internal Func<string, CancellationToken, Task>? BeforeUpload { get; set; }
+
     /// <summary>The names of the stored blobs (for tests).</summary>
     internal IReadOnlyCollection<string> Names => blobs.Keys.ToArray();
 
@@ -34,6 +37,8 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     {
         ArgumentNullException.ThrowIfNull(content);
         ArgumentNullException.ThrowIfNull(reference);
+        if (BeforeUpload is { } hook)
+            await hook(name, ct);
         using var buffer = new MemoryStream();
         await content.CopyToAsync(buffer, ct);
         var bytes = buffer.ToArray();

@@ -163,8 +163,9 @@ internal static class SplitRowLayout
         {
             if (!byIndex.TryGetValue(i, out var part))
                 throw new TableValueIntegrityException(SystemColumnNames.SplitParts, $"part {i} of {declared} missing");
+            // A part carries only chunk cells; any other cell on it (a stray merge) is never surfaced.
             foreach (var key in part.Keys)
-                if (!IsSystemKey(key) && key != SystemColumnNames.SplitOf && key != SystemColumnNames.SplitIndex)
+                if (IsChunk(key))
                     result[key] = part[key];
         }
         return result;

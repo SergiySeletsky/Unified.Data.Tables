@@ -117,14 +117,13 @@ public sealed partial class InMemoryStorage<T>
             long version;
             lock (gate)
             {
-                var current = ReadPrior(keys);
                 if (kind == LargeWriteKind.Create)
                 {
                     if (rows.ContainsKey(keys))
                         throw new DuplicateKeyException(typeof(T).Name, entity.Id,
                             new RequestFailedException(409, $"The specified entity already exists. Id: {entity.Id}"));
                 }
-                else if (current?.Version != prior?.Version)
+                else if (ReadPrior(keys) is var current && current?.Version != prior?.Version)
                 {
                     // The stored row changed (or appeared, or vanished) since it was planned against.
                     if (strict)

@@ -593,6 +593,33 @@ public class TableStorageSplitTests
     }
 
     [Fact]
+    public async Task PartialUpdate_PartRowId_IsRefused_PrimaryIntact()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r~0001", PartRow("p", "r", 1));
+        h.SetupUpdate();
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => h.Store.UpdateAsync("p|r~0001", b => b.SetProperty(x => x.Title, "injected"), Ct));
+
+        // Nothing reaches the table: no table creation, no merge into the continuation row.
+        await h.Table.DidNotReceiveWithAnyArgs().CreateIfNotExistsAsync(default);
+        await h.Table.DidNotReceiveWithAnyArgs().UpdateEntityAsync<TableEntity>(default!, default, default, default);
+    }
+
+    [Fact]
+    public async Task PartialUpdate_PlainType_TildeId_IsUnchanged()
+    {
+        using var h = new StorageHarness<PlainEntity>();
+        h.SetupUpdate();
+
+        await h.Store.UpdateAsync("p|r~0001", b => b.SetProperty(x => x.Body, "b"), Ct);
+
+        await h.Table.Received(1).UpdateEntityAsync(
+            Arg.Is<TableEntity>(e => e.RowKey == "r~0001"), Arg.Any<ETag>(), TableUpdateMode.Merge, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task Delete_PrimaryWithMissingPart_Succeeds()
     {
         using var h = new StorageHarness<SplitTextEntity>();

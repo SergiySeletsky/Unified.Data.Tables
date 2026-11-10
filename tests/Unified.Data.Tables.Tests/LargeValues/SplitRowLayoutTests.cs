@@ -92,6 +92,26 @@ public class SplitRowLayoutTests
     }
 
     [Fact]
+    public void Assemble_IgnoresNonChunkCellsOnParts()
+    {
+        var plan = SplitRowLayout.Plan(Bag("rk", ("Body", new string('a', 600_000))));
+        var part = plan.Parts[0];
+        // Cells a stray merge could leave on a continuation row, including one the primary also has.
+        part["Name"] = "injected";
+        part["UpdatedAt"] = DateTimeOffset.UnixEpoch;
+        part["Body__sha256"] = "0000";
+
+        var logical = SplitRowLayout.Assemble(plan.Primary, [part]);
+
+        Assert.Equal("n", logical["Name"]);
+        Assert.False(logical.ContainsKey("UpdatedAt"));
+        Assert.Equal(plan.Primary["Body__sha256"], logical["Body__sha256"]);
+        Assert.False(logical.ContainsKey("_SplitOf"));
+        Assert.False(logical.ContainsKey("_SplitIndex"));
+        Assert.Equal(new string('a', 600_000), (string)SplitCodec.Decode("Body", logical.ToDictionary(k => k.Key, k => k.Value)));
+    }
+
+    [Fact]
     public void Assemble_MissingPart_Throws()
     {
         var primary = new TableEntity("pk", "rk") { ["_SplitParts"] = 5 };

@@ -810,6 +810,8 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         }
 
         id = NormalizeId(id);
+        // A continuation row is not an entity: merging cells into one would surface them on the primary.
+        RefuseReservedRowKey(id);
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
 

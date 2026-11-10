@@ -100,6 +100,15 @@ public sealed partial class InMemoryStorage<T> : IStorage<T> where T : class, IE
         }
     }
 
+    /// <summary>A copy of the stored row at these keys, continuation rows included (for tests); null when absent.</summary>
+    internal TableEntity? PhysicalRow(string partitionKey, string rowKey)
+    {
+        lock (gate)
+        {
+            return rows.TryGetValue((partitionKey, rowKey), out var row) ? CopyOf(row.Data) : null;
+        }
+    }
+
     /// <summary>Stores a raw row as is (for tests that stage damaged or foreign rows).</summary>
     internal void SeedPhysicalRow(TableEntity row)
     {
@@ -292,6 +301,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T> where T : class, IE
         }
 
         var keys = EntityId.Split(NormalizeId(id));
+        // A continuation row is not an entity: merging cells into one would surface them on the primary.
+        RefuseReservedRowKey(id);
 
         lock (gate)
         {
