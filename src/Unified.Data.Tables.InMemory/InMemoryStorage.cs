@@ -100,6 +100,25 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         }
     }
 
+    /// <summary>The row keys stored in <paramref name="partitionKey"/>, continuation rows included, in order (for tests).</summary>
+    internal IReadOnlyList<string> PhysicalRowKeys(string partitionKey)
+    {
+        lock (gate)
+        {
+            return rows.Keys.Where(k => k.PartitionKey == partitionKey).Select(k => k.RowKey)
+                .OrderBy(k => k, StringComparer.Ordinal).ToList();
+        }
+    }
+
+    /// <summary>
+    /// How many entity-group transactions the batch writes of a large-value-aware type have attempted,
+    /// committed or not (for tests; TableStorage sends one <c>$batch</c> request each).
+    /// </summary>
+    internal int BatchTransactions { get; set; }
+
+    /// <summary>Runs after each large-value write or delete has committed, before its blob cleanup (for tests).</summary>
+    internal Action? AfterLargeCommit { get; set; }
+
     /// <summary>A copy of the stored row at these keys, continuation rows included (for tests); null when absent.</summary>
     internal TableEntity? PhysicalRow(string partitionKey, string rowKey)
     {

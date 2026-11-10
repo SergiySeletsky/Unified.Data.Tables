@@ -121,28 +121,69 @@ internal static class SplitRowLayout
     /// and within <see cref="TableRowSize.MaxTransactionWireBytes"/> as the SDK will actually send it
     /// (JSON-escaped text is up to six bytes per character on the wire).
     /// </summary>
-    internal static bool FitsOneTransaction(SplitRowPlan plan, int extraActions)
+    internal static bool FitsOneTransaction(SplitRowPlan plan, int extraActions) =>
+        Fits(TransactionCost.Of(plan, extraActions));
+
+    /// <summary>
+    /// Packs the write units (each a plan and the number of its stale-part deletes), in order, into
+    /// entity-group transactions: a unit is indivisible, so its rows never straddle two transactions, and
+    /// a transaction holds units of one partition only, within the limits <see cref="FitsOneTransaction"/>
+    /// applies. A unit that does not fit one transaction on its own gets a transaction of its own.
+    /// </summary>
+    internal static IReadOnlyList<BatchRange> PackTransactions(IReadOnlyList<(SplitRowPlan Plan, int ExtraActions)> units)
     {
-        if (1 + plan.Parts.Count + extraActions > BatchPlanner.DefaultMaxCount) return false;
-        // A stale delete carries no body, but its keys and framing still count toward the payload.
-        var staleKey = plan.Primary.RowKey + "~0000";
-        var deleteEstimate = TableRowSize.Estimate(new TableEntity(plan.Primary.PartitionKey, staleKey));
-        var sizes = new List<long>(1 + plan.Parts.Count + extraActions) { TableRowSize.Estimate(plan.Primary) };
-        foreach (var part in plan.Parts) sizes.Add(TableRowSize.Estimate(part));
-        for (var i = 0; i < extraActions; i++) sizes.Add(deleteEstimate);
-        try
+        var ranges = new List<BatchRange>();
+        var start = 0;
+        var total = TransactionCost.Zero;
+        for (var i = 0; i < units.Count; i++)
         {
-            if (BatchPlanner.Plan(sizes).Count != 1) return false;
+            var cost = TransactionCost.Of(units[i].Plan, units[i].ExtraActions);
+            if (i > start
+                && (!string.Equals(units[i].Plan.Primary.PartitionKey, units[start].Plan.Primary.PartitionKey, StringComparison.Ordinal)
+                    || !Fits(total + cost)))
+            {
+                ranges.Add(new BatchRange(start, i - start, total.Bytes));
+                start = i;
+                total = TransactionCost.Zero;
+            }
+            total += cost;
         }
-        catch (BatchPayloadTooLargeException)
+        if (units.Count > start)
+            ranges.Add(new BatchRange(start, units.Count - start, total.Bytes));
+        return ranges;
+    }
+
+    private static bool Fits(TransactionCost cost) =>
+        cost.Actions <= BatchPlanner.DefaultMaxCount
+        && cost.Bytes <= BatchPlanner.DefaultMaxBytes
+        && cost.Wire <= TableRowSize.MaxTransactionWireBytes;
+
+    /// <summary>
+    /// What a unit adds to a transaction: its actions, its payload as <see cref="TableRowSize.Estimate"/>
+    /// measures it (the plain batch planner's budget), and its size as the SDK sends it.
+    /// </summary>
+    private readonly record struct TransactionCost(int Actions, long Bytes, long Wire)
+    {
+        internal static TransactionCost Zero => default;
+
+        internal static TransactionCost Of(SplitRowPlan plan, int extraActions)
         {
-            return false;
+            // A stale delete carries no body, but its keys and framing still count toward the payload.
+            var staleKey = plan.Primary.RowKey + "~0000";
+            var bytes = TableRowSize.Estimate(plan.Primary)
+                + (extraActions * TableRowSize.Estimate(new TableEntity(plan.Primary.PartitionKey, staleKey)));
+            var wire = TableRowSize.ActionWireSize(plan.Primary)
+                + (extraActions * TableRowSize.DeleteActionWireSize(plan.Primary.PartitionKey, staleKey));
+            foreach (var part in plan.Parts)
+            {
+                bytes += TableRowSize.Estimate(part);
+                wire += TableRowSize.ActionWireSize(part);
+            }
+            return new TransactionCost(1 + plan.Parts.Count + extraActions, bytes, wire);
         }
 
-        var wire = TableRowSize.ActionWireSize(plan.Primary)
-            + (extraActions * TableRowSize.DeleteActionWireSize(plan.Primary.PartitionKey, staleKey));
-        foreach (var part in plan.Parts) wire += TableRowSize.ActionWireSize(part);
-        return wire <= TableRowSize.MaxTransactionWireBytes;
+        public static TransactionCost operator +(TransactionCost a, TransactionCost b) =>
+            new(a.Actions + b.Actions, a.Bytes + b.Bytes, a.Wire + b.Wire);
     }
 
     /// <summary>

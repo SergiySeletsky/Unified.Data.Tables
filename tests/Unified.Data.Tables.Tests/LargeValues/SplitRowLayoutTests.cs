@@ -161,4 +161,64 @@ public class SplitRowLayoutTests
         var ex = Assert.Throws<OversizedValueException>(() => SplitRowLayout.Plan(bag));
         Assert.Equal("rk", ex.ColumnName);
     }
+
+    // ── packing a batch into transactions ──────────────────────────────────
+
+    private static (SplitRowPlan Plan, int ExtraActions) Unit(string rk, string pk = "pk", int body = 10, int stale = 0)
+    {
+        var bag = new TableEntity(pk, rk) { ["Name"] = "n" };
+        foreach (var cell in SplitCodec.Encode("Body", new string('a', body), SplitEncoding.Text))
+            bag[cell.Key] = cell.Value;
+        return (SplitRowLayout.Plan(bag), stale);
+    }
+
+    [Fact]
+    public void Pack_SmallRows_OneHundredActionsPerTransaction()
+    {
+        var units = Enumerable.Range(0, 150).Select(i => Unit($"r{i:D3}")).ToList();
+
+        var ranges = SplitRowLayout.PackTransactions(units);
+
+        Assert.Equal([(0, 100), (100, 50)], ranges.Select(r => (r.Start, r.Count)));
+    }
+
+    [Fact]
+    public void Pack_CountsContinuationRowsAndStaleDeletes_AndNeverSplitsAUnit()
+    {
+        // Two-row units of 1.2 MB each: two fit the 3,000,000 B budget, a third does not.
+        var units = Enumerable.Range(0, 5).Select(i => Unit($"r{i}", body: 600_000)).ToList();
+        Assert.All(units, u => Assert.Single(u.Plan.Parts));
+
+        Assert.Equal([(0, 2), (2, 2), (4, 1)], SplitRowLayout.PackTransactions(units).Select(r => (r.Start, r.Count)));
+
+        // A primary and 99 stale-part deletes are 100 actions: the next unit opens a transaction.
+        var withStale = new List<(SplitRowPlan, int)> { Unit("a", stale: 99), Unit("b") };
+        Assert.Equal([(0, 1), (1, 1)], SplitRowLayout.PackTransactions(withStale).Select(r => (r.Start, r.Count)));
+    }
+
+    [Fact]
+    public void Pack_EscapedTextIsBudgetedOnItsWireSize()
+    {
+        // 300,000 Cyrillic chars: 600 KB estimated, 1.8 MB on the wire. Two fit the estimate budget
+        // of one transaction but not the 4 MiB request limit together with a third.
+        var units = Enumerable.Range(0, 3).Select(i =>
+        {
+            var bag = new TableEntity("pk", $"r{i}") { ["Name"] = "n" };
+            foreach (var cell in SplitCodec.Encode("Body", new string('Ж', 300_000), SplitEncoding.Text))
+                bag[cell.Key] = cell.Value;
+            return (SplitRowLayout.Plan(bag), 0);
+        }).ToList();
+
+        var ranges = SplitRowLayout.PackTransactions(units);
+
+        Assert.Equal([(0, 2), (2, 1)], ranges.Select(r => (r.Start, r.Count)));
+    }
+
+    [Fact]
+    public void Pack_APartitionChangeStartsATransaction()
+    {
+        var units = new List<(SplitRowPlan, int)> { Unit("r1", "p1"), Unit("r2", "p1"), Unit("r1", "p2") };
+
+        Assert.Equal([(0, 2), (2, 1)], SplitRowLayout.PackTransactions(units).Select(r => (r.Start, r.Count)));
+    }
 }

@@ -93,6 +93,20 @@ Lossless storage of large values, opt-in per property.
   post-commit re-read. Without a service time the client clock is used less a further 5 minutes. The
   provider SPI `IOffloadBlobStore` gains `GetServiceTimeAsync`, and `LargeValueTable.DeleteReleasedBlobsAsync`
   takes the commit's service time.
+- `CreateBatchAsync` and `UpsertBatchAsync` of a split-aware type are transactional again, with the plain
+  batch contract: per partition, each entity's rows (main row, continuation rows, stale-part deletes) are
+  one unit packed into entity-group transactions (at most 100 actions, within the byte and 4 MiB wire
+  budgets), atomic per transaction; an entity's rows never straddle two transactions. Blobs are uploaded
+  before the transactions and released ones deleted after each commit. Two small rows in one partition
+  are one transaction, not two separate writes. A key repeated in a create batch throws
+  `DuplicateKeyException` before anything is written; in an upsert batch its last occurrence wins. An
+  existing key fails its create transaction as a whole; earlier transactions stay committed. The
+  in-memory store packs and fails the same transactions. The provider SPI gains
+  `LargeValueTable.PlanTransactions`.
+- A split-aware write or delete that has committed is no longer reported as failed when the caller's token
+  is cancelled, or the version re-read fails, after the commit: the re-read and the blob cleanup run without
+  the caller's token, and a failed re-read leaves `ETag` null. Previously the cleanup was skipped too,
+  leaving the old blobs to the sweep. The same holds for the blob cleanup after `DeletePartitionAsync`.
 - `BlobOffloadOptions.ThresholdBytes` is validated: between 1 and `BlobOffloadOptions.MaxThresholdBytes`
   (4,194,304, one transaction's payload limit); anything else throws `ArgumentOutOfRangeException`.
 

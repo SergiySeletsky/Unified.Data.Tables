@@ -190,7 +190,7 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `MutateOrCreateAsync(id, create, mutate)` | Extension: insert-or-mutate CAS — the delta applies uniformly on first insert and on updates. |
 | `TryMutateAsync(id, e => …)` | Extension: outcome-returning CAS — `Updated` / `NotFound` / `Conflicted`, nothing thrown for expected branches. |
 | `TryTransitionAsync(id, when, apply)` | Extension: exactly-once transition as a result — the race-loser gets `PreconditionFailed` with the winner's row. |
-| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction (`DuplicateKeyException` on an existing or repeated key). |
+| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction, atomic per transaction (`DuplicateKeyException` on an existing or repeated key). Split-aware types too: an entity's continuation rows ride in its transaction. |
 | `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking. |
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
 | `DeleteAsync(id)` | Delete one row (idempotent). |
@@ -675,7 +675,14 @@ together as an `AggregateException` whose message says how many blobs were delet
   refuse it. The escaped blob name must fit 1,024 characters.
 - No LINQ filter and no partial update (`UpdateAsync(id, builder)`) on a large property; not supported by
   `IPolymorphicStorage`.
-- Batch writes of these types are executed per entity, not as one transaction.
+- Batch writes of these types keep the batch contract: per partition, each entity's rows (main row,
+  continuation rows, deletes of stale ones) are one unit, units are packed in order into entity-group
+  transactions (at most 100 actions and the same byte and 4&nbsp;MiB wire budgets as a single write), and
+  each transaction is atomic; an entity's rows never straddle two. Atomicity is per transaction only: a
+  failing transaction leaves earlier ones committed. Blobs are uploaded before the transactions and
+  released ones deleted after each commit. A key repeated in `CreateBatchAsync` throws
+  `DuplicateKeyException` before anything is written; in `UpsertBatchAsync` its last occurrence is
+  written. Upserts do one point read per entity first.
 - Split-aware writes do one point read first (to find stale parts and old blobs): order is table get,
   blob get, blob upload, table update. A `LastWriterWins` `UpdateAsync` can therefore throw
   `ConcurrencyConflictException` after three lost races.

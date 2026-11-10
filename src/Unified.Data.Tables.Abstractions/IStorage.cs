@@ -168,6 +168,9 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// Atomic per chunk only. Any existing key fails its chunk with
     /// <see cref="DuplicateKeyException"/>. Batch sub-responses are not correlated back, so every
     /// entity's <see cref="Entity.ETag"/> is reset to <c>null</c> — re-read before optimistic updates.
+    /// For a type with large values (split cells, continuation rows, offloaded blobs) each entity's rows
+    /// are one unit that never straddles two chunks, so a chunk may hold fewer than 100 entities; a key
+    /// repeated within the batch throws <see cref="DuplicateKeyException"/> before anything is written.
     /// </summary>
     /// <param name="entities">The entities to insert.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -177,7 +180,9 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <summary>
     /// Transactional insert-or-replace, grouped by partition and chunked at 100 entities per
     /// transaction. Last writer wins per row. Every entity's <see cref="Entity.ETag"/> is reset to
-    /// <c>null</c> — re-read before optimistic updates.
+    /// <c>null</c> — re-read before optimistic updates. For a type with large values each entity's rows
+    /// (including deletes of stale continuation rows) are one unit that never straddles two chunks, and a
+    /// key repeated within the batch is written once, with its last occurrence.
     /// </summary>
     /// <param name="entities">The entities to upsert.</param>
     /// <param name="ct">Cancellation token.</param>

@@ -66,7 +66,8 @@ public interface IOffloadBlobStore
     /// cutoffs are compared with blob <c>Last-Modified</c> times, which the service stamps, so they are
     /// taken from this clock rather than from the client's, which may run ahead.
     /// </summary>
-    /// <param name="ct">Cancels the call.</param>
+    /// <param name="ct">Cancels the call: a cancelled token throws <see cref="OperationCanceledException"/>
+    /// (both built-in stores), it is never reported as an unknown time.</param>
     /// <returns>The service time, or null.</returns>
     Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct);
 

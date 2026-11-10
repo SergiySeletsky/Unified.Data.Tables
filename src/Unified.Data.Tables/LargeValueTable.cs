@@ -224,6 +224,24 @@ public sealed class LargeValueTable
     }
 
     /// <summary>
+    /// Storage-provider SPI, not for application code. Packs the plans of a batch, in order, into
+    /// entity-group transactions, as a plain batch is packed: each plan (its primary, continuation rows and
+    /// stale-part deletes) is indivisible, so an entity's rows never straddle two transactions; a
+    /// transaction holds one partition only, at most <see cref="BatchPlanner.DefaultMaxCount"/> actions and
+    /// <see cref="BatchPlanner.DefaultMaxBytes"/> of payload, and stays within the service's 4 MiB request
+    /// limit as the SDK sends it (escaped text, base64 binary). Every plan from <see cref="PlanAsync"/>
+    /// fits one transaction on its own.
+    /// </summary>
+    /// <param name="plans">The plans, grouped by partition by the caller (a change of partition starts a new transaction).</param>
+    /// <returns>The transactions, as contiguous ranges over <paramref name="plans"/>.</returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static IReadOnlyList<BatchRange> PlanTransactions(IReadOnlyList<LargeValueWritePlan> plans)
+    {
+        ArgumentNullException.ThrowIfNull(plans);
+        return SplitRowLayout.PackTransactions(plans.Select(p => (p.Plan, p.StalePartRowKeys.Count)).ToList());
+    }
+
+    /// <summary>
     /// Storage-provider SPI, not for application code. Makes every blob <paramref name="plan"/>
     /// references exist (create-only upload, or a touch of an identical one) and binds its contents.
     /// Call it before the row write; a failed row write must not delete these blobs.

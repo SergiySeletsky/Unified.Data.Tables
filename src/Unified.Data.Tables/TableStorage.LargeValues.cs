@@ -139,9 +139,10 @@ public partial class TableStorage<T>
             }
 
             // The swap committed: the blobs only the replaced row referenced can go (the same content
-            // written again maps to the same name, which the new row still references).
+            // written again maps to the same name, which the new row still references). The caller's
+            // token no longer applies: a committed write is never reported as failed, nor left uncleaned.
             if (prior is { Blobs.Count: > 0 })
-                await DeleteBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), result.CommittedAt, ct);
+                await DeleteBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), result.CommittedAt, CancellationToken.None);
             return result;
         }
 
@@ -178,8 +179,9 @@ public partial class TableStorage<T>
         var committed = await client.SubmitTransactionAsync(actions, ct);
         // Taken from the commit itself, before the (slower) re-read below.
         var committedAt = HeaderDate(RawResponse(committed));
-        // Transaction sub-responses are not correlated back to their actions: re-read the version.
-        return new LargeWriteResult(await ReadETagAsync(pk, rk, ct), Cacheable: false, committedAt);
+        // Transaction sub-responses are not correlated back to their actions: re-read the version. The
+        // write has committed, so the caller's token no longer applies.
+        return new LargeWriteResult(await ReadETagAfterCommitAsync(pk, rk), Cacheable: false, committedAt);
     }
 
     /// <summary>
@@ -197,7 +199,8 @@ public partial class TableStorage<T>
     /// <summary>
     /// After a partition's rows are deleted, deletes every blob stored under it (best effort), each on
     /// condition that it was modified neither within the cleanup grace nor since it was listed, so a blob
-    /// a concurrent write has just touched for a new row survives.
+    /// a concurrent write has just touched for a new row survives. Once rows were deleted, the caller
+    /// passes <see cref="CancellationToken.None"/>: the deletion committed, so cleanup runs regardless.
     /// </summary>
     private Task DeletePartitionBlobsAsync(string partition, CancellationToken ct)
     {
@@ -268,10 +271,26 @@ public partial class TableStorage<T>
     private static bool IsPrimaryFailure(RequestFailedException ex) =>
         ex is not TableTransactionFailedException tx || tx.FailedTransactionActionIndex is null or 0;
 
-    private async Task<ETag> ReadETagAsync(string pk, string rk, CancellationToken ct)
+    /// <summary>
+    /// The version of a row a transaction has just committed, read without the caller's token; any
+    /// failure of the read (a transient error, a timeout) yields <c>default</c>, an unknown version,
+    /// which the write already reports as a null ETag and never caches.
+    /// </summary>
+    private async Task<ETag> ReadETagAfterCommitAsync(string pk, string rk)
     {
-        var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, KeysOnly, ct);
-        return response is { HasValue: true, Value: not null } ? response.Value.ETag : default;
+        try
+        {
+            var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, KeysOnly, CancellationToken.None);
+            return response is { HasValue: true, Value: not null } ? response.Value.ETag : default;
+        }
+#pragma warning disable CA1031 // the write has committed: failing to read its version must not report it as failed
+        catch (Exception ex)
+#pragma warning restore CA1031
+        {
+            logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: the write committed but its version could not be read back",
+                typeName, pk, rk);
+            return default;
+        }
     }
 
     // The service time of a response (its Date header), tolerating test doubles that have none.
@@ -442,8 +461,8 @@ public partial class TableStorage<T>
                 continue;
             }
 
-            // The entity is gone: the blobs it referenced follow (best effort).
-            await DeleteBlobsAsync(prior.Blobs, committedAt, ct);
+            // The entity is gone: the blobs it referenced follow (best effort, whatever the caller's token).
+            await DeleteBlobsAsync(prior.Blobs, committedAt, CancellationToken.None);
             return;
         }
 
@@ -473,17 +492,162 @@ public partial class TableStorage<T>
     private static readonly string[] SplitSystemColumns =
         [SystemColumnNames.SplitOf, SystemColumnNames.SplitIndex, SystemColumnNames.SplitParts];
 
-    // Split-aware: per-entity writes, each atomic with its own continuation rows (no per-chunk atomicity).
-    private async Task WriteBatchLargeAsync(IEnumerable<T> entities, TableTransactionActionType actionType, CancellationToken ct)
+    /// <summary>One entity of a split-aware batch: the stored row it was planned against and its rows.</summary>
+    private sealed record BatchUnit(T Entity, string Pk, string Rk, PriorRow? Prior, LargeValueWritePlan Plan);
+
+    /// <summary>
+    /// A split-aware batch, with the plain batch's contract: per partition, each entity's rows (primary,
+    /// continuation rows, stale-part deletes) are one indivisible unit, and the units are packed in order
+    /// into entity-group transactions (<see cref="LargeValueTable.PlanTransactions"/>), each atomic. The
+    /// blobs a partition's rows reference are uploaded (create-only) before its first transaction; after
+    /// each transaction commits, the blobs only the replaced rows referenced are deleted (best effort). A
+    /// key repeated in a create batch throws <see cref="DuplicateKeyException"/> before anything is
+    /// written; in an upsert batch its last occurrence is written. An existing key fails its create
+    /// transaction (<see cref="DuplicateKeyException"/>); earlier transactions stay committed. An upsert
+    /// transaction that lost a race to another writer is planned again from the re-read rows and retried.
+    /// </summary>
+    private async Task WriteBatchLargeAsync(IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
         var kind = actionType == TableTransactionActionType.Add ? LargeWriteKind.Create : LargeWriteKind.Upsert;
         // Refuse a reserved row key before the first entity is written, not halfway through.
         foreach (var entity in entities)
             SplitRowLayout.ValidateRowKey(GetEntityKeys(entity.Id).RowKey);
+        var writes = DistinctBatchKeys(entities, kind);
+
+        try
+        {
+            // Hash every TableBlobContent once (a non-seekable one is copied to a temporary file).
+            foreach (var entity in writes)
+                await large.PrepareAsync(entity, ct);
+            foreach (var group in writes.GroupBy(e => GetEntityKeys(e.Id).PartitionKey, StringComparer.Ordinal))
+            {
+                var units = await PlanBatchUnitsAsync([.. group], kind, ct);
+                // Every blob exists (uploaded, or touched when already there) before the rows that reference it.
+                foreach (var unit in units)
+                    await large.UploadAsync(unit.Plan, ct);
+                await SubmitBatchUnitsAsync(units, kind, attempt: 1, ct);
+            }
+        }
+        finally
+        {
+            foreach (var entity in writes)
+                LargeValueTable.ReleasePrepared(entity);
+        }
+    }
+
+    // A create batch refuses a repeated key up front (the same DuplicateKeyException the in-memory store
+    // throws); an upsert batch writes each key once, with its last occurrence (last writer wins).
+    private List<T> DistinctBatchKeys(IReadOnlyCollection<T> entities, LargeWriteKind kind)
+    {
+        if (kind == LargeWriteKind.Create)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var entity in entities)
+            {
+                if (!seen.Add(entity.Id))
+                    throw new DuplicateKeyException(typeName, entity.Id,
+                        new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}"));
+            }
+            return [.. entities];
+        }
+
+        var list = entities.ToList();
+        var last = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < list.Count; i++)
+            last[list[i].Id] = i;
+        return list.Where((e, i) => last[e.Id] == i).ToList();
+    }
+
+    private async Task<List<BatchUnit>> PlanBatchUnitsAsync(List<T> entities, LargeWriteKind kind, CancellationToken ct)
+    {
+        var units = new List<BatchUnit>(entities.Count);
         foreach (var entity in entities)
         {
-            var result = await WriteLargeAsync(entity, kind, ETag.All, ct);
-            entity.ETag = result.ETag == default ? null : result.ETag.ToString();
+            var (pk, rk) = GetEntityKeys(entity.Id);
+            var prior = kind == LargeWriteKind.Create ? null : await ReadPriorAsync(pk, rk, ct);
+            var plan = await large.PlanAsync(entity, pk, rk, prior?.Parts ?? 0, c => ExistingPartKeysAsync(pk, rk, c), ct);
+            units.Add(new BatchUnit(entity, pk, rk, prior, plan));
         }
+        return units;
+    }
+
+    private async Task SubmitBatchUnitsAsync(List<BatchUnit> units, LargeWriteKind kind, int attempt, CancellationToken ct)
+    {
+        foreach (var range in LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList()))
+        {
+            var chunk = units.GetRange(range.Start, range.Count);
+            var (actions, owners) = BatchActions(chunk);
+            DateTimeOffset? committedAt;
+            try
+            {
+                committedAt = HeaderDate(RawResponse(await client.SubmitTransactionAsync(actions, ct)));
+            }
+            catch (RequestFailedException ex) when (kind == LargeWriteKind.Create && ex.Status == 409 && IsBatchPrimaryFailure(ex, owners))
+            {
+                throw new DuplicateKeyException(typeName, FailedId(ex, owners, chunk), ex);
+            }
+            catch (RequestFailedException ex) when (kind == LargeWriteKind.Upsert
+                && (ex.Status == 404 || (ex.Status is 409 or 412 && IsBatchPrimaryFailure(ex, owners))))
+            {
+                // The whole transaction failed: nothing of it committed, so it is planned again from the
+                // rows as they are now. A stale part removed meanwhile (404) is not required again.
+                if (attempt >= MaxLargeWriteAttempts)
+                    throw new ConcurrencyConflictException(typeName, FailedId(ex, owners, chunk), ex);
+                var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, ct);
+                foreach (var unit in replanned)
+                    await large.UploadAsync(unit.Plan, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, ct);
+                continue;
+            }
+
+            // The transaction committed: the blobs only the replaced rows referenced can go, whatever
+            // happens to the caller's token now (a committed write is never reported as failed).
+            foreach (var unit in chunk)
+            {
+                if (unit.Prior is { Blobs.Count: > 0 })
+                    await DeleteBlobsAsync(unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), committedAt, CancellationToken.None);
+            }
+        }
+    }
+
+    // The actions of one transaction and, per action, its unit's index (bitwise-complemented for a
+    // primary), so a failed action maps back to its entity.
+    private static (List<TableTransactionAction> Actions, List<int> Owners) BatchActions(List<BatchUnit> chunk)
+    {
+        var actions = new List<TableTransactionAction>();
+        var owners = new List<int>();
+        for (var i = 0; i < chunk.Count; i++)
+        {
+            var unit = chunk[i];
+            actions.Add(unit.Prior is null
+                ? new TableTransactionAction(TableTransactionActionType.Add, unit.Plan.Primary)
+                : new TableTransactionAction(TableTransactionActionType.UpdateReplace, unit.Plan.Primary, unit.Prior.ETag));
+            owners.Add(~i);
+            foreach (var part in unit.Plan.Parts)
+            {
+                actions.Add(new TableTransactionAction(TableTransactionActionType.UpsertReplace, part));
+                owners.Add(i);
+            }
+            foreach (var partKey in unit.Plan.StalePartRowKeys)
+            {
+                actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(unit.Pk, partKey), ETag.All));
+                owners.Add(i);
+            }
+        }
+        return (actions, owners);
+    }
+
+    // A failure the service attributes to no action, or to a primary (an insert or conditional replace).
+    private static bool IsBatchPrimaryFailure(RequestFailedException ex, List<int> owners) =>
+        ex is not TableTransactionFailedException { FailedTransactionActionIndex: int i }
+        || i < 0 || i >= owners.Count
+        || owners[i] < 0;
+
+    // The id of the entity whose action failed ("{partition}|?" when the service did not say).
+    private string FailedId(RequestFailedException ex, List<int> owners, List<BatchUnit> chunk)
+    {
+        if (ex is TableTransactionFailedException { FailedTransactionActionIndex: int i } && i >= 0 && i < owners.Count)
+            return chunk[owners[i] < 0 ? ~owners[i] : owners[i]].Entity.Id;
+        return chunk[0].Pk + Separator + "?";
     }
 }

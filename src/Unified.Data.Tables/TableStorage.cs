@@ -282,8 +282,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         logger.LogInformation("Batch-deleted {Count} {Type} entities from partition {Partition}",
             logicalCount, typeName, partition);
 
-        // The rows are gone: so are the blobs stored under the partition (best effort).
-        await DeletePartitionBlobsAsync(partition, ct);
+        // The rows are gone: so are the blobs stored under the partition (best effort, whatever the token).
+        await DeletePartitionBlobsAsync(partition, CancellationToken.None);
         return logicalCount;
     }
 
@@ -669,16 +669,20 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
     /// the point of a batch) — treat them as trusted server-side paths. For a type with a
-    /// <see cref="TableValueSplitAttribute"/> member the entities are written one by one (each atomic
-    /// with its own continuation rows), so a batch of such entities has no per-chunk atomicity.</remarks>
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> member each entity's rows
+    /// (primary, continuation rows, stale-part deletes) are one indivisible unit packed into the
+    /// partition's transactions, so the batch stays atomic per transaction and an entity's rows never
+    /// straddle two.</remarks>
     public Task<int> CreateBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
         => WriteBatchAsync(entities, TableTransactionActionType.Add, ct);
 
     /// <inheritdoc />
     /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
     /// the point of a batch) — treat them as trusted server-side paths. For a type with a
-    /// <see cref="TableValueSplitAttribute"/> member the entities are written one by one (each atomic
-    /// with its own continuation rows), so a batch of such entities has no per-chunk atomicity.</remarks>
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> member each entity's rows
+    /// (primary, continuation rows, stale-part deletes) are one indivisible unit packed into the
+    /// partition's transactions, so the batch stays atomic per transaction and an entity's rows never
+    /// straddle two.</remarks>
     public Task<int> UpsertBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
         => WriteBatchAsync(entities, TableTransactionActionType.UpsertReplace, ct);
 
