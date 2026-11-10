@@ -48,7 +48,7 @@ public static class ServiceCollectionExtensions
     /// <see cref="UnifiedTableStorageOptions.BlobOffload"/>) built from <paramref name="connectionString"/>
     /// alongside the cache, options, and the open-generic <see cref="IStorage{T}"/> mapping. A client
     /// already registered is kept, and no blob client is registered for a connection string that has
-    /// no blob endpoint (a table-only endpoint with a SAS).
+    /// no Azure Storage blob endpoint (a table-only endpoint with a SAS, a Cosmos DB Table API account).
     /// </summary>
     public static IServiceCollection AddUnifiedTableStorage(
         this IServiceCollection services, string connectionString,
@@ -58,8 +58,8 @@ public static class ServiceCollectionExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
 
         services.TryAddSingleton(_ => new TableServiceClient(connectionString));
-        // Only a connection string a blob client can be built from: a table-only one (an endpoint and a
-        // SAS, no account) must keep resolving its stores exactly as before.
+        // Only an Azure Storage connection string a blob client can be built from: a table-only one (an
+        // endpoint and a SAS) or a Cosmos DB Table API one must keep resolving its stores exactly as before.
         if (CanBuildBlobClient(connectionString))
             services.TryAddSingleton(_ => new BlobServiceClient(connectionString));
         return services.AddUnifiedTableStorage(configure);
@@ -69,10 +69,11 @@ public static class ServiceCollectionExtensions
     /// Registers a <see cref="TableServiceClient"/> authenticated with a <see cref="TokenCredential"/>
     /// (e.g. a managed identity via <c>DefaultAzureCredential</c>) alongside the cache, options,
     /// and the open-generic <see cref="IStorage{T}"/> mapping. When the endpoint's host is an Azure
-    /// Storage table host (it contains <c>.table.</c>), a <see cref="BlobServiceClient"/> for the same
-    /// account (<c>.blob.</c>) and credential is registered too, for
-    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/>; for any other host (an emulator, a custom
-    /// domain) register the <see cref="BlobServiceClient"/> yourself. A client already registered is kept.
+    /// Storage table host (<c>{account}.table.core.{suffix}</c>, in any cloud), a
+    /// <see cref="BlobServiceClient"/> for the same account (<c>.blob.core.</c>) and credential is
+    /// registered too, for <see cref="UnifiedTableStorageOptions.BlobOffload"/>; for any other host (Cosmos
+    /// DB Table API, an emulator, a custom domain) register the <see cref="BlobServiceClient"/> yourself.
+    /// A client already registered is kept.
     /// </summary>
     /// <param name="services">The service collection.</param>
     /// <param name="endpoint">The table endpoint, e.g. <c>https://{account}.table.core.windows.net</c>.</param>
@@ -92,9 +93,25 @@ public static class ServiceCollectionExtensions
         return services.AddUnifiedTableStorage(configure);
     }
 
-    // Building the client parses the connection string and makes no call.
+    // True for an Azure Storage connection string with a blob endpoint (explicit, or derived from the
+    // account). A string whose table endpoint is not an Azure Storage table host (Cosmos DB Table API, a
+    // custom domain) and that names no blob endpoint gets none. Building the client only parses.
     private static bool CanBuildBlobClient(string connectionString)
     {
+        string? tableEndpoint = null;
+        var blobEndpoint = false;
+        foreach (var setting in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var eq = setting.IndexOf('=', StringComparison.Ordinal);
+            if (eq <= 0) continue;
+            var key = setting[..eq].Trim();
+            if (key.Equals("BlobEndpoint", StringComparison.OrdinalIgnoreCase)) blobEndpoint = true;
+            else if (key.Equals("TableEndpoint", StringComparison.OrdinalIgnoreCase)) tableEndpoint = setting[(eq + 1)..].Trim();
+        }
+        if (!blobEndpoint && tableEndpoint is not null
+            && (!Uri.TryCreate(tableEndpoint, UriKind.Absolute, out var table) || !IsAzureStorageTableHost(table.Host)))
+            return false;
+
         try
         {
             _ = new BlobServiceClient(connectionString);
@@ -108,16 +125,25 @@ public static class ServiceCollectionExtensions
         }
     }
 
-    // https://{account}.table.core.windows.net -> https://{account}.blob.core.windows.net; null for a host
-    // that is not an Azure Storage table host, whose blob endpoint cannot be derived.
+    private const string StorageTableHostPart = ".table.core.";
+
+    // An Azure Storage table host in any cloud: {account}.table.core.windows.net, .core.chinacloudapi.cn,
+    // .core.usgovcloudapi.net, ... A Cosmos DB Table API host ({account}.table.cosmos.azure.com) is not one.
+    private static bool IsAzureStorageTableHost(string host) =>
+        host.Contains(StorageTableHostPart, StringComparison.OrdinalIgnoreCase);
+
+    // https://{account}.table.core.{suffix} -> https://{account}.blob.core.{suffix}; null for any other
+    // host (Cosmos DB, an emulator, a custom domain), whose blob endpoint cannot be derived.
     private static Uri? BlobEndpointFor(Uri tableEndpoint)
     {
-        const string table = ".table.";
         var host = tableEndpoint.Host;
-        var at = host.IndexOf(table, StringComparison.OrdinalIgnoreCase);
+        var at = host.IndexOf(StorageTableHostPart, StringComparison.OrdinalIgnoreCase);
         if (at < 0)
             return null;
-        var builder = new UriBuilder(tableEndpoint) { Host = host[..at] + ".blob." + host[(at + table.Length)..] };
+        var builder = new UriBuilder(tableEndpoint)
+        {
+            Host = host[..at] + ".blob.core." + host[(at + StorageTableHostPart.Length)..],
+        };
         return builder.Uri;
     }
 

@@ -148,7 +148,11 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
             }
             if (!more) yield break;
             var item = pages.Current;
-            yield return (item.Name, item.Properties?.LastModified ?? DateTimeOffset.MinValue);
+            // The service always lists Last-Modified. An item without one cannot be deleted conditionally
+            // (any If-Unmodified-Since would be a guess), so it is skipped rather than given a fake time.
+            if (item.Properties?.LastModified is not { } lastModified)
+                continue;
+            yield return (item.Name, lastModified);
         }
     }
 

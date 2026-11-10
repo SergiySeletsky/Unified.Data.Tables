@@ -59,6 +59,9 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
 
     private readonly ValueOffloadCoordinator offload;
 
+    // Cleanup deletes only blobs not modified within this grace (BlobOffloadOptions.CleanupGrace).
+    private readonly TimeSpan cleanupGrace;
+
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger)
         : this(serviceClient, cache, logger, authorizer: null, options: null)
@@ -120,6 +123,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         client = serviceClient.GetTableClient(tableName);
         tableInitializer = new TableInitializer(client);
         offloadBlobs = opts.BlobOffload is null ? null : blobs;
+        cleanupGrace = opts.BlobOffload?.CleanupGrace ?? TimeSpan.Zero;
         offload = new ValueOffloadCoordinator(offloadBlobs, opts.BlobOffload, tableName);
     }
 

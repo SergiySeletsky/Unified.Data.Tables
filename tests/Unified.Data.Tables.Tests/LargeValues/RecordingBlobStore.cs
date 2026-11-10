@@ -24,6 +24,12 @@ internal sealed class RecordingBlobStore(List<string> log, InMemoryOffloadBlobSt
     /// <summary>Bytes the last discarded upload carried.</summary>
     public long DiscardedBytes { get; private set; }
 
+    /// <summary>The <c>If-Unmodified-Since</c> each delete passed, in order.</summary>
+    public List<DateTimeOffset?> DeleteConditions { get; } = [];
+
+    /// <summary>The outcome of each delete, in order.</summary>
+    public List<bool> DeleteResults { get; } = [];
+
     /// <summary>Thrown by every delete when set.</summary>
     public Exception? DeleteFailure { get; set; }
 
@@ -81,11 +87,14 @@ internal sealed class RecordingBlobStore(List<string> log, InMemoryOffloadBlobSt
         return Inner.OpenReadAsync(column, name, ct);
     }
 
-    public Task<bool> DeleteIfUnmodifiedAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct)
+    public async Task<bool> DeleteIfUnmodifiedAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct)
     {
         Record("delete", name);
+        lock (DeleteConditions) DeleteConditions.Add(unmodifiedSince);
         if (DeleteFailure is { } failure) throw failure;
-        return Inner.DeleteIfUnmodifiedAsync(name, unmodifiedSince, ct);
+        var deleted = await Inner.DeleteIfUnmodifiedAsync(name, unmodifiedSince, ct);
+        lock (DeleteResults) DeleteResults.Add(deleted);
+        return deleted;
     }
 
     public async IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(string prefix, [EnumeratorCancellation] CancellationToken ct)

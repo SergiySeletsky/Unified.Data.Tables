@@ -211,4 +211,23 @@ public class AzureOffloadBlobStoreTests
         Assert.Equal([(Name, modified)], listed);
         Assert.Equal("T/p/", options!.Prefix);
     }
+
+    [Fact]
+    public async Task List_ItemWithoutLastModified_IsSkipped()
+    {
+        var rig = new Rig();
+        var modified = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        var dated = BlobsModelFactory.BlobItem(name: Name, properties: BlobsModelFactory.BlobItemProperties(accessTierInferred: false, lastModified: modified));
+        var undated = BlobsModelFactory.BlobItem(name: "T/p/r/File/def", properties: BlobsModelFactory.BlobItemProperties(accessTierInferred: false));
+        var page = Page<BlobItem>.FromValues([undated, dated], null, new FakeResponse());
+        rig.Container.GetBlobsAsync(Arg.Any<GetBlobsOptions>(), Arg.Any<CancellationToken>())
+            .Returns(AsyncPageable<BlobItem>.FromPages([page]));
+
+        var listed = new List<(string, DateTimeOffset)>();
+        await foreach (var entry in rig.Store.ListAsync("T/p/", Ct))
+            listed.Add(entry);
+
+        // No made-up time (MinValue would make every conditional delete of it fail with 412).
+        Assert.Equal([(Name, modified)], listed);
+    }
 }

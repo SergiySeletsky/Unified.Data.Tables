@@ -95,6 +95,14 @@ public class TableStorageOffloadTests
     private static BlobReference Reference(TableEntity row, string column) =>
         BlobReference.Parse(column, (string)row[column + SplitCodec.BlobSuffix]);
 
+    /// <summary>Makes the blob a row references look written an hour ago (older than the cleanup grace).</summary>
+    private static async Task Age(InMemoryOffloadBlobStore inner, TableEntity row, string column)
+    {
+        var reference = Reference(row, column);
+        await using var stream = await inner.OpenReadAsync(column, reference.Path, CancellationToken.None);
+        inner.Seed(reference.Path, await ReadAllAsync(stream), reference.Sha256, DateTimeOffset.UtcNow.AddHours(-1));
+    }
+
     // ── writes ─────────────────────────────────────────────────────────────
 
     [Fact]
@@ -137,6 +145,7 @@ public class TableStorageOffloadTests
         var inner = new InMemoryOffloadBlobStore();
         var oldRow = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1, 2, 3], "image/png") });
         var oldPath = Reference(oldRow, "File").Path;
+        await Age(inner, oldRow, "File");
         using var rig = new Rig<FileEntity>(inner);
         rig.H.SetupGet(Pk, Rk, oldRow);
 
@@ -161,6 +170,85 @@ public class TableStorageOffloadTests
 
         Assert.Equal(["table:get", "blob:get", "blob:touch", "table:update"], rig.Log);
         Assert.Equal([Reference(oldRow, "File").Path], inner.Names);
+    }
+
+    [Fact]
+    public async Task Replace_ConcurrentWriterReusesOldBlob_BlobSurvives()
+    {
+        var inner = new InMemoryOffloadBlobStore();
+        var oldRow = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1, 2, 3], "image/png") });
+        var oldPath = Reference(oldRow, "File").Path;
+        await Age(inner, oldRow, "File");
+        using var rig = new Rig<FileEntity>(inner);
+        rig.H.SetupGet(Pk, Rk, oldRow);
+        // Right after our swap commits, another writer reuses the old content for its own row: it touches
+        // the blob before committing that row, so the blob is recent when our cleanup runs.
+        rig.Table.When(t => t.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>()))
+            .Do(_ => inner.TouchAsync(oldPath, CancellationToken.None).GetAwaiter().GetResult());
+
+        await rig.Store.UpdateAsync(new FileEntity { Id = Id, ETag = "W/\"v1\"", File = TableBlobContent.FromBytes([4, 5, 6], "image/png") }, Ct);
+
+        Assert.Contains(oldPath, inner.Names);
+        Assert.Equal([false], rig.Blobs.DeleteResults);
+    }
+
+    [Fact]
+    public async Task Replace_OldBlobOlderThanGrace_IsDeleted()
+    {
+        var inner = new InMemoryOffloadBlobStore();
+        var oldRow = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1, 2, 3], "image/png") });
+        var oldPath = Reference(oldRow, "File").Path;
+        await Age(inner, oldRow, "File");
+        using var rig = new Rig<FileEntity>(inner);
+        rig.H.SetupGet(Pk, Rk, oldRow);
+
+        var before = DateTimeOffset.UtcNow;
+        await rig.Store.UpdateAsync(new FileEntity { Id = Id, ETag = "W/\"v1\"", File = TableBlobContent.FromBytes([4, 5, 6], "image/png") }, Ct);
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.DoesNotContain(oldPath, inner.Names);
+        var since = Assert.Single(rig.Blobs.DeleteConditions);
+        var grace = new BlobOffloadOptions().CleanupGrace;
+        Assert.InRange(since!.Value, before - grace, after - grace);
+    }
+
+    [Fact]
+    public async Task Delete_RecentlyTouchedBlob_IsKept()
+    {
+        var inner = new InMemoryOffloadBlobStore();
+        var row = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1], "image/png") });
+        using var rig = new Rig<FileEntity>(inner);
+        rig.H.SetupGet(Pk, Rk, row);
+
+        await rig.Store.DeleteAsync(Id, Ct);
+
+        // Written moments ago (within the grace): another writer may be about to reference it.
+        await rig.Table.Received(1).DeleteEntityAsync(Pk, Rk, Arg.Any<ETag>(), Arg.Any<CancellationToken>());
+        Assert.Equal([Reference(row, "File").Path], inner.Names);
+        Assert.Equal([false], rig.Blobs.DeleteResults);
+    }
+
+    [Fact]
+    public async Task DeletePartition_RecentlyTouchedBlob_IsKept()
+    {
+        var inner = new InMemoryOffloadBlobStore();
+        var row = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1], "image/png") });
+        using var rig = new Rig<FileEntity>(inner);
+        rig.H.SetupQueryByPartition(row);
+
+        await rig.Store.DeletePartitionAsync(Pk, Ct);
+
+        Assert.Single(inner.Names);
+        Assert.Equal([false], rig.Blobs.DeleteResults);
+    }
+
+    [Fact]
+    public void CleanupGrace_DefaultsToFiveMinutes_RejectsNegative()
+    {
+        Assert.Equal(TimeSpan.FromMinutes(5), new BlobOffloadOptions().CleanupGrace);
+        var options = new BlobOffloadOptions { CleanupGrace = TimeSpan.Zero };
+        Assert.Equal(TimeSpan.Zero, options.CleanupGrace);
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.CleanupGrace = TimeSpan.FromSeconds(-1));
     }
 
     [Fact]
@@ -214,6 +302,8 @@ public class TableStorageOffloadTests
     {
         var inner = new InMemoryOffloadBlobStore();
         var row = await WrittenRow(inner, new TextAndBlobEntity { Id = Id, Body = BigText, Content = TableBlobContent.FromBytes([9], "image/png") });
+        await Age(inner, row, "Body");
+        await Age(inner, row, "Content");
         using var rig = new Rig<TextAndBlobEntity>(inner);
         rig.H.SetupGet(Pk, Rk, row);
 
@@ -244,6 +334,7 @@ public class TableStorageOffloadTests
         var inner = new InMemoryOffloadBlobStore();
         var row = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1], "image/png") });
         await WrittenRow(inner, new FileEntity { Id = "other|r", File = TableBlobContent.FromBytes([2], "image/png") });
+        await Age(inner, row, "File");
         using var rig = new Rig<FileEntity>(inner);
         rig.H.SetupQueryByPartition(row);
 

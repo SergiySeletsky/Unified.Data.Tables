@@ -93,6 +93,52 @@ public class OffloadRegistrationTests
         Assert.Equal(new Uri("https://acct.blob.core.windows.net"), blobs!.Uri);
     }
 
+    [Theory]
+    [InlineData("DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=YWJj;TableEndpoint=https://acct.table.cosmos.azure.com:443/;")]
+    [InlineData("AccountName=acct;AccountKey=YWJj;TableEndpoint=https://tables.example.com/;")]
+    public void ConnectionStringOverload_CosmosOrCustomTableHost_RegistersNoBlobClient_AndOffloadFailsClearly(string connectionString)
+    {
+        var services = Services(tableClient: false);
+        services.AddUnifiedTableStorage(connectionString, o => o.BlobOffload = new BlobOffloadOptions());
+        using var provider = services.BuildServiceProvider();
+
+        Assert.Null(provider.GetService<BlobServiceClient>());
+        var ex = Assert.Throws<InvalidOperationException>(() => provider.GetRequiredService<IStorage<FileEntity>>());
+        Assert.Contains(nameof(BlobServiceClient), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ConnectionStringOverload_AzureStorageTableEndpoint_RegistersBlobClient()
+    {
+        var services = Services(tableClient: false);
+        services.AddUnifiedTableStorage("AccountName=acct;AccountKey=YWJj;TableEndpoint=https://acct.table.core.windows.net/;BlobEndpoint=https://acct.blob.core.windows.net/");
+        using var provider = services.BuildServiceProvider();
+
+        Assert.Equal(new Uri("https://acct.blob.core.windows.net/"), provider.GetRequiredService<BlobServiceClient>().Uri);
+    }
+
+    [Theory]
+    [InlineData("https://acct.table.cosmos.azure.com")]
+    [InlineData("https://acct.table.example.com")]
+    public void CredentialOverload_CosmosOrNonStorageHost_RegistersNoBlobClient(string endpoint)
+    {
+        var services = Services(tableClient: false);
+        services.AddUnifiedTableStorage(new Uri(endpoint), new DummyCredential());
+        using var provider = services.BuildServiceProvider();
+
+        Assert.Null(provider.GetService<BlobServiceClient>());
+    }
+
+    [Fact]
+    public void CredentialOverload_SovereignCloud_DerivesBlobEndpoint()
+    {
+        var services = Services(tableClient: false);
+        services.AddUnifiedTableStorage(new Uri("https://acct.table.core.chinacloudapi.cn"), new DummyCredential());
+        using var provider = services.BuildServiceProvider();
+
+        Assert.Equal(new Uri("https://acct.blob.core.chinacloudapi.cn"), provider.GetRequiredService<BlobServiceClient>().Uri);
+    }
+
     [Fact]
     public void CustomHost_RegistersNoBlobClient()
     {

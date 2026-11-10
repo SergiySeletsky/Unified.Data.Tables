@@ -214,15 +214,22 @@ public partial class TableStorage<T>
 
     /// <summary>
     /// Deletes blobs no row references any more, after the write or delete that released them has
-    /// committed. Best effort: a failure is logged, never thrown (the orphan sweep collects the blob).
+    /// committed. Each delete is conditional on the blob not having been modified within the cleanup
+    /// grace: a concurrent writer that reuses the same content touches the blob before committing its
+    /// row, so such a blob survives (the orphan sweep collects it if it really is unreferenced). Best
+    /// effort: a failure is logged, never thrown.
     /// </summary>
     private async Task DeleteBlobsAsync(IEnumerable<string> paths, CancellationToken ct)
     {
         if (offloadBlobs is null)
             return;
+        var unmodifiedSince = CleanupCutoff();
         foreach (var path in paths)
-            await DeleteBlobAsync(path, unmodifiedSince: null, ct);
+            await DeleteBlobAsync(path, unmodifiedSince, ct);
     }
+
+    // Blobs modified after this instant may be about to be referenced by a concurrent write: keep them.
+    private DateTimeOffset CleanupCutoff() => DateTimeOffset.UtcNow - cleanupGrace;
 
     private async Task DeleteBlobAsync(string path, DateTimeOffset? unmodifiedSince, CancellationToken ct)
     {
@@ -240,8 +247,8 @@ public partial class TableStorage<T>
 
     /// <summary>
     /// After a partition's rows are deleted, deletes every blob stored under it (best effort), each on
-    /// condition that it was not modified since it was listed, so a blob a concurrent write has just
-    /// touched for a new row survives.
+    /// condition that it was modified neither within the cleanup grace nor since it was listed, so a blob
+    /// a concurrent write has just touched for a new row survives.
     /// </summary>
     private async Task DeletePartitionBlobsAsync(string partition, CancellationToken ct)
     {
@@ -261,8 +268,9 @@ public partial class TableStorage<T>
             logger.LogWarning(ex, "{Type}: could not list the blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition);
             return;
         }
+        var cutoff = CleanupCutoff();
         foreach (var (name, lastModified) in listed)
-            await DeleteBlobAsync(name, lastModified, ct);
+            await DeleteBlobAsync(name, lastModified < cutoff ? lastModified : cutoff, ct);
     }
 
     /// <summary>
