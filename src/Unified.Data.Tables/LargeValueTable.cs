@@ -289,7 +289,8 @@ public sealed class LargeValueTable
     /// <summary>
     /// Storage-provider SPI, not for application code. After a partition's rows are deleted, deletes
     /// every blob stored under it, each on condition that it was modified neither within the cleanup
-    /// grace nor since it was listed. Best effort: a failure goes to the callbacks.
+    /// grace nor since it was listed. Only names of the exact offload shape
+    /// (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) are deleted. Best effort: a failure goes to the callbacks.
     /// </summary>
     /// <param name="partitionKey">The deleted partition.</param>
     /// <param name="onListFailure">Called when the blobs cannot be listed.</param>
@@ -320,12 +321,15 @@ public sealed class LargeValueTable
             return;
         }
         foreach (var (name, lastModified) in listed)
-            await DeleteBlobAsync(name, lastModified < cutoff ? lastModified : cutoff, onFailure, ct);
+        {
+            if (OffloadBlobNames.IsOffloadBlobName(name, prefix))
+                await DeleteBlobAsync(name, lastModified < cutoff ? lastModified : cutoff, onFailure, ct);
+        }
     }
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The core of
-    /// <see cref="IStorage{T}.SweepOrphanBlobsAsync"/>: deletes the blobs offloaded under
+    /// <see cref="IOrphanBlobSweeper.SweepOrphanBlobsAsync(string, TimeSpan, CancellationToken)"/>: deletes the blobs offloaded under
     /// <c>{table}/{partitionKey}/</c> that no row of the partition references and whose Last-Modified
     /// is older than <paramref name="olderThan"/>, each on condition that it was not modified since it
     /// was listed. The blobs are listed first; the rows are read (once, through
@@ -360,16 +364,98 @@ public sealed class LargeValueTable
         string partitionKey, TimeSpan olderThan, Type entityType,
         Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
     {
-        // Ages are measured on the service clock, read before the listing (so never later than it).
+        var cutoff = await SweepCutoffAsync(olderThan, ct);
+        return await coordinator.SweepAsync(partitionKey, cutoff, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, ct);
+    }
+
+    // Ages are measured on the service clock, read before the listing (so never later than it).
+    private async Task<DateTimeOffset> SweepCutoffAsync(TimeSpan olderThan, CancellationToken ct)
+    {
         var now = await ServiceNowAsync(ct);
         // An age beyond the start of the calendar makes no blob old enough (instead of overflowing).
-        var cutoff = olderThan >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - olderThan;
-        return await coordinator.SweepAsync(partitionKey, cutoff, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, ct);
+        return olderThan >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - olderThan;
+    }
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The core of
+    /// <see cref="IOrphanBlobSweeper.SweepOrphanBlobsAsync(TimeSpan, CancellationToken)"/>: lists the
+    /// partitions that hold blobs (<c>{table}/</c> with the delimiter <c>/</c>), unescapes each listed
+    /// partition segment exactly once (a segment this library does not write is skipped), and sweeps
+    /// each partition as the partition sweep does, with one cutoff for the whole table taken from the
+    /// service clock before the listing. A partition that fails does not stop the others: once every
+    /// partition was tried, the failures are thrown together as an <see cref="AggregateException"/>.
+    /// Cancellation is not a partition failure: it ends the sweep.
+    /// </summary>
+    /// <param name="olderThan">The minimum age of a deleted blob; not negative.</param>
+    /// <param name="entityType">The store's entity type (its large-value columns are always read).</param>
+    /// <param name="partitionRows">
+    /// Returns every stored row of the given (stored) partition, continuation rows included, projected
+    /// onto the given columns, or whole when the projection is null.
+    /// </param>
+    /// <param name="ct">Cancels the listings, the reads and the deletes.</param>
+    /// <returns>The number of blobs deleted; 0 when blob offload is not configured.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="olderThan"/> is negative.</exception>
+    /// <exception cref="AggregateException">
+    /// One or more partitions could not be swept (one inner exception each); the message says how many
+    /// blobs the other partitions' sweeps deleted.
+    /// </exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<int> SweepTableOrphanBlobsAsync(
+        TimeSpan olderThan, Type entityType,
+        Func<string, IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(olderThan, TimeSpan.Zero);
+        ArgumentNullException.ThrowIfNull(entityType);
+        ArgumentNullException.ThrowIfNull(partitionRows);
+        if (blobs is null)
+            return Task.FromResult(0);
+        return SweepTableCoreAsync(olderThan, entityType, partitionRows, ct);
+    }
+
+    private async Task<int> SweepTableCoreAsync(
+        TimeSpan olderThan, Type entityType,
+        Func<string, IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
+    {
+        var cutoff = await SweepCutoffAsync(olderThan, ct);
+        var tablePrefix = ValueOffloadCoordinator.TablePrefix(tableName);
+        var partitions = new List<string>();
+        await foreach (var listed in blobs!.ListPrefixesAsync(tablePrefix, ct).WithCancellation(ct))
+        {
+            // {table}/{segment}/: the segment is unescaped exactly once, and only when this library wrote
+            // it, so the partition sweep re-escapes it to the listed prefix (never to a double-escaped one).
+            if (listed.Length > tablePrefix.Length + 1
+                && listed.StartsWith(tablePrefix, StringComparison.Ordinal)
+                && listed[^1] == '/'
+                && OffloadBlobNames.TryUnescapeSegment(listed[tablePrefix.Length..^1], out var partition))
+                partitions.Add(partition);
+        }
+
+        var columns = TypeMetadataCache.LargeValueColumns(entityType);
+        var deleted = 0;
+        List<Exception>? failures = null;
+        foreach (var partition in partitions)
+        {
+            try
+            {
+                deleted += await coordinator.SweepAsync(partition, cutoff, columns, (select, c) => partitionRows(partition, select, c), ct);
+            }
+#pragma warning disable CA1031 // one partition's failure must not stop the others; every failure is rethrown below
+            catch (Exception ex) when (!(ex is OperationCanceledException && ct.IsCancellationRequested))
+#pragma warning restore CA1031
+            {
+                (failures ??= []).Add(ex);
+            }
+        }
+        if (failures is not null)
+            throw new AggregateException(
+                $"The orphan sweep of table '{tableName}' deleted {deleted} blob(s), but {failures.Count} of {partitions.Count} partition(s) could not be swept.",
+                failures);
+        return deleted;
     }
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The argument checks of
-    /// <see cref="IStorage{T}.SweepOrphanBlobsAsync"/>, for a store to run before it normalizes the partition.
+    /// <see cref="IOrphanBlobSweeper.SweepOrphanBlobsAsync(string, TimeSpan, CancellationToken)"/>, for a store to run before it normalizes the partition.
     /// </summary>
     /// <param name="partitionKey">The partition argument.</param>
     /// <param name="olderThan">The age argument.</param>

@@ -10,7 +10,7 @@ using static Unified.Data.Tables.Tests.LargeValues.OffloadTestSupport;
 namespace Unified.Data.Tables.Tests.LargeValues;
 
 /// <summary>
-/// <see cref="IStorage{T}.SweepOrphanBlobsAsync"/>: deletes the blobs of a partition that no row
+/// <see cref="IOrphanBlobSweeper.SweepOrphanBlobsAsync(string, TimeSpan, CancellationToken)"/>: deletes the blobs of a partition that no row
 /// references and that are older than the given age, each on condition that it was not modified since
 /// it was listed, and never touches a row.
 /// </summary>
@@ -29,8 +29,9 @@ public class SweepOrphanBlobsTests
         BlobOffload = new BlobOffloadOptions { ThresholdBytes = 1_000 },
     };
 
-    private static string Name(string table, string pk, string rk, string column, string sha) =>
-        $"{Uri.EscapeDataString(table)}/{Uri.EscapeDataString(pk)}/{Uri.EscapeDataString(rk)}/{Uri.EscapeDataString(column)}/{sha}";
+    // A well-formed offload name whose hash is that of the token (sweeps only delete names of this shape).
+    private static string Name(string table, string pk, string rk, string column, string token) =>
+        ValueOffloadCoordinator.BlobName(table, pk, rk, column, Sha(Utf8(token)));
 
     private static string Seed(InMemoryOffloadBlobStore blobs, string name, TimeSpan age)
     {
@@ -332,18 +333,20 @@ public class SweepOrphanBlobsTests
     }
 
     [Fact]
-    public async Task Sweep_UnrecognizedBlobName_SelectsEveryColumn()
+    public async Task Sweep_UnrecognizedBlobName_IsNeverDeleted()
     {
-        // A blob under the prefix whose name does not follow {table}/{pk}/{rk}/{column}/{sha} cannot say
-        // which cell would reference it, so the sweep reads whole rows rather than guess a projection.
+        // A blob under the prefix whose name does not have the offload shape
+        // {table}/{pk}/{rk}/{column}/{sha256} was not written by this library: it is not a candidate.
         using var rig = new Rig();
         var odd = Seed(rig.Inner, "SplitTextEntity/p/stray", TimeSpan.FromHours(1));
+        var shortHash = Seed(rig.Inner, "SplitTextEntity/p/r/Body/aa", TimeSpan.FromHours(1));
         rig.Rows();
 
-        Assert.Equal(1, await rig.Store.SweepOrphanBlobsAsync(Pk, TimeSpan.FromMinutes(5), Ct));
+        Assert.Equal(0, await rig.Store.SweepOrphanBlobsAsync(Pk, TimeSpan.FromMinutes(5), Ct));
 
-        Assert.DoesNotContain(odd, rig.Inner.Names);
-        Assert.Null(Assert.Single(rig.Selects));
+        Assert.Contains(odd, rig.Inner.Names);
+        Assert.Contains(shortHash, rig.Inner.Names);
+        rig.AssertNoTableRead();
     }
 
     [Fact]
@@ -467,17 +470,17 @@ public class SweepOrphanBlobsTests
         await Assert.ThrowsAsync<ArgumentNullException>(() => store.SweepOrphanBlobsAsync(" ", TimeSpan.Zero, Ct));
     }
 
-    // ── default interface member ──────────────────────────────────────────
+    // ── an IStorage<T> that is not an IOrphanBlobSweeper ──────────────────
 
     [Fact]
-    public async Task Sweep_PlainImplementer_DefaultThrowsNotSupported()
+    public async Task Sweep_PlainImplementer_ExtensionThrowsNotSupported()
     {
         IStorage<SplitTextEntity> storage = new PlainStorage();
 
         await Assert.ThrowsAsync<NotSupportedException>(() => storage.SweepOrphanBlobsAsync(Pk, TimeSpan.Zero, Ct));
     }
 
-    /// <summary>An implementer written before the member existed: it does not implement it.</summary>
+    /// <summary>A third-party implementer: it implements IStorage&lt;T&gt; only, not the sweeper capability.</summary>
     private sealed class PlainStorage : IStorage<SplitTextEntity>
     {
         public Task DeleteAsync(string id, CancellationToken ct = default) => throw new NotImplementedException();

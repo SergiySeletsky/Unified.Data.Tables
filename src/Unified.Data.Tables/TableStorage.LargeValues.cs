@@ -217,6 +217,11 @@ public partial class TableStorage<T>
             (select, c) => PartitionRowsAsync(partition, select, c), ct);
     }
 
+    /// <inheritdoc />
+    public Task<int> SweepOrphanBlobsAsync(TimeSpan olderThan, CancellationToken ct = default) =>
+        // The listed partitions are stored keys already: they are not normalized again.
+        large.SweepTableOrphanBlobsAsync(olderThan, typeof(T), PartitionRowsAsync, ct);
+
     // Every stored row of the partition (continuation rows included), in one query projected onto select.
     private async IAsyncEnumerable<TableEntity> PartitionRowsAsync(
         string partition, IReadOnlyList<string>? select, [EnumeratorCancellation] CancellationToken ct)

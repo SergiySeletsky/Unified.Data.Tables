@@ -22,7 +22,7 @@ namespace Unified.Data.Tables;
 /// <see cref="ServiceCollectionExtensions.AddUnifiedTableStorage(Microsoft.Extensions.DependencyInjection.IServiceCollection, Action{UnifiedTableStorageOptions})"/>.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
+public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
 {
     private const char Separator = '|';
 

@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 
 namespace Unified.Data.Tables.Providers;
@@ -74,6 +75,28 @@ public interface IOffloadBlobStore
     /// <param name="ct">Cancels the listing.</param>
     /// <returns>Each blob's name and <c>Last-Modified</c>.</returns>
     IAsyncEnumerable<(string Name, DateTimeOffset LastModified)> ListAsync(string prefix, CancellationToken ct);
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Lists, once each, the "virtual directories"
+    /// directly under <paramref name="prefix"/>: for every blob <c>{prefix}{segment}/...</c>, the
+    /// prefix <c>{prefix}{segment}/</c> (a hierarchical listing with the delimiter <c>/</c>). Blobs
+    /// directly under the prefix, with no further <c>/</c>, are not listed. The default derives the
+    /// prefixes from <see cref="ListAsync"/>.
+    /// </summary>
+    /// <param name="prefix">The name prefix, ending with <c>/</c>.</param>
+    /// <param name="ct">Cancels the listing.</param>
+    /// <returns>Each prefix, ending with <c>/</c>.</returns>
+    async IAsyncEnumerable<string> ListPrefixesAsync(string prefix, [EnumeratorCancellation] CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(prefix);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var (name, _) in ListAsync(prefix, ct).WithCancellation(ct))
+        {
+            var slash = name.IndexOf('/', prefix.Length);
+            if (slash >= 0 && seen.Add(name[..(slash + 1)]))
+                yield return name[..(slash + 1)];
+        }
+    }
 }
 
 /// <summary>Storage-provider SPI, not for application code. A stored blob's metadata.</summary>

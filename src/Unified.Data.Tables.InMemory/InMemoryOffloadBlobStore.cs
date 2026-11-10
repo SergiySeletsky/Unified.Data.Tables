@@ -8,6 +8,8 @@ namespace Unified.Data.Tables.InMemory;
 /// An in-memory blob container for offloaded values with the same create-only, content-addressed
 /// contract as the Azure one: an existing blob with a matching hash is success, a different hash
 /// throws, a touch refreshes <c>Last-Modified</c>, and a conditional delete loses to a newer touch.
+/// Like the Azure store, it refuses a name the Blobs SDK would not address as given (one with a
+/// <c>.</c> or <c>..</c> segment), so a naming regression fails here too instead of only in Azure.
 /// </summary>
 internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
 {
@@ -29,6 +31,7 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     /// <inheritdoc />
     public Task<BlobState?> GetStateAsync(string name, CancellationToken ct)
     {
+        OffloadBlobNames.ThrowIfNotAddressable(name);
         ct.ThrowIfCancellationRequested();
         return Task.FromResult(blobs.TryGetValue(name, out var blob)
             ? new BlobState(blob.Ref.Sha256, blob.Ref.Length, blob.LastModified)
@@ -40,6 +43,7 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     {
         ArgumentNullException.ThrowIfNull(content);
         ArgumentNullException.ThrowIfNull(reference);
+        OffloadBlobNames.ThrowIfNotAddressable(name);
         if (BeforeUpload is { } hook)
             await hook(name, ct);
         using var buffer = new MemoryStream();
@@ -64,6 +68,7 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     /// <inheritdoc />
     public Task TouchAsync(string name, CancellationToken ct)
     {
+        OffloadBlobNames.ThrowIfNotAddressable(name);
         ct.ThrowIfCancellationRequested();
         while (true)
         {
@@ -77,6 +82,7 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     /// <inheritdoc />
     public async Task<Stream> OpenReadAsync(string column, string name, CancellationToken ct)
     {
+        OffloadBlobNames.ThrowIfNotAddressable(name);
         ct.ThrowIfCancellationRequested();
         if (BeforeOpenRead is { } hook)
             await hook(name, ct);
@@ -88,6 +94,7 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     /// <inheritdoc />
     public Task<bool> DeleteIfUnmodifiedAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct)
     {
+        OffloadBlobNames.ThrowIfNotAddressable(name);
         ct.ThrowIfCancellationRequested();
         if (!blobs.TryGetValue(name, out var blob))
             return Task.FromResult(false);
@@ -118,8 +125,11 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     }
 
     /// <summary>Stores a blob directly, as if an earlier write had uploaded it (for tests).</summary>
-    internal void Seed(string name, byte[] bytes, string sha256, DateTimeOffset lastModified) =>
+    internal void Seed(string name, byte[] bytes, string sha256, DateTimeOffset lastModified)
+    {
+        OffloadBlobNames.ThrowIfNotAddressable(name);
         blobs[name] = (bytes, new BlobReference(name, sha256, bytes.Length, "application/octet-stream", "binary"), null, lastModified);
+    }
 
     /// <summary>Replaces a blob's bytes but keeps its metadata, simulating corruption (for tests).</summary>
     internal void Tamper(string name, byte[] bytes) =>

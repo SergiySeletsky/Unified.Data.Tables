@@ -28,6 +28,8 @@ public class AzureOffloadBlobStoreTests
         public Rig()
         {
             Container.GetBlobClient(Name).Returns(Blob);
+            // The store checks that the SDK addresses the name it was given.
+            Blob.Name.Returns(Name);
             Container.CreateIfNotExistsAsync(Arg.Any<PublicAccessType>(), Arg.Any<IDictionary<string, string>>(),
                     Arg.Any<BlobContainerEncryptionScopeOptions>(), Arg.Any<CancellationToken>())
                 .Returns(Task.FromResult<Response<BlobContainerInfo>>(null!));
@@ -123,7 +125,9 @@ public class AzureOffloadBlobStoreTests
         // A create-only upload conflicts with an orphan, which a sweep deletes before the follow-up state
         // read: the write must upload again rather than fail with an integrity error.
         var rig = new Rig();
-        rig.Container.GetBlobClient(Arg.Any<string>()).Returns(rig.Blob);
+        var requested = Name;
+        rig.Container.GetBlobClient(Arg.Do<string>(n => requested = n)).Returns(rig.Blob);
+        rig.Blob.Name.Returns(_ => requested);
         rig.Blob.GetPropertiesAsync(Arg.Any<BlobRequestConditions>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(Status(404, "BlobNotFound"));
         var uploads = 0;
@@ -143,7 +147,9 @@ public class AzureOffloadBlobStoreTests
     public async Task Upload_KeepsConflictingWithAVanishingBlob_GivesUpAfterThreeAttempts()
     {
         var rig = new Rig();
-        rig.Container.GetBlobClient(Arg.Any<string>()).Returns(rig.Blob);
+        var requested = Name;
+        rig.Container.GetBlobClient(Arg.Do<string>(n => requested = n)).Returns(rig.Blob);
+        rig.Blob.Name.Returns(_ => requested);
         rig.Blob.GetPropertiesAsync(Arg.Any<BlobRequestConditions>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(Status(404, "BlobNotFound"));
         rig.Blob.UploadAsync(Arg.Any<Stream>(), Arg.Any<BlobUploadOptions>(), Arg.Any<CancellationToken>())

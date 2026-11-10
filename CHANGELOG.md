@@ -21,9 +21,14 @@ Lossless storage of large values, opt-in per property.
   (never buffers in memory; leaves the caller's stream open; a non-seekable stream is copied to a
   delete-on-close temp file under `Path.GetTempPath()`, a seekable one is read twice and must not change
   until the write completes), `Length`/`Sha256` known after the write.
-- **`IStorage<T>.SweepOrphanBlobsAsync(partitionKey, olderThan)`** deletes unreferenced blobs. Best-effort
-  cleanup after replace/delete only removes blobs untouched for `CleanupGrace`, so schedule the sweep;
-  `olderThan` must exceed the longest write duration.
+- **`IOrphanBlobSweeper.SweepOrphanBlobsAsync(partitionKey, olderThan)`** and the table-wide
+  **`SweepOrphanBlobsAsync(olderThan)`** delete unreferenced blobs, implemented by `TableStorage<T>` and
+  `InMemoryStorage<T>`, with matching extension methods on `IStorage<T>` (they throw
+  `NotSupportedException` for a store without the capability). Best-effort cleanup after replace/delete
+  only removes blobs untouched for `CleanupGrace`, so schedule the sweep; `olderThan` must exceed the
+  longest write duration. The table-wide sweep lists partitions with the delimiter `/`, isolates a failing
+  partition and throws the failures as one `AggregateException` at the end. Sweeps and partition deletes
+  only delete names of the exact offload shape; the container is for offload alone.
 - **`TableValueIntegrityException`** and **`OversizedValueException`** (with `ColumnName`, `EncodedBytes`,
   `Reason` and `OffloadForbiddenByProperty`, which is true when offload is configured but the property
   sets `BlobOffload.Never`; the message names the matching fix).
@@ -35,8 +40,7 @@ Lossless storage of large values, opt-in per property.
 
 ### Changed
 
-- **`IStorage<T>` gains `SweepOrphanBlobsAsync`**: a default implementation that throws
-  `NotSupportedException` on `net10.0`; `netstandard2.0` implementers must implement it.
+- `IStorage<T>` has no new member: third-party implementers, on `netstandard2.0` too, compile unchanged.
 - New dependency **Azure.Storage.Blobs 12.30.1**; it lifts `Azure.Core` from 1.44.1 to 1.60.0 transitively.
 - The connection-string overload registers a `BlobServiceClient` only for Azure Storage hosts or
   `UseDevelopmentStorage=true`. A custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a
@@ -53,6 +57,11 @@ Lossless storage of large values, opt-in per property.
 - Corrected the `UnifiedTableStorageOptions.OversizedCells` comment: the default is `Throw`, not trim.
 
 ### Fixed (before release)
+
+- Blob names escape `.` as `%2E` (and write an empty key as `%`). With `Uri.EscapeDataString` alone, a
+  PartitionKey or RowKey `.` or `..` became a dot segment that the Blobs SDK collapses: the blob was stored
+  under another name (`..` even outside the table's prefix), the sweep then deleted it as unreferenced and
+  reads threw `TableValueIntegrityException`. Both blob stores now refuse a name with a dot segment.
 
 - Large-value transactions are planned on the size the SDK actually sends: JSON-escaped text (`\uXXXX`,
   six bytes per character, for non-ASCII and `< > & ' +` and the like) and base64 binary, within the

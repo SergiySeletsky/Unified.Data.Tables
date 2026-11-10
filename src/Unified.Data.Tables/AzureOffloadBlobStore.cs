@@ -34,7 +34,7 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     {
         try
         {
-            var properties = (await container.GetBlobClient(name).GetPropertiesAsync(conditions: null, ct).ConfigureAwait(false)).Value;
+            var properties = (await Blob(name).GetPropertiesAsync(conditions: null, ct).ConfigureAwait(false)).Value;
             return ToState(name, properties);
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
@@ -48,9 +48,9 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     {
         ArgumentNullException.ThrowIfNull(content);
         ArgumentNullException.ThrowIfNull(reference);
+        var blob = Blob(name);
         await containerInit.EnsureAsync(ct).ConfigureAwait(false);
 
-        var blob = container.GetBlobClient(name);
         var options = new BlobUploadOptions
         {
             Conditions = new BlobRequestConditions { IfNoneMatch = ETag.All },
@@ -82,7 +82,7 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     /// <inheritdoc />
     public async Task TouchAsync(string name, CancellationToken ct)
     {
-        var blob = container.GetBlobClient(name);
+        var blob = Blob(name);
         try
         {
             // Setting metadata is what refreshes Last-Modified; the same values are written back.
@@ -102,7 +102,7 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
         try
         {
             // allowModifications: false pins the read to one version of the blob.
-            return await container.GetBlobClient(name)
+            return await Blob(name)
                 .OpenReadAsync(new BlobOpenReadOptions(allowModifications: false), ct).ConfigureAwait(false);
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
@@ -116,7 +116,7 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     {
         try
         {
-            await container.GetBlobClient(name).DeleteAsync(
+            await Blob(name).DeleteAsync(
                 DeleteSnapshotsOption.IncludeSnapshots,
                 new BlobRequestConditions { IfUnmodifiedSince = unmodifiedSince },
                 ct).ConfigureAwait(false);
@@ -170,6 +170,40 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
                 continue;
             yield return (item.Name, lastModified);
         }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>A hierarchical listing with the delimiter <c>/</c>; nothing when the container does not exist.</remarks>
+    public async IAsyncEnumerable<string> ListPrefixesAsync(string prefix, [EnumeratorCancellation] CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(prefix);
+        await using var pages = container.GetBlobsByHierarchyAsync(BlobTraits.None, BlobStates.None, "/", prefix, ct).GetAsyncEnumerator(ct);
+        while (true)
+        {
+            bool more;
+            try
+            {
+                more = await pages.MoveNextAsync().ConfigureAwait(false);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 404)
+            {
+                yield break;
+            }
+            if (!more) yield break;
+            if (pages.Current is { IsPrefix: true, Prefix: { } listed })
+                yield return listed;
+        }
+    }
+
+    // The client of the blob named exactly name: the SDK collapses '.' and '..' segments of the URI it
+    // builds, which would address another blob than the one a row references.
+    private BlobClient Blob(string name)
+    {
+        OffloadBlobNames.ThrowIfNotAddressable(name);
+        var blob = container.GetBlobClient(name);
+        if (!string.Equals(blob.Name, name, StringComparison.Ordinal))
+            throw new ArgumentException($"The Blobs SDK addresses the blob name '{name}' as '{blob.Name}'.", nameof(name));
+        return blob;
     }
 
     private static Dictionary<string, string> Metadata(string sha256, long length) => new(StringComparer.OrdinalIgnoreCase)

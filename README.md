@@ -195,7 +195,8 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
 | `DeleteAsync(id)` | Delete one row (idempotent). |
 | `DeletePartitionAsync(partition)` | Batch-delete a whole partition; returns the count. |
-| `SweepOrphanBlobsAsync(partition, olderThan)` | Delete offloaded blobs of the partition that no row references and that are older than `olderThan`; returns the count. See [Large values](#large-values-split-and-blob-offload). |
+| `SweepOrphanBlobsAsync(partition, olderThan)` | Extension (`IOrphanBlobSweeper`): delete offloaded blobs of the partition that no row references and that are older than `olderThan`; returns the count. See [Large values](#large-values-split-and-blob-offload). |
+| `SweepOrphanBlobsAsync(olderThan)` | Extension (`IOrphanBlobSweeper`): the same for every partition of the table. |
 
 ### Bounded queries
 
@@ -590,6 +591,10 @@ For a custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a 
 register your own `BlobServiceClient`. Without offload configured, tiers 1 and 2 still work and a value
 that needs tier 3 throws `OversizedValueException`.
 
+The container belongs to offload alone: do not store other blobs in it. Sweeps and partition deletes
+only ever delete names of the exact offload shape (see below) and skip anything else, but they list
+the whole `{table}/` prefix.
+
 ### Files: `TableBlobContent`
 
 A `TableBlobContent` property is always offloaded, whatever its size, and reading an entity never
@@ -608,8 +613,10 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
   row no longer references.
 - **Delete** - the entity first, then its blobs.
 - A failed entity write never deletes a blob. Blobs are named
-  `{table}/{partitionKey}/{rowKey}/{property}/{sha256}` (each segment escaped), so rewriting identical
-  content reuses the blob.
+  `{table}/{partitionKey}/{rowKey}/{property}/{sha256}`, so rewriting identical content reuses the blob.
+  Each segment is percent-escaped (`Uri.EscapeDataString`) with `.` also escaped as `%2E`, and an empty
+  key is written as `%`: no segment is ever `.` or `..`, which the Blobs SDK would collapse out of the
+  URI (a key `.` or `..` would otherwise address another blob, even outside the table's prefix).
 - Reads reassemble or download eagerly (`string`, `byte[]`) and verify the SHA-256. A mismatch, a missing
   chunk, continuation row or blob throws `TableValueIntegrityException`; partial data is never returned.
   A transport that transparently decompresses `Content-Encoding: gzip` would break the hash check.
@@ -647,11 +654,20 @@ the current second is not yet older than `TimeSpan.Zero`.
 
 ```csharp
 int deleted = await storage.SweepOrphanBlobsAsync("tenant-a", olderThan: TimeSpan.FromHours(1));
+int all = await storage.SweepOrphanBlobsAsync(olderThan: TimeSpan.FromHours(1)); // every partition
 ```
 
 `olderThan` must exceed the longest write (blob upload to entity commit): a younger blob may belong to
 a write still in flight. Each delete is conditional on the blob being unmodified since it was listed, so a
-write that reuses an old orphan is never undercut.
+write that reuses an old orphan is never undercut. Only names of the exact offload shape
+`{table}/{partitionKey}/{rowKey}/{property}/{64 lower-hex sha256}` are ever deleted.
+
+The sweep is the capability interface `IOrphanBlobSweeper`, implemented by `TableStorage<T>` and
+`InMemoryStorage<T>`; on an `IStorage<T>` the same calls are extension methods that throw
+`NotSupportedException` for a store without it. The table-wide overload lists the partitions from the
+container (`{table}/` with the delimiter `/`), takes one cutoff from the service clock, and sweeps each
+partition in turn. A failing partition does not stop the others: afterwards the failures are thrown
+together as an `AggregateException` whose message says how many blobs were deleted.
 
 ### Limitations
 
@@ -671,8 +687,6 @@ write that reuses an old orphan is never undercut.
   it was read from. Once a replace or delete has removed that blob (after `CleanupGrace`), `OpenReadAsync`
   throws `TableValueIntegrityException` saying the row may have changed; read the entity again. It never
   returns other bytes: blobs are named by their hash.
-- `IStorage<T>.SweepOrphanBlobsAsync` has a default implementation on `net10.0` that throws
-  `NotSupportedException`; `netstandard2.0` implementers must provide it.
 - A projection of a plain type (one that does not opt the property in) that names a property another type
   stored split or offloaded reads it as null: the plain store neither fetches nor recognises the value's
   cells. Read such rows through the opted-in type.

@@ -119,4 +119,11 @@ internal sealed class RecordingBlobStore(List<string> log, InMemoryOffloadBlobSt
         await foreach (var item in Inner.ListAsync(prefix, ct))
             yield return item;
     }
+
+    public async IAsyncEnumerable<string> ListPrefixesAsync(string prefix, [EnumeratorCancellation] CancellationToken ct)
+    {
+        Record("prefixes", prefix);
+        await foreach (var item in ((IOffloadBlobStore)Inner).ListPrefixesAsync(prefix, ct))
+            yield return item;
+    }
 }

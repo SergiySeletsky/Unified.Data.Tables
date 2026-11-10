@@ -19,7 +19,7 @@ namespace Unified.Data.Tables.InMemory;
 /// (PartitionKey, RowKey) result ordering.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public sealed partial class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, new()
+public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
 {
     private static readonly List<(PropertyInfo Prop, ProtectedPropertyAttribute Attr)> ProtectedProps =
         typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)

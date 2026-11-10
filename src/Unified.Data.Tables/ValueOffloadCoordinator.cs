@@ -23,16 +23,19 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     private static readonly IReadOnlyDictionary<string, object> NothingResolved = new Dictionary<string, object>(StringComparer.Ordinal);
 
-    /// <summary><c>{table}/{partitionKey}/{rowKey}/{column}/{sha256}</c>, each segment escaped.</summary>
+    /// <summary>
+    /// <c>{table}/{partitionKey}/{rowKey}/{column}/{sha256}</c>, each segment escaped by
+    /// <see cref="OffloadBlobNames.EscapeSegment"/> (so no segment is ever <c>.</c>, <c>..</c> or empty).
+    /// </summary>
     /// <exception cref="ArgumentException">The name exceeds <see cref="MaxBlobNameLength"/> characters.</exception>
     internal static string BlobName(string table, string pk, string rk, string column, string sha256)
     {
         var name = string.Join('/',
-            Uri.EscapeDataString(table),
-            Uri.EscapeDataString(pk),
-            Uri.EscapeDataString(rk),
-            Uri.EscapeDataString(column),
-            Uri.EscapeDataString(sha256));
+            OffloadBlobNames.EscapeSegment(table),
+            OffloadBlobNames.EscapeSegment(pk),
+            OffloadBlobNames.EscapeSegment(rk),
+            OffloadBlobNames.EscapeSegment(column),
+            OffloadBlobNames.EscapeSegment(sha256));
         if (name.Length > MaxBlobNameLength)
             throw new ArgumentException(
                 $"The blob name for column '{column}' would be {name.Length} characters; blob names are limited to {MaxBlobNameLength}. Use shorter keys.");
@@ -358,11 +361,15 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     /// <summary><c>{table}/{partitionKey}/</c>, each segment escaped: the prefix of every blob of a partition.</summary>
     internal static string PartitionPrefix(string table, string pk) =>
-        Uri.EscapeDataString(table) + "/" + Uri.EscapeDataString(pk) + "/";
+        TablePrefix(table) + OffloadBlobNames.EscapeSegment(pk) + "/";
+
+    /// <summary><c>{table}/</c>, escaped: the prefix of every blob of the table.</summary>
+    internal static string TablePrefix(string table) => OffloadBlobNames.EscapeSegment(table) + "/";
 
     /// <summary>
     /// Deletes the blobs under <paramref name="pk"/> that no row of the partition references and whose
-    /// Last-Modified is before <paramref name="cutoff"/>; returns how many were deleted (0 when blob
+    /// Last-Modified is before <paramref name="cutoff"/>; only names of the exact offload shape
+    /// (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) are candidates, anything else is left alone; returns how many were deleted (0 when blob
     /// offload is not configured). The blobs are listed first and the table is read only when some are
     /// old enough. Each delete is conditional on the blob not having been modified since it was listed,
     /// so a blob a concurrent write touches to reuse it (before writing its row) is kept.
@@ -390,7 +397,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         var candidates = new List<(string Name, DateTimeOffset LastModified)>();
         await foreach (var (name, lastModified) in blobs.ListAsync(prefix, ct).WithCancellation(ct))
         {
-            if (lastModified < cutoff)
+            if (lastModified < cutoff && OffloadBlobNames.IsOffloadBlobName(name, prefix))
                 candidates.Add((name, lastModified));
         }
         if (candidates.Count == 0)
@@ -419,7 +426,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 {
                     // An unreadable reference names no blob, but it may have named one this cell wrote:
                     // keep every blob of the cell rather than delete one a repair could still recover.
-                    guarded.Add(prefix + Uri.EscapeDataString(row.RowKey ?? string.Empty) + "/" + Uri.EscapeDataString(column) + "/");
+                    guarded.Add(prefix + OffloadBlobNames.EscapeSegment(row.RowKey ?? string.Empty) + "/" + OffloadBlobNames.EscapeSegment(column) + "/");
                 }
             }
         }
@@ -454,9 +461,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     // row and the column whose cell references it ({table}/{pk}/{rk}/{column}/{sha256}), so each
     // candidate's own name says which {column}__blob cell to read, whatever entity type wrote it (another
     // type sharing the table, or a runtime subtype of a member the store's type declares as a base,
-    // abstract or interface type). The type's declared columns are read as well. A candidate whose name
-    // does not follow that shape, too many columns, or a select list longer than MaxSweepSelectLength
-    // reads whole rows (null) instead.
+    // abstract or interface type). The type's declared columns are read as well. Every candidate has that
+    // shape (SweepAsync filters the others out); a column that is not a valid property name, too many
+    // columns, or a select list longer than MaxSweepSelectLength reads whole rows (null) instead.
     private static List<string>? SweepSelect(
         string prefix, List<(string Name, DateTimeOffset LastModified)> candidates, IReadOnlyList<string> declaredColumns)
     {
@@ -465,9 +472,8 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         foreach (var (name, _) in candidates)
         {
             var segments = name[prefix.Length..].Split('/');
-            if (segments.Length != 3)
+            if (segments.Length != 3 || !OffloadBlobNames.TryUnescapeSegment(segments[1], out var column))
                 return null;
-            var column = Uri.UnescapeDataString(segments[1]);
             if (!IsReferenceColumn(column))
                 return null;
             if (seen.Add(column))

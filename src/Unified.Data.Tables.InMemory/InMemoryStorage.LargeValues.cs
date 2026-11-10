@@ -241,6 +241,11 @@ public sealed partial class InMemoryStorage<T>
         return large.SweepOrphanBlobsAsync(partition, olderThan, typeof(T), (_, _) => PartitionRowsAsync(partition), ct);
     }
 
+    /// <inheritdoc />
+    public Task<int> SweepOrphanBlobsAsync(TimeSpan olderThan, CancellationToken ct = default) =>
+        // The listed partitions are stored keys already: they are not normalized again.
+        large.SweepTableOrphanBlobsAsync(olderThan, typeof(T), (partition, _, _) => PartitionRowsAsync(partition), ct);
+
     // A snapshot of every stored row of the partition (continuation rows included), taken under the gate.
     // The projection is not applied: a whole row holds every cell the sweep would have selected.
     private async IAsyncEnumerable<TableEntity> PartitionRowsAsync(string partition)
