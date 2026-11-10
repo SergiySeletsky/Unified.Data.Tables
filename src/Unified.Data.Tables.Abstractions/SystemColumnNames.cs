@@ -27,6 +27,15 @@ public static class SystemColumnNames
     /// <summary>Column holding the stored type discriminator.</summary>
     public const string TypeName = "_TypeName";
 
+    /// <summary>Column on a continuation row naming the row key of the head row it continues.</summary>
+    public const string SplitOf = "_SplitOf";
+
+    /// <summary>Column on a continuation row holding its 1-based position among the continuation rows.</summary>
+    public const string SplitIndex = "_SplitIndex";
+
+    /// <summary>Column on a head row holding the number of continuation rows that belong to it.</summary>
+    public const string SplitParts = "_SplitParts";
+
     /// <summary>
     /// True when <paramref name="columnName"/> is a system column. Used on every read path to keep
     /// a system column out of a same-named property, and on every write path to validate a raw
