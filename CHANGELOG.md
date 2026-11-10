@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-11-10
+
+Lossless storage of large values, opt-in per property.
+
+### Added
+
+- **`[TableValueSplit(SplitEncoding)]`** (property or class, `Offload` = `BlobOffload.AboveThreshold`
+  or `Never`) stores strings and `byte[]` beyond the 64 KB cell and 1 MB row limits without trimming:
+  split cells, continuation rows (`{RowKey}~0001..`) in the same entity-group transaction, or an Azure
+  Blob, with a SHA-256 over the stored bytes verified on read. `SplitEncoding.Text` and `Gzip`; strings
+  that are not well-formed UTF-16 are stored as `utf16le`.
+- **`BlobOffload`**, **`BlobOffloadOptions`** (`ContainerName`, `ThresholdBytes`, `CleanupGrace`) and
+  `UnifiedTableStorageOptions.BlobOffload`.
+- **`TableBlobContent`** for files: always offloaded, lazy `OpenReadAsync`, `FromBytes`/`FromStream`
+  (never buffers; leaves the caller's stream open), `Length`/`Sha256` known after the write.
+- **`IStorage<T>.SweepOrphanBlobsAsync(partitionKey, olderThan)`** deletes unreferenced blobs. Best-effort
+  cleanup after replace/delete only removes blobs untouched for `CleanupGrace`, so schedule the sweep;
+  `olderThan` must exceed the longest write duration.
+- **`TableValueIntegrityException`** and **`OversizedValueException`**.
+- A six-parameter `TableStorage<T>` constructor taking the `BlobServiceClient`, and a `BlobServiceClient`
+  registration in the connection-string and credential `AddUnifiedTableStorage` overloads.
+- Storage-provider SPI in `Unified.Data.Tables.Providers` (`LargeValueRows`, `LargeValueTable`,
+  `LargeValueWritePlan`, `IOffloadBlobStore`, `BlobState`, `BlobReference`), hidden from IntelliSense, for
+  provider implementations such as the in-memory package. The in-memory store supports all of the above.
+
+### Changed
+
+- **`IStorage<T>` gains `SweepOrphanBlobsAsync`**: a default implementation that throws
+  `NotSupportedException` on `net10.0`; `netstandard2.0` implementers must implement it.
+- New dependency **Azure.Storage.Blobs 12.30.1**; it lifts `Azure.Core` from 1.44.1 to 1.60.0 transitively.
+- The connection-string overload registers a `BlobServiceClient` only for Azure Storage hosts or
+  `UseDevelopmentStorage=true`. A custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a
+  Cosmos Table API host, must register its own `BlobServiceClient`.
+- Split-aware writes do one point read first. A `LastWriterWins` `UpdateAsync` on such a type can throw
+  `ConcurrencyConflictException` after three lost races. All writes and partial updates refuse a `~` RowKey
+  for split-aware types.
+- `QueryPageAsync` can return a page with no items and a non-null continuation token when it held only
+  continuation rows; keep paging until the token is null.
+- A projected `QueryPageAsync` no longer warms the entity cache for any type.
+- Corrected the `UnifiedTableStorageOptions.OversizedCells` comment: the default is `Throw`, not trim.
+
+### Unchanged
+
+- Types that opt into nothing produce the same columns and make the same SDK calls as 0.8.3.
+  `OversizedCellPolicy` gains no value.
+
 ## [0.8.3] — 2026-08-21
 
 Another legacy-row read gap found by the production canary.

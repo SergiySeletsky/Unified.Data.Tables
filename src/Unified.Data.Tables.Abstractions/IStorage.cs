@@ -63,6 +63,9 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <see cref="UpdateAsync(string, Action{UpdateBuilder{T}}, CancellationToken)"/> for
     /// disjoint-field mutation (race-safe by construction), and
     /// <c>StorageExtensions.MutateAsync</c> for values derived from the current row.
+    /// For a type with a <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property,
+    /// a <see cref="ConcurrencyMode.LastWriterWins"/> update reads the row first and can throw
+    /// <see cref="ConcurrencyConflictException"/> after three lost races.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="mode">The optimistic-concurrency behaviour to apply.</param>

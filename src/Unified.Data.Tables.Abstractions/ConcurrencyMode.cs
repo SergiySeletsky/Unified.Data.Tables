@@ -27,6 +27,9 @@ public enum ConcurrencyMode
     /// Unconditional replace (<c>If-Match: *</c>). Explicit, greppable last-writer-wins — the only
     /// supported way to say "make the row look like this object regardless of its current state"
     /// on the update path (nulling <see cref="Entity.ETag"/> under <see cref="Auto"/> throws).
+    /// For a type with a <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property
+    /// the write must read the row to find stale parts, so it retries on interleaved writes and throws
+    /// <see cref="ConcurrencyConflictException"/> after three lost races.
     /// </summary>
     LastWriterWins = 2,
 }

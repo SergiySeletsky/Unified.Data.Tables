@@ -23,8 +23,11 @@ copy-pasted into each one.
   created lazily on first use (`EnsureCreatedAsync()` for fail-fast hosts).
 - **Reflection-based serializer** — flattens nested objects into `Parent_Child` columns, stores enums as
   strings and money-style `decimal`s as doubles, and falls back to JSON (then GZip) for collections and
-  complex graphs. Oversized cells are compressed — and, as a last resort, truncated — so a single large
-  property can never blow the 64&nbsp;KB limit and lose the whole row.
+  complex graphs. Oversized cells are compressed, and an oversized payload throws rather than being
+  trimmed. Opt a property into `[TableValueSplit]` to store arbitrarily large values losslessly.
+- **Large values & blob offload** — `[TableValueSplit]` stores strings and byte arrays far beyond the
+  64&nbsp;KB cell limit as split cells, continuation rows or an Azure Blob, SHA-256 verified on read;
+  `TableBlobContent` stores files as blobs with a lazy stream. Opt-in; types that use neither are unchanged.
 - **Configurable caching** — reads are served from `IMemoryCache` per a registration-time `CachePolicy`
   (`Sliding`, `Absolute`, or `Disabled` — per entity type or globally); writes keep the entity cache
   coherent and invalidate the relevant query caches automatically.
@@ -192,6 +195,7 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
 | `DeleteAsync(id)` | Delete one row (idempotent). |
 | `DeletePartitionAsync(partition)` | Batch-delete a whole partition; returns the count. |
+| `SweepOrphanBlobsAsync(partition, olderThan)` | Delete offloaded blobs of the partition that no row references and that are older than `olderThan`; returns the count. See [Large values](#large-values-split-and-blob-offload). |
 
 ### Bounded queries
 
@@ -504,6 +508,129 @@ Customer     back = row.FromTableEntity<Customer>();
 
 ---
 
+## Large values: split and blob offload
+
+A table cell holds 64&nbsp;KB and a row 1&nbsp;MB. By default an oversized value throws
+(`OversizedCellPolicy.Throw`); nothing is ever trimmed. Opt a property in and it is stored
+losslessly instead. Types with no `[TableValueSplit]` and no `TableBlobContent` property produce the
+same columns and make the same SDK calls as before.
+
+```csharp
+public sealed class Document : Entity
+{
+    [TableValueSplit(SplitEncoding.Text)]                 // large text
+    public string Body { get; set; } = "";
+
+    [TableValueSplit(SplitEncoding.Gzip, Offload = BlobOffload.Never)]  // never leaves the table
+    public string Notes { get; set; } = "";
+
+    public TableBlobContent? Attachment { get; set; }     // a file: always a blob
+}
+```
+
+The attribute goes on a property, or on a class to cover every `string`/`byte[]` property of it.
+`Offload = BlobOffload.Never` forbids tier 3 below; a value that would need it throws
+`OversizedValueException`.
+
+### Tiers
+
+For each opted-in property the smallest tier that fits is used:
+
+1. **Inline** - one cell, exactly as before, when the value fits.
+2. **Split** - cells `{Prop}__c0..cN` (strings in chunks of at most 32,000 chars, never splitting a
+   surrogate pair; `byte[]` as raw binary cells of at most 65,536 bytes), plus `{Prop}__chunks`,
+   `{Prop}__sha256`, `{Prop}__enc` and `{Prop}__len`. When the cells do not fit one row, the rest go to
+   continuation rows with RowKey `{RowKey}~0001`, `~0002`, ... in the same partition, written in **one**
+   entity-group transaction with the main row.
+3. **Blob offload** - when the encoded value exceeds `BlobOffloadOptions.ThresholdBytes` (default
+   3,145,728) or the row would not fit one transaction, the row holds only `{Prop}__blob` (reference
+   JSON: path, sha256, length, content type, encoding) and the bytes live in an Azure Blob.
+
+`__enc` is `text`, `gzip`, `binary` or `utf16le`. `SplitEncoding.Text` stores UTF-8; `SplitEncoding.Gzip`
+gzips first and stores binary cells (a blob carries `Content-Encoding: gzip`), which suits compressible
+text. A string that is not well-formed UTF-16 (an unpaired surrogate) cannot survive UTF-8, so it ignores
+the requested encoding and is stored as `utf16le`, code unit for code unit. The SHA-256 is over the stored
+bytes; a split value and the same value offloaded have the same hash.
+
+### Registering blob offload
+
+```csharp
+services.AddUnifiedTableStorage(o =>
+{
+    o.BlobOffload = new BlobOffloadOptions
+    {
+        ContainerName = "unified-tables-values",   // default
+        ThresholdBytes = 3_145_728,                // default
+        CleanupGrace = TimeSpan.FromMinutes(5),    // default
+    };
+});
+```
+
+`TableStorage<T>` takes a `BlobServiceClient` from DI like it does `TableServiceClient`. The
+connection-string overload registers one from the same string only for Azure Storage hosts or
+`UseDevelopmentStorage=true`; the credential overload derives the blob endpoint for `*.table.*` hosts.
+For a custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a Cosmos Table API host,
+register your own `BlobServiceClient`. Without offload configured, tiers 1 and 2 still work and a value
+that needs tier 3 throws `OversizedValueException`.
+
+### Files: `TableBlobContent`
+
+A `TableBlobContent` property is always offloaded, whatever its size, and reading an entity never
+downloads it. `TableBlobContent.FromBytes(bytes, contentType)` and `FromStream(stream, contentType)` create
+one; `FromStream` never buffers the content in memory and leaves your stream open. `Length` and `Sha256`
+are known after the write (immediately for `FromBytes`). On a loaded entity, `await content.OpenReadAsync()`
+streams the blob lazily and verifies the SHA-256 when the stream reaches its end.
+
+### Ordering and integrity
+
+- **Write** - the blob is uploaded create-only first (an existing blob with the same name and matching
+  `sha256` counts as success, and its `Last-Modified` is touched), then the entity is written.
+- **Replace** - new blob, entity swap guarded by the ETag, then best-effort delete of old blobs the new
+  row no longer references.
+- **Delete** - the entity first, then its blobs.
+- A failed entity write never deletes a blob. Blobs are named
+  `{table}/{partitionKey}/{rowKey}/{property}/{sha256}` (each segment escaped), so rewriting identical
+  content reuses the blob.
+- Reads reassemble or download eagerly (`string`, `byte[]`) and verify the SHA-256. A mismatch, a missing
+  chunk, continuation row or blob throws `TableValueIntegrityException`; partial data is never returned.
+  A transport that transparently decompresses `Content-Encoding: gzip` would break the hash check.
+
+### Sweeping orphans
+
+Lost races, crashes and failed deletes leave unreferenced blobs. Best-effort cleanup after a replace or
+delete only removes blobs untouched for `BlobOffloadOptions.CleanupGrace` (default 5 minutes); younger ones
+are left for the sweep. The library does not schedule anything, so run it yourself:
+
+```csharp
+int deleted = await storage.SweepOrphanBlobsAsync("tenant-a", olderThan: TimeSpan.FromHours(1));
+```
+
+`olderThan` must exceed the longest write (blob upload to entity commit): a younger blob may belong to
+a write still in flight. Each delete is conditional on the blob being unmodified since it was listed, so a
+write that reuses an old orphan is never undercut.
+
+### Limitations
+
+- `~` is reserved in RowKeys of split-aware types (the continuation separator); writes and partial updates
+  refuse it. The escaped blob name must fit 1,024 characters.
+- No LINQ filter and no partial update (`UpdateAsync(id, builder)`) on a large property; not supported by
+  `IPolymorphicStorage`.
+- Batch writes of these types are executed per entity, not as one transaction.
+- Split-aware writes do one point read first (to find stale parts and old blobs): order is table get,
+  blob get, blob upload, table update. A `LastWriterWins` `UpdateAsync` can therefore throw
+  `ConcurrencyConflictException` after three lost races.
+- A `QueryPageAsync` page can hold zero items with a non-null continuation token when it contained only
+  continuation rows; keep paging until the token is null.
+- Eager offloaded values download on every read, one blob per entity; the entity cache holds the full value.
+  For types with very large eager values use `CacheFor<T>(CachePolicy.Disabled)`.
+- `IStorage<T>.SweepOrphanBlobsAsync` has a default implementation on `net10.0` that throws
+  `NotSupportedException`; `netstandard2.0` implementers must provide it.
+- Storage-provider SPI types (namespace `Unified.Data.Tables.Providers`) are public only so other
+  providers, such as the in-memory package, can share the implementation. They are hidden from
+  IntelliSense and not for application code.
+
+---
+
 ## Polymorphic storage
 
 `IStorage<T>` is one CLR type per table. When many types share one table — an event store, a command
@@ -615,7 +742,8 @@ enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `
 `DuplicateKeyException`, updating a missing row throws 404, stale ETags throw
 `ConcurrencyConflictException` per `ConcurrencyMode`, deletes are idempotent,
 and results arrive in lexical key order — so a green test against the fake means the same code holds
-against Azure Tables.
+against Azure Tables. `[TableValueSplit]` and `TableBlobContent` work too: the fake keeps offloaded blobs in
+an in-memory dictionary, with the same integrity checks and `SweepOrphanBlobsAsync` support.
 
 The polymorphic store has the same mirror, keyed the same way:
 
