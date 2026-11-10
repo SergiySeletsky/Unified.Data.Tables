@@ -268,6 +268,70 @@ public class SweepOrphanBlobsTests
     }
 
     [Fact]
+    public async Task Sweep_AbsentReferenceCell_ComesBackNull_AndItsOrphanIsDeleted()
+    {
+        // Azure returns a selected property the row does not have as null: the row's value was replaced by
+        // an inline one, so the blob it once referenced is an orphan, not a guarded cell.
+        using var rig = new Rig();
+        var orphan = Seed(rig.Inner, Name("SplitTextEntity", Pk, Rk, "Body", "aa"), TimeSpan.FromHours(1));
+        rig.Rows(new TableEntity(Pk, Rk) { ["Body__blob"] = null, ["_SplitOf"] = null });
+
+        Assert.Equal(1, await rig.Store.SweepOrphanBlobsAsync(Pk, TimeSpan.FromMinutes(5), Ct));
+
+        Assert.DoesNotContain(orphan, rig.Inner.Names);
+    }
+
+    [Fact]
+    public async Task Sweep_NonStringReferenceCell_KeepsTheBlobsOfThatCell()
+    {
+        using var rig = new Rig();
+        var guarded = Seed(rig.Inner, Name("SplitTextEntity", Pk, Rk, "Body", "aa"), TimeSpan.FromHours(1));
+        var sibling = Seed(rig.Inner, Name("SplitTextEntity", Pk, "other", "Body", "bb"), TimeSpan.FromHours(1));
+        rig.Rows(new TableEntity(Pk, Rk) { ["Body__blob"] = 42 }, new TableEntity(Pk, "other") { ["Body__blob"] = null });
+
+        Assert.Equal(1, await rig.Store.SweepOrphanBlobsAsync(Pk, TimeSpan.FromMinutes(5), Ct));
+
+        Assert.Equal([guarded], rig.Inner.Names);
+        Assert.DoesNotContain(sibling, rig.Inner.Names);
+    }
+
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(1, false)]
+    public async Task Sweep_SelectListLongerThanTheLimit_ReadsWholeRows(int overLimit, bool projected)
+    {
+        // Reference columns sized so the select list is exactly at the limit, or one character over it.
+        var target = ValueOffloadCoordinator.MaxSweepSelectLength + overLimit;
+        var columns = new List<string>();
+        var length = ValueOffloadCoordinator.SelectLength(["PartitionKey", "RowKey", "_SplitOf", "Body__blob"]);
+        string Column(int len) => ("C" + columns.Count.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)).PadRight(len, 'x');
+        while (target - length > 258)
+        {
+            columns.Add(Column(200));
+            length += 3 + 200 + SplitCodec.BlobSuffix.Length;
+        }
+        columns.Add(Column(target - length - 3 - SplitCodec.BlobSuffix.Length));
+
+        using var rig = new Rig();
+        foreach (var column in columns)
+            Seed(rig.Inner, Name("SplitTextEntity", Pk, Rk, column, "aa"), TimeSpan.FromHours(1));
+        rig.Rows();
+
+        Assert.Equal(columns.Count, await rig.Store.SweepOrphanBlobsAsync(Pk, TimeSpan.FromMinutes(5), Ct));
+
+        var select = Assert.Single(rig.Selects);
+        if (projected)
+        {
+            Assert.NotNull(select);
+            Assert.Equal(target, ValueOffloadCoordinator.SelectLength(select));
+        }
+        else
+        {
+            Assert.Null(select);
+        }
+    }
+
+    [Fact]
     public async Task Sweep_UnrecognizedBlobName_SelectsEveryColumn()
     {
         // A blob under the prefix whose name does not follow {table}/{pk}/{rk}/{column}/{sha} cannot say

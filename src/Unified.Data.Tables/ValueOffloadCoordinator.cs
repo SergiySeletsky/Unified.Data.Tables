@@ -281,6 +281,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// <summary>The most reference columns a sweep names in a projection before it reads whole rows instead.</summary>
     internal const int MaxSweepSelectColumns = 200;
 
+    /// <summary>
+    /// The longest projection (the URL-encoded, comma-joined <c>$select</c> list) a sweep sends before it
+    /// reads whole rows instead, so the query URL stays well within the service's limits.
+    /// </summary>
+    internal const int MaxSweepSelectLength = 2_000;
+
     /// <summary>The service limit on a property name.</summary>
     private const int MaxPropertyNameLength = 255;
 
@@ -326,12 +332,17 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
         // (2) The references: one read of the partition's keys and reference cells.
         var referenced = new HashSet<string>(StringComparer.Ordinal);
-        var guarded = new List<string>();
+        // {table}/{pk}/{rk}/{column}/ of each cell whose reference cannot be read.
+        var guarded = new HashSet<string>(StringComparer.Ordinal);
         await foreach (var row in partitionRows(SweepSelect(prefix, candidates, declaredColumns), ct).WithCancellation(ct))
         {
             foreach (var (key, value) in row)
             {
                 if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
+                    continue;
+                // A selected cell the row does not have comes back as null: no reference (for example a
+                // value replaced by an inline one), so the blobs it once referenced are orphans.
+                if (value is null)
                     continue;
                 try
                 {
@@ -351,7 +362,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         var deleted = 0;
         foreach (var (name, lastModified) in candidates)
         {
-            if (referenced.Contains(name) || guarded.Exists(g => name.StartsWith(g, StringComparison.Ordinal)))
+            if (referenced.Contains(name) || IsGuarded(name, prefix.Length, guarded))
                 continue;
             if (await blobs.DeleteIfUnmodifiedAsync(name, lastModified, ct))
                 deleted++;
@@ -359,12 +370,27 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         return deleted;
     }
 
+    // True when a '/'-terminated prefix of the name (past the partition prefix) is a guarded cell:
+    // one set lookup per name segment.
+    private static bool IsGuarded(string name, int start, HashSet<string> guarded)
+    {
+        if (guarded.Count == 0)
+            return false;
+        for (var slash = name.IndexOf('/', start); slash >= 0; slash = name.IndexOf('/', slash + 1))
+        {
+            if (guarded.Contains(name[..(slash + 1)]))
+                return true;
+        }
+        return false;
+    }
+
     // The projection that reads every cell that could reference a candidate. A blob is named after the
     // row and the column whose cell references it ({table}/{pk}/{rk}/{column}/{sha256}), so each
     // candidate's own name says which {column}__blob cell to read, whatever entity type wrote it (another
     // type sharing the table, or a runtime subtype of a member the store's type declares as a base,
     // abstract or interface type). The type's declared columns are read as well. A candidate whose name
-    // does not follow that shape, or too many columns, reads whole rows (null) instead.
+    // does not follow that shape, too many columns, or a select list longer than MaxSweepSelectLength
+    // reads whole rows (null) instead.
     private static List<string>? SweepSelect(
         string prefix, List<(string Name, DateTimeOffset LastModified)> candidates, IReadOnlyList<string> declaredColumns)
     {
@@ -386,8 +412,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
         var select = new List<string>(3 + columns.Count) { "PartitionKey", "RowKey", SystemColumnNames.SplitOf };
         select.AddRange(columns.Select(c => c + SplitCodec.BlobSuffix));
-        return select;
+        return SelectLength(select) > MaxSweepSelectLength ? null : select;
     }
+
+    /// <summary>The length of <paramref name="select"/> as a URL-encoded, comma-joined <c>$select</c> value.</summary>
+    internal static int SelectLength(IReadOnlyList<string> select) =>
+        Uri.EscapeDataString(string.Join(',', select)).Length;
 
     // A column whose reference cell is a valid table property name (letters, digits and '_', not
     // starting with a digit); any other segment cannot be a column this library wrote.
