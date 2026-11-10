@@ -23,7 +23,9 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// own partition <c>lv-{guid}</c> and its own blob container <c>lv-{guid}</c> and deletes both when it
 /// ends; no other table row, partition or container is touched.
 /// <para>
-/// The tests self-skip when the table or the blob endpoint is unreachable. The connection string
+/// The tests self-skip only when the table or the blob endpoint is unreachable (connection refused, host
+/// or network unreachable); any other probe failure fails the run, and with
+/// <c>UNIFIED_TABLES_REQUIRE_AZURITE=1</c> (set in CI) so does an unreachable emulator. The connection string
 /// defaults to <c>UseDevelopmentStorage=true</c>; the environment variable
 /// <see cref="ConnectionStringVariable"/> overrides it (for example to point at another emulator, or at
 /// an unused port to exercise the skip path).
@@ -43,7 +45,9 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
     private static readonly string ConnectionString =
         Environment.GetEnvironmentVariable(ConnectionStringVariable) is { Length: > 0 } configured ? configured : DevelopmentStorage;
 
-    private static readonly Lazy<Task<bool>> Probe = new(ProbeAsync);
+    // Once per test run: skips only when the emulator is not there at all (see AzuriteProbe).
+    private static readonly Lazy<Task<bool>> Probe =
+        new(() => TestSupport.AzuriteProbe.ProbeAsync(ConnectionString, blobs: true, TestSupport.AzuriteProbe.Required));
 
     private readonly string pk = "lv-" + Guid.NewGuid().ToString("N");
     private readonly string containerName = "lv-" + Guid.NewGuid().ToString("N");
@@ -93,31 +97,6 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
             }
         }
         await container.DeleteIfExistsAsync(cancellationToken: CancellationToken.None);
-    }
-
-    // Reachability of both endpoints, once per test run, without retries (an absent emulator skips fast).
-    private static async Task<bool> ProbeAsync()
-    {
-        try
-        {
-            var tableOptions = new TableClientOptions();
-            tableOptions.Retry.MaxRetries = 0;
-            tableOptions.Retry.NetworkTimeout = TimeSpan.FromSeconds(5);
-            var blobOptions = new BlobClientOptions();
-            blobOptions.Retry.MaxRetries = 0;
-            blobOptions.Retry.NetworkTimeout = TimeSpan.FromSeconds(5);
-            await foreach (var _ in new TableServiceClient(ConnectionString, tableOptions).QueryAsync(maxPerPage: 1))
-                break;
-            await foreach (var _ in new BlobServiceClient(ConnectionString, blobOptions).GetBlobContainersAsync())
-                break;
-            return true;
-        }
-#pragma warning disable CA1031 // any failure (refused connection, bad string, auth) means "not available here"
-        catch (Exception)
-#pragma warning restore CA1031
-        {
-            return false;
-        }
     }
 
     // ── helpers ────────────────────────────────────────────────────────────

@@ -12,7 +12,9 @@ namespace Unified.Data.Tables.Tests;
 /// unit tests, these go through the actual Azure.Data.Tables SDK, so they catch serializer /
 /// persisted-type mismatches that in-memory mocks cannot.
 ///
-/// They self-skip when Azurite is not reachable, so they are safe to run anywhere (CI, other devs).
+/// They self-skip only when Azurite is not there at all (connection refused, host unreachable), so they
+/// are safe to run anywhere; any other probe failure fails them, and CI sets
+/// <c>UNIFIED_TABLES_REQUIRE_AZURITE=1</c> so an absent emulator fails them too.
 /// To run locally: start Azurite (e.g. <c>azurite --silent</c> or the VS Code Azurite extension),
 /// then <c>dotnet test</c>. They never touch any cloud Azure resource.
 /// </summary>
@@ -24,20 +26,16 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     private bool _available;
     private readonly List<(string Table, string PartitionKey, string RowKey)> _cleanup = new();
 
+    // Once per test run: skips only when the emulator is not there at all (see AzuriteProbe); any other
+    // probe failure, or an absent emulator with UNIFIED_TABLES_REQUIRE_AZURITE=1, fails the tests.
+    private static readonly Lazy<Task<bool>> Probe =
+        new(() => AzuriteProbe.ProbeAsync(AzuriteConnectionString, blobs: false, AzuriteProbe.Required));
+
     public async ValueTask InitializeAsync()
     {
-        try
-        {
+        _available = await Probe.Value;
+        if (_available)
             _service = new TableServiceClient(AzuriteConnectionString);
-            // Probe with a real network call. If Azurite is down this throws and every test skips.
-            await foreach (var _ in _service.QueryAsync(maxPerPage: 1))
-                break;
-            _available = true;
-        }
-        catch (Exception)
-        {
-            _available = false;
-        }
     }
 
     public async ValueTask DisposeAsync()

@@ -896,8 +896,12 @@ dotnet test  Unified.Data.Tables.slnx -c Release
 ```
 
 The test suite mixes fast unit tests (Azure SDK mocked with NSubstitute) with integration tests that run
-against a local **Azurite** emulator. The integration tests self-skip when Azurite is not reachable, so
-`dotnet test` is safe to run anywhere.
+against a local **Azurite** emulator (tables on port 10002, blobs on 10000). The integration tests skip
+only when nothing is listening there (connection refused, host unreachable), so `dotnet test` is safe to
+run anywhere; an emulator that answers but fails (a timeout, an error) fails them after three attempts.
+Set `UNIFIED_TABLES_REQUIRE_AZURITE=1` to make an absent emulator a failure too: CI does, and starts a
+pinned Azurite (3.35.0, `--loose --skipApiVersionCheck`) before the tests, so a release or pull request
+is never gated by skipped integration tests.
 
 ---
 

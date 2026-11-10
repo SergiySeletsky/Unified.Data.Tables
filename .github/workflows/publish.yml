@@ -38,7 +38,25 @@ jobs:
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version: ${VERSION:-<.csproj default>}"
 
+      # The Azurite integration tests must run, not skip, before anything is published: start the
+      # emulator (pinned, same flags as local development) and make an unreachable one a test failure.
+      - name: Start Azurite
+        shell: bash
+        run: |
+          docker run -d --name azurite -p 10000:10000 -p 10002:10002 \
+            mcr.microsoft.com/azure-storage/azurite:3.35.0 \
+            azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --loose --skipApiVersionCheck
+          for port in 10000 10002; do
+            for attempt in $(seq 1 60); do
+              if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then break; fi
+              if [ "$attempt" = 60 ]; then echo "Azurite did not open port $port"; docker logs azurite; exit 1; fi
+              sleep 1
+            done
+          done
+
       - name: Test
+        env:
+          UNIFIED_TABLES_REQUIRE_AZURITE: "1"
         run: dotnet test Unified.Data.Tables.slnx -c Release
 
       - name: Pack

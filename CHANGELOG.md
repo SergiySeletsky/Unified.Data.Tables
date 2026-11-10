@@ -81,6 +81,12 @@ Lossless storage of large values, opt-in per property.
 - `BlobOffloadOptions.ThresholdBytes` is validated: between 1 and `BlobOffloadOptions.MaxThresholdBytes`
   (4,194,304, one transaction's payload limit); anything else throws `ArgumentOutOfRangeException`.
 
+### Tests and CI
+
+- The Azurite integration tests skip only when the emulator is not reachable at all; any other probe
+  failure is retried and then fails the run. `UNIFIED_TABLES_REQUIRE_AZURITE=1` turns a skip into a
+  failure. The publish and pull-request workflows start a pinned Azurite 3.35.0 and set it.
+
 ### Unchanged
 
 - Types that opt into nothing produce the same columns and make the same SDK calls as 0.8.3.
