@@ -10,7 +10,7 @@ namespace Unified.Data.Tables;
 /// <summary>
 /// DI helpers for wiring the unified Azure Table Storage layer.
 /// </summary>
-public static class ServiceCollectionExtensions
+public static partial class ServiceCollectionExtensions
 {
     /// <summary>
     /// The DI key of the <see cref="BlobServiceClient"/> blob offload uses. The library registers it only

@@ -883,6 +883,62 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task HostedSweep_DeletesOrphansInEveryPartition_KeepsTheLiveBlob()
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(tableService);
+        services.AddUnifiedTableStorage(o => o.BlobOffload = new BlobOffloadOptions { ContainerName = containerName, ServiceClient = blobService });
+        services.AddUnifiedOrphanBlobSweep(o =>
+        {
+            o.InitialDelay = TimeSpan.Zero;
+            o.OlderThan = TimeSpan.Zero;
+        });
+        services.AddUnifiedOrphanBlobSweep<SplitTextEntity>();
+        await using var sp = services.BuildServiceProvider();
+        tables.Add(nameof(SplitTextEntity));
+        var store = sp.GetRequiredService<IStorage<SplitTextEntity>>();
+        var text = Ascii(3_200_000, seed: 30);
+        await store.CreateAsync(new SplitTextEntity { Id = Id("live"), Body = text }, Ct);
+        var live = Reference(Assert.Single(await RawRowsAsync<SplitTextEntity>()), "Body").Path;
+
+        var blobs = new AzureOffloadBlobStore(container);
+        var orphans = new List<string>();
+        foreach (var (partition, rk) in new[] { (pk + "-other", "crashed"), (pk, "crashed") })
+        {
+            var bytes = Utf8(partition + rk);
+            var sha = Sha(bytes);
+            var name = $"SplitTextEntity/{partition}/{rk}/Body/{sha}";
+            await using (var content = new MemoryStream(bytes))
+                await blobs.UploadCreateOnlyAsync(name, content, new BlobReference(name, sha, bytes.LongLength, "text/plain; charset=utf-8", "text"), null, Ct);
+            orphans.Add(name);
+        }
+        await PastTheServiceSecondAsync<SplitTextEntity>();
+
+        var service = sp.GetServices<Microsoft.Extensions.Hosting.IHostedService>().OfType<OrphanBlobSweepService>().Single();
+        var steps = new OrphanBlobSweepServiceTests.SteppedDelay();
+        service.Delay = steps.Delay;
+        await service.StartAsync(Ct);
+        try
+        {
+            await steps.StepAsync();
+            await steps.WaitingAsync();
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        var remaining = new List<string>();
+        await foreach (var item in container.GetBlobsAsync(cancellationToken: Ct))
+            remaining.Add(item.Name);
+        Assert.Equal([live], remaining);
+        Assert.Equal(text, (await store.OneAsync(Id("live"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.True(service.ExecuteTask!.IsCompletedSuccessfully);
+    }
+
+    [Fact]
     public async Task LegacyRowWithTheReservedShape_StaysDeletable()
     {
         Assert.SkipUnless(available, SkipReason);
