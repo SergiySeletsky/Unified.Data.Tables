@@ -11,6 +11,8 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
+    <!-- Binds to the main package's hidden provider SPI (Unified.Data.Tables.Providers) and the abstractions' internals, which may change in any minor version: depend on exactly the same version. See Directory.Build.targets. -->
+    <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
   </PropertyGroup>
 
   <ItemGroup>

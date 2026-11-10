@@ -1,0 +1,24 @@
+<Project>
+
+  <!--
+    Exact-version project dependencies. A package that binds to another package's internals
+    (InternalsVisibleTo) or to its hidden provider SPI (Unified.Data.Tables.Providers, which "may
+    change in any minor version") must not run against any other build of it: a project setting
+    PackExactProjectReferenceVersions=true packs every ProjectReference as [version] instead of
+    NuGet's default >= version, so a consumer can never pair, say, InMemory 0.9.0 with the main
+    package 0.10.0. NuGet has no ProjectReference metadata for this, hence the rewrite after pack
+    has resolved the referenced projects' versions.
+  -->
+  <Target Name="_UnifiedExactProjectReferenceVersions"
+          AfterTargets="_GetProjectReferenceVersions"
+          Condition="'$(PackExactProjectReferenceVersions)' == 'true'">
+    <ItemGroup>
+      <_UnifiedExactProjectReferences Include="@(_ProjectReferencesWithVersions)">
+        <ProjectVersion>[%(_ProjectReferencesWithVersions.ProjectVersion)]</ProjectVersion>
+      </_UnifiedExactProjectReferences>
+      <_ProjectReferencesWithVersions Remove="@(_ProjectReferencesWithVersions)" />
+      <_ProjectReferencesWithVersions Include="@(_UnifiedExactProjectReferences)" />
+    </ItemGroup>
+  </Target>
+
+</Project>
