@@ -62,27 +62,11 @@ public partial class TableStorage<T>
         return new PriorRow(response.Value.ETag, SplitRowLayout.PartCount(response.Value), BlobPaths(response.Value));
     }
 
-    // The blob names a stored row references. A malformed reference cannot name a blob to clean up, and
-    // must not block a write that replaces it, so it is logged and skipped.
-    private List<string> BlobPaths(TableEntity row)
-    {
-        var paths = new List<string>();
-        foreach (var (key, value) in row)
-        {
-            if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
-                continue;
-            try
-            {
-                paths.Add(BlobReference.Parse(column, value as string ?? string.Empty).Path);
-            }
-            catch (TableValueIntegrityException ex)
-            {
-                logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: ignoring a malformed blob reference in {Column}",
-                    typeName, row.PartitionKey, row.RowKey, column);
-            }
-        }
-        return paths;
-    }
+    // The blob names a stored row references; a malformed reference is logged and skipped.
+    private IReadOnlyList<string> BlobPaths(TableEntity row) =>
+        LargeValueTable.BlobPaths(row, (column, ex) =>
+            logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: ignoring a malformed blob reference in {Column}",
+                typeName, row.PartitionKey, row.RowKey, column));
 
     /// <summary>
     /// Writes a split-aware entity: one SDK call when the value fits one row and no continuation rows
@@ -100,13 +84,13 @@ public partial class TableStorage<T>
         try
         {
             // Hash every TableBlobContent once (a non-seekable one is copied to a temporary file).
-            await offload.PrepareAsync(entity, ct);
+            await large.PrepareAsync(entity, ct);
             return await WritePreparedAsync(entity, kind, ifMatch, pk, rk, ct);
         }
         finally
         {
             // A content the write did not get to bind to its blob gives its temporary copy back now.
-            ValueOffloadCoordinator.ReleasePrepared(entity);
+            LargeValueTable.ReleasePrepared(entity);
         }
     }
 
@@ -128,16 +112,16 @@ public partial class TableStorage<T>
                     throw new ConcurrencyConflictException(typeName, entity.Id, null);
             }
 
-            var (row, plan, blobs, stale) = await PlanWriteAsync(entity, pk, rk, prior, ct);
+            var plan = await large.PlanAsync(entity, pk, rk, prior?.Parts ?? 0, c => ExistingPartKeysAsync(pk, rk, c), ct);
             // Every blob exists (uploaded, or touched when already there) before the row that references it.
-            await offload.UploadAsync(blobs, ct);
+            await large.UploadAsync(plan, ct);
             // null = insert (no stored row); otherwise replace conditional on the version just read.
             ETag? condition = prior is null ? null : strict ? ifMatch : prior.ETag;
 
             LargeWriteResult result;
             try
             {
-                result = await SubmitPlanAsync(plan, stale, condition, pk, rk, ct);
+                result = await SubmitPlanAsync(plan, condition, pk, rk, ct);
             }
             catch (RequestFailedException ex) when (LostCondition(ex, kind))
             {
@@ -154,40 +138,21 @@ public partial class TableStorage<T>
             // The swap committed: the blobs only the replaced row referenced can go (the same content
             // written again maps to the same name, which the new row still references).
             if (prior is { Blobs.Count: > 0 })
-                await DeleteBlobsAsync(prior.Blobs.Except(BlobPaths(row), StringComparer.Ordinal), ct);
+                await DeleteBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), ct);
             return result;
         }
 
         throw new ConcurrencyConflictException(typeName, entity.Id, lost);
     }
 
-    /// <summary>
-    /// Serializes <paramref name="entity"/> onto a primary and its parts, offloading values to blobs
-    /// until the rows fit one transaction together with the deletes of the stored row's stale parts.
-    /// </summary>
-    private async Task<(TableEntity Row, SplitRowPlan Plan, IReadOnlyList<PendingBlob> Blobs, List<TableEntity> Stale)> PlanWriteAsync(
-        T entity, string pk, string rk, PriorRow? prior, CancellationToken ct)
-    {
-        var (row, plan, blobs) = offload.Serialize(entity, pk, rk, extraActions: 0);
-        // A shrink deletes the continuation rows that actually exist beyond the new plan, found by the
-        // range query rather than trusted from _SplitParts, so a part already gone is never required.
-        if (prior is null || prior.Parts <= plan.Parts.Count)
-            return (row, plan, blobs, []);
-
-        var existing = await QueryPartsAsync(pk, rk, PartKeys, ct);
-        var stale = StaleParts(existing, plan);
-        if (!SplitRowLayout.FitsOneTransaction(plan, stale.Count))
-        {
-            // Budget for deleting every existing part: the stale ones are a subset whatever the new plan.
-            (row, plan, blobs) = offload.Serialize(entity, pk, rk, extraActions: existing.Count);
-            stale = StaleParts(existing, plan);
-        }
-        return (row, plan, blobs, stale);
-    }
+    /// <summary>The row keys of the continuation rows of <paramref name="rk"/> that exist now (one range query).</summary>
+    private async Task<IReadOnlyList<string>> ExistingPartKeysAsync(string pk, string rk, CancellationToken ct) =>
+        (await QueryPartsAsync(pk, rk, PartKeys, ct)).Select(p => p.RowKey).ToList();
 
     private async Task<LargeWriteResult> SubmitPlanAsync(
-        SplitRowPlan plan, List<TableEntity> stale, ETag? condition, string pk, string rk, CancellationToken ct)
+        LargeValueWritePlan plan, ETag? condition, string pk, string rk, CancellationToken ct)
     {
+        var stale = plan.StalePartRowKeys;
         if (plan.Parts.Count == 0 && stale.Count == 0)
         {
             var response = condition is ETag c
@@ -204,8 +169,8 @@ public partial class TableStorage<T>
         };
         foreach (var part in plan.Parts)
             actions.Add(new TableTransactionAction(TableTransactionActionType.UpsertReplace, part));
-        foreach (var part in stale)
-            actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), ETag.All));
+        foreach (var partKey in stale)
+            actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, partKey), ETag.All));
 
         await client.SubmitTransactionAsync(actions, ct);
         // Transaction sub-responses are not correlated back to their actions: re-read the version.
@@ -214,63 +179,28 @@ public partial class TableStorage<T>
 
     /// <summary>
     /// Deletes blobs no row references any more, after the write or delete that released them has
-    /// committed. Each delete is conditional on the blob not having been modified within the cleanup
-    /// grace: a concurrent writer that reuses the same content touches the blob before committing its
-    /// row, so such a blob survives (the orphan sweep collects it if it really is unreferenced). Best
-    /// effort: a failure is logged, never thrown.
+    /// committed, each on condition that it was not modified within the cleanup grace (a concurrent
+    /// writer that reuses the same content touches the blob before committing its row; the orphan sweep
+    /// collects a blob that really is unreferenced). Best effort: a failure is logged, never thrown.
     /// </summary>
-    private async Task DeleteBlobsAsync(IEnumerable<string> paths, CancellationToken ct)
-    {
-        if (offloadBlobs is null)
-            return;
-        var unmodifiedSince = CleanupCutoff();
-        foreach (var path in paths)
-            await DeleteBlobAsync(path, unmodifiedSince, ct);
-    }
+    private Task DeleteBlobsAsync(IEnumerable<string> paths, CancellationToken ct) =>
+        large.DeleteReleasedBlobsAsync(paths, LogBlobDeleteFailure, ct);
 
-    // Blobs modified after this instant may be about to be referenced by a concurrent write: keep them.
-    private DateTimeOffset CleanupCutoff() => DateTimeOffset.UtcNow - cleanupGrace;
-
-    private async Task DeleteBlobAsync(string path, DateTimeOffset? unmodifiedSince, CancellationToken ct)
-    {
-        try
-        {
-            await offloadBlobs!.DeleteIfUnmodifiedAsync(path, unmodifiedSince, ct);
-        }
-#pragma warning disable CA1031 // the row change already committed: a cleanup failure must not turn it into an error
-        catch (Exception ex)
-#pragma warning restore CA1031
-        {
-            logger.LogWarning(ex, "{Type}: could not delete blob {Blob}; an orphan sweep will remove it", typeName, path);
-        }
-    }
+    private void LogBlobDeleteFailure(string path, Exception ex) =>
+        logger.LogWarning(ex, "{Type}: could not delete blob {Blob}; an orphan sweep will remove it", typeName, path);
 
     /// <summary>
     /// After a partition's rows are deleted, deletes every blob stored under it (best effort), each on
     /// condition that it was modified neither within the cleanup grace nor since it was listed, so a blob
     /// a concurrent write has just touched for a new row survives.
     /// </summary>
-    private async Task DeletePartitionBlobsAsync(string partition, CancellationToken ct)
+    private Task DeletePartitionBlobsAsync(string partition, CancellationToken ct)
     {
-        if (!LargeValueAware || offloadBlobs is null)
-            return;
-        var prefix = Uri.EscapeDataString(tableName) + "/" + Uri.EscapeDataString(partition) + "/";
-        var listed = new List<(string Name, DateTimeOffset LastModified)>();
-        try
-        {
-            await foreach (var blob in offloadBlobs.ListAsync(prefix, ct))
-                listed.Add(blob);
-        }
-#pragma warning disable CA1031 // the rows are already deleted: a cleanup failure must not turn that into an error
-        catch (Exception ex)
-#pragma warning restore CA1031
-        {
-            logger.LogWarning(ex, "{Type}: could not list the blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition);
-            return;
-        }
-        var cutoff = CleanupCutoff();
-        foreach (var (name, lastModified) in listed)
-            await DeleteBlobAsync(name, lastModified < cutoff ? lastModified : cutoff, ct);
+        if (!LargeValueAware)
+            return Task.CompletedTask;
+        return large.DeletePartitionBlobsAsync(partition,
+            ex => logger.LogWarning(ex, "{Type}: could not list the blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition),
+            LogBlobDeleteFailure, ct);
     }
 
     /// <summary>
@@ -281,8 +211,7 @@ public partial class TableStorage<T>
     {
         if (!LargeValueAware)
             return row.FromTableEntity<T>();
-        var ctx = await offload.ResolveAsync(row, typeof(T), projectedColumns: null, ct);
-        return TableEntitySerializer.FromTableEntity<T>(row, ctx);
+        return await large.ReadAsync<T>(row, ct);
     }
 
     /// <summary>True when the row references a blob (a value that cannot be deserialized from the row alone).</summary>
@@ -327,13 +256,6 @@ public partial class TableStorage<T>
         {
             return null;
         }
-    }
-
-    // The existing continuation rows the new plan no longer writes.
-    private static List<TableEntity> StaleParts(List<TableEntity> existing, SplitRowPlan plan)
-    {
-        var kept = new HashSet<string>(plan.Parts.Select(p => p.RowKey), StringComparer.Ordinal);
-        return existing.Where(p => !kept.Contains(p.RowKey)).ToList();
     }
 
     /// <summary>The continuation rows of <paramref name="rk"/> that exist now (one range query).</summary>

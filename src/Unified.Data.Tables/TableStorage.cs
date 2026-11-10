@@ -54,13 +54,9 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
     // The resolved table name (also the first segment of every offloaded blob name).
     private readonly string tableName;
 
-    // The blob store for offloaded values; null when blob offload is not configured (or T cannot use it).
-    private readonly IOffloadBlobStore? offloadBlobs;
-
-    private readonly ValueOffloadCoordinator offload;
-
-    // Cleanup deletes only blobs not modified within this grace (BlobOffloadOptions.CleanupGrace).
-    private readonly TimeSpan cleanupGrace;
+    // The large-value rules of this table (split rows, blob offload, cleanup), shared with other
+    // providers through the storage-provider SPI so they run the same code.
+    private readonly LargeValueTable large;
 
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger)
@@ -122,9 +118,7 @@ public partial class TableStorage<T> : IStorage<T> where T : class, IEntity, new
         tableName = ResolveTableName(opts);
         client = serviceClient.GetTableClient(tableName);
         tableInitializer = new TableInitializer(client);
-        offloadBlobs = opts.BlobOffload is null ? null : blobs;
-        cleanupGrace = opts.BlobOffload?.CleanupGrace ?? TimeSpan.Zero;
-        offload = new ValueOffloadCoordinator(offloadBlobs, opts.BlobOffload, tableName);
+        large = new LargeValueTable(tableName, opts.BlobOffload, blobs);
     }
 
     // The Azure blob container for this store's offloaded values. Built only for a type that can carry
