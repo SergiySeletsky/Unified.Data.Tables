@@ -65,6 +65,8 @@ Lossless storage of large values, opt-in per property.
 - `[TableValueSplit]` on a property of an interface or abstract (non-collection) type is refused with
   `NotSupportedException` on first use of the type: such a value may flatten into columns at runtime, where
   the attribute was silently ignored.
+- A create-only blob upload that conflicts with an orphan which a sweep deletes before the follow-up state
+  read uploads again (three attempts in all) instead of failing the write with an integrity error.
 
 ### Unchanged
 

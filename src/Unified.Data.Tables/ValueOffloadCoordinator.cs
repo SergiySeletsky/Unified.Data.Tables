@@ -175,7 +175,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             }
 
             if (!exists)
-                await UploadOneAsync(store, blob, ct);
+                await UploadWithRetryAsync(store, blob, ct);
         }
 
         // Bind only once every blob exists: one content assigned to two properties is uploaded twice
@@ -197,6 +197,38 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         ArgumentNullException.ThrowIfNull(entity);
         foreach (var (_, content) in TableEntitySerializer.FindBlobContents(entity))
             content.ReleasePrepared();
+    }
+
+    /// <summary>How many times a create-only upload that lost its blob to a concurrent delete is retried in all.</summary>
+    internal const int MaxUploadAttempts = 3;
+
+    // A create-only upload can conflict with an existing blob (an orphan of the same content) that an
+    // orphan sweep then deletes before the store reads it back, so the store reports an integrity
+    // failure for a blob that is simply gone. When the blob is indeed gone, upload again (from a newly
+    // opened source); a blob that exists with another hash, or any other failure, is not retried.
+    private static async Task UploadWithRetryAsync(IOffloadBlobStore store, PendingBlob blob, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await UploadOneAsync(store, blob, ct);
+                return;
+            }
+            catch (TableValueIntegrityException) when (attempt < MaxUploadAttempts)
+            {
+                // Swept between the conflict and the state read: try again. Re-created meanwhile with the
+                // same content: done. Otherwise (another hash, or a different failure) report it.
+                var state = await store.GetStateAsync(blob.Reference.Path, ct);
+                if (state is not null)
+                {
+                    if (!string.Equals(state.Sha256, blob.Reference.Sha256, StringComparison.OrdinalIgnoreCase))
+                        throw;
+                    await store.TouchAsync(blob.Reference.Path, ct);
+                    return;
+                }
+            }
+        }
     }
 
     private static async Task UploadOneAsync(IOffloadBlobStore store, PendingBlob blob, CancellationToken ct)

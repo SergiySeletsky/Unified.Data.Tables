@@ -118,6 +118,44 @@ public class AzureOffloadBlobStoreTests
     }
 
     [Fact]
+    public async Task Upload_409_ThenSweptBeforeTheStateRead_UploadsAgain()
+    {
+        // A create-only upload conflicts with an orphan, which a sweep deletes before the follow-up state
+        // read: the write must upload again rather than fail with an integrity error.
+        var rig = new Rig();
+        rig.Container.GetBlobClient(Arg.Any<string>()).Returns(rig.Blob);
+        rig.Blob.GetPropertiesAsync(Arg.Any<BlobRequestConditions>(), Arg.Any<CancellationToken>())
+            .ThrowsAsync(Status(404, "BlobNotFound"));
+        var uploads = 0;
+        rig.Blob.UploadAsync(Arg.Any<Stream>(), Arg.Any<BlobUploadOptions>(), Arg.Any<CancellationToken>())
+            .Returns(_ => ++uploads == 1
+                ? Task.FromException<Response<BlobContentInfo>>(Status(409, "BlobAlreadyExists"))
+                : Task.FromResult<Response<BlobContentInfo>>(null!));
+        var coordinator = new ValueOffloadCoordinator(rig.Store, new BlobOffloadOptions { ThresholdBytes = 1_000 }, "T");
+        var (_, _, pending) = coordinator.Serialize(new SplitTextEntity { Body = new string('a', 40_000) }, "p", "r", 0);
+
+        await coordinator.UploadAsync(pending, Ct);
+
+        Assert.Equal(2, uploads);
+    }
+
+    [Fact]
+    public async Task Upload_KeepsConflictingWithAVanishingBlob_GivesUpAfterThreeAttempts()
+    {
+        var rig = new Rig();
+        rig.Container.GetBlobClient(Arg.Any<string>()).Returns(rig.Blob);
+        rig.Blob.GetPropertiesAsync(Arg.Any<BlobRequestConditions>(), Arg.Any<CancellationToken>())
+            .ThrowsAsync(Status(404, "BlobNotFound"));
+        rig.Blob.UploadAsync(Arg.Any<Stream>(), Arg.Any<BlobUploadOptions>(), Arg.Any<CancellationToken>())
+            .ThrowsAsync(Status(409, "BlobAlreadyExists"));
+        var coordinator = new ValueOffloadCoordinator(rig.Store, new BlobOffloadOptions { ThresholdBytes = 1_000 }, "T");
+        var (_, _, pending) = coordinator.Serialize(new SplitTextEntity { Body = new string('a', 40_000) }, "p", "r", 0);
+
+        await Assert.ThrowsAsync<TableValueIntegrityException>(() => coordinator.UploadAsync(pending, Ct));
+        await rig.Blob.Received(3).UploadAsync(Arg.Any<Stream>(), Arg.Any<BlobUploadOptions>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task GetState_ReadsMetadata_404IsNull()
     {
         var rig = new Rig();
