@@ -190,4 +190,30 @@ public class SplitCodecTests
     [InlineData("__c1")]
     public void TryParseLargeValueColumn_RejectsOthers(string column) =>
         Assert.False(SplitCodec.TryParseLargeValueColumn(column, out _, out _, out _));
+
+    [Theory]
+    [InlineData("Tags__Json")]
+    [InlineData("Tags__GZip")]
+    [InlineData("Tags__Truncated")]
+    [InlineData("Plain")]
+    [InlineData("Body__c")]
+    public void TryParseLargeValueColumn_OnAColumnThatIsNotOurs_AllocatesNothing(string column)
+    {
+        // Asked of every column of every row read: a plain type's __Json/__GZip fallbacks must cost nothing.
+        Assert.False(SplitCodec.TryParseLargeValueColumn(column, out _, out _, out _));
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 100; i++)
+            SplitCodec.TryParseLargeValueColumn(column, out _, out _, out _);
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+    }
+
+    [Fact]
+    public void ToTableEntity_WithOffloadButNoPendingList_IsRefused()
+    {
+        var ctx = new ValueWriteContext(new BlobOffloadOptions(), "T", new HashSet<string>(), IsClone: false);
+        Assert.Throws<ArgumentNullException>(() =>
+            TableEntitySerializer.ToTableEntity(new SplitTextEntity { Body = "x" }, "p", "r", ctx, pending: null));
+        // A context without offload never produces a pending blob, so it needs no list.
+        Assert.Equal("x", TableEntitySerializer.ToTableEntity(new SplitTextEntity { Body = "x" }, "p", "r", ValueWriteContext.ForClone, pending: null)["Body"]);
+    }
 }

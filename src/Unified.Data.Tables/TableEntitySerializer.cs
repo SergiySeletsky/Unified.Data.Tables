@@ -46,26 +46,29 @@ public static class TableEntitySerializer
         string partitionKey,
         string rowKey,
         bool persistType = false)
-        => Build(root, partitionKey, rowKey, persistType, ValueWriteContext.Public, []);
+        => Build(root, partitionKey, rowKey, persistType, ValueWriteContext.Public, pending: null);
 
     /// <summary>
     /// Flatten <paramref name="root"/> under a storage write context: <paramref name="ctx"/> decides
-    /// how large values are stored and <paramref name="pending"/> collects the blobs to upload first.
+    /// how large values are stored and <paramref name="pending"/> collects the blobs to upload first. A
+    /// context without blob offload (<see cref="ValueWriteContext.ForClone"/>) never produces one, so its
+    /// callers pass null rather than allocate an empty list per call.
     /// </summary>
     internal static TableEntity ToTableEntity(
         object root,
         string partitionKey,
         string rowKey,
         ValueWriteContext ctx,
-        List<PendingBlob> pending)
+        List<PendingBlob>? pending)
     {
         ArgumentNullException.ThrowIfNull(ctx);
-        ArgumentNullException.ThrowIfNull(pending);
+        if (pending is null && ctx.Offload is not null)
+            throw new ArgumentNullException(nameof(pending), "A write with blob offload must collect its pending blobs.");
         return Build(root, partitionKey, rowKey, persistType: false, ctx, pending);
     }
 
     private static TableEntity Build(
-        object root, string partitionKey, string rowKey, bool persistType, ValueWriteContext ctx, List<PendingBlob> pending)
+        object root, string partitionKey, string rowKey, bool persistType, ValueWriteContext ctx, List<PendingBlob>? pending)
     {
         var entity = new TableEntity(partitionKey, rowKey);
         if (root == null) return entity;
@@ -445,7 +448,7 @@ public static class TableEntitySerializer
 
         var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
         var node = new TableEntityValue(ImmutableList<string>.Empty.Add(propertyName), value);
-        var state = new FlattenState(ValueWriteContext.Public, [], Partial: true, string.Empty, string.Empty);
+        var state = new FlattenState(ValueWriteContext.Public, Pending: null, Partial: true, string.Empty, string.Empty);
         if (!Flatten(dict, seen, node, state, split: null))
             throw new InvalidOperationException($"Cannot flatten property '{propertyName}' of type {value.GetType()}.");
 
@@ -728,7 +731,15 @@ public static class TableEntitySerializer
 /// update (which must refuse large values), and the row keys blob names are built from.
 /// </summary>
 internal readonly record struct FlattenState(
-    ValueWriteContext Ctx, List<PendingBlob> Pending, bool Partial, string PartitionKey, string RowKey);
+    ValueWriteContext Ctx, List<PendingBlob>? Pending, bool Partial, string PartitionKey, string RowKey)
+{
+    /// <summary>
+    /// Records a blob to upload before the entity write. Only a context with blob offload produces one,
+    /// and its caller always collects them; a null list here is a bug, never silently dropped.
+    /// </summary>
+    public void AddPending(PendingBlob blob) =>
+        (Pending ?? throw new InvalidOperationException("A write without blob offload produced a pending blob.")).Add(blob);
+}
 
 internal enum TableEntityValueFormat { Raw, Json, GZip }
 
@@ -1075,7 +1086,7 @@ internal sealed class TableEntityValue
                 var bytes = stored.Bytes;
                 var reference = new Providers.BlobReference(
                     BlobName(ctx, st, columnName, stored.Sha256), stored.Sha256, bytes.Length, contentType, stored.Enc);
-                st.Pending.Add(new PendingBlob(columnName, reference, stored.Enc == "gzip" ? "gzip" : null,
+                st.AddPending(new PendingBlob(columnName, reference, stored.Enc == "gzip" ? "gzip" : null,
                     _ => Task.FromResult<Stream>(new MemoryStream(bytes, writable: false))));
                 largeCells = [new(columnName + SplitCodec.BlobSuffix, reference.ToJson())];
                 return true;
@@ -1124,7 +1135,7 @@ internal sealed class TableEntityValue
         var st = state!.Value;
         var reference = new Providers.BlobReference(
             BlobName(ctx, st, columnName, blob.Sha256), blob.Sha256, blob.Length, blob.ContentType, "binary");
-        st.Pending.Add(new PendingBlob(columnName, reference, null, OpenSource(blob)) { Content = blob });
+        st.AddPending(new PendingBlob(columnName, reference, null, OpenSource(blob)) { Content = blob });
         largeCells = [new(columnName + SplitCodec.BlobSuffix, reference.ToJson())];
         return true;
     }

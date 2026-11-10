@@ -714,10 +714,15 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
     public async Task ConnectionStringRegistration_EmulatorShortcut_RegistersBlobClient_AndOffloads()
     {
         // The emulator shortcut is not an Azure Storage host name, yet it must still get a blob client.
+        // It is registered only under the library's own key: the host's BlobServiceClient slot stays free.
         var shortcut = new ServiceCollection();
-        shortcut.AddUnifiedTableStorage(DevelopmentStorage);
+        shortcut.AddUnifiedTableStorage(DevelopmentStorage, o => o.BlobOffload = Offload());
         using (var provider = shortcut.BuildServiceProvider())
-            Assert.Equal("devstoreaccount1", provider.GetRequiredService<BlobServiceClient>().AccountName);
+        {
+            Assert.Equal("devstoreaccount1",
+                provider.GetRequiredKeyedService<BlobServiceClient>(ServiceCollectionExtensions.OffloadBlobServiceClientKey).AccountName);
+            Assert.Null(provider.GetService<BlobServiceClient>());
+        }
 
         Assert.SkipUnless(available, SkipReason);
         var services = new ServiceCollection();
@@ -732,6 +737,64 @@ public sealed class AzuriteLargeValueIntegrationTests : IAsyncLifetime
 
         Assert.Equal(text, (await sp.GetRequiredService<IStorage<SplitTextEntity>>().OneAsync(Id("di1"), Ct))!.Body, StringComparer.Ordinal);
         Assert.Single(await BlobsAsync<SplitTextEntity>());
+    }
+
+    [Fact]
+    public async Task ExplicitServiceClientRegistration_Offloads()
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(tableService);
+        var offload = Offload();
+        offload.ServiceClient = blobService;
+        services.AddUnifiedTableStorage(o => o.BlobOffload = offload);
+        await using var sp = services.BuildServiceProvider();
+        tables.Add(nameof(SplitTextEntity));
+        var text = Ascii(3_200_000, seed: 31);
+
+        await sp.GetRequiredService<IStorage<SplitTextEntity>>().CreateAsync(new SplitTextEntity { Id = Id("ex1"), Body = text }, Ct);
+
+        Assert.Equal(text, (await sp.GetRequiredService<IStorage<SplitTextEntity>>().OneAsync(Id("ex1"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Single(await BlobsAsync<SplitTextEntity>());
+        Assert.Contains(requests, r => r.Service == "blob");
+    }
+
+    [Fact]
+    public async Task RegisteredServiceClient_IsUsed_OnlyWhenTheOptionsSaySo()
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(tableService);
+        var offload = Offload();
+        offload.UseRegisteredServiceClient = true;
+        services.AddUnifiedTableStorage(o => o.BlobOffload = offload);
+        services.AddSingleton(blobService); // the host's own client, registered after the library
+        await using var sp = services.BuildServiceProvider();
+        tables.Add(nameof(SplitTextEntity));
+        var text = Ascii(3_200_000, seed: 37);
+
+        await sp.GetRequiredService<IStorage<SplitTextEntity>>().CreateAsync(new SplitTextEntity { Id = Id("hr1"), Body = text }, Ct);
+
+        Assert.Equal(text, (await sp.GetRequiredService<IStorage<SplitTextEntity>>().OneAsync(Id("hr1"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Single(await BlobsAsync<SplitTextEntity>());
+        Assert.Same(blobService, sp.GetRequiredService<BlobServiceClient>());
+    }
+
+    [Fact]
+    public async Task StoreWithoutOffload_ReadingAnOffloadedRow_ThrowsNotConfigured()
+    {
+        Assert.SkipUnless(available, SkipReason);
+        var text = Ascii(3_200_000, seed: 41);
+        await Store<SplitTextEntity>().CreateAsync(new SplitTextEntity { Id = Id("nc1"), Body = text }, Ct);
+        using var cache = new MemoryCache(new MemoryCacheOptions());
+        var plain = new TableStorage<SplitTextEntity>(tableService, cache, NullLogger<TableStorage<SplitTextEntity>>.Instance, null, new UnifiedTableStorageOptions());
+
+        var ex = await Assert.ThrowsAsync<BlobOffloadNotConfiguredException>(() => plain.OneAsync(Id("nc1"), Ct));
+
+        Assert.Equal("Body", ex.ColumnName);
+        Assert.Equal(nameof(SplitTextEntity), ex.TableName);
     }
 
     // ── '~' in row keys ────────────────────────────────────────────────────

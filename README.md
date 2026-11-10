@@ -78,7 +78,11 @@ This is shipped as four packages:
 | **Unified.Data.Tables.InMemory** | `InMemoryStorage<T>` — serializer-faithful in-memory `IStorage<T>` | test projects, dev/offline mode |
 | **Unified.Data.Tables.Identity** | ASP.NET Core Identity `IUserStore`/`IRoleStore` persisted through `IStorage<T>` | hosts using ASP.NET Core Identity |
 
-`Unified.Data.Tables` references the abstractions transitively, so most apps just install it. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone.
+`Unified.Data.Tables` references the abstractions transitively, so most apps just install it. The
+implementation packages pin each other exactly: `Unified.Data.Tables` depends on
+`Unified.Data.Tables.Abstractions` `[x.y.z]` and `Unified.Data.Tables.InMemory` on `Unified.Data.Tables`
+`[x.y.z]` (they share internals), so upgrade them together. Blob offload needs `Azure.Storage.Blobs`
+12.29.2 or later. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone.
 
 Requires **.NET 10** and an Azure Storage account (or the local [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator).
 
@@ -583,13 +587,27 @@ services.AddUnifiedTableStorage(o =>
 });
 ```
 
-`TableStorage<T>` takes a `BlobServiceClient` from DI like it does `TableServiceClient`. The
-connection-string overload registers one from the same string only for Azure Storage hosts or
-`UseDevelopmentStorage=true`; the credential overload derives the blob endpoint only for `*.table.core.*` hosts (a Cosmos
-`.table.cosmos.azure.com` endpoint is not derived).
-For a custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a Cosmos Table API host,
-register your own `BlobServiceClient`. Without offload configured, tiers 1 and 2 still work and a value
-that needs tier 3 throws `OversizedValueException`.
+The blob client is chosen only when `BlobOffload` is set, in this order, and the library never registers
+or replaces the host's own `BlobServiceClient` service:
+
+1. `BlobOffloadOptions.ServiceClient`, when set (also honoured by the `TableStorage<T>` constructors);
+2. the `BlobServiceClient` the host registers in DI, only when `BlobOffloadOptions.UseRegisteredServiceClient`
+   is `true` (resolved lazily, so it may be registered before or after `AddUnifiedTableStorage`);
+3. one the overload derives, kept to the library: the connection-string overload builds it from the same
+   string when it has a blob endpoint (`BlobEndpoint`, `UseDevelopmentStorage=true`, or an `AccountName`
+   with no `TableEndpoint` or an Azure Storage one); the credential overload derives
+   `{account}.blob.core.{suffix}` only for `*.table.core.*` hosts (not Cosmos `.table.cosmos.azure.com`).
+
+```csharp
+services.AddUnifiedTableStorage(o => o.BlobOffload = new BlobOffloadOptions
+{
+    ServiceClient = new BlobServiceClient(blobUri, credential),   // or UseRegisteredServiceClient = true
+});
+```
+
+With no client found, only types that have `[TableValueSplit]` or `TableBlobContent` members fail to resolve
+(`InvalidOperationException` naming the fix); every other `IStorage<T>` resolves as before. Without offload
+configured, tiers 1 and 2 still work and a value that needs tier 3 throws `OversizedValueException`.
 
 The container belongs to offload alone: do not store other blobs in it. Sweeps and partition deletes
 only ever delete names of the exact offload shape (see below) and skip anything else, but they list
@@ -631,8 +649,9 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
   - the public `FromTableEntity<T>()`, or a store whose type has no `[TableValueSplit]` or
     `TableBlobContent` property, throws `InvalidOperationException`;
   - a store whose type has such properties but no `BlobOffload` configured throws
-    `TableValueIntegrityException` ("blob offload is not configured") from the read. A `TableBlobContent`
-    property is still read lazily, and throws that `TableValueIntegrityException` when it is opened.
+    `BlobOffloadNotConfiguredException` (an `InvalidOperationException` with `TableName` and `ColumnName`; a
+    configuration error, not corruption, and not retried) from the read. A `TableBlobContent` property is
+    still read lazily, and throws that exception when it is opened.
 
   Only a projection (`QueryOptions.Select`) that omits the property leaves it at its default. Split cells are
   reassembled by any reader; a plain reader that sees a split row without its continuation rows throws
@@ -704,6 +723,24 @@ together as an `AggregateException` whose message says how many blobs were delet
 - Storage-provider SPI types (namespace `Unified.Data.Tables.Providers`) are public only so other
   providers, such as the in-memory package, can share the implementation. They are hidden from
   IntelliSense and not for application code.
+
+### Sizing your own transactions: `TableRequestSize`
+
+Code that builds its own `TableTransactionAction` lists can measure them as the library's planners do:
+
+```csharp
+long stored = TableRequestSize.EstimateEntityBytes(entity);      // vs MaxEntityBytes (1,000,000)
+long wire = TableRequestSize.EstimateEntityWireBytes(entity);    // upper bound of the JSON body the SDK sends
+bool fits = TableRequestSize.FitsOneTransaction(actions);        // one partition, <= 100 actions,
+                                                                 // <= 3,000,000 B stored, <= 4 MiB - 64 KiB on the wire
+```
+
+The wire estimate counts JSON escaping (six bytes for every non-ASCII character and for
+`"`, `\`, `<`, `>`, `&`, `'`, `+` and `` ` ``), base64 binary and an `@odata.type` annotation for every value other than a string,
+`bool` or `int` (doubles included). A `TableEntity` is measured as is; another `ITableEntity` as the SDK
+serializes a model (public properties, `[IgnoreDataMember]` skipped, `[DataMember(Name)]` honoured).
+`MaxTransactionActions`, `MaxTransactionPayloadBytes`, `MaxTransactionWireBytes`, `MaxTransactionEntityBytes`,
+`MaxEntityBytes` and `MaxEntityProperties` are public constants.
 
 ---
 
@@ -819,7 +856,8 @@ enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `
 `ConcurrencyConflictException` per `ConcurrencyMode`, deletes are idempotent,
 and results arrive in lexical key order — so a green test against the fake means the same code holds
 against Azure Tables. `[TableValueSplit]` and `TableBlobContent` work too: the fake keeps offloaded blobs in
-an in-memory dictionary, with the same integrity checks and `SweepOrphanBlobsAsync` support.
+an in-memory dictionary, with the same integrity checks and `SweepOrphanBlobsAsync` support (it needs no
+`BlobServiceClient` and ignores `BlobOffloadOptions.ServiceClient`).
 
 The polymorphic store has the same mirror, keyed the same way:
 

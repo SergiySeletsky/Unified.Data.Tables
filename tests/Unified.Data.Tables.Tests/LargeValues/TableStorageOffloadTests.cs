@@ -462,22 +462,26 @@ public class TableStorageOffloadTests
     }
 
     [Fact]
-    public async Task OptedInStore_WithoutBlobOffload_ReadingAnOffloadedRow_ThrowsIntegrity()
+    public async Task OptedInStore_WithoutBlobOffload_ReadingAnOffloadedRow_ThrowsNotConfigured()
     {
         // The type opts the property in, but this store has no BlobOffload: the reference is recognized
-        // and cannot be fetched, which is an integrity failure (never an empty value).
+        // and cannot be fetched. That is a configuration error, never an empty value and never "corruption".
         var inner = new InMemoryOffloadBlobStore();
         var row = await WrittenRow(inner, new SplitTextEntity { Id = Id, Body = BigText, Title = "t" });
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet(Pk, Rk, row);
 
-        var ex = await Assert.ThrowsAsync<TableValueIntegrityException>(() => h.Store.OneAsync(Id, Ct));
+        var ex = await Assert.ThrowsAsync<BlobOffloadNotConfiguredException>(() => h.Store.OneAsync(Id, Ct));
+        Assert.Equal("Body", ex.ColumnName);
+        Assert.Equal(nameof(SplitTextEntity), ex.TableName);
         Assert.Contains("blob offload is not configured", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("Body", ex.Message, StringComparison.Ordinal);
+        Assert.IsAssignableFrom<InvalidOperationException>(ex);
+        // Not retried as a torn read: one point read only.
+        await h.Table.Received(1).GetEntityIfExistsAsync<TableEntity>(Pk, Rk, Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
-    public async Task TableBlobContentStore_WithoutBlobOffload_ReadsLazily_ThrowsIntegrityWhenOpened()
+    public async Task TableBlobContentStore_WithoutBlobOffload_ReadsLazily_ThrowsNotConfiguredWhenOpened()
     {
         var inner = new InMemoryOffloadBlobStore();
         var row = await WrittenRow(inner, new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1, 2, 3], "image/png"), Title = "t" });
@@ -487,8 +491,9 @@ public class TableStorageOffloadTests
         var read = await h.Store.OneAsync(Id, Ct);
 
         Assert.NotNull(read?.File);
-        var ex = await Assert.ThrowsAsync<TableValueIntegrityException>(() => read!.File!.OpenReadAsync(Ct));
-        Assert.Contains("blob offload is not configured", ex.Message, StringComparison.Ordinal);
+        var ex = await Assert.ThrowsAsync<BlobOffloadNotConfiguredException>(() => read!.File!.OpenReadAsync(Ct));
+        Assert.Equal("File", ex.ColumnName);
+        Assert.Equal(nameof(FileEntity), ex.TableName);
     }
 
     [Fact]

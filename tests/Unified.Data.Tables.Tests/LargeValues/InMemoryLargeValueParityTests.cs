@@ -260,6 +260,38 @@ public class InMemoryLargeValueParityTests
     }
 
     [Fact]
+    public async Task NoOffloadConfigured_ReadingAnOffloadedRow_ThrowsNotConfigured_LikeTableStorage()
+    {
+        // A row written by an offloading store, read by one without BlobOffload: a configuration error.
+        var writer = Store<ParityEntity>();
+        var entity = Make("text", 3_200_000);
+        await writer.CreateAsync(entity, Ct);
+        var row = writer.PhysicalRow(Pk, "r")!;
+        Assert.True(row.ContainsKey("Body__blob"));
+        var reader = Store<ParityEntity>(offload: false);
+        reader.SeedPhysicalRow(row);
+
+        var one = await Assert.ThrowsAsync<BlobOffloadNotConfiguredException>(() => reader.OneAsync(Id, Ct));
+        Assert.Equal("Body", one.ColumnName);
+        Assert.Equal(nameof(ParityEntity), one.TableName);
+        await Assert.ThrowsAsync<BlobOffloadNotConfiguredException>(() => reader.QueryAsync(new QueryOptions { Partition = Pk }, Ct));
+    }
+
+    [Fact]
+    public async Task NoOffloadConfigured_OpeningAnOffloadedFile_ThrowsNotConfigured_LikeTableStorage()
+    {
+        var writer = Store<FileEntity>();
+        await writer.CreateAsync(new FileEntity { Id = Id, File = TableBlobContent.FromBytes([1, 2, 3], "image/png") }, Ct);
+        var reader = Store<FileEntity>(offload: false);
+        reader.SeedPhysicalRow(writer.PhysicalRow(Pk, "r")!);
+
+        var read = await reader.OneAsync(Id, Ct);
+
+        var ex = await Assert.ThrowsAsync<BlobOffloadNotConfiguredException>(() => read!.File!.OpenReadAsync(Ct));
+        Assert.Equal("File", ex.ColumnName);
+    }
+
+    [Fact]
     public async Task Exceptions_MatchTableStorage()
     {
         var store = Store<ParityEntity>();

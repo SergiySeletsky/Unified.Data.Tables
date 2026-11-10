@@ -148,13 +148,14 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// through a read that verifies the bytes still match what was prepared. Each
     /// <see cref="TableBlobContent"/> is then bound to its blob.
     /// </summary>
-    /// <exception cref="InvalidOperationException">Blob offload is not configured, or a source changed after it was prepared.</exception>
+    /// <exception cref="BlobOffloadNotConfiguredException">Blob offload is not configured.</exception>
+    /// <exception cref="InvalidOperationException">A source changed after it was prepared.</exception>
     /// <exception cref="TableValueIntegrityException">A blob of that name exists with a different hash.</exception>
     internal async Task UploadAsync(IReadOnlyList<PendingBlob> pending, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(pending);
         if (pending.Count == 0) return;
-        var store = blobs ?? throw new InvalidOperationException("Blob offload is not configured.");
+        var store = blobs ?? throw new BlobOffloadNotConfiguredException(tableName, pending[0].Column);
 
         foreach (var blob in pending)
         {
@@ -285,6 +286,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// <param name="projectedColumns">The caller's projection, or null for the whole entity.</param>
     /// <param name="ct">Cancels downloads.</param>
     /// <exception cref="TableValueIntegrityException">A blob is missing, malformed, or fails verification.</exception>
+    /// <exception cref="BlobOffloadNotConfiguredException">A reference is in scope and blob offload is not configured.</exception>
     internal async Task<ValueReadContext> ResolveAsync(
         TableEntity row, Type entityType, IReadOnlyCollection<string>? projectedColumns, CancellationToken ct)
     {
@@ -309,8 +311,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
             var reference = BlobReference.Parse(column,
                 value as string ?? throw new TableValueIntegrityException(column, "the blob reference is not a string."));
-            var store = blobs ?? throw new TableValueIntegrityException(column,
-                "the value is stored in blob storage, but blob offload is not configured.");
+            var store = blobs ?? throw new BlobOffloadNotConfiguredException(tableName, column);
             var bytes = await DownloadAsync(store, column, reference, ct);
             resolved ??= new Dictionary<string, object>(StringComparer.Ordinal);
             resolved[column] = SplitCodec.FromStored(column, bytes, reference.Encoding, reference.Sha256);
@@ -324,7 +325,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 reference.Length, reference.Sha256, reference.ContentType, reference.Path,
                 c => store is not null
                     ? OpenLazyAsync(store, column, reference.Path, c)
-                    : throw new TableValueIntegrityException(column, "the value is stored in blob storage, but blob offload is not configured."),
+                    : throw new BlobOffloadNotConfiguredException(tableName, column),
                 column);
         }
         return new ValueReadContext(resolved ?? NothingResolved, lazy, projectedColumns);

@@ -233,16 +233,18 @@ internal static class SplitCodec
         index = 0;
         var at = column.LastIndexOf("__", StringComparison.Ordinal);
         if (at <= 0) return false;
-        var suffix = column.Substring(at + 2);
+        // Compared as a span: every row read asks this of each column, and most columns (a plain
+        // '__Json' or '__GZip' fallback, any other name) are not ours, so nothing is allocated for them.
+        var suffix = column.AsSpan(at + 2);
         LargeValueCellKind parsed;
         var parsedIndex = 0;
-        if (suffix == "chunks") parsed = LargeValueCellKind.Count;
-        else if (suffix == "sha256") parsed = LargeValueCellKind.Sha256;
-        else if (suffix == "enc") parsed = LargeValueCellKind.Encoding;
-        else if (suffix == "len") parsed = LargeValueCellKind.Length;
-        else if (suffix == "blob") parsed = LargeValueCellKind.BlobReference;
+        if (suffix.SequenceEqual("chunks")) parsed = LargeValueCellKind.Count;
+        else if (suffix.SequenceEqual("sha256")) parsed = LargeValueCellKind.Sha256;
+        else if (suffix.SequenceEqual("enc")) parsed = LargeValueCellKind.Encoding;
+        else if (suffix.SequenceEqual("len")) parsed = LargeValueCellKind.Length;
+        else if (suffix.SequenceEqual("blob")) parsed = LargeValueCellKind.BlobReference;
         else if (suffix.Length > 1 && suffix[0] == 'c'
-            && int.TryParse(suffix.AsSpan(1), NumberStyles.None, CultureInfo.InvariantCulture, out parsedIndex))
+            && int.TryParse(suffix[1..], NumberStyles.None, CultureInfo.InvariantCulture, out parsedIndex))
             parsed = LargeValueCellKind.Chunk;
         else return false;
         baseColumn = column.Substring(0, at);

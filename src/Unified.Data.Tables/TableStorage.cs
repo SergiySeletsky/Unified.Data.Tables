@@ -6,6 +6,7 @@ using Azure;
 using Azure.Data.Tables;
 using Azure.Storage.Blobs;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Unified.Data.Tables.Providers;
 
@@ -85,7 +86,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// Creates a store with an <see cref="UnifiedTableStorageOptions"/> (cache policy etc.) and an
     /// optional <see cref="IProtectedPropertyAuthorizer"/>. Null options fall back to the defaults
     /// (sliding 1&#160;hour cache — the 0.2.x behaviour). Blob offload needs a
-    /// <see cref="BlobServiceClient"/>: use the constructor that takes one.
+    /// <see cref="BlobServiceClient"/> for a type with large-value members: set <see cref="BlobOffloadOptions.ServiceClient"/> or use the constructor that takes one.
     /// </summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
         IProtectedPropertyAuthorizer? authorizer, UnifiedTableStorageOptions? options)
@@ -97,15 +98,21 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// Creates a store with an <see cref="UnifiedTableStorageOptions"/>, an optional
     /// <see cref="IProtectedPropertyAuthorizer"/> and an optional <see cref="BlobServiceClient"/> for
     /// blob offload (<see cref="UnifiedTableStorageOptions.BlobOffload"/>). The trailing defaults let the
-    /// DI container select this constructor whichever of the optional services are registered. No call
-    /// is made to either service here; the table and the blob container are created on first use.
+    /// DI container select this constructor whichever of the optional services are registered; in DI the
+    /// blob client is the library's own keyed registration (see <c>AddUnifiedTableStorage</c>), never the
+    /// host's unkeyed <see cref="BlobServiceClient"/>. <see cref="BlobOffloadOptions.ServiceClient"/> is used
+    /// when <paramref name="blobServiceClient"/> is null. No call is made to either service here; the table
+    /// and the blob container are created on first use.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set and <paramref name="blobServiceClient"/> is null.
+    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set, <typeparamref name="T"/> has a
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> member, and no blob client is
+    /// supplied (neither <paramref name="blobServiceClient"/> nor <see cref="BlobOffloadOptions.ServiceClient"/>).
+    /// Any other <typeparamref name="T"/> needs none.
     /// </exception>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
         IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null,
-        BlobServiceClient? blobServiceClient = null)
+        [FromKeyedServices(ServiceCollectionExtensions.OffloadBlobServiceClientKey)] BlobServiceClient? blobServiceClient = null)
         : this(serviceClient, cache, logger, authorizer, options, OffloadStore(options, blobServiceClient))
     {
     }
@@ -129,16 +136,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     }
 
     // The Azure blob container for this store's offloaded values. Built only for a type that can carry
-    // them (no client call either way); a plain type never touches the blob service.
+    // them (no client call either way); a plain type never touches the blob service and needs no client,
+    // so a host with offload configured but no blob client still resolves every plain store.
     private static AzureOffloadBlobStore? OffloadStore(UnifiedTableStorageOptions? options, BlobServiceClient? blobServiceClient)
     {
-        if (options?.BlobOffload is not { } offload)
+        if (!LargeValueAware || options?.BlobOffload is not { } offload)
             return null;
-        if (blobServiceClient is null)
-            throw new InvalidOperationException(
-                $"UnifiedTableStorageOptions.BlobOffload is set, but no {nameof(BlobServiceClient)} was supplied. " +
-                $"Register a {nameof(BlobServiceClient)} (the connection-string overload of AddUnifiedTableStorage does) or pass one to the constructor.");
-        return LargeValueAware ? new AzureOffloadBlobStore(blobServiceClient.GetBlobContainerClient(offload.ContainerName)) : null;
+        var client = blobServiceClient ?? offload.ServiceClient
+            ?? throw new InvalidOperationException(
+                $"UnifiedTableStorageOptions.BlobOffload is set and {typeof(T).Name} has large-value members, but no {nameof(BlobServiceClient)} was supplied. " +
+                $"Set {nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.ServiceClient)}, set {nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.UseRegisteredServiceClient)} " +
+                $"to use the {nameof(BlobServiceClient)} registered in DI, use a connection-string or credential overload of AddUnifiedTableStorage that derives one, or pass one to the constructor.");
+        return new AzureOffloadBlobStore(client.GetBlobContainerClient(offload.ContainerName));
     }
 
     /// <summary>
@@ -536,6 +545,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
         var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, select, ct);
 
+        var projection = ProjectionContext(select);
         var yielded = 0;
         await foreach (var queried in pageable.WithCancellation(ct))
         {
@@ -555,7 +565,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             else
             {
                 // A projection that omits every large value: nothing outside the row is read.
-                yield return warmCache ? Materialize(queried) : Deserialize(queried, select);
+                yield return warmCache ? Materialize(queried) : Deserialize(queried, projection);
             }
 
             if (take is int max && ++yielded >= max)
@@ -598,13 +608,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         var page = pages.Current;
         var items = new List<T>(page.Values.Count);
+        var projection = ProjectionContext(select);
         foreach (var queried in page.Values)
         {
             if (SplitRowLayout.IsPartRow(queried))
                 continue;
             // A projected row is a partial entity: it must never warm the per-entity cache.
             if (select is not null)
-                items.Add(Deserialize(queried, select));
+                items.Add(Deserialize(queried, projection));
             else if (assemble)
             {
                 if (await ReadLargeAsync(queried, ct) is not { } read)
@@ -627,12 +638,15 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         return await enumerator.MoveNextAsync();
     }
 
-    // Deserialize a queried row and stamp its ETag/Timestamp (no caching).
-    // A projected row: an offloaded value the projection omits keeps its default instead of throwing.
-    private static T Deserialize(TableEntity row, IEnumerable<string>? select = null) =>
-        Stamp(select is null
-            ? row.FromTableEntity<T>()
-            : TableEntitySerializer.FromTableEntity<T>(row, new ValueReadContext(NothingResolved, null, [.. select])), row);
+    // Deserialize a queried row and stamp its ETag/Timestamp (no caching). A projected row
+    // (ProjectionContext): an offloaded value the projection omits keeps its default instead of throwing.
+    private static T Deserialize(TableEntity row, ValueReadContext? projection = null) =>
+        Stamp(TableEntitySerializer.FromTableEntity<T>(row, projection ?? ValueReadContext.None), row);
+
+    // The read context of a query, built once per query rather than per row: none for a whole-entity
+    // read, the projected columns otherwise.
+    private static ValueReadContext ProjectionContext(IEnumerable<string>? select) =>
+        select is null ? ValueReadContext.None : new ValueReadContext(NothingResolved, null, [.. select]);
 
     private static readonly Dictionary<string, object> NothingResolved = new(StringComparer.Ordinal);
 
@@ -659,7 +673,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     {
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
         // The clone context keeps a cached split value a plain in-process bag, never re-encoded for storage.
-        var copy = TableEntitySerializer.ToTableEntity(entity, partitionKey, rowKey, ValueWriteContext.ForClone, [])
+        var copy = TableEntitySerializer.ToTableEntity(entity, partitionKey, rowKey, ValueWriteContext.ForClone, pending: null)
             .FromTableEntity<T>();
         copy.ETag = entity.ETag;
         copy.Timestamp = entity.Timestamp;

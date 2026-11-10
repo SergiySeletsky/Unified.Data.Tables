@@ -14,8 +14,8 @@ internal sealed record SplitRowPlan(TableEntity Primary, IReadOnlyList<TableEnti
 /// </summary>
 internal static class SplitRowLayout
 {
-    internal const int MaxPropertiesPerRow = 252;
-    internal const long MaxEntityBytes = 1_000_000;
+    internal const int MaxPropertiesPerRow = TableRequestSize.MaxEntityProperties;
+    internal const long MaxEntityBytes = TableRequestSize.MaxEntityBytes;
 
     /// <summary>
     /// The budget of one row's JSON body (<see cref="TableRowSize.WireSize"/>) when split cells are

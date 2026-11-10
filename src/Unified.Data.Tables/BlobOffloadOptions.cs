@@ -1,3 +1,5 @@
+using Azure.Storage.Blobs;
+
 namespace Unified.Data.Tables;
 
 /// <summary>
@@ -9,6 +11,24 @@ public sealed class BlobOffloadOptions
 {
     /// <summary>The blob container that holds offloaded values. Defaults to <c>unified-tables-values</c>.</summary>
     public string ContainerName { get; set; } = "unified-tables-values";
+
+    /// <summary>
+    /// The blob service that holds the container. Takes precedence over every other source: a client passed
+    /// to the <c>TableStorage&lt;T&gt;</c> constructor, the host's registered client
+    /// (<see cref="UseRegisteredServiceClient"/>) and the one the connection-string or credential overload of
+    /// <c>AddUnifiedTableStorage</c> derives. <c>null</c> (the default) leaves the choice to those. The
+    /// in-memory store ignores it.
+    /// </summary>
+    public BlobServiceClient? ServiceClient { get; set; }
+
+    /// <summary>
+    /// When <c>true</c>, <c>AddUnifiedTableStorage</c> uses the <see cref="BlobServiceClient"/> the host
+    /// registers in DI (before or after the call) for offload, unless <see cref="ServiceClient"/> is set.
+    /// Defaults to <c>false</c>: the library then never resolves the host's client and uses only
+    /// <see cref="ServiceClient"/> or the client its connection-string or credential overload derives, which it
+    /// keeps to itself, so the host's own <see cref="BlobServiceClient"/> registration is never taken or replaced.
+    /// </summary>
+    public bool UseRegisteredServiceClient { get; set; }
 
     /// <summary>The largest <see cref="ThresholdBytes"/>: the 4 MiB payload limit of one entity-group transaction.</summary>
     public const long MaxThresholdBytes = 4_194_304;

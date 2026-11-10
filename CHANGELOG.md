@@ -15,8 +15,8 @@ Lossless storage of large values, opt-in per property.
   split cells, continuation rows (`{RowKey}~0001..`) in the same entity-group transaction, or an Azure
   Blob, with a SHA-256 over the stored bytes verified on read. `SplitEncoding.Text` and `Gzip`; strings
   that are not well-formed UTF-16 are stored as `utf16le`.
-- **`BlobOffload`**, **`BlobOffloadOptions`** (`ContainerName`, `ThresholdBytes`, `CleanupGrace`) and
-  `UnifiedTableStorageOptions.BlobOffload`.
+- **`BlobOffload`**, **`BlobOffloadOptions`** (`ContainerName`, `ThresholdBytes`, `CleanupGrace`,
+  `ServiceClient`, `UseRegisteredServiceClient`) and `UnifiedTableStorageOptions.BlobOffload`.
 - **`TableBlobContent`** for files: always offloaded, lazy `OpenReadAsync`, `FromBytes`/`FromStream`
   (never buffers in memory; leaves the caller's stream open; a non-seekable stream is copied to a
   delete-on-close temp file under `Path.GetTempPath()`, a seekable one is read twice and must not change
@@ -32,8 +32,18 @@ Lossless storage of large values, opt-in per property.
 - **`TableValueIntegrityException`** and **`OversizedValueException`** (with `ColumnName`, `EncodedBytes`,
   `Reason` and `OffloadForbiddenByProperty`, which is true when offload is configured but the property
   sets `BlobOffload.Never`; the message names the matching fix).
-- A six-parameter `TableStorage<T>` constructor taking the `BlobServiceClient`, and a `BlobServiceClient`
-  registration in the connection-string and credential `AddUnifiedTableStorage` overloads.
+- **`BlobOffloadNotConfiguredException`** (an `InvalidOperationException` with `TableName` and
+  `ColumnName`): a row holds a `{Prop}__blob` reference and the store has no `BlobOffload` configured.
+- **`TableRequestSize`** for callers that build their own transactions: `EstimateEntityBytes`,
+  `EstimateEntityWireBytes` and `EstimateActionWireBytes` (the planners' stored and escaped-wire estimates,
+  for a `TableEntity` or any `ITableEntity` model), `FitsOneTransaction`, and the limits as constants
+  (`MaxTransactionActions`, `MaxTransactionPayloadBytes`, `MaxTransactionWireBytes`,
+  `MaxTransactionEntityBytes`, `MaxEntityBytes`, `MaxEntityProperties`).
+- A six-parameter `TableStorage<T>` constructor taking the `BlobServiceClient`. In DI the offload client is
+  chosen only when `BlobOffload` is set: `BlobOffloadOptions.ServiceClient`, else the host's registered
+  `BlobServiceClient` when `UseRegisteredServiceClient` is true, else the one the connection-string or
+  credential overload derives. The library keeps that client under its own key and never registers or
+  takes the host's unkeyed `BlobServiceClient`.
 - Storage-provider SPI in `Unified.Data.Tables.Providers` (`LargeValueRows`, `LargeValueTable`,
   `LargeValueWritePlan`, `IOffloadBlobStore`, `BlobState`, `BlobReference`), hidden from IntelliSense, for
   provider implementations such as the in-memory package. The in-memory store supports all of the above.
@@ -41,10 +51,17 @@ Lossless storage of large values, opt-in per property.
 ### Changed
 
 - `IStorage<T>` has no new member: third-party implementers, on `netstandard2.0` too, compile unchanged.
-- New dependency **Azure.Storage.Blobs 12.30.1**; it lifts `Azure.Core` from 1.44.1 to 1.60.0 transitively.
-- The connection-string overload registers a `BlobServiceClient` only for Azure Storage hosts or
-  `UseDevelopmentStorage=true`. A custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a
-  Cosmos Table API host, must register its own `BlobServiceClient`.
+- New dependency **Azure.Storage.Blobs 12.29.2** (a floor: hosts that pin 12.29.2, 12.30.x or later need no
+  change and get no NU1605 downgrade). It lifts `Azure.Core` from 1.44.1 to 1.55.0 transitively and pulls in
+  `Azure.Storage.Common` 12.28.0; it does not pull `Apache.Arrow` (12.30.x does).
+- The connection-string overload derives an offload client only when the string has a blob endpoint
+  (`BlobEndpoint`, `UseDevelopmentStorage=true`, or an `AccountName` with no `TableEndpoint` or an Azure
+  Storage one) and throws `ArgumentException` at registration when that endpoint is malformed. For a
+  custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a Cosmos Table API host, set
+  `BlobOffloadOptions.ServiceClient`.
+- `Unified.Data.Tables` depends on exactly the same version of `Unified.Data.Tables.Abstractions`
+  (`[0.9.0]`), and `Unified.Data.Tables.InMemory` on exactly the same version of `Unified.Data.Tables`: they
+  share internals and the provider SPI, which may change in any minor version. Upgrade them together.
 - Split-aware writes do one point read first. A `LastWriterWins` `UpdateAsync` on such a type can throw
   `ConcurrencyConflictException` after three lost races. For split-aware types, writes and partial updates
   refuse only a RowKey ending with `~` and four digits (the continuation-row shape, e.g. `r~0001`); any
@@ -73,8 +90,9 @@ Lossless storage of large values, opt-in per property.
 - Reading a row with an offloaded value through a path that cannot fetch it throws naming the column
   instead of leaving the property null, which a later write would have turned into data loss:
   `InvalidOperationException` from `FromTableEntity<T>()` or a store whose type has no `[TableValueSplit]`
-  or `TableBlobContent` property, `TableValueIntegrityException` from a store of such a type with no
-  `BlobOffload` configured. A projection
+  or `TableBlobContent` property, `BlobOffloadNotConfiguredException` from a store of such a type with no
+  `BlobOffload` configured (it was `TableValueIntegrityException`, which means corruption and was retried
+  as a torn read; uploading without offload threw a bare `InvalidOperationException`). A projection
   that omits the property still leaves it at its default. `ExistsAsync` on a plain type does not cache an
   entity from a row with large-value cells.
 - `[TableValueSplit]` on a property of an interface or abstract (non-collection) type is refused with
@@ -108,6 +126,16 @@ Lossless storage of large values, opt-in per property.
   is cancelled, or the version re-read fails, after the commit: the re-read and the blob cleanup run without
   the caller's token, and a failed re-read leaves `ETag` null. Previously the cleanup was skipped too,
   leaving the old blobs to the sweep. The same holds for the blob cleanup after `DeletePartitionAsync`.
+- With `BlobOffload` set and no blob client, every `IStorage<T>` failed to resolve; now only a type with
+  `[TableValueSplit]` or `TableBlobContent` members does, as `UnifiedTableStorageOptions.BlobOffload`
+  documents. The overloads no longer build a throwaway `BlobServiceClient` (swallowing every exception) to
+  decide whether to register one.
+- The escaped-wire estimate counts the `@odata.type` annotation Azure.Data.Tables 12.11.0 writes for every
+  `double` (`"Edm.Double"`); a row of many doubles could be planned below its real request size.
+- Fewer read-path allocations for plain types, with the same wire behaviour: recognising the large-value
+  cell suffixes no longer allocates a substring for every `__Json`/`__GZip` (or other `__`) column, a
+  projected query builds its read context once instead of copying the column list per row, and the cache
+  clone and the public `ToTableEntity` no longer allocate an empty pending-blob list.
 - `BlobOffloadOptions.ThresholdBytes` is validated: between 1 and `BlobOffloadOptions.MaxThresholdBytes`
   (4,194,304, one transaction's payload limit); anything else throws `ArgumentOutOfRangeException`.
 

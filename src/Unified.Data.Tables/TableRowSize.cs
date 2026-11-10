@@ -9,13 +9,13 @@ namespace Unified.Data.Tables;
 internal static class TableRowSize
 {
     /// <summary>The service limit on the payload of one entity-group transaction (4 MiB).</summary>
-    internal const long ServiceTransactionPayloadBytes = 4_194_304;
+    internal const long ServiceTransactionPayloadBytes = TableRequestSize.MaxTransactionPayloadBytes;
 
     /// <summary>
     /// The wire budget a large-value transaction is planned on: the service limit less 64 KiB for the
     /// multipart envelope and request headers that <see cref="ActionWireOverhead"/> approximates.
     /// </summary>
-    internal const long MaxTransactionWireBytes = ServiceTransactionPayloadBytes - 65_536;
+    internal const long MaxTransactionWireBytes = TableRequestSize.MaxTransactionWireBytes;
 
     /// <summary>Per-action multipart framing, request line and headers (If-Match, Content-Type...), generously.</summary>
     internal const long ActionWireOverhead = 1_024;
@@ -74,7 +74,9 @@ internal static class TableRowSize
             double => 26,
             _ => 48, // long, DateTimeOffset, DateTime, Guid: quoted text
         };
-        if (value is not (null or string or bool or int or double))
+        // Azure.Data.Tables annotates every value but null, string, bool and int: Edm.Int64, Edm.DateTime,
+        // Edm.Guid, Edm.Binary, and Edm.Double too (12.11.0 writes "key@odata.type":"Edm.Double" for each).
+        if (value is not (null or string or bool or int))
             bytes += name + 32; // "key@odata.type":"Edm.Xxx",
         return bytes;
     }
