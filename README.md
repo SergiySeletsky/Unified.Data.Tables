@@ -27,7 +27,8 @@ copy-pasted into each one.
   trimmed. Opt a property into `[TableValueSplit]` to store arbitrarily large values losslessly.
 - **Large values & blob offload** — `[TableValueSplit]` stores strings and byte arrays far beyond the
   64&nbsp;KB cell limit as split cells, continuation rows or an Azure Blob, SHA-256 verified on read;
-  `TableBlobContent` stores files as blobs with a lazy stream. Opt-in; types that use neither are unchanged.
+  `TableBlobContent` stores files as blobs with a lazy stream; an optional hosted sweep removes orphan
+  blobs. Opt-in; types that use neither are unchanged (roll forward only once a type opts in).
 - **Configurable caching** — reads are served from `IMemoryCache` per a registration-time `CachePolicy`
   (`Sliding`, `Absolute`, or `Disabled` — per entity type or globally); writes keep the entity cache
   coherent and invalidate the relevant query caches automatically.
@@ -82,7 +83,7 @@ This is shipped as four packages:
 implementation packages pin each other exactly: `Unified.Data.Tables` depends on
 `Unified.Data.Tables.Abstractions` `[x.y.z]` and `Unified.Data.Tables.InMemory` on `Unified.Data.Tables`
 `[x.y.z]` (they share internals), so upgrade them together. Blob offload needs `Azure.Storage.Blobs`
-12.29.2 or later. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone.
+12.29.2 or later; the optional hosted sweep uses `Microsoft.Extensions.Hosting.Abstractions`. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone.
 
 Requires **.NET 10** and an Azure Storage account (or the local [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator).
 
@@ -520,6 +521,11 @@ A table cell holds 64&nbsp;KB and a row 1&nbsp;MB. By default an oversized value
 losslessly instead. Types with no `[TableValueSplit]` and no `TableBlobContent` property produce the
 same columns and make the same SDK calls as before.
 
+> **Roll forward only.** Rows written split or offloaded cannot be read correctly by 0.8.x or older.
+> Deploy the 0.9.0 package bump first with no attributes, and add `[TableValueSplit]` or
+> `TableBlobContent` in a later deploy, once no older reader (a staging slot, a rollback target, another
+> service) can reach the table. See [Upgrading, backups and restores](#upgrading-backups-and-restores).
+
 ```csharp
 public sealed class Document : Entity
 {
@@ -661,7 +667,8 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
 
 Lost races, crashes and failed deletes leave unreferenced blobs. Best-effort cleanup after a replace or
 delete only removes blobs untouched for `BlobOffloadOptions.CleanupGrace` (default 5 minutes); younger ones
-are left for the sweep. The library does not schedule anything, so run it yourself:
+are left for the sweep, which must be scheduled: call it yourself, or register the
+[hosted sweep](#hosted-sweep).
 
 Both ages are measured on the storage service's clock, the one that stamps a blob's `Last-Modified`: the
 cleanup after a write or delete uses the `Date` of the commit response, and the sweep and the cleanup after
@@ -688,6 +695,56 @@ container (`{table}/` with the delimiter `/`), takes one cutoff from the service
 partition in turn. A failing partition does not stop the others: afterwards the failures are thrown
 together as an `AggregateException` whose message says how many blobs were deleted.
 
+### Hosted sweep
+
+`AddUnifiedOrphanBlobSweep` registers an `IHostedService` that runs the table-wide sweep of each
+registered type on a schedule:
+
+```csharp
+services.AddUnifiedTableStorage(connectionString, o => o.BlobOffload = new BlobOffloadOptions());
+services.AddUnifiedOrphanBlobSweep(o =>
+{
+    o.Interval = TimeSpan.FromHours(1);      // default; pause between rounds
+    o.OlderThan = TimeSpan.FromHours(1);     // default; must exceed the longest write
+    o.InitialDelay = TimeSpan.FromMinutes(1); // default; first round after startup
+});
+services.AddUnifiedOrphanBlobSweep<Document>();   // once per type with large-value members
+```
+
+Each round resolves `IStorage<T>` for every registered type (in a fresh scope) and calls
+`SweepOrphanBlobsAsync(OlderThan)`; the next round starts `Interval` after the previous one ended. A type
+that throws (a partition failure, a store that cannot be built, a timeout) is logged through
+`ILogger<>` at `Error` and retried next round; the other types still run. A store that does not
+implement `IOrphanBlobSweeper` is skipped with a warning. Shutdown cancels the round in progress. Without
+`UnifiedTableStorageOptions.BlobOffload`, or with no type registered, the service logs that once and does
+nothing. The first `AddUnifiedOrphanBlobSweep(configure)` call's options win; out-of-range options throw
+`ArgumentOutOfRangeException` at registration. Works the same over `AddUnifiedInMemoryStorage`. Every
+instance that registers it sweeps: concurrent sweeps are safe (each delete is conditional) but redundant,
+so a scaled-out app may register it in one instance only.
+
+### Upgrading, backups and restores
+
+- **Roll forward only.** A 0.8.x (or older) reader does not know the 0.9.0 layout: it returns
+  continuation rows (`{RowKey}~0001`, ...) as entities of their own, reads `Stages__c0` as the nested path
+  `[Stages, c0]` so a split collection reads as empty, and sees an offloaded property as null. A later
+  replace or upsert from that reader writes the empty value back and the data is lost (its blob is then
+  an orphan the sweep deletes). Deploy in two steps: first the package bump with no `[TableValueSplit]` or
+  `TableBlobContent`, which writes exactly what 0.8.3 wrote; then, once no older reader remains (swapped
+  slots drained, rollback no longer to a pre-0.9.0 build, every service that reads the table upgraded), the
+  attributes. Rolling back past the second deploy needs the data rewritten first.
+- **Back up and restore an entity as one unit**: its main row, its continuation rows (same partition,
+  RowKeys `{RowKey}~NNNN`) and its blobs in the offload container, taken together. A row restored without
+  its parts or blobs (or with those of another version) reads as `TableValueIntegrityException`.
+- **A table copied raw shares the source's blobs**: each `{Prop}__blob` reference holds the blob path
+  under the source table's name, so the copy reads the source's blobs, and once the source replaces or
+  deletes those rows its cleanup and sweep delete blobs the copy still reads. Give the copy its own copy of
+  the blobs (rewrite the entities through the library, or copy the container and point the copy's
+  `ContainerName` at it). Blob versioning or soft delete on the container makes such a mistake recoverable.
+- **The offload container is the library's.** Do not put other blobs in it, and do not share it between
+  applications whose tables have the same names.
+- **Schedule the sweep** (above): nothing else removes orphans younger than `CleanupGrace` or left by a
+  crash.
+
 ### Limitations
 
 - In RowKeys of split-aware types, only the continuation-row shape is reserved: a key ending with `~`
@@ -711,7 +768,11 @@ together as an `AggregateException` whose message says how many blobs were delet
   `ConcurrencyConflictException` after three lost races.
 - A `QueryPageAsync` page can hold zero items with a non-null continuation token when it contained only
   continuation rows; keep paging until the token is null.
-- Eager offloaded values download on every read, one blob per entity; the entity cache holds the full value.
+- Reads and scans cost more for these types: an entity whose value is split across continuation rows
+  takes one extra range query for its parts (on every read, queries included), and an eager offloaded
+  value (`string`, `byte[]`) is downloaded from blob storage on every read, one blob per entity, so a
+  query over N such entities makes N extra requests. `TableBlobContent` is never downloaded by a read.
+  The entity cache holds the full value.
   For types with very large eager values use `CacheFor<T>(CachePolicy.Disabled)`.
 - A `TableBlobContent` on an entity you hold (or one the entity cache returns) names the blob of the version
   it was read from. Once a replace or delete has removed that blob (after `CleanupGrace`), `OpenReadAsync`

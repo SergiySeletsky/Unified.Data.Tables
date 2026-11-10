@@ -8,6 +8,23 @@ All notable changes to this project are documented here. The format is based on
 
 Lossless storage of large values, opt-in per property.
 
+### Upgrade notes
+
+- **Roll forward only.** Rows written split or offloaded cannot be read correctly by 0.8.x or older: a
+  0.8.3 reader returns the `{RowKey}~NNNN` continuation rows as entities, parses `Stages__c0` as the path
+  `[Stages, c0]` so a split collection reads as empty, sees an offloaded property as null, and a later
+  replace or upsert from that reader drops the value. Deploy the package bump first with no attributes
+  (types that opt into nothing write exactly what 0.8.3 wrote), and add `[TableValueSplit]` or
+  `TableBlobContent` in a later deploy, once no older reader (a swapped slot, a rollback target, another
+  service) remains.
+- Back up and restore an entity's main row, continuation rows and offload blobs together. A table copied
+  raw shares the source's blobs (the references hold the source table's blob paths): give the copy its own
+  copy of them, or enable blob versioning or soft delete on the container.
+- The offload container is exclusive to the library. Orphan blobs are removed only by
+  `SweepOrphanBlobsAsync`: schedule it, or register `AddUnifiedOrphanBlobSweep`.
+- Reads of split-aware types cost one extra range query per entity with continuation rows, plus a blob
+  download per eager offloaded value, queries included.
+
 ### Added
 
 - **`[TableValueSplit(SplitEncoding)]`** (property or class, `Offload` = `BlobOffload.AboveThreshold`
@@ -29,6 +46,12 @@ Lossless storage of large values, opt-in per property.
   longest write duration. The table-wide sweep lists partitions with the delimiter `/`, isolates a failing
   partition and throws the failures as one `AggregateException` at the end. Sweeps and partition deletes
   only delete names of the exact offload shape; the container is for offload alone.
+- **`AddUnifiedOrphanBlobSweep(o => ...)`** and **`AddUnifiedOrphanBlobSweep<T>()`**: a hosted service
+  (`IHostedService`) that runs the table-wide sweep of each registered type every
+  `OrphanBlobSweepOptions.Interval` (default 1 hour) with `OlderThan` (default 1 hour), first after
+  `InitialDelay` (default 1 minute). A failing type is logged at `Error` and retried next round without
+  stopping the others; shutdown cancels the round; without `BlobOffload` it does nothing. Out-of-range
+  options throw `ArgumentOutOfRangeException` at registration.
 - **`TableValueIntegrityException`** and **`OversizedValueException`** (with `ColumnName`, `EncodedBytes`,
   `Reason` and `OffloadForbiddenByProperty`, which is true when offload is configured but the property
   sets `BlobOffload.Never`; the message names the matching fix).
@@ -54,6 +77,8 @@ Lossless storage of large values, opt-in per property.
 - New dependency **Azure.Storage.Blobs 12.29.2** (a floor: hosts that pin 12.29.2, 12.30.x or later need no
   change and get no NU1605 downgrade). It lifts `Azure.Core` from 1.44.1 to 1.55.0 transitively and pulls in
   `Azure.Storage.Common` 12.28.0; it does not pull `Apache.Arrow` (12.30.x does).
+- New dependency **Microsoft.Extensions.Hosting.Abstractions 10.0.9** (abstractions only, for the hosted
+  sweep's `BackgroundService`; any ASP.NET Core or generic host already has it).
 - The connection-string overload derives an offload client only when the string has a blob endpoint
   (`BlobEndpoint`, `UseDevelopmentStorage=true`, or an `AccountName` with no `TableEndpoint` or an Azure
   Storage one) and throws `ArgumentException` at registration when that endpoint is malformed. For a
