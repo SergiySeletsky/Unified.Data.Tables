@@ -151,6 +151,10 @@ public class SplitCodecTests
         Assert.True(SplitCodec.FitsOneCell(new string('a', 32_000), SplitEncoding.Text));
         Assert.False(SplitCodec.FitsOneCell(new string('a', 32_001), SplitEncoding.Text));
         Assert.False(SplitCodec.FitsOneCell("a" + '\uD800', SplitEncoding.Text));
+        Assert.True(SplitCodec.FitsOneCell(new string('a', 32_000), SplitEncoding.Gzip));
+        Assert.True(SplitCodec.FitsOneCell("hello", SplitEncoding.Gzip));
+        Assert.False(SplitCodec.FitsOneCell(new string('a', 32_001), SplitEncoding.Gzip));
+        Assert.False(SplitCodec.FitsOneCell("a" + '\uD800', SplitEncoding.Gzip));
         Assert.True(SplitCodec.FitsOneCell(new byte[65_536], SplitEncoding.Gzip));
         Assert.False(SplitCodec.FitsOneCell(new byte[65_537], SplitEncoding.Gzip));
     }

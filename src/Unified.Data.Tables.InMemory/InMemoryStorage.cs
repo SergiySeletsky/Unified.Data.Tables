@@ -3,6 +3,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using Azure;
 using Azure.Data.Tables;
+using Unified.Data.Tables.Providers;
 
 namespace Unified.Data.Tables.InMemory;
 
@@ -248,7 +249,9 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             var merged = CopyOf(existing.Data);
             foreach (var (name, value) in builder.Updates)
             {
-                foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(name, value))
+                // The typed flatten refuses a [TableValueSplit] member exactly as TableStorage<T> does: a
+                // merged plain cell beside the old split cells would read back the OLD value.
+                foreach (var (col, cell) in LargeValueRows.FlattenPropertyForUpdate(typeof(T), name, value))
                 {
                     merged[col] = cell;
                 }

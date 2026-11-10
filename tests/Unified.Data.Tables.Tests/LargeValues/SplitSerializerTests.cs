@@ -80,6 +80,46 @@ public class SplitSerializerTests
     }
 
     [Fact]
+    public void GzipValue_ThatFitsOneCell_IsAnOrdinaryStringColumn()
+    {
+        foreach (var body in new[] { "hello", RandomText(32_000) })
+        {
+            var row = new SplitGzipEntity { Body = body }.ToTableEntity(Pk, Rk);
+            Assert.Equal(body, Assert.IsType<string>(row["Body"]));
+            Assert.Empty(LargeValueColumnsOf(row, "Body"));
+            Assert.Equal(body, row.FromTableEntity<SplitGzipEntity>().Body);
+        }
+    }
+
+    [Fact]
+    public void GzipValue_Over32000Chars_IsGzipSplit()
+    {
+        var body = RandomText(32_001);
+        var row = new SplitGzipEntity { Body = body }.ToTableEntity(Pk, Rk);
+
+        Assert.False(row.ContainsKey("Body"));
+        Assert.Equal("gzip", row["Body__enc"]);
+        Assert.IsType<byte[]>(row["Body__c0"]);
+        Assert.Equal(body, row.FromTableEntity<SplitGzipEntity>().Body);
+    }
+
+    [Fact]
+    public void GzipJsonFallback_ThatFits_StaysJsonColumn_LargerIsGzipSplit()
+    {
+        var few = new List<string> { "a", "b" };
+        var small = new SplitGzipJsonEntity { Items = few }.ToTableEntity(Pk, Rk);
+        Assert.IsType<string>(small["Items__Json"]);
+        Assert.False(small.ContainsKey("Items__chunks"));
+        Assert.Equal(few, small.FromTableEntity<SplitGzipJsonEntity>().Items);
+
+        var many = Enumerable.Range(0, 5_000).Select(i => RandomText(50, i)).ToList();
+        var large = new SplitGzipJsonEntity { Items = many }.ToTableEntity(Pk, Rk);
+        Assert.False(large.ContainsKey("Items__Json"));
+        Assert.Equal("gzip", large["Items__enc"]);
+        Assert.Equal(many, large.FromTableEntity<SplitGzipJsonEntity>().Items);
+    }
+
+    [Fact]
     public void BinarySplit_RoundTrips()
     {
         var image = new byte[1_048_576];
@@ -217,6 +257,32 @@ public class SplitSerializerTests
         harness.SetupUpdate();
         await Assert.ThrowsAsync<NotSupportedException>(() =>
             harness.Store.UpdateAsync("p|r", b => b.SetProperty(x => x.Body, "x")));
+    }
+
+    [Fact]
+    public async Task InMemoryStorage_UpdateOfSplitProperty_IsRefused_AndValueUnchanged()
+    {
+        var store = new InMemoryStorage<SplitTextEntity>();
+        var original = RandomText(40_000);
+        await store.CreateAsync(new SplitTextEntity { Id = "p|r", Body = original, Title = "t" });
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            store.UpdateAsync("p|r", b => b.SetProperty(x => x.Body, "new")));
+        Assert.Contains("'Body' is a large value", ex.Message, StringComparison.Ordinal);
+
+        var nested = new InMemoryStorage<SplitNestedEntity>();
+        await nested.CreateAsync(new SplitNestedEntity { Id = "p|r", Inner = new SplitInner { Body = "old" } });
+        await Assert.ThrowsAsync<NotSupportedException>(() =>
+            nested.UpdateAsync("p|r", b => b.SetProperty(x => x.Inner!.Body, "new")));
+
+        var back = await store.OneAsync("p|r");
+        Assert.Equal(original, back!.Body);
+
+        // Ordinary members of the same type still merge.
+        await store.UpdateAsync("p|r", b => b.SetProperty(x => x.Title, "t2"));
+        back = await store.OneAsync("p|r");
+        Assert.Equal("t2", back!.Title);
+        Assert.Equal(original, back.Body);
     }
 
     [Fact]

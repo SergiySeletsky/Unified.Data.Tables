@@ -130,10 +130,14 @@ internal static class SplitCodec
         }
     }
 
-    /// <summary>True when the value can be stored as one plain cell with no split metadata.</summary>
+    /// <summary>
+    /// True when the value can be stored as one plain cell with no split metadata. The encoding only
+    /// governs how a value that does not fit is split: a well-formed string of at most
+    /// <see cref="MaxTextCellChars"/> chars stays one ordinary string cell under either encoding.
+    /// </summary>
     internal static bool FitsOneCell(object payload, SplitEncoding encoding) => payload switch
     {
-        string s => encoding == SplitEncoding.Text && s.Length <= MaxTextCellChars && IsWellFormedUtf16(s),
+        string s => s.Length <= MaxTextCellChars && IsWellFormedUtf16(s),
         byte[] b => b.Length <= MaxBinaryCellBytes,
         _ => false,
     };

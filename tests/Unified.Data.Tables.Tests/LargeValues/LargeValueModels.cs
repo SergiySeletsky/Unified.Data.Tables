@@ -67,3 +67,9 @@ public class SplitOnScalarEntity : Entity
     [TableValueSplit(SplitEncoding.Text)]
     public int Number { get; set; }
 }
+
+public class SplitGzipJsonEntity : Entity
+{
+    [TableValueSplit(SplitEncoding.Gzip)]
+    public List<string>? Items { get; set; }
+}
