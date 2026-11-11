@@ -10,7 +10,7 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// arrives at <see cref="FailAt"/>, and the stream can refuse to be rewound. Every read stops short at
 /// <see cref="FailAt"/> first, so the failure is hit at that exact offset whatever the reader's buffer.
 /// </summary>
-internal sealed class FaultyStream(byte[] data, bool seekable, long start = 0) : Stream
+internal sealed class FaultyContentStream(byte[] data, bool seekable, long start = 0) : Stream
 {
     private long position = start;
     private int arrivals;
@@ -183,7 +183,7 @@ public class BlobContentRetryTests
     public async Task SeekableSourceFailingOnceMidHash_RetryStoresEveryByte()
     {
         var data = RandomBytes(Size, seed: 41);
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1 };
         var entity = Entity(source);
         var store = Store();
 
@@ -203,7 +203,7 @@ public class BlobContentRetryTests
     {
         var data = RandomBytes(Size, seed: 42);
         using var cts = new CancellationTokenSource();
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, CancelAtFailAt = cts };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, CancelAtFailAt = cts };
         var entity = Entity(source);
         var store = Store();
 
@@ -221,7 +221,7 @@ public class BlobContentRetryTests
     public async Task SeekableSourceThatCannotBeRewound_RetryThrowsTheClearError_AndStoresNothing()
     {
         var data = RandomBytes(Size, seed: 43);
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1, RefuseRewindAfterFailure = true };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1, RefuseRewindAfterFailure = true };
         var entity = Entity(source);
         var store = Store();
 
@@ -242,7 +242,7 @@ public class BlobContentRetryTests
     public async Task SourceThatCannotBeRewoundAfterItWasHashed_RetryThrows_NeverStoresAnEmptyFile()
     {
         var data = RandomBytes(Size, seed: 44);
-        var source = new FaultyStream(data, seekable: true) { RefuseRewind = true };
+        var source = new FaultyContentStream(data, seekable: true) { RefuseRewind = true };
         var entity = Entity(source);
         var store = Store();
 
@@ -261,7 +261,7 @@ public class BlobContentRetryTests
     public async Task NonSeekableSourceFailingMidCopy_RetryThrowsTheClearError_AndStoresNothing()
     {
         var data = RandomBytes(Size, seed: 45);
-        var source = new FaultyStream(data, seekable: false) { FailAt = FailAt, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: false) { FailAt = FailAt, FailuresLeft = 1 };
         var entity = Entity(source);
         var store = Store();
 
@@ -282,7 +282,7 @@ public class BlobContentRetryTests
     {
         var data = RandomBytes(Size, seed: 46);
         using var cts = new CancellationTokenSource();
-        var source = new FaultyStream(data, seekable: false) { FailAt = FailAt, CancelAtFailAt = cts };
+        var source = new FaultyContentStream(data, seekable: false) { FailAt = FailAt, CancelAtFailAt = cts };
         var entity = Entity(source);
         var store = Store();
 
@@ -297,7 +297,7 @@ public class BlobContentRetryTests
     public async Task UploadFailingOnce_RetryStoresEveryByte_ForASeekableSource()
     {
         var data = RandomBytes(Size, seed: 47);
-        var source = new FaultyStream(data, seekable: true);
+        var source = new FaultyContentStream(data, seekable: true);
         var entity = Entity(source);
         var store = Store();
         var failures = 1;
@@ -316,7 +316,7 @@ public class BlobContentRetryTests
     {
         var data = RandomBytes(Size, seed: 48);
         // The hashing pass gets through; the upload's pass fails at the same offset, leaving the source mid-way.
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, PassesBeforeFailure = 1, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, PassesBeforeFailure = 1, FailuresLeft = 1 };
         var entity = Entity(source);
         var store = Store();
 
@@ -334,7 +334,7 @@ public class BlobContentRetryTests
     {
         const int start = 1_000;
         var data = RandomBytes(Size, seed: 49);
-        var source = new FaultyStream(data, seekable: true, start) { FailAt = FailAt, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: true, start) { FailAt = FailAt, FailuresLeft = 1 };
         var entity = Entity(source);
         var store = Store();
 
@@ -350,7 +350,7 @@ public class BlobContentRetryTests
     public async Task SourceDisposedBetweenAttempts_RetryThrowsInvalidOperation_NotObjectDisposed()
     {
         var data = RandomBytes(Size, seed: 50);
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1 };
         var entity = Entity(source);
         var store = Store();
         await Assert.ThrowsAsync<IOException>(() => store.CreateAsync(entity, Ct));
@@ -367,7 +367,7 @@ public class BlobContentRetryTests
     public async Task TokenCancelledBeforeTheWrite_LeavesAForwardOnlySourceUntouched()
     {
         var data = RandomBytes(Size, seed: 51);
-        var source = new FaultyStream(data, seekable: false);
+        var source = new FaultyContentStream(data, seekable: false);
         var entity = Entity(source);
         var store = Store();
         using var cancelled = new CancellationTokenSource();
@@ -384,7 +384,7 @@ public class BlobContentRetryTests
     [Fact]
     public async Task ContentWhoseSourceWasLost_CannotBeOpenedForReading_AndSaysWhy()
     {
-        var source = new FaultyStream(RandomBytes(Size, seed: 52), seekable: false) { FailAt = FailAt, FailuresLeft = 1 };
+        var source = new FaultyContentStream(RandomBytes(Size, seed: 52), seekable: false) { FailAt = FailAt, FailuresLeft = 1 };
         var entity = Entity(source);
         await Assert.ThrowsAsync<IOException>(() => Store().CreateAsync(entity, Ct));
 
@@ -394,11 +394,32 @@ public class BlobContentRetryTests
     }
 
     [Fact]
+    public async Task SourceDisposedAfterItWasPrepared_TheUploadRefusesTheContent_AndStoresNothing()
+    {
+        var data = RandomBytes(Size, seed: 54);
+        var source = new FaultyContentStream(data, seekable: true);
+        var blobs = new InMemoryOffloadBlobStore();
+        var coordinator = new ValueOffloadCoordinator(blobs, new BlobOffloadOptions(), "T");
+        var entity = Entity(source);
+        await coordinator.PrepareAsync(entity, Ct);
+        var (_, _, pending) = coordinator.Serialize(entity, "p", "r", 0);
+
+        await source.DisposeAsync(); // the caller let go of the stream before the write was over
+
+        // Every upload starts where the content starts, or not at all.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.UploadAsync(pending, Ct));
+        Assert.Contains("'File'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Create the content again", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(blobs.Names);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.PrepareAsync(entity, Ct));
+    }
+
+    [Fact]
     public async Task SuccessPath_SeekableSource_IsLeftWhereItsContentStarts_AfterTheHashingPass()
     {
         // Unchanged behaviour: the hashing pass rewinds, the upload then reads the source to its end.
         var data = RandomBytes(Size, seed: 53);
-        var source = new FaultyStream(data, seekable: true);
+        var source = new FaultyContentStream(data, seekable: true);
         var coordinator = new ValueOffloadCoordinator(new InMemoryOffloadBlobStore(), new BlobOffloadOptions(), "T");
         var entity = Entity(source);
 
@@ -444,7 +465,7 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
     {
         Assert.SkipUnless(Available, SkipReason);
         var data = RandomBytes(Size, seed: 61);
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1 };
         var entity = Entity(source, "s1");
         var store = Store<FileEntity>();
 
@@ -464,7 +485,7 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
         Assert.SkipUnless(Available, SkipReason);
         var data = RandomBytes(Size, seed: 62);
         using var cts = new CancellationTokenSource();
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, CancelAtFailAt = cts };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, CancelAtFailAt = cts };
         var entity = Entity(source, "s2");
         var store = Store<FileEntity>();
 
@@ -483,7 +504,7 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
     {
         Assert.SkipUnless(Available, SkipReason);
         var data = RandomBytes(Size, seed: 63);
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1, RefuseRewindAfterFailure = true };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, FailuresLeft = 1, RefuseRewindAfterFailure = true };
         var entity = Entity(source, "s3");
         var store = Store<FileEntity>();
 
@@ -501,7 +522,7 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
     {
         Assert.SkipUnless(Available, SkipReason);
         var data = RandomBytes(Size, seed: 64);
-        var source = new FaultyStream(data, seekable: false) { FailAt = FailAt, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: false) { FailAt = FailAt, FailuresLeft = 1 };
         var entity = Entity(source, "s4");
         var store = Store<FileEntity>();
 
@@ -518,7 +539,7 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
     {
         Assert.SkipUnless(Available, SkipReason);
         var data = RandomBytes(Size, seed: 65);
-        var source = new FaultyStream(data, seekable: true);
+        var source = new FaultyContentStream(data, seekable: true);
         var entity = Entity(source, "s5");
         var failing = new FailFirstUpload();
         var store = Store<FileEntity>(blobs: BlobServiceWith(failing));
@@ -539,7 +560,7 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
     {
         Assert.SkipUnless(Available, SkipReason);
         var data = RandomBytes(Size, seed: 66);
-        var source = new FaultyStream(data, seekable: true) { FailAt = FailAt, PassesBeforeFailure = 1, FailuresLeft = 1 };
+        var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, PassesBeforeFailure = 1, FailuresLeft = 1 };
         var entity = Entity(source, "s6");
         var store = Store<FileEntity>();
 

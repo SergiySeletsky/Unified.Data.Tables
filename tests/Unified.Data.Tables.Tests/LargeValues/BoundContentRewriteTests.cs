@@ -182,7 +182,7 @@ public class BoundContentRewriteTests
     {
         var data = RandomBytes(Size, seed: 107);
         var store = Store<TwoBlobEntity>();
-        var shared = TableBlobContent.FromStream(new FaultyStream(data, seekable: false), "application/octet-stream");
+        var shared = TableBlobContent.FromStream(new FaultyContentStream(data, seekable: false), "application/octet-stream");
         var entity = new TwoBlobEntity { Id = "p|r", First = shared, Second = shared };
 
         await store.CreateAsync(entity, Ct);

@@ -17,7 +17,7 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// <paramref name="data"/> from <paramref name="start"/> and, once <paramref name="failAfter"/> bytes
 /// were handed out, every further read throws <paramref name="failure"/> (a ranged GET the service refused).
 /// </summary>
-internal sealed class ScriptedBlobStream(byte[] data, long start, int failAfter = int.MaxValue, Exception? failure = null) : Stream
+internal sealed class ScriptedBlobReadStream(byte[] data, long start, int failAfter = int.MaxValue, Exception? failure = null) : Stream
 {
     private long position = start;
     private int delivered;
@@ -148,10 +148,10 @@ public class OpenReadDuringWriteTests
             }
         }
 
-        public Func<long, Stream> Whole => position => new ScriptedBlobStream(Data, position);
+        public Func<long, Stream> Whole => position => new ScriptedBlobReadStream(Data, position);
 
         public Func<long, Stream> FailingAfter(int bytes, Exception failure) =>
-            position => new ScriptedBlobStream(Data, position, bytes, failure);
+            position => new ScriptedBlobReadStream(Data, position, bytes, failure);
 
         public static Func<long, Stream> Failing(Exception failure) => _ => throw failure;
     }
@@ -191,7 +191,7 @@ public class OpenReadDuringWriteTests
 
         Assert.Equal(rig.Data, read);
         Assert.Equal([0L, 30_000L], rig.Opens);
-        Assert.True(((ScriptedBlobStream)rig.Streams[0]).Disposed, "the refused stream is released");
+        Assert.True(((ScriptedBlobReadStream)rig.Streams[0]).Disposed, "the refused stream is released");
         Assert.False(stream.CanSeek);
         Assert.Equal(Size, stream.Position);
     }
@@ -333,7 +333,7 @@ public class OpenReadDuringWriteTests
         await stream.ReadExactlyAsync(new byte[16], Ct);
         await stream.DisposeAsync();
 
-        Assert.True(((ScriptedBlobStream)Assert.Single(rig.Streams)).Disposed);
+        Assert.True(((ScriptedBlobReadStream)Assert.Single(rig.Streams)).Disposed);
     }
 
     // ── the eager read path of TableStorage over that stream ───────────────
@@ -385,9 +385,9 @@ public class OpenReadDuringWriteTests
         var container = Substitute.For<BlobContainerClient>();
         // The replace committed and deleted v1's blob while the reader was 10,000 bytes into it.
         BlobOf(container, PathOf(v1)).OpenReadAsync(Arg.Any<BlobOpenReadOptions>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult<Stream>(new ScriptedBlobStream(Utf8(oldBody), 0, 10_000, Status(404, "BlobNotFound"))));
+            .Returns(_ => Task.FromResult<Stream>(new ScriptedBlobReadStream(Utf8(oldBody), 0, 10_000, Status(404, "BlobNotFound"))));
         BlobOf(container, PathOf(v2)).OpenReadAsync(Arg.Any<BlobOpenReadOptions>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult<Stream>(new ScriptedBlobStream(Utf8(newBody), 0)));
+            .Returns(_ => Task.FromResult<Stream>(new ScriptedBlobReadStream(Utf8(newBody), 0)));
         using var h = new StorageHarness<SplitTextEntity>(options: Offload, blobs: new AzureOffloadBlobStore(container));
         PrimaryReads(h, v1, v2);
 
@@ -404,7 +404,7 @@ public class OpenReadDuringWriteTests
         var v1 = await OffloadedRowAsync(new SplitTextEntity { Id = Id, Body = body }, "W/\"v1\"");
         var container = Substitute.For<BlobContainerClient>();
         BlobOf(container, PathOf(v1)).OpenReadAsync(Arg.Any<BlobOpenReadOptions>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult<Stream>(new ScriptedBlobStream(Utf8(body), 0, 10_000, Status(404, "BlobNotFound"))));
+            .Returns(_ => Task.FromResult<Stream>(new ScriptedBlobReadStream(Utf8(body), 0, 10_000, Status(404, "BlobNotFound"))));
         using var h = new StorageHarness<SplitTextEntity>(options: Offload, blobs: new AzureOffloadBlobStore(container));
         PrimaryReads(h, v1, v1, v1);
 
@@ -427,8 +427,8 @@ public class OpenReadDuringWriteTests
                 var position = call.Arg<BlobOpenReadOptions>().Position;
                 opens.Add(position);
                 return Task.FromResult<Stream>(opens.Count == 1
-                    ? new ScriptedBlobStream(Utf8(body), position, 0, Status(412, "ConditionNotMet"))
-                    : new ScriptedBlobStream(Utf8(body), position));
+                    ? new ScriptedBlobReadStream(Utf8(body), position, 0, Status(412, "ConditionNotMet"))
+                    : new ScriptedBlobReadStream(Utf8(body), position));
             });
         using var h = new StorageHarness<SplitTextEntity>(options: Offload, blobs: new AzureOffloadBlobStore(container));
         PrimaryReads(h, v1);

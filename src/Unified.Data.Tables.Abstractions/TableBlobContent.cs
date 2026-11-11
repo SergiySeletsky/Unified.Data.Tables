@@ -6,7 +6,8 @@ namespace Unified.Data.Tables;
 /// Binary content of any size that an entity property stores in blob storage rather than in table
 /// cells. The row keeps only a reference (path, SHA-256, length, content type). It is always
 /// offloaded, whatever its size, and reading the entity never downloads it: the content is fetched
-/// when <see cref="OpenReadAsync"/> is called and verified when that stream reaches its end.
+/// when <see cref="OpenReadAsync"/> is called and verified by the time that stream has delivered it:
+/// the read that would return the last byte throws instead when the content does not match.
 /// </summary>
 /// <remarks>
 /// Requires blob offload to be configured on the storage (<c>UnifiedTableStorageOptions.BlobOffload</c>).
@@ -98,12 +99,21 @@ public sealed class TableBlobContent
 
     /// <summary>
     /// Opens the content for reading. In-memory content returns a read-only stream over the bytes.
-    /// Written content, or content read from a row, streams the blob lazily; the stream throws
-    /// <see cref="TableValueIntegrityException"/> at its end when the length or SHA-256 does not match.
+    /// Written content, or content read from a row, streams the blob lazily and verifies it: the read
+    /// that would return the last byte of the expected length compares the SHA-256 first and throws
+    /// <see cref="TableValueIntegrityException"/> instead when it does not match, so reading exactly
+    /// <see cref="Length"/> bytes is verified too. A blob that holds more bytes than expected, or fewer,
+    /// fails the read with the same exception, and so does a blob deleted while it is read, unless the
+    /// stream already holds its bytes. The entity being saved again while the stream is read (which
+    /// touches the blob) does not disturb the read.
     /// </summary>
     /// <param name="ct">Cancels opening the blob.</param>
     /// <returns>A stream the caller disposes.</returns>
-    /// <exception cref="InvalidOperationException">The content was created from a stream that has not been written yet.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The content was created from a stream and has not been written yet, or can no longer be written
+    /// or read because a write of it failed (see <see cref="FromStream"/>).
+    /// </exception>
+    /// <exception cref="TableValueIntegrityException">The blob is missing (the row was replaced or deleted since the entity was read).</exception>
     public async Task<Stream> OpenReadAsync(CancellationToken ct = default)
     {
         if (bytes is not null)

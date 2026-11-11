@@ -21,7 +21,7 @@ public class SharedBlobContentTests
         new(null, new UnifiedTableStorageOptions { BlobOffload = new BlobOffloadOptions() });
 
     private static TableBlobContent ForwardOnly(byte[] data) =>
-        TableBlobContent.FromStream(new FaultyStream(data, seekable: false), "application/octet-stream");
+        TableBlobContent.FromStream(new FaultyContentStream(data, seekable: false), "application/octet-stream");
 
     private static async Task AssertStoredAsync(InMemoryStorage<FileEntity> store, string id, byte[] expected)
     {
@@ -50,6 +50,11 @@ public class SharedBlobContentTests
         // The content itself still reads (it is bound to a blob that holds it).
         await using var back = await shared.OpenReadAsync(Ct);
         Assert.Equal(data, await ReadAllAsync(back));
+        // It is bound to the first entity's blob; the second entity holds a content bound to its own.
+        Assert.Same(shared, batch[0].File);
+        Assert.NotSame(shared, batch[1].File);
+        Assert.Equal(ValueOffloadCoordinator.BlobName(nameof(FileEntity), "p", "a", "File", Sha(data)), shared.BoundPath);
+        Assert.Equal(ValueOffloadCoordinator.BlobName(nameof(FileEntity), "p", "b", "File", Sha(data)), batch[1].File!.BoundPath);
     }
 
     [Fact]
@@ -152,7 +157,7 @@ public class AbandonedBlobContentTests
         new(null, new UnifiedTableStorageOptions { BlobOffload = new BlobOffloadOptions() });
 
     private static TableBlobContent ForwardOnly(byte[] data) =>
-        TableBlobContent.FromStream(new FaultyStream(data, seekable: false), "application/octet-stream");
+        TableBlobContent.FromStream(new FaultyContentStream(data, seekable: false), "application/octet-stream");
 
     internal static void AssertAbandoned(Exception? ex, string column)
     {
@@ -318,7 +323,7 @@ public sealed class AzuriteSharedAndAbandonedContentTests : AzuriteContentTestBa
     private const int Size = 300_000;
 
     private static TableBlobContent ForwardOnly(byte[] data) =>
-        TableBlobContent.FromStream(new FaultyStream(data, seekable: false), "application/octet-stream");
+        TableBlobContent.FromStream(new FaultyContentStream(data, seekable: false), "application/octet-stream");
 
     private async Task AssertStoredAsync<T>(string rk, byte[] expected, Func<T, TableBlobContent?> file) where T : class, IEntity, new()
     {
