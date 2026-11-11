@@ -96,34 +96,4 @@ internal static class RowRequestInterleaving
             ProcessNext(message, pipeline);
         }
     }
-
-    /// <summary>
-    /// Records each table request as its method and kind: <c>POST $batch</c> (a transaction),
-    /// <c>GET entity</c> (a point read), <c>GET query</c> (a query page), and so on.
-    /// </summary>
-    internal sealed class RequestLog : HttpPipelineSynchronousPolicy
-    {
-        private readonly List<string> log = [];
-
-        public List<string> Snapshot()
-        {
-            lock (log) return [.. log];
-        }
-
-        public void Clear()
-        {
-            lock (log) log.Clear();
-        }
-
-        public override void OnSendingRequest(HttpMessage message)
-        {
-            var path = message.Request.Uri.Path;
-            var kind = path.EndsWith("$batch", StringComparison.Ordinal) ? "$batch"
-                : path.Contains("(PartitionKey=", StringComparison.Ordinal) ? "entity"
-                : path.EndsWith("/Tables", StringComparison.Ordinal) ? "Tables"
-                : message.Request.Method == RequestMethod.Post ? "entity" // an insert is a POST to the table
-                : "query";
-            lock (log) log.Add(message.Request.Method.Method + " " + kind);
-        }
-    }
 }
