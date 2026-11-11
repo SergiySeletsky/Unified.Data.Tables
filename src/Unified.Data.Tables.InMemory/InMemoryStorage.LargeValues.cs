@@ -267,11 +267,16 @@ public sealed partial class InMemoryStorage<T>
     private sealed record BatchUnit(
         T Entity, (string PartitionKey, string RowKey) Keys, PriorRow? Prior, LargeValueWritePlan Plan, Dictionary<string, long>? OwnParts);
 
+    /// <summary>The blobs one committed batch transaction released from one row, and the time of that commit.</summary>
+    private sealed record ReleasedBlobs((string PartitionKey, string RowKey) Keys, List<string> Paths, DateTimeOffset? CommittedAt);
+
     /// <summary>
     /// The batch contract of TableStorage&lt;T&gt;: per partition, each entity's rows are one indivisible
     /// unit, packed in order into the same transactions (<see cref="LargeValueTable.PlanTransactions"/>),
-    /// each applied atomically under the gate. A transaction's blobs are uploaded just before it, and
-    /// released ones deleted after each commit. A repeated key in a create batch was
+    /// each applied atomically under the gate. A transaction's blobs are uploaded just before it; the
+    /// released ones are deleted once, after the last transaction committed, each on condition of the grace
+    /// counted from the commit that released it (a later entity may hold a content read from one of them).
+    /// A batch that fails part way deletes none of them; the orphan sweep does. A repeated key in a create batch was
     /// refused before this point; in an upsert batch its last occurrence is written. An existing key fails
     /// its create transaction; an upsert transaction that lost a race is planned again and retried (five
     /// attempts in all, with a short pause before each retry, as TableStorage). A
@@ -295,11 +300,18 @@ public sealed partial class InMemoryStorage<T>
         {
             foreach (var (_, entity) in writes)
                 await large.PrepareAsync(entity, ct);
+            var released = new List<ReleasedBlobs>();
             foreach (var group in writes.GroupBy(w => w.Keys.Item1, StringComparer.Ordinal))
             {
                 var units = await PlanBatchUnitsAsync(group.Select(g => g.Entity).ToList(), kind, takeBack: null, ct);
-                await CommitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, ct);
+                await CommitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, released, ct);
             }
+
+            // Every transaction committed, so no content of the batch is still to be read from a released
+            // blob (a cancelled token only bounds how long cleanup may take).
+            foreach (var row in released)
+                await large.DeleteReleasedBlobsAsync(row.Keys.PartitionKey, row.Keys.RowKey, row.Paths, row.CommittedAt,
+                    onForeign: null, onFailure: null, ct);
         }
         finally
         {
@@ -345,7 +357,8 @@ public sealed partial class InMemoryStorage<T>
         return units;
     }
 
-    private async Task CommitBatchUnitsAsync(List<BatchUnit> units, LargeWriteKind kind, int attempt, HashSet<string>? takeBack, CancellationToken ct)
+    private async Task CommitBatchUnitsAsync(
+        List<BatchUnit> units, LargeWriteKind kind, int attempt, HashSet<string>? takeBack, List<ReleasedBlobs> released, CancellationToken ct)
     {
         foreach (var range in LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList()))
         {
@@ -417,17 +430,21 @@ public sealed partial class InMemoryStorage<T>
                 if (lostRace)
                     await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
-                await CommitBatchUnitsAsync(replanned, kind, attempt + 1, taking, ct);
+                await CommitBatchUnitsAsync(replanned, kind, attempt + 1, taking, released, ct);
                 continue;
             }
 
-            // Committed: the blobs only the replaced rows referenced go (a cancelled token only bounds it).
+            // Committed: the blobs only the replaced rows referenced go once the whole batch has committed,
+            // their grace counted from now (the committed transaction is not failed by a cancelled token).
             AfterLargeCommit?.Invoke();
+            DateTimeOffset? committedAt = null;
             foreach (var unit in chunk)
             {
                 if (unit.Prior is { Blobs.Count: > 0 })
-                    await large.DeleteReleasedBlobsAsync(unit.Keys.PartitionKey, unit.Keys.RowKey,
-                        unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), serviceNow: null, onForeign: null, onFailure: null, ct);
+                {
+                    committedAt ??= await large.CommitTimeAsync(CancellationToken.None);
+                    released.Add(new ReleasedBlobs(unit.Keys, [.. unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal)], committedAt));
+                }
             }
         }
     }
@@ -436,7 +453,8 @@ public sealed partial class InMemoryStorage<T>
 
     /// <summary>
     /// Deletes the entity and its continuation rows in one step under the gate; once it is gone, the blobs
-    /// it referenced are deleted (best effort, after the grace). When there is no row at the id, the
+    /// TableStorage's read before a delete finds it referencing (<see cref="LargeValueTable.PriorRowBlobPaths"/>)
+    /// are deleted (best effort, after the grace); any others are left for the orphan sweep. When there is no row at the id, the
     /// entity's leftover continuation rows (if any) are removed, so nothing of it stays behind; a
     /// continuation row addressed by its own id is not an entity and is left alone.
     /// </summary>
@@ -470,7 +488,7 @@ public sealed partial class InMemoryStorage<T>
                         rows.Remove((keys.PartitionKey, part));
                 }
                 rows.Remove(keys);
-                released = LargeValueTable.BlobPaths(stored.Data);
+                released = LargeValueTable.PriorRowBlobPaths(typeof(T), stored.Data);
             }
         }
 
@@ -484,23 +502,30 @@ public sealed partial class InMemoryStorage<T>
     /// transactions (<see cref="LargeValueTable.PlanPartitionDelete"/>: a primary and its continuation
     /// rows always together, at most 100 rows each), each applied atomically under the gate. A token
     /// cancelled between two transactions stops the delete there, with whole entities left; a row
-    /// written after the listing survives. Then the blobs no remaining row references are deleted.
+    /// written after the listing survives. Continuation rows listed without their primary go last, and
+    /// only when no primary exists for them by then, each only while it is still the version listed, so
+    /// an entity written meanwhile is left whole. Then the blobs no remaining row references are deleted.
     /// </summary>
     private async Task<int> DeletePartitionLargeAsync(string partition, CancellationToken ct)
     {
-        // The partition's rows in row-key order, as the service lists them.
+        // The partition's rows in row-key order, as the service lists them, with their versions.
         List<TableEntity> listed;
+        var listedVersions = new Dictionary<string, long>(StringComparer.Ordinal);
         lock (gate)
         {
-            listed = rows.Where(kv => kv.Key.PartitionKey == partition)
-                .OrderBy(kv => kv.Key.RowKey, StringComparer.Ordinal)
-                .Select(kv => kv.Value.Data)
-                .ToList();
+            listed = [];
+            foreach (var (key, stored) in rows.Where(kv => kv.Key.PartitionKey == partition).OrderBy(kv => kv.Key.RowKey, StringComparer.Ordinal))
+            {
+                listed.Add(stored.Data);
+                listedVersions[key.RowKey] = stored.Version;
+            }
         }
         // Every row goes, continuation rows included; only logical entities are counted.
         var logical = listed.Count(row => !LargeValueTable.IsPartRow(row));
+        // Continuation rows listed without their primary go last, as TableStorage deletes them.
+        var (whole, leftovers) = LargeValueTable.SeparateListedLeftovers(listed);
 
-        foreach (var transaction in LargeValueTable.PlanPartitionDelete(listed))
+        foreach (var transaction in LargeValueTable.PlanPartitionDelete(whole))
         {
             // A cancelled token fails a transaction before it is sent, as the SDK does.
             ct.ThrowIfCancellationRequested();
@@ -509,6 +534,24 @@ public sealed partial class InMemoryStorage<T>
                 BatchTransactions++;
                 foreach (var row in transaction)
                     rows.Remove((row.PartitionKey, row.RowKey));
+            }
+            AfterLargeCommit?.Invoke();
+        }
+        foreach (var (primaryRowKey, group) in leftovers)
+        {
+            ct.ThrowIfCancellationRequested();
+            lock (gate)
+            {
+                // A primary there now owns these rows: they are left alone. Otherwise each row goes only
+                // while it is still the row listed (a row a writer took back since is another version).
+                if (rows.TryGetValue((partition, primaryRowKey), out var primary) && !LargeValueTable.IsPartRow(primary.Data))
+                    continue;
+                BatchTransactions++;
+                foreach (var row in group)
+                {
+                    if (rows.TryGetValue((partition, row.RowKey), out var current) && current.Version == listedVersions[row.RowKey])
+                        rows.Remove((partition, row.RowKey));
+                }
             }
             AfterLargeCommit?.Invoke();
         }
@@ -650,10 +693,14 @@ public sealed partial class InMemoryStorage<T>
         }
     }
 
-    /// <summary>Under the gate: the stored entity row's version, part count and blobs; null when there is none.</summary>
+    /// <summary>
+    /// Under the gate: the stored entity row's version, part count and blobs; null when there is none. The
+    /// blobs are those TableStorage's point read before a write learns: the references in the cells it
+    /// selects (<see cref="LargeValueTable.PriorRowBlobPaths"/>); one in any other cell is left for the sweep.
+    /// </summary>
     private PriorRow? ReadPrior((string PartitionKey, string RowKey) keys) =>
         rows.TryGetValue(keys, out var row) && !LargeValueTable.IsPartRow(row.Data)
-            ? new PriorRow(row.Version, LargeValueTable.PartCount(row.Data), LargeValueTable.BlobPaths(row.Data))
+            ? new PriorRow(row.Version, LargeValueTable.PartCount(row.Data), LargeValueTable.PriorRowBlobPaths(typeof(T), row.Data))
             : null;
 
     /// <summary>Under the gate: the row keys of the continuation rows of <paramref name="keys"/> that exist now.</summary>

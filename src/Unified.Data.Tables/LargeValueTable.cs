@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Security.Cryptography;
 using Azure.Data.Tables;
@@ -254,6 +255,85 @@ public sealed class LargeValueTable
         return paths;
     }
 
+    // The projection of the point read before a write or delete, per entity type, built on first use (by
+    // an operation, never by a store's type initializer: listing the columns may construct the entity).
+    private static readonly ConcurrentDictionary<Type, PriorRowProjection> PriorRowProjections = new();
+
+    private sealed record PriorRowProjection(string[]? Select, HashSet<string>? ReferenceColumns);
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The <c>$select</c> of the point read that precedes
+    /// an upsert, a replace, a delete and a batch upsert of an existing row of
+    /// <paramref name="entityType"/>: the part count and continuation marker cells and one
+    /// <c>{column}__blob</c> cell per large-value column of the type (legacy alias columns included). When
+    /// that list would name more columns, or be longer as a URL-encoded <c>$select</c> value, than the
+    /// orphan sweep allows itself, the row is read whole instead (null), so the read always stays within
+    /// the service's projection and URL limits. Computed on first use and kept.
+    /// </summary>
+    /// <param name="entityType">The store's entity type.</param>
+    /// <returns>The columns to select, or null to read the row whole.</returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static IReadOnlyList<string>? PriorRowSelect(Type entityType)
+    {
+        ArgumentNullException.ThrowIfNull(entityType);
+        return PriorRowProjectionOf(entityType).Select;
+    }
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The blob names the point read before a write or
+    /// delete learns from the stored <paramref name="row"/>: the references in the cells
+    /// <see cref="PriorRowSelect"/> selects, or in every cell when it reads the row whole. A provider that
+    /// holds the whole row passes it as it is and releases the same blobs as one that reads the
+    /// projection; a reference in any other cell is left for the orphan sweep. Null and malformed cells
+    /// are handled as <see cref="BlobPaths"/> handles them.
+    /// </summary>
+    /// <param name="entityType">The store's entity type.</param>
+    /// <param name="row">The stored primary row, whole or projected onto <see cref="PriorRowSelect"/>.</param>
+    /// <param name="onMalformed">Called with the column and the error of each malformed reference.</param>
+    /// <returns>The referenced blob names.</returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static IReadOnlyList<string> PriorRowBlobPaths(
+        Type entityType, TableEntity row, Action<string, TableValueIntegrityException>? onMalformed = null)
+    {
+        ArgumentNullException.ThrowIfNull(entityType);
+        ArgumentNullException.ThrowIfNull(row);
+        var selected = PriorRowProjectionOf(entityType).ReferenceColumns;
+        var paths = new List<string>();
+        foreach (var (column, cell) in ValueOffloadCoordinator.ReferenceCells(row))
+        {
+            if (selected is not null && !selected.Contains(column))
+                continue;
+            try
+            {
+                paths.Add(ValueOffloadCoordinator.ParseReference(column, cell).Path);
+            }
+            catch (TableValueIntegrityException ex)
+            {
+                onMalformed?.Invoke(column, ex);
+            }
+        }
+        return paths;
+    }
+
+    private static PriorRowProjection PriorRowProjectionOf(Type entityType) =>
+        PriorRowProjections.GetOrAdd(entityType, static type =>
+        {
+            var columns = TypeMetadataCache.LargeValueColumns(type);
+            if (columns.Count > ValueOffloadCoordinator.MaxSweepSelectColumns)
+                return new PriorRowProjection(null, null);
+            // The version is not a column: the service returns it with every entity (and may refuse a
+            // $select that names odata.etag).
+            string[] select =
+            [
+                SystemColumnNames.SplitParts,
+                SystemColumnNames.SplitOf,
+                .. columns.Select(c => c + SplitCodec.BlobSuffix),
+            ];
+            return ValueOffloadCoordinator.SelectLength(select) > ValueOffloadCoordinator.MaxSweepSelectLength
+                ? new PriorRowProjection(null, null)
+                : new PriorRowProjection(select, new HashSet<string>(columns, StringComparer.Ordinal));
+        });
+
     /// <summary>
     /// Storage-provider SPI, not for application code. Seals every <see cref="TableBlobContent"/> of
     /// <paramref name="entity"/> (hashing it; a non-seekable source is copied to a temporary file).
@@ -467,6 +547,19 @@ public sealed class LargeValueTable
         }
     }
 
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The time of a commit that released blobs, on the
+    /// clock cleanup measures their age with, for a cleanup that runs later
+    /// (<see cref="DeleteReleasedBlobsAsync"/>, <c>serviceNow</c>): a batch deletes the blobs its
+    /// transactions released only after its last transaction has committed, and the grace of each is
+    /// counted from the commit that released it. Null when this table never deletes a released blob.
+    /// </summary>
+    /// <param name="ct">Cancels the read of the blob store's clock.</param>
+    /// <returns>The blob store's time now (the client clock less <see cref="ClientClockMargin"/> when it cannot tell), or null.</returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<DateTimeOffset?> CommitTimeAsync(CancellationToken ct) =>
+        blobs is null || NeverCleansUp ? null : await ServiceNowAsync(ct);
+
     // The paths that are blobs of the row itself: offload-shaped names under {table}/{pk}/{rk}/. Every
     // blob a write of the row uploads has such a name, so anything else was not written for this row: a
     // row copied raw from another table, or to another row key, still references the source row's
@@ -593,6 +686,56 @@ public sealed class LargeValueTable
             transactions.Add(current);
             current = [];
         }
+    }
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Separates, from the rows a partition delete
+    /// listed, the continuation rows listed without their primary: a leftover, or the rows of an entity
+    /// written while the listing was read page by page, whose primary sorts before a page boundary and
+    /// its continuation rows after it. Those may belong to an entity that is live, so they are not
+    /// deleted with the others: each group (the rows that name one primary) is deleted only when no
+    /// primary exists for it after the listing, and each row only while it is still the row listed.
+    /// </summary>
+    /// <param name="rows">The rows of one partition, as for <see cref="PlanPartitionDelete"/>.</param>
+    /// <returns>
+    /// <c>Whole</c>: the other rows, in the order listed (<paramref name="rows"/> itself when there is no
+    /// such group), to be planned with <see cref="PlanPartitionDelete"/>. <c>Leftovers</c>: the groups,
+    /// in the order their first row was listed, each with the row key of the primary its rows name.
+    /// </returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static (IReadOnlyList<TableEntity> Whole, IReadOnlyList<(string PrimaryRowKey, IReadOnlyList<TableEntity> Rows)> Leftovers)
+        SeparateListedLeftovers(IReadOnlyList<TableEntity> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        // The row keys of the listed rows that are not continuation rows: the primaries the listing holds.
+        var primaries = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            ArgumentNullException.ThrowIfNull(row);
+            if (PrimaryKeyOf(row) is null)
+                primaries.Add(row.RowKey ?? string.Empty);
+        }
+
+        var groups = new List<(string PrimaryRowKey, IReadOnlyList<TableEntity> Rows)>();
+        var groupOf = new Dictionary<string, List<TableEntity>>(StringComparer.Ordinal);
+        List<TableEntity>? whole = null;
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            if (PrimaryKeyOf(row) is not { } primary || primaries.Contains(primary))
+            {
+                whole?.Add(row);
+                continue;
+            }
+            whole ??= [.. rows.Take(i)];
+            if (!groupOf.TryGetValue(primary, out var group))
+            {
+                groupOf[primary] = group = [];
+                groups.Add((primary, group));
+            }
+            group.Add(row);
+        }
+        return (whole ?? rows, groups);
     }
 
     // The row key of the primary a continuation row belongs to (its _SplitOf cell); null for any other row.

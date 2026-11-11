@@ -38,12 +38,10 @@ public partial class TableStorage<T>
     // one; the __blob reference columns are selected now so the offload tier can read them from the same
     // point read. The row's version is not a column and is never selected: the service returns it with
     // every entity (and as the response's ETag header), and may refuse a $select that names odata.etag.
-    private static readonly string[] PriorSelect =
-    [
-        SystemColumnNames.SplitParts,
-        SystemColumnNames.SplitOf,
-        .. TypeMetadataCache.LargeValueColumns(typeof(T)).Select(c => c + SplitCodec.BlobSuffix),
-    ];
+    // A type with more large-value columns than a projection may name reads the row whole (null). Built
+    // on first use by an operation, never by this type's initializer (listing the columns may construct
+    // the entity).
+    private static IReadOnlyList<string>? PriorSelect => LargeValueTable.PriorRowSelect(typeof(T));
 
     private static readonly string[] PartKeys = ["PartitionKey", "RowKey", SystemColumnNames.SplitOf];
 
@@ -73,7 +71,7 @@ public partial class TableStorage<T>
 
     /// <summary>
     /// The row at an entity's keys as the point read before a write or delete returns it (projected onto
-    /// <see cref="PriorSelect"/>), with its version. A continuation row has none here: nothing is ever
+    /// <see cref="PriorSelect"/>, or whole), with its version. A continuation row has none here: nothing is ever
     /// written or deleted on condition of it.
     /// </summary>
     private readonly record struct StoredRow(TableEntity Row, ETag ETag);
@@ -120,10 +118,12 @@ public partial class TableStorage<T>
     // A version a conditional write can name: not empty, and not the "any version" wildcard.
     private static bool IsVersion(ETag etag) => etag != ETag.All && !string.IsNullOrEmpty(etag.ToString());
 
-    // The blob names a stored row references; a malformed reference is logged and skipped. The keys are
-    // passed in: the projected row does not carry them.
+    // The blob names the prior read learns from a stored row (the references in the cells PriorSelect
+    // names, every cell when the row was read whole: the rule InMemoryStorage applies to its whole rows);
+    // a malformed reference is logged and skipped. The keys are passed in: the projected row does not
+    // carry them.
     private IReadOnlyList<string> BlobPaths(TableEntity row, string pk, string rk) =>
-        LargeValueTable.BlobPaths(row, (column, ex) =>
+        LargeValueTable.PriorRowBlobPaths(typeof(T), row, (column, ex) =>
             logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: ignoring a malformed blob reference in {Column}",
                 typeName, pk, rk, column));
 
@@ -205,7 +205,15 @@ public partial class TableStorage<T>
                 // other row is foreign: the write is refused and that row is left as it is.
                 ownParts = await OwnPartsAsync(pk, rk, ct);
                 if (!ownParts.ContainsKey(taken))
-                    throw LargeValueTable.ContinuationKeyTaken(pk, rk, taken, ex);
+                {
+                    if (await HeldByForeignRowAsync(pk, rk, taken, ct))
+                        throw LargeValueTable.ContinuationKeyTaken(pk, rk, taken, ex);
+                    // The row in the way is gone (or the entity's own again): a lost race, planned again.
+                    ownParts = null;
+                    lost = ex;
+                    lostRace = true;
+                    continue;
+                }
                 takeBack = true;
                 lost = ex;
                 continue;
@@ -329,6 +337,18 @@ public partial class TableStorage<T>
             actions.Add(new TableTransactionAction(
                 TableTransactionActionType.Delete, new TableEntity(pk, partKey), ReadVersion(own, partKey) ?? ETag.All));
         }
+    }
+
+    // After a new continuation row failed on a taken key that is not among the entity's own rows: true
+    // when a row that is not the entity's continuation row holds that key now (one point read, on this
+    // refusal path only), so the foreign-row error names a row that is there. No row there, or the
+    // entity's own continuation row again, is a lost race.
+    private async Task<bool> HeldByForeignRowAsync(string pk, string rk, string partKey, CancellationToken ct)
+    {
+        var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, partKey, PartKeys, ct);
+        if (!response.HasValue || response.Value is not { } row)
+            return false;
+        return !(row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is string owner && string.Equals(owner, rk, StringComparison.Ordinal));
     }
 
     // The version one of the entity's own continuation rows was read at, when the plan was made over them.
@@ -603,7 +623,9 @@ public partial class TableStorage<T>
     /// declares a part already gone can still be deleted). When there is no row at the id, the entity's
     /// leftover continuation rows (if any) are deleted, so nothing of it stays behind; a continuation row
     /// addressed by its own id is not an entity and is left alone. A lost race re-reads and retries. Any
-    /// row key is accepted. Once the entity is deleted, the blobs it referenced are deleted (best effort).
+    /// row key is accepted. Once the entity is deleted, the blobs the read before the delete found it
+    /// referencing are deleted (best effort; see <see cref="BlobPaths"/>), the others are left for the
+    /// orphan sweep.
     /// </summary>
     private async Task DeleteLargeAsync(string pk, string rk, CancellationToken ct)
     {
@@ -726,6 +748,49 @@ public partial class TableStorage<T>
     }
 
     /// <summary>
+    /// The part of a partition delete for continuation rows it listed without their primary
+    /// (<see cref="LargeValueTable.SeparateListedLeftovers"/>). They may be leftovers, or the rows of an
+    /// entity written while the delete ran: the primary's key is read once more, now that they are
+    /// listed, and when a primary is there they are its rows and are left alone. Otherwise they are
+    /// deleted in one transaction (at most 100 rows each), each row on condition of the version it was
+    /// listed at, so a row a writer has taken back for a new entity since is not deleted. When that
+    /// condition fails (412) or a row is gone (404), each row of the transaction is deleted on its own
+    /// condition and a row that changed or is gone is left alone; the partition delete goes on. A row
+    /// whose version is unknown is never deleted here (the service always sends one).
+    /// </summary>
+    private async Task DeleteListedLeftoversAsync(string pk, string primaryRowKey, IReadOnlyList<TableEntity> rows, CancellationToken ct)
+    {
+        var primary = await client.GetEntityIfExistsAsync<TableEntity>(pk, primaryRowKey, PartKeys, ct);
+        if (primary.HasValue && primary.Value is { } row && !SplitRowLayout.IsPartRow(row))
+            return;
+
+        foreach (var chunk in rows.Where(part => IsVersion(part.ETag)).Chunk(BatchPlanner.DefaultMaxCount))
+        {
+            try
+            {
+                await client.SubmitTransactionAsync(chunk.Select(part => new TableTransactionAction(
+                    TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), part.ETag)), ct);
+            }
+            catch (RequestFailedException ex) when (ex.Status is 412 or 404)
+            {
+                if (chunk.Length == 1)
+                    continue;
+                foreach (var part in chunk)
+                {
+                    try
+                    {
+                        await client.DeleteEntityAsync(pk, part.RowKey, part.ETag, ct);
+                    }
+                    catch (RequestFailedException single) when (single.Status is 412 or 404)
+                    {
+                        // Changed since it was listed (another writer's now), or already gone: left alone.
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// True when a projection names a large-value column, or an object that owns one: such a value
     /// spans cells and continuation rows, so the whole row is fetched and assembled instead.
     /// </summary>
@@ -754,13 +819,20 @@ public partial class TableStorage<T>
     /// </summary>
     private sealed record BatchUnit(T Entity, string Pk, string Rk, PriorRow? Prior, LargeValueWritePlan Plan, Dictionary<string, ETag>? OwnParts);
 
+    /// <summary>The blobs one committed batch transaction released from one row, and the service time of that commit.</summary>
+    private sealed record ReleasedBlobs(string Pk, string Rk, List<string> Paths, DateTimeOffset? CommittedAt);
+
     /// <summary>
     /// A split-aware batch, with the plain batch's contract: per partition, each entity's rows (primary,
     /// continuation rows, stale-part deletes) are one indivisible unit, and the units are packed in order
     /// into entity-group transactions (<see cref="LargeValueTable.PlanTransactions"/>), each atomic. The
     /// blobs a transaction's rows reference are uploaded (create-only) just before that transaction, so a
-    /// blob waits for its row no longer than in a single write; after each transaction commits, the blobs
-    /// only the replaced rows referenced are deleted (best effort). A
+    /// blob waits for its row no longer than in a single write. The blobs only the replaced rows referenced
+    /// are deleted (best effort) once, after the last transaction of the call has committed, each on
+    /// condition of the cleanup grace counted from the commit that released it: an entity of a later
+    /// transaction may hold a content read from such a blob, and it is read when that entity's upload runs.
+    /// A batch that fails part way deletes none of them (the orphan sweep does), so every entity it did not
+    /// write keeps a readable content and the same batch can be sent again. A
     /// key repeated in a create batch throws <see cref="DuplicateKeyException"/> before anything is
     /// written; in an upsert batch its last occurrence is written. An existing key fails its create
     /// transaction (<see cref="DuplicateKeyException"/>); earlier transactions stay committed. An upsert
@@ -768,7 +840,9 @@ public partial class TableStorage<T>
     /// after a short pause; after five lost races it throws <see cref="ConcurrencyConflictException"/>. A transaction that
     /// finds the key of a new continuation row held by a leftover continuation row of the same entity is
     /// planned again over that entity's own rows (they are replaced or deleted in the retried
-    /// transaction); a foreign row at such a key fails the transaction, and is left as it is.
+    /// transaction); a foreign row at such a key fails the transaction, and is left as it is. A key no
+    /// row holds any more by the time the write looks (another caller removed the leftover) is a lost
+    /// race: planned again after the pause, within the five attempts.
     /// </summary>
     private async Task WriteBatchLargeAsync(IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
@@ -786,11 +860,18 @@ public partial class TableStorage<T>
             // Hash every TableBlobContent once (a non-seekable one is copied to a temporary file).
             foreach (var entity in writes)
                 await large.PrepareAsync(entity, ct);
+            var released = new List<ReleasedBlobs>();
             foreach (var group in writes.GroupBy(e => GetEntityKeys(e.Id).PartitionKey, StringComparer.Ordinal))
             {
                 var units = await PlanBatchUnitsAsync([.. group], kind, takeBack: null, ct);
-                await SubmitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, ct);
+                await SubmitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, released, ct);
             }
+
+            // Every transaction committed: nothing of the batch is left to upload, so no blob a content of
+            // it is read from can be needed any more. A committed write is never reported as failed: a
+            // cancelled token only bounds how long cleanup may take.
+            foreach (var row in released)
+                await DeleteBlobsAsync(row.Pk, row.Rk, row.Paths, row.CommittedAt, ct);
         }
         finally
         {
@@ -852,7 +933,8 @@ public partial class TableStorage<T>
     }
 
     private async Task SubmitBatchUnitsAsync(
-        List<BatchUnit> units, LargeWriteKind kind, int attempt, Dictionary<string, Dictionary<string, ETag>?>? takeBack, CancellationToken ct)
+        List<BatchUnit> units, LargeWriteKind kind, int attempt, Dictionary<string, Dictionary<string, ETag>?>? takeBack,
+        List<ReleasedBlobs> released, CancellationToken ct)
     {
         foreach (var range in LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList()))
         {
@@ -876,7 +958,18 @@ public partial class TableStorage<T>
                 var unit = chunk[owners[((TableTransactionFailedException)ex).FailedTransactionActionIndex!.Value]];
                 var own = await OwnPartsAsync(unit.Pk, unit.Rk, ct);
                 if (!own.ContainsKey(taken))
-                    throw LargeValueTable.ContinuationKeyTaken(unit.Pk, unit.Rk, taken, ex);
+                {
+                    if (await HeldByForeignRowAsync(unit.Pk, unit.Rk, taken, ct))
+                        throw LargeValueTable.ContinuationKeyTaken(unit.Pk, unit.Rk, taken, ex);
+                    // The row in the way is gone (or the entity's own again): a lost race, planned again
+                    // from the rows as they are now, after a short pause.
+                    if (attempt >= MaxLargeWriteAttempts)
+                        throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
+                    await large.WaitBeforeRetryAsync(attempt + 1, ct);
+                    var again = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
+                    await SubmitBatchUnitsAsync(again, kind, attempt + 1, takeBack, released, ct);
+                    continue;
+                }
                 if (attempt >= MaxLargeWriteAttempts)
                     throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
                 var taking = takeBack is null
@@ -892,7 +985,7 @@ public partial class TableStorage<T>
                         taking.TryAdd(other.Rk, null);
                 }
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
-                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, released, ct);
                 continue;
             }
             catch (RequestFailedException ex) when (kind == LargeWriteKind.Create && ex.Status == 409 && IsBatchPrimaryFailure(ex, owners))
@@ -908,16 +1001,16 @@ public partial class TableStorage<T>
                     throw new ConcurrencyConflictException(typeName, FailedId(ex, owners, chunk), ex);
                 await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
-                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, released, ct);
                 continue;
             }
 
-            // The transaction committed: the blobs only the replaced rows referenced can go. A committed
-            // write is never reported as failed: a cancelled token only bounds how long cleanup may take.
+            // The transaction committed: the blobs only the replaced rows referenced can go, once the whole
+            // batch has committed (a later transaction may still read one of them as a content's source).
             foreach (var unit in chunk)
             {
                 if (unit.Prior is { Blobs.Count: > 0 })
-                    await DeleteBlobsAsync(unit.Pk, unit.Rk, unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), committedAt, ct);
+                    released.Add(new ReleasedBlobs(unit.Pk, unit.Rk, [.. unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal)], committedAt));
             }
         }
     }

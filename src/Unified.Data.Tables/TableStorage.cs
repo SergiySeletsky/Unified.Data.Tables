@@ -278,9 +278,15 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         // Azure Table batch: max 100 entities per transaction, same partition. For a split-aware type a
         // primary and its continuation rows are one unit that is never divided between two transactions,
         // so a failure or a cancellation between transactions leaves no continuation row without its
-        // primary (rows nothing could read, and that would block the key).
+        // primary (rows nothing could read, and that would block the key). Continuation rows listed
+        // without their primary may belong to an entity that is live by now: they go last, each group
+        // only once no primary exists for it, and each row on condition of the version it was listed at.
+        IReadOnlyList<TableEntity> whole = entities;
+        IReadOnlyList<(string PrimaryRowKey, IReadOnlyList<TableEntity> Rows)> leftovers = [];
+        if (LargeValueAware)
+            (whole, leftovers) = LargeValueTable.SeparateListedLeftovers(entities);
         IEnumerable<IReadOnlyList<TableEntity>> transactions =
-            LargeValueAware ? LargeValueTable.PlanPartitionDelete(entities) : entities.Chunk(100);
+            LargeValueAware ? LargeValueTable.PlanPartitionDelete(whole) : entities.Chunk(100);
         try
         {
             foreach (var batch in transactions)
@@ -289,6 +295,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                     new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
                 await client.SubmitTransactionAsync(actions, ct);
             }
+            foreach (var (primaryRowKey, rows) in leftovers)
+                await DeleteListedLeftoversAsync(partition, primaryRowKey, rows, ct);
         }
         finally
         {
@@ -771,6 +779,20 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             return 0;
 
         await EnsureTableAsync(ct);
+
+        // A type with large values refuses a reserved or unsplittable key before any entity is stamped
+        // (as InMemoryStorage does), so a refused batch leaves the caller's entities as they were.
+        if (LargeValueAware)
+        {
+            foreach (var entity in entities)
+            {
+                if (entity is not null && !string.IsNullOrWhiteSpace(entity.Id))
+                {
+                    var (pk, rk) = GetEntityKeys(NormalizeId(entity.Id));
+                    SplitRowLayout.ValidateKeys(pk, rk);
+                }
+            }
+        }
 
         var now = DateTimeOffset.UtcNow;
         var rows = new List<(string Partition, string Id, TableEntity Row)>(entities.Count);

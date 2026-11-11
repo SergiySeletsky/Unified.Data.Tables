@@ -304,6 +304,8 @@ public class TableStorageSplitTests
         var failure = TxFailed(409, index: 1);
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
+        // The row at the key, read once on the refusal path: another writer's row, not r's continuation row.
+        h.SetupGet("p", "r~0001", new TableEntity("p", "r~0001") { ETag = new ETag("W/\"theirs\"") });
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => h.Store.CreateAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct));
@@ -379,6 +381,8 @@ public class TableStorageSplitTests
         var failure = TxFailed(409, index: 1);
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
+        // The row at the key, read once on the refusal path: another writer's row, not r1's continuation row.
+        h.SetupGet("p", "r1~0001", new TableEntity("p", "r1~0001") { ETag = new ETag("W/\"theirs\"") });
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => h.Store.CreateBatchAsync(
             [new SplitTextEntity { Id = "p|r1", Body = TwoRowText }], Ct));
@@ -415,6 +419,8 @@ public class TableStorageSplitTests
         var failure = TxFailed(409, index: 1);
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
+        // The row at the key, read once on the refusal path: another writer's row, not r's continuation row.
+        h.SetupGet("p", "r~0001", new TableEntity("p", "r~0001") { ETag = new ETag("W/\"theirs\"") });
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct));
@@ -429,6 +435,8 @@ public class TableStorageSplitTests
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet(null);
         // Actions: r1, r2, r2~0001: the service fails action 2, r2's new continuation row.
+        // The row at the key, read once on the refusal path: another writer's row, not r2's continuation row.
+        h.SetupGet("p", "r2~0001", new TableEntity("p", "r2~0001") { ETag = new ETag("W/\"theirs\"") });
         var failure = TxFailed(409, index: 2);
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
