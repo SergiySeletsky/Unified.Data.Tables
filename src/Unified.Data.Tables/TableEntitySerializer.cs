@@ -1706,31 +1706,33 @@ internal static class TypeMetadataCache
         return options;
     }
 
-    // The class-level [TableValueSplit] that applies to t and the class that declares it: the nearest
-    // one, on t itself or on a base class.
-    private static (Type Annotated, TableValueSplitAttribute Attribute)? ClassLevelSplit(Type t)
+    // The class-level [TableValueSplit] that applies to t: the nearest one, on t itself or on a base
+    // class (a derived class inherits it, and may declare its own).
+    private static TableValueSplitAttribute? ClassLevelSplit(Type t)
     {
         for (var cur = t; cur is not null; cur = cur.BaseType)
         {
             if (cur.GetCustomAttribute<TableValueSplitAttribute>(inherit: false) is { } attribute)
-                return (cur, attribute);
+                return attribute;
         }
         return null;
     }
 
-    // The [TableValueSplit] that applies to one property of t, or null. A property-level attribute
-    // wins. A class-level attribute covers every string, byte[] and JSON-stored property declared by
-    // the annotated class or a class derived from it - not members inherited from its bases (Entity.Id
-    // stays an ordinary, filterable key column). A property-level attribute on a scalar or on a
-    // concrete type that flattens into columns has nothing to split; one on an interface or abstract
-    // type that may flatten at runtime cannot be honoured. With validate such a misuse throws (the
-    // serializer, on first use of the type); without, the property is simply not opted in (the
-    // large-value walk, which must not throw).
-    private static TableValueSplitAttribute? SplitFor(
-        Type t, PropertyInfo prop, (Type Annotated, TableValueSplitAttribute Attribute)? classLevel, bool validate)
+    // The [TableValueSplit] that applies to one property of t, or null.
+    //  - A property-level attribute wins: the property's own, or the one of the base property it
+    //    re-declares (override or new), so a re-declaration keeps the opt-in.
+    //  - Otherwise the class-level attribute of t covers every string, byte[] and JSON-stored property
+    //    of t, declared or inherited - but never the entity id (it stays an ordinary, filterable key
+    //    column) nor a member that is not stored as an ordinary column (an indexer; ETag, Timestamp and
+    //    [IgnoreDataMember] members are not serialized properties at all).
+    // A property-level attribute on a scalar or on a concrete type that flattens into columns has
+    // nothing to split; one on an interface or abstract type that may flatten at runtime cannot be
+    // honoured. With validate such a misuse throws (the serializer, on first use of the type); without,
+    // the property is simply not opted in (the large-value walk, which must not throw).
+    private static TableValueSplitAttribute? SplitFor(Type t, PropertyInfo prop, TableValueSplitAttribute? classLevel, bool validate)
     {
         var type = prop.PropertyType;
-        if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
+        if (PropertyLevelSplit(prop) is { } own)
         {
             if (type == typeof(TableBlobContent))
                 return !validate ? null : throw new InvalidOperationException(
@@ -1753,12 +1755,37 @@ internal static class TypeMetadataCache
             return own;
         }
 
-        return classLevel is { } scope
-               && prop.DeclaringType is { } declaring && scope.Annotated.IsAssignableFrom(declaring)
-               && IsSplittable(type)
-            ? scope.Attribute
-            : null;
+        return classLevel is not null && IsSplittable(type) && IsOrdinaryColumn(t, prop) ? classLevel : null;
     }
+
+    // The property's own [TableValueSplit], or that of the base property it re-declares: an override
+    // inherits it through reflection; a property that hides (new) a base property of the same name and
+    // type does not, so the hidden declarations are looked up.
+    private static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
+    {
+        if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
+            return own;
+        if (prop.GetIndexParameters().Length > 0)
+            return null;
+
+        for (var cur = prop.DeclaringType?.BaseType; cur is not null; cur = cur.BaseType)
+        {
+            foreach (var hidden in cur.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+            {
+                if (hidden.Name == prop.Name && hidden.PropertyType == prop.PropertyType && hidden.GetIndexParameters().Length == 0
+                    && hidden.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } inherited)
+                    return inherited;
+            }
+        }
+        return null;
+    }
+
+    // A property a class-level attribute may opt in: one the writer stores as an ordinary column (not
+    // an indexer, nor a name with the path delimiter, which the writer refuses), and not the entity id.
+    private static bool IsOrdinaryColumn(Type t, PropertyInfo prop) =>
+        prop.GetIndexParameters().Length == 0
+        && !TableEntityValue.ContainsPathDelimiter(prop.Name)
+        && !(prop.Name == nameof(IEntity.Id) && typeof(IEntity).IsAssignableFrom(t));
 
     // string, byte[], or a type the serializer stores as one JSON cell.
     private static bool IsSplittable(Type type) =>
