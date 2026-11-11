@@ -275,6 +275,78 @@ public class InterfaceInheritedMemberMatrixTests
         Assert.True(TypeMetadataCache.TryGetMember(typeof(IPlainDerived), "Inner", out var memberType, out var large) && memberType == typeof(PlainLeaf) && !large);
     }
 
+    // The plain-store refusal names declarations that work: a nullable struct reached through a member the
+    // declared interface inherits is named, and following the declaration stores and reads the value back.
+    public struct SMarked
+    {
+        public SMarked()
+        {
+        }
+
+        [TableValueSplit(SplitEncoding.Text)]
+        public string? Notes { get; set; }
+    }
+
+    public interface INsBase
+    {
+        SMarked? Extra { get; set; }
+    }
+
+    public interface INsDer : INsBase
+    {
+    }
+
+    public sealed class NsImpl : INsDer
+    {
+        public SMarked? Extra { get; set; }
+    }
+
+    public sealed class NsHolder : Entity
+    {
+        public INsDer Doc { get; set; } = new NsImpl();
+    }
+
+    public interface INsBaseF
+    {
+        SMarked Extra { get; set; }
+    }
+
+    public interface INsDerF : INsBaseF
+    {
+    }
+
+    public sealed class NsImplF : INsDerF
+    {
+        public SMarked Extra { get; set; }
+    }
+
+    public sealed class NsHolderF : Entity
+    {
+        public INsDerF Doc { get; set; } = new NsImplF();
+    }
+
+    [Theory]
+    [MemberData(nameof(StoresAndSizes))]
+    public async Task PlainStoreRefusal_ThroughAnInheritedInterfaceMember_NamesTheNullableStruct_AndTheNamedDeclarationWorks(string kind, int length)
+    {
+        await using var stores = await LargeValueStores.OpenAsync(kind);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        var refused = await Assert.ThrowsAsync<NotSupportedException>(() => stores.Store<NsHolder>(Table).CreateAsync(
+            new NsHolder { Id = stores.Id("r"), Doc = new NsImpl { Extra = new SMarked { Notes = "x" } } }, Ct));
+        Assert.Contains("Declare INsDer.Extra as SMarked, not nullable", refused.Message, StringComparison.Ordinal);
+        Assert.Empty(await stores.RawRowsAsync<NsHolder>(Table));
+
+        var notes = new string('n', length);
+        await stores.Store<NsHolderF>(Table).CreateAsync(new NsHolderF { Id = stores.Id("f"), Doc = new NsImplF { Extra = new SMarked { Notes = notes } } }, Ct);
+        Assert.Equal(notes, (await stores.Store<NsHolderF>(Table).OneAsync(stores.Id("f"), Ct))!.Doc.Extra.Notes);
+    }
+
+    public static TheoryData<string, int> StoresAndSizes() => new()
+    {
+        { LargeValueStores.Memory, 10 }, { LargeValueStores.Memory, 40_000 },
+        { LargeValueStores.Azurite, 10 }, { LargeValueStores.Azurite, 40_000 },
+    };
+
     // ── Family B: the misuse (R11): [TableValueSplit] on an interface member, reached through the member ──
 
     public interface IMarked
