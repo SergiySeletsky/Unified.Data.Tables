@@ -206,7 +206,7 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `MutateOrCreateAsync(id, create, mutate)` | Extension: insert-or-mutate CAS — the delta applies uniformly on first insert and on updates. |
 | `TryMutateAsync(id, e => …)` | Extension: outcome-returning CAS — `Updated` / `NotFound` / `Conflicted`, nothing thrown for expected branches. |
 | `TryTransitionAsync(id, when, apply)` | Extension: exactly-once transition as a result — the race-loser gets `PreconditionFailed` with the winner's row. |
-| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction, atomic per transaction (`DuplicateKeyException` on an existing or repeated key). Split-aware types too: an entity's continuation rows ride in its transaction. |
+| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction, atomic per transaction (`DuplicateKeyException` on an existing or repeated key). Types with large values too: an entity's continuation rows ride in its transaction. |
 | `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking. A type with large values reads each row first and replaces it conditionally; `ConcurrencyConflictException` after five lost races. |
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
 | `DeleteAsync(id)` | Delete one row (idempotent). For a type with large values it reads the row first and deletes it, with its continuation rows and blobs, on condition of the version read; `ConcurrencyConflictException` after five lost races. |
@@ -786,10 +786,10 @@ replaced.
 - A read that races a replace or delete (the main row is read before its continuation rows and blobs) can
   see parts or a missing blob of another version, or have a blob deleted while it downloads it (a blob
   that is only touched, by a write that reuses its content, does not disturb the download). On such a
-  failure the main row is read again: if its
-  ETag changed, the whole read is retried from the new version (three attempts in all); a row deleted
-  meanwhile reads as absent (`OneAsync` returns null, a query skips it); only an unchanged ETag is reported
-  as `TableValueIntegrityException`. Data of two versions is never combined.
+  failure the main row is read again: if its ETag changed, the whole read is retried from the new version
+  (three attempts in all); a row deleted meanwhile reads as absent (`OneAsync` returns null, a query
+  skips it); only an unchanged ETag is reported as `TableValueIntegrityException`. Data of two versions
+  is never combined.
 - An offloaded value is never returned empty: writing such an entity back would drop the reference and let
   the sweep delete the value. Reading a row that holds a `{Prop}__blob` reference through something that
   cannot fetch it throws, naming the column:
@@ -882,10 +882,11 @@ so a scaled-out app may register it in one instance only.
   `[Stages, c0]` so a split collection reads as empty, and sees an offloaded property as null. A later
   replace or upsert from that reader writes the empty value back and the data is lost (its blob is then
   an orphan the sweep deletes). Values that each fit one cell are not exempt: an entity whose opted-in
-  values together exceed one entity is written with split cells and continuation rows too. Deploy in two steps: first the package bump with no `[TableValueSplit]` or
-  `TableBlobContent`, which writes exactly what 0.8.3 wrote; then, once no older reader remains (swapped
-  slots drained, rollback no longer to a pre-0.9.0 build, every service that reads the table upgraded), the
-  attributes. Rolling back past the second deploy needs the data rewritten first.
+  values together exceed one entity is written with split cells and continuation rows too. Deploy in two
+  steps: first the package bump with no `[TableValueSplit]` or `TableBlobContent`, which writes exactly
+  what 0.8.3 wrote; then, once no older reader remains (swapped slots drained, rollback no longer to a
+  pre-0.9.0 build, every service that reads the table upgraded), the attributes. Rolling back past the
+  second deploy needs the data rewritten first.
 - **Back up and restore an entity as one unit**: its main row, its continuation rows (same partition,
   RowKeys `{RowKey}~NNNN`) and its blobs in the offload container, taken together. A row restored without
   its parts or blobs (or with those of another version) reads as `TableValueIntegrityException`.
@@ -1146,9 +1147,9 @@ against Azure Tables. `[TableValueSplit]` and `TableBlobContent` work too: the f
 an in-memory dictionary, with the same integrity checks and `SweepOrphanBlobsAsync` support (it needs no
 `BlobServiceClient` and ignores `BlobOffloadOptions.ServiceClient`). It plans the same rows and
 transactions, refuses the same keys and shapes, takes back leftover continuation rows, cleans up only a
-row's own blobs and retries a write that lost a race with the same five attempts and pauses. Two differences are
-worth knowing: it has no read cache, and a stream opened on a `TableBlobContent` holds the bytes it was
-opened with, so a blob deleted meanwhile does not fail that read.
+row's own blobs and retries a write that lost a race with the same five attempts and pauses. Two
+differences are worth knowing: it has no read cache, and a stream opened on a `TableBlobContent` holds
+the bytes it was opened with, so a blob deleted meanwhile does not fail that read.
 
 The polymorphic store has the same mirror, keyed the same way:
 
