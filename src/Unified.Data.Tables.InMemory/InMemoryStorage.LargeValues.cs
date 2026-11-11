@@ -484,23 +484,30 @@ public sealed partial class InMemoryStorage<T>
     /// transactions (<see cref="LargeValueTable.PlanPartitionDelete"/>: a primary and its continuation
     /// rows always together, at most 100 rows each), each applied atomically under the gate. A token
     /// cancelled between two transactions stops the delete there, with whole entities left; a row
-    /// written after the listing survives. Then the blobs no remaining row references are deleted.
+    /// written after the listing survives. Continuation rows listed without their primary go last, and
+    /// only when no primary exists for them by then, each only while it is still the version listed, so
+    /// an entity written meanwhile is left whole. Then the blobs no remaining row references are deleted.
     /// </summary>
     private async Task<int> DeletePartitionLargeAsync(string partition, CancellationToken ct)
     {
-        // The partition's rows in row-key order, as the service lists them.
+        // The partition's rows in row-key order, as the service lists them, with their versions.
         List<TableEntity> listed;
+        var listedVersions = new Dictionary<string, long>(StringComparer.Ordinal);
         lock (gate)
         {
-            listed = rows.Where(kv => kv.Key.PartitionKey == partition)
-                .OrderBy(kv => kv.Key.RowKey, StringComparer.Ordinal)
-                .Select(kv => kv.Value.Data)
-                .ToList();
+            listed = [];
+            foreach (var (key, stored) in rows.Where(kv => kv.Key.PartitionKey == partition).OrderBy(kv => kv.Key.RowKey, StringComparer.Ordinal))
+            {
+                listed.Add(stored.Data);
+                listedVersions[key.RowKey] = stored.Version;
+            }
         }
         // Every row goes, continuation rows included; only logical entities are counted.
         var logical = listed.Count(row => !LargeValueTable.IsPartRow(row));
+        // Continuation rows listed without their primary go last, as TableStorage deletes them.
+        var (whole, leftovers) = LargeValueTable.SeparateListedLeftovers(listed);
 
-        foreach (var transaction in LargeValueTable.PlanPartitionDelete(listed))
+        foreach (var transaction in LargeValueTable.PlanPartitionDelete(whole))
         {
             // A cancelled token fails a transaction before it is sent, as the SDK does.
             ct.ThrowIfCancellationRequested();
@@ -509,6 +516,24 @@ public sealed partial class InMemoryStorage<T>
                 BatchTransactions++;
                 foreach (var row in transaction)
                     rows.Remove((row.PartitionKey, row.RowKey));
+            }
+            AfterLargeCommit?.Invoke();
+        }
+        foreach (var (primaryRowKey, group) in leftovers)
+        {
+            ct.ThrowIfCancellationRequested();
+            lock (gate)
+            {
+                // A primary there now owns these rows: they are left alone. Otherwise each row goes only
+                // while it is still the row listed (a row a writer took back since is another version).
+                if (rows.TryGetValue((partition, primaryRowKey), out var primary) && !LargeValueTable.IsPartRow(primary.Data))
+                    continue;
+                BatchTransactions++;
+                foreach (var row in group)
+                {
+                    if (rows.TryGetValue((partition, row.RowKey), out var current) && current.Version == listedVersions[row.RowKey])
+                        rows.Remove((partition, row.RowKey));
+                }
             }
             AfterLargeCommit?.Invoke();
         }

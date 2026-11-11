@@ -726,6 +726,49 @@ public partial class TableStorage<T>
     }
 
     /// <summary>
+    /// The part of a partition delete for continuation rows it listed without their primary
+    /// (<see cref="LargeValueTable.SeparateListedLeftovers"/>). They may be leftovers, or the rows of an
+    /// entity written while the delete ran: the primary's key is read once more, now that they are
+    /// listed, and when a primary is there they are its rows and are left alone. Otherwise they are
+    /// deleted in one transaction (at most 100 rows each), each row on condition of the version it was
+    /// listed at, so a row a writer has taken back for a new entity since is not deleted. When that
+    /// condition fails (412) or a row is gone (404), each row of the transaction is deleted on its own
+    /// condition and a row that changed or is gone is left alone; the partition delete goes on. A row
+    /// whose version is unknown is never deleted here (the service always sends one).
+    /// </summary>
+    private async Task DeleteListedLeftoversAsync(string pk, string primaryRowKey, IReadOnlyList<TableEntity> rows, CancellationToken ct)
+    {
+        var primary = await client.GetEntityIfExistsAsync<TableEntity>(pk, primaryRowKey, PartKeys, ct);
+        if (primary.HasValue && primary.Value is { } row && !SplitRowLayout.IsPartRow(row))
+            return;
+
+        foreach (var chunk in rows.Where(part => IsVersion(part.ETag)).Chunk(BatchPlanner.DefaultMaxCount))
+        {
+            try
+            {
+                await client.SubmitTransactionAsync(chunk.Select(part => new TableTransactionAction(
+                    TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), part.ETag)), ct);
+            }
+            catch (RequestFailedException ex) when (ex.Status is 412 or 404)
+            {
+                if (chunk.Length == 1)
+                    continue;
+                foreach (var part in chunk)
+                {
+                    try
+                    {
+                        await client.DeleteEntityAsync(pk, part.RowKey, part.ETag, ct);
+                    }
+                    catch (RequestFailedException single) when (single.Status is 412 or 404)
+                    {
+                        // Changed since it was listed (another writer's now), or already gone: left alone.
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// True when a projection names a large-value column, or an object that owns one: such a value
     /// spans cells and continuation rows, so the whole row is fetched and assembled instead.
     /// </summary>

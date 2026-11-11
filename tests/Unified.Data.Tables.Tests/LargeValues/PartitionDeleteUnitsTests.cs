@@ -258,10 +258,14 @@ public class PartitionDeleteUnitsTests
     [Fact]
     public async Task TableStorage_DeletesEveryRow_InWholeUnits_AndCountsLogicalEntities()
     {
-        List<TableEntity> rows = [.. Singles("a", 99), .. Unit("b", 2), Part("gone", 1), .. Singles("c", 120)];
+        // The listing returns every row's version; "gone~0001" is a continuation row without its primary.
+        var leftover = Part("gone", 1);
+        leftover.ETag = new ETag("W/\"listed\"");
+        List<TableEntity> rows = [.. Singles("a", 99), .. Unit("b", 2), leftover, .. Singles("c", 120)];
         var selects = new List<IEnumerable<string>?>();
         using var h = new StorageHarness<SplitTextEntity>();
         Lists(h, rows, selects);
+        h.SetupGet(Pk, "gone", null);
         var submitted = CaptureTransactions(h);
 
         // 99 + 1 + 120 entities; the continuation rows are deleted, not counted.
@@ -269,8 +273,11 @@ public class PartitionDeleteUnitsTests
 
         Assert.Equal(rows.Select(r => r.RowKey).Order(StringComparer.Ordinal), submitted.SelectMany(t => t).Order(StringComparer.Ordinal));
         Assert.All(submitted, t => Assert.InRange(t.Count, 1, Max));
-        Assert.Equal([99, 100, 24], submitted.Select(t => t.Count));
-        Assert.Equal(["b", "b~0001", "b~0002", "gone~0001"], submitted[1].Take(4));
+        // The leftover goes last, in a transaction of its own, once no primary is found for it
+        // (PartitionDeleteLiveEntityTests: it may belong to an entity written while the delete ran).
+        Assert.Equal([99, 100, 23, 1], submitted.Select(t => t.Count));
+        Assert.Equal(["b", "b~0001", "b~0002", "c000"], submitted[1].Take(4));
+        Assert.Equal(["gone~0001"], submitted[3]);
         Assert.Equal(["PartitionKey", "RowKey", SystemColumnNames.SplitOf], selects[0]!);
     }
 
@@ -337,7 +344,9 @@ public class PartitionDeleteUnitsTests
         Assert.Equal(100, await store.DeletePartitionAsync(Pk, Ct));
 
         Assert.Equal(0, store.PhysicalRowCount);
-        Assert.Equal(2, store.BatchTransactions); // 99 rows, then the primary with its part and the leftover
+        // 99 rows, then the primary with its part, then the leftover (a continuation row without its
+        // primary) on its own, as TableStorage deletes it.
+        Assert.Equal(3, store.BatchTransactions);
     }
 
     [Fact]

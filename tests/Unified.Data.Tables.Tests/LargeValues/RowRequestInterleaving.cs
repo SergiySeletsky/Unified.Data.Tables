@@ -1,5 +1,6 @@
 using Azure.Core;
 using Azure.Core.Pipeline;
+using Azure.Data.Tables;
 
 namespace Unified.Data.Tables.Tests.LargeValues;
 
@@ -10,6 +11,17 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// </summary>
 internal static class RowRequestInterleaving
 {
+    /// <summary>
+    /// The continuation rows a split-aware store writes for <paramref name="body"/> of a
+    /// <see cref="SplitTextEntity"/> under <paramref name="rk"/>: what a test puts in by hand as a leftover.
+    /// </summary>
+    internal static List<TableEntity> ContinuationRowsOf(string pk, string rk, string body)
+    {
+        var logical = TableEntitySerializer.ToTableEntity(
+            new SplitTextEntity { Id = pk + "|" + rk, Body = body }, pk, rk, ValueWriteContext.Public, []);
+        return [.. SplitRowLayout.Plan(logical).Parts];
+    }
+
     /// <summary>A GET that is neither a point read of one entity nor a call on the table collection: a query page.</summary>
     private static bool IsRangeQuery(HttpMessage message) =>
         message.Request.Method == RequestMethod.Get
