@@ -244,6 +244,17 @@ public static class TableEntitySerializer
     internal static string PartialUpdateRefusal(string name) =>
         $"'{name}' is a large value; partial updates cannot write it — replace the entity instead.";
 
+    /// <summary>
+    /// The message for a partial update of <paramref name="column"/> of an aware <paramref name="root"/> whose
+    /// read-side resolution threw <paramref name="failure"/>: whether the column is a large value is not known.
+    /// </summary>
+    internal static string UndecidablePartialUpdateRefusal(Type root, string column, Exception failure) =>
+        $"The partial update of '{column}' of {root.Name} was refused: deciding whether the column is a large value needs a " +
+        $"new {root.Name} as a read creates it, and that failed ({failure.GetType().Name}: {failure.Message}). The type's " +
+        "constructor or a getter failed (or an object along the path cannot be created), so the library cannot tell whether " +
+        $"'{column}' is a large value, which a partial update cannot write. Nothing was written. Send the update again once " +
+        "the constructor and getters succeed, or replace the entity instead.";
+
     /// <summary>The message for a large value whose column a read of <paramref name="root"/> maps to no property.</summary>
     internal static string UnreadableLargeValue(Type root, string column) =>
         $"'{column}' of {root.Name} needs split cells or a blob, and a read of {root.Name} would not map the column " +
@@ -773,8 +784,11 @@ public static class TableEntitySerializer
         // The same question for the object a read finds along the path: a default instance may be of a
         // runtime type that opts the member in although the declared type's member is ordinary. A plain
         // cell merged beside its split cells would read back the old value.
-        if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath))
+        if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath, out var unresolved))
             throw new NotSupportedException(PartialUpdateRefusal(columnPath));
+        // A column the read-side resolution could not resolve may be a large value: refused, never merged.
+        if (unresolved is not null)
+            throw new NotSupportedException(UndecidablePartialUpdateRefusal(ownerType, columnPath, unresolved), unresolved);
         return FlattenProperty(columnPath, value);
     }
 
@@ -2347,27 +2361,41 @@ internal static class TypeMetadataCache
     /// <summary>
     /// True when the property a read of <paramref name="type"/> sets <paramref name="column"/> on is a
     /// large-value member: a <see cref="TableBlobContent"/>, or one its owner's runtime type opts in.
-    /// Never throws, and the answer is remembered: a column a read cannot resolve is not one. False, with
-    /// nothing constructed, for a type that is not large-value aware (<see cref="IsLargeValueAware"/>).
+    /// Never throws. The answer is remembered once the column was resolved; when resolving it throws (the
+    /// entity's constructor or a getter failed, or an owner along the path cannot be created) the answer
+    /// is false and is not remembered: <see cref="IsLargeValueOnRead(Type, string, out Exception?)"/> tells
+    /// that case apart. False, with nothing constructed, for a type that is not large-value aware
+    /// (<see cref="IsLargeValueAware"/>).
     /// </summary>
-    internal static bool IsLargeValueOnRead(Type type, string column)
+    internal static bool IsLargeValueOnRead(Type type, string column) => IsLargeValueOnRead(type, column, out _);
+
+    /// <summary>
+    /// <see cref="IsLargeValueOnRead(Type, string)"/>, with <paramref name="unresolved"/> set to the exception
+    /// of the resolution when it threw: then the library cannot tell whether the column is a large value, and
+    /// a write that depends on the answer refuses rather than take the false for "not one".
+    /// </summary>
+    internal static bool IsLargeValueOnRead(Type type, string column, out Exception? unresolved)
     {
         ArgumentNullException.ThrowIfNull(type);
+        unresolved = null;
         if (!IsLargeValueAware(type))
             return false;
         if (_largeOnRead.TryGetValue((type, column), out var known))
             return known;
 
         bool large;
-#pragma warning disable CA1031 // a path a read cannot resolve names no member to refuse
+#pragma warning disable CA1031 // a path the check cannot resolve is reported to the caller, never remembered
         try
         {
             large = ReadTarget(type, column) is { ReflectedType: { } owner } leaf
                 && (leaf.PropertyType == typeof(TableBlobContent) || GetMetadata(owner).SplitOptions.ContainsKey(leaf.Name));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            large = false;
+            // Not remembered: the constructor or a getter may succeed at the next call, and the answer
+            // must not depend on whether it failed once.
+            unresolved = ex;
+            return false;
         }
 #pragma warning restore CA1031
         if (_largeOnRead.Count < MaxRememberedReadTargets)
