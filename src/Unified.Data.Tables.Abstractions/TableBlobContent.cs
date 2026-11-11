@@ -23,6 +23,8 @@ namespace Unified.Data.Tables;
 /// came from (and any cached copy of it) is not affected by what later happens to the other row.
 /// </para>
 /// </remarks>
+[System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1001:Types that own disposable fields should be disposable",
+    Justification = "The SemaphoreSlim that orders writes of one content never allocates its wait handle (only Wait(0) and WaitAsync are used), so it holds nothing to dispose.")]
 public sealed class TableBlobContent
 {
 
@@ -39,13 +41,36 @@ public sealed class TableBlobContent
     private const string TemporaryCopyReleased =
         "it was created from a non-seekable stream, and its temporary copy was released by a failed write";
 
+    // Why a NEW content over a stream that a write of this library has read cannot be written.
+    private const string ForwardOnlyAlreadyRead =
+        "its source stream is not seekable and a write has already read from it, so the bytes it delivered cannot be read again. "
+        + "Create the content once and assign that instance on every attempt, use a seekable stream or TableBlobContent.FromBytes, "
+        + "or open the source again for each attempt (for example inside the MutateAsync delegate).";
+
+    private const string SeekableNotPutBack =
+        "a write read its source stream and could not put it back where that write's content started (the stream can no longer be repositioned). "
+        + "Open the source again, or use TableBlobContent.FromBytes.";
+
+    // The callers' streams that a write has read and that no new content can be read from as the
+    // caller expects: a forward-only stream once read at all, a seekable one that could not be put
+    // back. Weak keys: a stream is not kept alive by being listed here.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Stream, string> UnusableStreams = new();
+
     private readonly byte[]? bytes;
     private long length;
     private string? sha256;
-    private Func<CancellationToken, Task<Stream>>? open;
-    private string? column;
+    // The blob this content streams: its name, the column an integrity failure names, and the way to
+    // open it, published together so that a reader never pairs the name of one blob with the opener of another.
+    private Binding? binding;
     private bool originRecorded;
     private string? sourceLost;
+
+    // One write at a time hashes, copies, uploads from or binds this content (BLOBS-1). Held only
+    // while the content's own source or state is used, never while entity code runs.
+    private readonly SemaphoreSlim turn = new(1, 1);
+    private readonly object sync = new();
+    // The writes that prepared this content and have not released it yet (see ReleasePrepared).
+    private int writers;
 
     private TableBlobContent(string contentType, byte[]? bytes, Stream? source)
     {
@@ -71,14 +96,31 @@ public sealed class TableBlobContent
     /// stream is read from its current position; it must not change until the write completes.
     /// </summary>
     /// <remarks>
-    /// A write that fails can be retried with the same content when the stream is seekable: every
-    /// attempt reads it again from the position it had at the first one. A non-seekable stream is
-    /// copied to a temporary file once, and a write that fails releases that copy, so its content
-    /// cannot be written again: use a seekable stream (or <see cref="FromBytes"/>) for content whose
-    /// write may be retried, for example by <c>MutateAsync</c> after a conflict. A content that can no
-    /// longer be written (its temporary copy was released, or its stream was partly read by a failed
-    /// write and cannot be put back) makes every later write of it throw
-    /// <see cref="InvalidOperationException"/> before anything is uploaded; create it again from the source.
+    /// <para>
+    /// A seekable stream is read from the position it had when the content was first written, and the
+    /// library puts it back there whenever it is done reading it (after hashing, after an upload, and
+    /// after a write that failed or was cancelled). So a write that fails can be retried with the same
+    /// content, and a retry that creates a new content over the same stream (for example inside a
+    /// <c>MutateAsync</c> delegate that runs again after a conflict) stores the same bytes. A stream
+    /// that can no longer be put back (seeking throws, or it was disposed) makes the content, and any
+    /// new content over that stream, throw <see cref="InvalidOperationException"/> when written.
+    /// </para>
+    /// <para>
+    /// A non-seekable stream is copied to a temporary file once. A write that fails releases that copy,
+    /// so its content cannot be written again; and a stream that a write has read cannot be read
+    /// again, so a new content over it is refused with <see cref="InvalidOperationException"/> before
+    /// anything is uploaded. For content whose write may be retried, create the content once and assign
+    /// that instance on every attempt, use a seekable stream or <see cref="FromBytes"/>, or open the
+    /// source again for each attempt. A content that can no longer be written (its temporary copy was
+    /// released, or its stream was partly read by a failed write and cannot be put back) makes every
+    /// later write of it throw <see cref="InvalidOperationException"/> before anything is uploaded;
+    /// create it again from the source.
+    /// </para>
+    /// <para>
+    /// One content may be held by several writes at the same time (one content on several entities
+    /// written concurrently): they take turns reading its source (a non-seekable one is still copied
+    /// only once), and every write that succeeds stores the whole content.
+    /// </para>
     /// </remarks>
     /// <param name="content">A readable stream.</param>
     /// <param name="contentType">The MIME type to store the blob with.</param>
@@ -127,16 +169,16 @@ public sealed class TableBlobContent
     {
         if (bytes is not null)
             return new MemoryStream(bytes, writable: false);
-        if (open is null)
+        if (Volatile.Read(ref binding) is not { } bound)
             throw new InvalidOperationException(
                 sourceLost is not null ? $"This TableBlobContent cannot be read: {sourceLost}. Create the content again from the source."
                 : Abandoned ? $"This TableBlobContent cannot be read: {TemporaryCopyReleased}. Create the content again from the source."
                 : "A TableBlobContent created from a stream can be read once the entity has been written.");
 
-        var name = column ?? BoundPath!;
+        var name = bound.Column ?? bound.Path;
         var expectedLength = length;
         var expectedSha = sha256;
-        var stream = await open(ct).ConfigureAwait(false);
+        var stream = await bound.Open(ct).ConfigureAwait(false);
         return new HashingReadStream(stream, expectedLength, expectedSha,
             reason => new TableValueIntegrityException(name, reason), leaveOpen: false);
     }
@@ -163,7 +205,7 @@ public sealed class TableBlobContent
     internal byte[]? Bytes => bytes;
 
     /// <summary>The blob this content was written to or read from; null before the first write.</summary>
-    internal string? BoundPath { get; private set; }
+    internal string? BoundPath => Volatile.Read(ref binding)?.Path;
 
     /// <summary>Whether <see cref="Source"/> is a temporary copy this content owns and disposes.</summary>
     private bool OwnsSource { get; set; }
@@ -228,6 +270,7 @@ public sealed class TableBlobContent
         }
 
         sourceLost = NotRewindable;
+        MarkUnusable(source);
         throw new InvalidOperationException(NotWritable(columnName, NotRewindable), failure);
     }
 
@@ -253,6 +296,88 @@ public sealed class TableBlobContent
         }
 
         sourceLost = PartlyReadAndNotRewound;
+        if (Source is { } lost)
+            MarkUnusable(lost);
+    }
+
+    /// <summary>
+    /// After an upload read the prepared source, whether it succeeded, failed or was cancelled: puts the
+    /// caller's seekable stream back where the content starts, so that whoever reads it next (another
+    /// upload, or a new content created over the same stream by a retry) starts at the same place. A
+    /// stream that can no longer be put there makes this content unusable (see
+    /// <see cref="ThrowIfNotWritable"/>) and refuses every new content over it (see <see cref="ClaimSource"/>).
+    /// </summary>
+    internal void EndUploadRead()
+    {
+        if (OwnsSource || Source is not { } source)
+            return;
+        try
+        {
+            if (source.CanSeek)
+            {
+                source.Position = SourceOrigin;
+                return;
+            }
+        }
+#pragma warning disable CA1031 // whatever the stream throws, it is not where the content starts
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+        }
+
+        sourceLost = NotRewindable;
+        MarkUnusable(source);
+    }
+
+    /// <summary>
+    /// Before a content reads its source for the first time: refuses a stream that a write has already
+    /// read and could not leave as the caller gave it (a forward-only stream read at all, a seekable one
+    /// that could not be put back), so a new content over it never stores the rest of it, or nothing.
+    /// A forward-only stream is listed from now on.
+    /// </summary>
+    /// <param name="columnName">The column the content is being written to.</param>
+    /// <exception cref="InvalidOperationException">The stream cannot deliver this content's bytes.</exception>
+    internal void ClaimSource(string columnName)
+    {
+        var source = Source
+            ?? throw new InvalidOperationException($"The TableBlobContent of '{columnName}' has no source stream to read.");
+        lock (UnusableStreams)
+        {
+            if (UnusableStreams.TryGetValue(source, out var why))
+                throw new InvalidOperationException($"The TableBlobContent of '{columnName}' cannot be written: {why}");
+            if (!source.CanSeek)
+                UnusableStreams.Add(source, ForwardOnlyAlreadyRead);
+        }
+    }
+
+    // A caller's stream that a write read and could not put back (a temporary copy is nobody else's).
+    private void MarkUnusable(Stream source)
+    {
+        if (OwnsSource)
+            return;
+        lock (UnusableStreams)
+        {
+            if (!UnusableStreams.TryGetValue(source, out _))
+                UnusableStreams.Add(source, SeekableNotPutBack);
+        }
+    }
+
+    /// <summary>Waits until no other write is using this content; pair with <see cref="EndTurn"/>.</summary>
+    /// <param name="ct">Cancels the wait.</param>
+    /// <returns>A task that completes once this write holds the content.</returns>
+    internal Task WaitTurnAsync(CancellationToken ct) => turn.WaitAsync(ct);
+
+    /// <summary>Lets the next write use this content.</summary>
+    internal void EndTurn() => turn.Release();
+
+    /// <summary>
+    /// Counts a write that is about to prepare this content; it calls <see cref="ReleasePrepared"/>
+    /// once when it ends. The temporary copy of a forward-only source is released only by the last one.
+    /// </summary>
+    internal void Enlist()
+    {
+        lock (sync)
+            writers++;
     }
 
     /// <summary>
@@ -322,31 +447,47 @@ public sealed class TableBlobContent
     /// or it keeps its bytes in memory and never reads a blob. False when it streams another blob and
     /// was not changed; the caller then gives the written entity a content of its own.
     /// </returns>
+    /// <remarks>
+    /// A content that may be shared with another write is bound only while the binding write holds it
+    /// (<see cref="WaitTurnAsync"/>), so of several writes that bind one content that streams no blob
+    /// yet exactly one binds it and every other one is told to give its entity a content of its own.
+    /// </remarks>
     internal bool Bind(string path, Func<CancellationToken, Task<Stream>> open, string? columnName = null)
     {
         Guard.NotNull(path, nameof(path));
         Guard.NotNull(open, nameof(open));
-        if (BoundPath is { } bound)
+        if (Volatile.Read(ref binding) is { } bound)
         {
             if (bytes is not null)
                 return true;
-            if (!string.Equals(bound, path, StringComparison.Ordinal))
+            if (!string.Equals(bound.Path, path, StringComparison.Ordinal))
                 return false;
         }
         else
         {
-            BoundPath = path;
+            // The source is not needed any more: it is where the content started (EndUploadRead), and
+            // a stream that could not be put back no longer stops this content from being written.
             Abandoned = false;
+            sourceLost = null;
             ReleaseSpool();
             Source = null;
         }
 
-        // The opener last: a concurrent OpenReadAsync that sees it also sees the name it reports. For a
+        // Name, column and opener in one step: a concurrent OpenReadAsync sees all of one binding. For a
         // content already bound to this blob only the way to it changes (the row may have been read by
         // a store that could not open it, and written by one that can).
-        column = columnName;
-        this.open = open;
+        Volatile.Write(ref binding, new Binding(path, columnName, open));
         return true;
+    }
+
+    /// <summary>The blob a content streams: its name, the column an integrity failure names, and the way to open it.</summary>
+    private sealed class Binding(string path, string? column, Func<CancellationToken, Task<Stream>> open)
+    {
+        public string Path { get; } = path;
+
+        public string? Column { get; } = column;
+
+        public Func<CancellationToken, Task<Stream>> Open { get; } = open;
     }
 
     /// <summary>Content read from a row: known length, hash and type, streamed lazily from its blob.</summary>
@@ -360,16 +501,33 @@ public sealed class TableBlobContent
     }
 
     /// <summary>
-    /// Deletes the temporary copy a write made of a non-seekable source, when the write failed before
-    /// the content was bound to its blob. The content stays sealed but has nothing left to be uploaded
-    /// from: every later write refuses it (<see cref="ThrowIfNotWritable"/>) before anything is uploaded.
+    /// Ends a write that prepared this content (<see cref="Enlist"/>). The last such write deletes the
+    /// temporary copy made of a non-seekable source when no write bound the content to its blob: the
+    /// content stays sealed but has nothing left to be uploaded from, and every later write refuses it
+    /// (<see cref="ThrowIfNotWritable"/>) before anything is uploaded. While another write still holds
+    /// the content, the copy is kept for it.
     /// </summary>
     internal void ReleasePrepared()
     {
-        if (OwnsSource)
+        lock (sync)
         {
-            ReleaseSpool();
-            Abandoned = true;
+            if (writers > 0)
+                writers--;
+            if (writers > 0 || !OwnsSource)
+                return;
+            // A write reading the copy right now (counted out by a caller that released more than it
+            // prepared) keeps it; that write's own release deletes it.
+            if (!turn.Wait(0))
+                return;
+            try
+            {
+                ReleaseSpool();
+                Abandoned = true;
+            }
+            finally
+            {
+                turn.Release();
+            }
         }
     }
 

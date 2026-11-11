@@ -52,39 +52,73 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// seekable source is put back where its content starts, so a retry reads all of it; one that cannot
     /// be put back, and a forward-only one that was partly consumed, make the content unusable: this and
     /// every later write of it throws before anything is read or uploaded. So does a content whose
-    /// temporary copy an earlier failed write released (<see cref="ReleasePrepared"/>).
+    /// temporary copy an earlier failed write released (<see cref="ReleasePrepared"/>), and a new content
+    /// over a stream that a write has already read (a forward-only stream, or a seekable one that could
+    /// not be put back where its content started).
+    /// <para>
+    /// A content held by several writes at once is prepared by one of them; the others wait for it and
+    /// find it prepared. Each content is waited for on its own, never two at a time.
+    /// </para>
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// A content can no longer be written: its source was partly read by a failed write and cannot be
-    /// read again from where the content starts, or its temporary copy was released by a failed write.
+    /// read again from where the content starts, its temporary copy was released by a failed write, or
+    /// its source stream was already read by another write and cannot deliver its bytes again.
     /// </exception>
     internal async Task PrepareAsync(object entity, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entity);
         var contents = TableEntitySerializer.FindBlobContents(entity);
-        // Refused before any source is read and any blob uploaded.
+        // Counted before anything can fail: the write's ReleasePrepared ends each of them once.
+        foreach (var (_, content) in contents)
+            content.Enlist();
+
+        // Refused before any source is read and any blob uploaded. A content another write is using is
+        // waited for (one write at a time hashes, copies, uploads from or binds a content).
         foreach (var (column, content) in contents)
         {
-            content.ThrowIfNotWritable(column);
-            // A source prepared by an earlier write that failed must still be there to upload from: one the
-            // caller has closed since is found now, not after other blobs of this write were uploaded.
-            if (content.IsSealed && content.Source is not null)
-                content.RewindSource(column);
+            await content.WaitTurnAsync(ct);
+            try
+            {
+                content.ThrowIfNotWritable(column);
+                // A source prepared by an earlier write that failed must still be there to upload from: one the
+                // caller has closed since is found now, not after other blobs of this write were uploaded.
+                if (content.IsSealed && content.Source is not null)
+                    content.RewindSource(column);
+            }
+            finally
+            {
+                content.EndTurn();
+            }
         }
 
         foreach (var (column, content) in contents)
         {
-            if (content.IsSealed) continue;
-            var source = content.Source
-                ?? throw new InvalidOperationException($"The TableBlobContent of '{column}' has no content to read.");
-            // Before the first read: a write cancelled by now has not touched the source.
-            ct.ThrowIfCancellationRequested();
-            // A source that was seekable when it was first prepared stays on this path: it is read from
-            // the recorded origin or not at all, never from wherever it stands now.
-            if (content.HasSourceOrigin || source.CanSeek)
-                await HashSeekableAsync(column, content, source, ct);
-            else
-                await SpoolAsync(content, source, ct);
+            await content.WaitTurnAsync(ct);
+            try
+            {
+                // Another write may have prepared the content, or given it up, while this one waited.
+                content.ThrowIfNotWritable(column);
+                if (content.IsSealed) continue;
+                var source = content.Source
+                    ?? throw new InvalidOperationException($"The TableBlobContent of '{column}' has no content to read.");
+                // Before the first read: a write cancelled by now has not touched the source.
+                ct.ThrowIfCancellationRequested();
+                // A stream a write has already read (a forward-only one, or one it could not put back) is
+                // refused before this content reads any of it.
+                if (!content.HasSourceOrigin)
+                    content.ClaimSource(column);
+                // A source that was seekable when it was first prepared stays on this path: it is read from
+                // the recorded origin or not at all, never from wherever it stands now.
+                if (content.HasSourceOrigin || source.CanSeek)
+                    await HashSeekableAsync(column, content, source, ct);
+                else
+                    await SpoolAsync(content, source, ct);
+            }
+            finally
+            {
+                content.EndTurn();
+            }
         }
     }
 
@@ -241,6 +275,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// through a read that verifies the bytes still match what was prepared. Each
     /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob
     /// stays bound there, and the property it was written from gets a content bound to this one.
+    /// An upload reads a content's source, and a content is bound, while this write holds the content,
+    /// so concurrent writes of one content take turns; a caller's seekable stream is put back where the
+    /// content starts after every upload, whether it succeeded or not.
     /// </summary>
     /// <exception cref="BlobOffloadNotConfiguredException">Blob offload is not configured.</exception>
     /// <exception cref="InvalidOperationException">A source changed after it was prepared.</exception>
@@ -285,7 +322,19 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             var name = blob.Reference.Path;
             var column = blob.Column;
             Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, c);
-            if (content.Bind(name, open, column))
+            // Bound while this write holds the content: of several writes binding it at once, exactly one
+            // binds the shared instance. The property is assigned after the turn ends (no lock across a setter).
+            bool bound;
+            await content.WaitTurnAsync(ct);
+            try
+            {
+                bound = content.Bind(name, open, column);
+            }
+            finally
+            {
+                content.EndTurn();
+            }
+            if (bound)
                 continue;
 
             // The content already streams another blob: it was read from another row, or it is on another
@@ -362,26 +411,43 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     private static async Task UploadOneAsync(IOffloadBlobStore store, PendingBlob blob, CancellationToken ct)
     {
-        var column = blob.Column;
-        var source = await blob.OpenSource(ct);
-        await using var verified = new HashingReadStream(source, blob.Reference.Length, blob.Reference.Sha256,
-            reason => new InvalidOperationException(
-                $"The content of '{column}' changed after it was prepared for writing ({reason})."),
-            leaveOpen: false);
+        // One upload at a time reads a content's prepared source (two reading one stream at once would
+        // each get part of it), and none while another write hashes, copies or binds the content.
+        var content = blob.Content;
+        if (content is not null)
+            await content.WaitTurnAsync(ct);
         try
         {
-            await store.UploadCreateOnlyAsync(blob.Reference.Path, verified, blob.Reference, blob.ContentEncoding, ct);
+            var column = blob.Column;
+            var source = await blob.OpenSource(ct);
+            await using var verified = new HashingReadStream(source, blob.Reference.Length, blob.Reference.Sha256,
+                reason => new InvalidOperationException(
+                    $"The content of '{column}' changed after it was prepared for writing ({reason})."),
+                leaveOpen: false);
+            try
+            {
+                await store.UploadCreateOnlyAsync(blob.Reference.Path, verified, blob.Reference, blob.ContentEncoding, ct);
+            }
+            catch when (verified.Mismatch is not null)
+            {
+                // The SDK pipeline wraps (or retries past) what the content stream throws: report the cause.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(verified.Mismatch).Throw();
+                throw;
+            }
+            // A store that swallowed the failure, or stopped reading before the end, still gets the content checked.
+            if (verified.Mismatch is { } mismatch)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(mismatch).Throw();
+            await verified.DrainAndVerifyAsync(ct);
         }
-        catch when (verified.Mismatch is not null)
+        finally
         {
-            // The SDK pipeline wraps (or retries past) what the content stream throws: report the cause.
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(verified.Mismatch).Throw();
-            throw;
+            if (content is not null)
+            {
+                // Done reading the caller's stream, whatever happened: it goes back where the content starts.
+                content.EndUploadRead();
+                content.EndTurn();
+            }
         }
-        // A store that swallowed the failure, or stopped reading before the end, still gets the content checked.
-        if (verified.Mismatch is { } mismatch)
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(mismatch).Throw();
-        await verified.DrainAndVerifyAsync(ct);
     }
 
     /// <summary>
