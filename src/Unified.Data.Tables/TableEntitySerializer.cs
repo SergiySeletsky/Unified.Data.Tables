@@ -178,11 +178,13 @@ public static class TableEntitySerializer
     /// <paramref name="contentInAnotherType"/>, the member holds a <see cref="TableBlobContent"/> but is not
     /// declared as one (only that declaration lets a read give it back); <paramref name="runtimeNullable"/>,
     /// the nullable struct the plain serializer met on the path through runtime owners, which a read cannot
-    /// create.
+    /// create, with the properties on that path whose declared type differs from the runtime type of their
+    /// value (each is named with that runtime type, beside the struct property declared non-nullable).
     /// </summary>
     internal static string PlainPathRefusal(
         Type root, IReadOnlyList<string> ownerPath, Type ownerType, string member, bool partial = false,
-        bool contentInAnotherType = false, (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<string> OwnerPath)? runtimeNullable = null)
+        bool contentInAnotherType = false,
+        (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<(IReadOnlyList<string> Path, Type Type)> Holders)? runtimeNullable = null)
     {
         var column = string.Join(TableEntityValue.PathDelimiter, ownerPath.Append(member));
         var holder = string.Join('.', ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)));
@@ -205,17 +207,18 @@ public static class TableEntitySerializer
                 $"[TableValueSplit] is not enough on its own). Declare {nullable.Owner.Name}.{nullable.Property.Name} as " +
                 $"{nullable.Struct.Name}, not nullable, so that {root.Name} is large-value aware by its declared types and reads " +
                 "the value back.";
-        // The same struct reached through a runtime owner (a property declared as an interface, an abstract or
-        // a base class): the declared types from the root do not lead to it, so both declarations are named.
+        // The same struct reached through runtime owners (properties declared as an interface, an abstract or
+        // a base class): the declared types from the root do not lead to it, so the struct property and every
+        // runtime-typed holder on the path are named.
         else if (runtimeNullable is { } below)
             remedy =
                 $"A value below a nullable struct cannot be stored as a large value: a read cannot create the struct of the " +
                 $"nullable property {below.Owner.Name}.{below.Property.Name} ({below.Struct.Name}?), and marking {root.Name} " +
                 $"with [TableValueSplit] does not change that. Declare {below.Owner.Name}.{below.Property.Name} as " +
                 $"{below.Struct.Name}, not nullable" +
-                (below.OwnerPath.Count == 0 ? "" :
-                    $", and declare {root.Name}.{string.Join('.', below.OwnerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))} " +
-                    $"with the type that has it ({below.Owner.Name})") +
+                string.Concat(below.Holders.Select(h =>
+                    $", and declare {root.Name}.{string.Join('.', h.Path.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))} " +
+                    $"with the type that has it ({h.Type.Name})")) +
                 $", so that {root.Name} is large-value aware by its declared types and reads the value back.";
         // A read gives a TableBlobContent back only to a property declared as one: marking the type does not.
         else if (contentInAnotherType)
@@ -238,16 +241,18 @@ public static class TableEntitySerializer
 
     // The outermost property, on the path from the root to node (its owners, by their runtime types), that
     // holds a struct and is declared as a nullable struct: its owner's runtime type, the property, the
-    // struct and the path of the owner. Null when there is none.
-    private static (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<string> OwnerPath)? RuntimeNullableStructOnPath(TableEntityValue node)
+    // struct, and every other property on that path whose declared type differs from the runtime type of
+    // its value (its path and that runtime type, from the root down). Null when there is none.
+    private static (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<(IReadOnlyList<string> Path, Type Type)> Holders)? RuntimeNullableStructOnPath(TableEntityValue node)
     {
-        (Type, PropertyInfo, Type, IReadOnlyList<string>)? outermost = null;
-        for (var cur = node; cur is { HeldBy: { } property, Parent: { Type: { } ownerType } parent }; cur = parent)
-        {
-            if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
-                outermost = (ownerType, property, underlying, parent.Path);
-        }
-        return outermost;
+        var path = new List<TableEntityValue>();
+        for (var cur = node; cur is { HeldBy: not null, Parent: { Type: not null } parent }; cur = parent)
+            path.Insert(0, cur);
+        if (path.Find(n => Nullable.GetUnderlyingType(n.HeldBy!.PropertyType) is not null) is not { } outermost)
+            return null;
+        var holders = path.Where(n => n != outermost && n.HeldBy!.PropertyType != n.Type)
+            .Select(n => ((IReadOnlyList<string>)n.Path, n.Type!)).ToList();
+        return (outermost.Parent!.Type!, outermost.HeldBy!, outermost.Type!, holders);
     }
 
     // The first property along ownerPath (property names from root, by reflection only) declared as a
