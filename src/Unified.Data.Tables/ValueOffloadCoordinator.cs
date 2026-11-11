@@ -93,7 +93,6 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     internal (TableEntity Row, SplitRowPlan Plan, IReadOnlyList<PendingBlob> Blobs) Serialize(object entity, string pk, string rk, int extraActions)
     {
         ArgumentNullException.ThrowIfNull(entity);
-        var type = entity.GetType();
         var force = new HashSet<string>(StringComparer.Ordinal);
         while (true)
         {
@@ -114,7 +113,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                     continue;
                 if (force.Contains(column)) continue;
                 var length = value switch { long l => l, int i => i, _ => 0L };
-                if (TableEntitySerializer.SplitOptionFor(type, column)?.Offload == BlobOffload.Never)
+                if (TableEntitySerializer.SplitOptionFor(entity, column)?.Offload == BlobOffload.Never)
                 {
                     if (length > neverLength) (never, neverLength) = (column, length);
                 }
@@ -279,7 +278,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// <summary>
     /// Resolves the blob references of <paramref name="row"/> that are in scope (every one, or those a
     /// projection names): a <see cref="TableBlobContent"/> target becomes lazy content; any other target
-    /// is downloaded and verified into <see cref="ValueReadContext.Resolved"/>.
+    /// is downloaded and verified into <see cref="ValueReadContext.Resolved"/>. A reference's target is
+    /// the property the read of the row sets its column on, which follows the runtime type of the
+    /// entity's default instances, not only the declared property types.
     /// </summary>
     /// <param name="row">The (assembled) row.</param>
     /// <param name="entityType">The type the row is read as, which decides each reference's target.</param>
@@ -300,10 +301,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 continue;
             if (projectedColumns is not null && !Projects(projectedColumns, column))
                 continue;
-            var path = TableEntityValue.Create(column, string.Empty).Path;
-            if (TypeMetadataCache.ResolvePath(entityType, path) is not { } target)
+            if (TableEntitySerializer.LargeValueTargetType(entityType, column) is not { } target)
                 continue;
-            if (target.PropertyType == typeof(TableBlobContent))
+            if (target == typeof(TableBlobContent))
             {
                 anyLazy = true;
                 continue;
