@@ -37,6 +37,12 @@ public class RuntimeSubtypeSplitTests
     {
         string? Title { get; set; }
 
+        /// <summary>
+        /// A column a LINQ filter can name: the class-level [TableValueSplit] that opts the holder in
+        /// also opts in its string Title, and a large value cannot be filtered server-side.
+        /// </summary>
+        int Rank { get; set; }
+
         /// <summary>The object in <c>Shape</c>, seen through its large members.</summary>
         IRuntimeLargeMembers Large { get; }
     }
@@ -61,11 +67,14 @@ public class RuntimeSubtypeSplitTests
     }
 
     /// <summary>An interface-typed property with a default instance (the shape of the review finding).</summary>
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class InterfaceHolder : Entity, IRuntimeHolder
     {
         public IRuntimeShape Shape { get; set; } = new RuntimeCircle();
 
         public string? Title { get; set; }
+
+        public int Rank { get; set; }
 
         public IRuntimeLargeMembers Large => (IRuntimeLargeMembers)Shape;
     }
@@ -90,11 +99,14 @@ public class RuntimeSubtypeSplitTests
     }
 
     /// <summary>An abstract-base-typed property with a default instance.</summary>
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class AbstractHolder : Entity, IRuntimeHolder
     {
         public RuntimeShapeBase Shape { get; set; } = new RuntimeSquare();
 
         public string? Title { get; set; }
+
+        public int Rank { get; set; }
 
         public IRuntimeLargeMembers Large => (IRuntimeLargeMembers)Shape;
     }
@@ -119,11 +131,14 @@ public class RuntimeSubtypeSplitTests
     }
 
     /// <summary>A base-class-typed property whose default instance is a subclass.</summary>
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class BaseClassHolder : Entity, IRuntimeHolder
     {
         public RuntimeBox Shape { get; set; } = new RuntimeCrate();
 
         public string? Title { get; set; }
+
+        public int Rank { get; set; }
 
         public IRuntimeLargeMembers Large => (IRuntimeLargeMembers)Shape;
     }
@@ -136,6 +151,7 @@ public class RuntimeSubtypeSplitTests
         public string? Name { get; set; }
     }
 
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class NestedHolder : Entity
     {
         public RuntimeWrapper Wrapper { get; set; } = new();
@@ -153,6 +169,7 @@ public class RuntimeSubtypeSplitTests
         public List<string>? Tags { get; set; }
     }
 
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class GzipHolder : Entity
     {
         public IRuntimeShape Shape { get; set; } = new RuntimeGzipShape();
@@ -168,6 +185,7 @@ public class RuntimeSubtypeSplitTests
         public string? Name { get; set; }
     }
 
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class MidHolder : Entity
     {
         public RuntimeMid? Mid { get; set; }
@@ -197,6 +215,7 @@ public class RuntimeSubtypeSplitTests
     }
 
     /// <summary>An interface-typed property with no default instance: a read cannot create it (as on 0.8.3).</summary>
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class NoDefaultInterfaceHolder : Entity
     {
         public IRuntimeShape? Shape { get; set; }
@@ -227,6 +246,7 @@ public class RuntimeSubtypeSplitTests
         public string? Label { get; set; }
     }
 
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class NotedHolder : Entity
     {
         public IRuntimeNoted Shape { get; set; } = new RuntimeNoted();
@@ -242,6 +262,7 @@ public class RuntimeSubtypeSplitTests
         public string? Name { get; set; }
     }
 
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class NotedMidHolder : Entity
     {
         public RuntimeNotedMid? Mid { get; set; }
@@ -257,6 +278,7 @@ public class RuntimeSubtypeSplitTests
         public TableBlobContent? File { get; set; }
     }
 
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class AttachmentHolder : Entity
     {
         public IRuntimeShape Shape { get; set; } = new RuntimeAttachment();
@@ -274,6 +296,7 @@ public class RuntimeSubtypeSplitTests
         public string? Notes { get; set; }
     }
 
+    [TableValueSplit(SplitEncoding.Text)] // opts in the large values of the runtime subtypes in its properties
     public sealed class PinnedHolder : Entity
     {
         public IRuntimeShape Shape { get; set; } = new RuntimePinned();
@@ -459,20 +482,20 @@ public class RuntimeSubtypeSplitTests
 
         var roundTrip = shape switch
         {
-            "interface" => RoundTripAsync<InterfaceHolder>(stores!, kind, form, e => e.Title == "before"),
-            "abstract" => RoundTripAsync<AbstractHolder>(stores!, kind, form, e => e.Title == "before"),
-            _ => RoundTripAsync<BaseClassHolder>(stores!, kind, form, e => e.Title == "before"),
+            "interface" => RoundTripAsync<InterfaceHolder>(stores!, kind, form, e => e.Rank == 1),
+            "abstract" => RoundTripAsync<AbstractHolder>(stores!, kind, form, e => e.Rank == 1),
+            _ => RoundTripAsync<BaseClassHolder>(stores!, kind, form, e => e.Rank == 1),
         };
         await roundTrip;
     }
 
-    private static async Task RoundTripAsync<T>(LargeValueStores stores, string kind, string form, Expression<Func<T, bool>> titleIsBefore)
+    private static async Task RoundTripAsync<T>(LargeValueStores stores, string kind, string form, Expression<Func<T, bool>> rankIsOne)
         where T : Entity, IRuntimeHolder, new()
     {
         var id = stores.Id("r1");
         var column = "Shape_" + Member(kind);
         var value = Value(kind, form);
-        var entity = new T { Id = id, Title = "before" };
+        var entity = new T { Id = id, Title = "before", Rank = 1 };
         Set(entity.Large, kind, value);
 
         await stores.Store<T>().CreateAsync(entity, Ct);
@@ -486,7 +509,7 @@ public class RuntimeSubtypeSplitTests
         AssertValue(Assert.Single(await stores.Store<T>().QueryAsync(stores.Pk, Ct)).Large, kind, value);
         AssertValue(Assert.Single(await stores.Store<T>().QueryAsync(new QueryOptions { Partition = stores.Pk }, Ct)).Large, kind, value);
         AssertValue(Assert.Single((await stores.Store<T>().QueryPageAsync(new QueryOptions { Partition = stores.Pk }, Ct)).Items).Large, kind, value);
-        AssertValue(Assert.Single(await stores.Store<T>().QueryAsync(titleIsBefore, stores.Pk, ct: Ct)).Large, kind, value);
+        AssertValue(Assert.Single(await stores.Store<T>().QueryAsync(rankIsOne, stores.Pk, ct: Ct)).Large, kind, value);
 
         // Change another property and save: the large value is still there.
         read.Title = "after";
@@ -620,10 +643,12 @@ public class RuntimeSubtypeSplitTests
         var id = stores!.Id("r1");
         var notes = Ascii(40_000);
 
-        // Mid is null on a new MidHolder, so the type's columns do not show Mid_Shape_Notes and the store
-        // takes the plain path: the value is split into cells of the one row. A read creates the Mid, whose
-        // constructor creates the circle, and maps the cells back.
-        Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(MidHolder)));
+        // Mid is null on a new MidHolder, so the type's columns do not show Mid_Shape_Notes; the class-level
+        // attribute makes the type aware all the same, and the store takes the large-value path: the value
+        // is split into cells of the one row. A read creates the Mid, whose constructor creates the circle,
+        // and maps the cells back.
+        Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(MidHolder)));
+        Assert.DoesNotContain("Mid_Shape_Notes", TypeMetadataCache.LargeValueColumns(typeof(MidHolder)));
         await stores.Store<MidHolder>().CreateAsync(
             new MidHolder { Id = id, Title = "t", Mid = new RuntimeMid { Name = "m", Shape = new RuntimeCircle { Radius = 1, Notes = notes } } }, Ct);
 
@@ -646,14 +671,16 @@ public class RuntimeSubtypeSplitTests
     {
         Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(InterfaceHolder)));
         Assert.True(LargeValueTable.IsLargeValueAware(typeof(InterfaceHolder)));
-        Assert.Equal(["Shape_Notes", "Shape_Image", "Shape_Tags"], TypeMetadataCache.LargeValueColumns(typeof(InterfaceHolder)));
-        Assert.Equal(["Shape_Notes", "Shape_Image", "Shape_Tags"], TypeMetadataCache.LargeValueColumns(typeof(AbstractHolder)));
-        Assert.Equal(["Shape_Notes", "Shape_Image", "Shape_Tags"], TypeMetadataCache.LargeValueColumns(typeof(BaseClassHolder)));
+        // The class-level attribute that opts each holder in also covers its own string Title (declared
+        // columns first); the columns of the runtime subtype in its default instance follow.
+        Assert.Equal(["Title", "Shape_Notes", "Shape_Image", "Shape_Tags"], TypeMetadataCache.LargeValueColumns(typeof(InterfaceHolder)));
+        Assert.Equal(["Title", "Shape_Notes", "Shape_Image", "Shape_Tags"], TypeMetadataCache.LargeValueColumns(typeof(AbstractHolder)));
+        Assert.Equal(["Title", "Shape_Notes", "Shape_Image", "Shape_Tags"], TypeMetadataCache.LargeValueColumns(typeof(BaseClassHolder)));
         Assert.Equal(
-            ["Wrapper_Inner_Notes", "Wrapper_Inner_Image", "Wrapper_Inner_Tags"],
+            ["Title", "Wrapper_Inner_Notes", "Wrapper_Inner_Image", "Wrapper_Inner_Tags"],
             TypeMetadataCache.LargeValueColumns(typeof(NestedHolder)));
-        Assert.Equal(["Shape_File"], TypeMetadataCache.LargeValueColumns(typeof(AttachmentHolder)));
-        Assert.Equal(["Shape_Notes"], TypeMetadataCache.LargeValueColumns(typeof(NotedHolder)));
+        Assert.Equal(["Title", "Shape_File"], TypeMetadataCache.LargeValueColumns(typeof(AttachmentHolder)));
+        Assert.Equal(["Title", "Shape_Notes"], TypeMetadataCache.LargeValueColumns(typeof(NotedHolder)));
     }
 
     [Fact]
@@ -661,9 +688,10 @@ public class RuntimeSubtypeSplitTests
     {
         Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(PlainDefaultHolder)));
         Assert.Empty(TypeMetadataCache.LargeValueColumns(typeof(PlainDefaultHolder)));
-        // No default instance: the declared types alone decide, as before.
+        // No default instance: the declared types alone decide, as before (NoDefaultInterfaceHolder is
+        // opted in by its class-level attribute).
         Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(NoDefaultBaseHolder)));
-        Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(NoDefaultInterfaceHolder)));
+        Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(NoDefaultInterfaceHolder)));
         // The runtime types themselves are large-value aware; they are not entity types and are never constructed here.
         Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(RuntimeCircle)));
         Assert.Equal(["Notes", "Image", "Tags"], TypeMetadataCache.LargeValueColumns(typeof(RuntimeCircle)));
@@ -677,11 +705,13 @@ public class RuntimeSubtypeSplitTests
         Assert.Empty(TypeMetadataCache.LargeValueColumns(typeof(CountedFlatDoc)));
         Assert.Equal(0, CountedFlatDoc.Constructed());
 
-        // A property that may hold a runtime subtype: constructed once, and the answer is kept.
+        // A property that may hold a runtime subtype: the declared types opt into nothing, so the type is
+        // plain and nothing is constructed to find that out (an entity whose large values are below such a
+        // property opts in with a class-level [TableValueSplit]).
         Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(CountedNestedDoc)));
         Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(CountedNestedDoc)));
         Assert.Empty(TypeMetadataCache.LargeValueColumns(typeof(CountedNestedDoc)));
-        Assert.Equal(1, CountedNestedDoc.Constructed());
+        Assert.Equal(0, CountedNestedDoc.Constructed());
 
         // A constructor that fails is not the store's problem: the declared types decide.
         Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(ThrowingConstructorHolder)));
@@ -876,9 +906,10 @@ public class RuntimeSubtypeSplitTests
         var id = stores!.Id("r1");
         var notes = Ascii(40_000);
 
-        // Mid is null on a new entity, so the type lists no large-value column and its store takes the
-        // plain path; the value is still stored as split cells (in the one row) and read back.
-        Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(NotedMidHolder)));
+        // Mid is null on a new entity, so the type does not list the column; opted in by its class-level
+        // attribute, its store takes the large-value path and stores the value as split cells of the one row.
+        Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(NotedMidHolder)));
+        Assert.DoesNotContain("Mid_Shape_Notes", TypeMetadataCache.LargeValueColumns(typeof(NotedMidHolder)));
         await stores.Store<NotedMidHolder>().CreateAsync(
             new NotedMidHolder { Id = id, Mid = new RuntimeNotedMid { Name = "m", Shape = new RuntimeNoted { Notes = notes, Label = "l1" } } }, Ct);
         Assert.Equal(2, Assert.Single(await stores.RawRowsAsync<NotedMidHolder>())["Mid_Shape_Notes__chunks"]);
@@ -933,20 +964,26 @@ public class RuntimeSubtypeSplitTests
     [Theory]
     [InlineData(LargeValueStores.Memory)]
     [InlineData(LargeValueStores.Azurite)]
-    public async Task SubclassBelowABaseTypedPropertyWithNoDefaultInstance_ValueOfOneCell_IsAnOrdinaryCell_AsOn083(string store)
+    public async Task SubclassBelowABaseTypedPropertyWithNoDefaultInstance_ValueOfOneCell_IsRefusedToo(string store)
     {
         await using var stores = await LargeValueStores.OpenAsync(store);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
         var id = stores!.Id("r1");
         var notes = (string)Value("string", Inline);
 
-        // Nothing of the large-value feature is involved: the subclass's members are ordinary cells, which
-        // a read drops with every other member the base class does not have (as on 0.8.3).
-        await stores.Store<NoDefaultBaseHolder>().CreateAsync(
-            new NoDefaultBaseHolder { Id = id, Shape = new RuntimeCrate { Weight = 3, Label = "l", Notes = notes } }, Ct);
+        // The holder is not large-value aware, so its store never stores a large-value member, whatever the
+        // size of its value: a model wired this way fails on its first write, not on its first large value.
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => stores.Store<NoDefaultBaseHolder>().CreateAsync(
+            new NoDefaultBaseHolder { Id = id, Shape = new RuntimeCrate { Weight = 3, Label = "l", Notes = notes } }, Ct));
 
+        Assert.Contains("'Shape_Notes'", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(await stores.RawRowsAsync<NoDefaultBaseHolder>());
+
+        // Without a value in the member the subclass's members are ordinary cells, which a read drops with
+        // every other member the base class does not have (as on 0.8.3).
+        await stores.Store<NoDefaultBaseHolder>().CreateAsync(
+            new NoDefaultBaseHolder { Id = id, Shape = new RuntimeCrate { Weight = 3, Label = "l" } }, Ct);
         var row = Assert.Single(await stores.RawRowsAsync<NoDefaultBaseHolder>());
-        Assert.Equal(notes, row["Shape_Notes"]);
         Assert.Equal(3, row["Shape_Weight"]);
         var read = await stores.Store<NoDefaultBaseHolder>().OneAsync(id, Ct);
         Assert.Equal(typeof(RuntimeBox), read!.Shape!.GetType());
