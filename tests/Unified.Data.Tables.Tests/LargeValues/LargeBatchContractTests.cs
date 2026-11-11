@@ -7,6 +7,7 @@ using Azure.Storage.Blobs.Models;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
 using Unified.Data.Tables.InMemory;
+using Unified.Data.Tables.Providers;
 using static Unified.Data.Tables.Tests.LargeValues.OffloadTestSupport;
 
 namespace Unified.Data.Tables.Tests.LargeValues;
@@ -17,7 +18,9 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// transactions per partition, and each transaction is atomic. The same tests run on
 /// <see cref="InMemoryStorage{T}"/> and on <see cref="TableStorage{T}"/> against Azurite, so the two
 /// providers behave identically. Also covers the post-commit robustness of single writes: a token
-/// cancelled after the commit no longer reports the committed write as failed, nor skips blob cleanup.
+/// cancelled after the commit no longer reports the committed write as failed, nor skips blob cleanup;
+/// and the continuation rows an entity can be left with (its own leftovers, which a write takes back and
+/// a delete removes, as opposed to a foreign row at a continuation key, which is never overwritten).
 /// </summary>
 public abstract class LargeBatchContract : IAsyncLifetime
 {
@@ -27,6 +30,8 @@ public abstract class LargeBatchContract : IAsyncLifetime
 
     private static readonly string SplitText = new('s', 600_000);   // two rows, one transaction
     private static readonly string OffloadText = Ascii(3_200_000, seed: 3); // above the threshold: a blob
+    private static readonly string TwoPartText = new('u', 1_000_000);   // a primary and two continuation rows
+    private static readonly string ThreePartText = new('v', 1_480_000); // a primary and three: about all one transaction holds
 
     public abstract ValueTask InitializeAsync();
 
@@ -63,6 +68,12 @@ public abstract class LargeBatchContract : IAsyncLifetime
 
     /// <summary>The raw <c>Title</c> cell of the stored row at <paramref name="rk"/>; null when the row or the cell is absent.</summary>
     protected abstract Task<string?> PhysicalTitleAsync<T>(string rk) where T : class, IEntity, new();
+
+    /// <summary>
+    /// Stores <paramref name="row"/> exactly as given in <typeparamref name="T"/>'s table, without the store:
+    /// a continuation row left behind, a damaged row.
+    /// </summary>
+    protected abstract Task SeedRowAsync<T>(TableEntity row) where T : class, IEntity, new();
 
     /// <summary>
     /// From now on, records after each committed large-value batch transaction how many blobs of this test's
@@ -321,6 +332,268 @@ public abstract class LargeBatchContract : IAsyncLifetime
         Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
     }
 
+    // ── leftover continuation rows of the same entity ─────────────────────
+
+    private const string LeftoverMark = "leftover";
+
+    /// <summary>
+    /// The continuation rows the store writes for <paramref name="body"/> under <paramref name="rk"/>, in index
+    /// order: what stays behind when a writer that does not know continuation rows deletes or replaces the
+    /// primary, when a partition delete stops halfway, or when a delete races a write. Each carries a
+    /// <c>Title</c> mark (no real continuation row has one), so a test can tell a leftover that is still
+    /// there from the row a write put in its place.
+    /// </summary>
+    private List<TableEntity> LeftoverParts(string rk, string body)
+    {
+        var logical = TableEntitySerializer.ToTableEntity(Text(rk, body), Pk, rk, ValueWriteContext.Public, []);
+        var parts = SplitRowLayout.Plan(logical).Parts.ToList();
+        foreach (var part in parts)
+            part["Title"] = LeftoverMark;
+        return parts;
+    }
+
+    private async Task SeedLeftoversAsync(string rk, string body, int skip = 0)
+    {
+        foreach (var part in LeftoverParts(rk, body).Skip(skip))
+            await SeedRowAsync<SplitTextEntity>(part);
+    }
+
+    [Fact]
+    public async Task Create_OverLeftoverContinuationRowsOfTheSameEntity_Succeeds_AndLeavesNoStrayRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r1", ThreePartText);
+        Assert.Equal(["r1~0001", "r1~0002", "r1~0003"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        // Continuation rows without a primary are no entity.
+        Assert.Null(await store.OneAsync(Id("r1"), Ct));
+        Assert.Equal(0, await store.CountAsync(Pk, Ct));
+
+        var created = await store.CreateAsync(Text("r1", SplitText), Ct);
+
+        Assert.NotNull(created.ETag);
+        // The leftover at the key the value needs was replaced whole, the two beyond it deleted.
+        Assert.Equal(["r1", "r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Equal(1, await store.CountAsync(Pk, Ct));
+    }
+
+    [Fact]
+    public async Task Upsert_OverALeftoverContinuationRowOfTheSameEntity_Succeeds_AndReadsBackTheNewValue()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r1", SplitText);
+        var other = new string('z', 600_000);
+
+        await store.UpsertAsync(Text("r1", other), Ct);
+
+        Assert.Equal(["r1", "r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+        Assert.Equal(other, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task Upsert_GrowingOntoLeftoversTheStoredRowDoesNotDeclare_TakesThemBack_AndAShrinkThenRemovesThem()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        // The stored row declares one continuation row; r1~0002 and r1~0003 are leftovers of an earlier, larger value.
+        await store.CreateAsync(Text("r1", SplitText), Ct);
+        await SeedLeftoversAsync("r1", ThreePartText, skip: 1);
+        Assert.Equal(["r1", "r1~0001", "r1~0002", "r1~0003"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+
+        await store.UpsertAsync(Text("r1", ThreePartText), Ct);
+
+        Assert.Equal(["r1", "r1~0001", "r1~0002", "r1~0003"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r1~0002"));
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r1~0003"));
+        Assert.Equal(ThreePartText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+
+        await store.UpsertAsync(Text("r1", SplitText), Ct);
+
+        Assert.Equal(["r1", "r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task Upsert_GrowingOntoSomeLeftovers_DeletesTheOnesBeyondTheNewValue_InTheSameWrite()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r1", SplitText), Ct);
+        await SeedLeftoversAsync("r1", ThreePartText, skip: 1);
+
+        await store.UpsertAsync(Text("r1", TwoPartText), Ct);
+
+        Assert.Equal(["r1", "r1~0001", "r1~0002"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r1~0002"));
+        Assert.Equal(TwoPartText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task Update_GrowingOntoALeftover_Succeeds()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r1", "small"), Ct);
+        await SeedLeftoversAsync("r1", SplitText);
+        var read = (await store.OneAsync(Id("r1"), Ct))!;
+
+        read.Body = SplitText;
+        await store.UpdateAsync(read, ConcurrencyMode.Strict, Ct);
+
+        Assert.Equal(["r1", "r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task Upsert_ThatNeedsNoLeftoverKey_Succeeds_TheLeftoversStayInvisible_AndADeleteRemovesThem()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await store.CreateAsync(Text("r1", SplitText), Ct);
+        await SeedLeftoversAsync("r1", ThreePartText, skip: 1);
+        var other = new string('z', 600_000);
+
+        // The value needs r1~0001 only, which the stored row declares: the write does not look for
+        // leftovers (that would be one more round trip on every write), and none is in its way.
+        await store.UpsertAsync(Text("r1", other), Ct);
+
+        Assert.Equal(other, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Equal(1, await store.CountAsync(Pk, Ct));
+        Assert.Equal(Id("r1"), Assert.Single(await store.QueryAsync(new QueryOptions { Partition = Pk }, Ct)).Id);
+
+        await store.DeleteAsync(Id("r1"), Ct);
+
+        Assert.Empty(await PhysicalRowKeysAsync<SplitTextEntity>());
+    }
+
+    [Fact]
+    public async Task Upsert_OwnLeftoverAtOneKey_ForeignRowAtTheNext_IsRefused_AndBothRowsStayAsTheyWere()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r1", SplitText);
+        await SeedForeignRowAsync<SplitTextEntity>("r1~0002", "foreign");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.UpsertAsync(Text("r1", ThreePartText), Ct));
+
+        // The entity's own leftover is no obstacle; the foreign row is, and it is named.
+        Assert.Contains("'r1~0002'", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(["r1~0001", "r1~0002"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal(LeftoverMark, await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+        Assert.Equal("foreign", await PhysicalTitleAsync<SplitTextEntity>("r1~0002"));
+    }
+
+    [Fact]
+    public async Task Create_RowAtTheKeyIsAContinuationRowOfAnotherEntity_IsForeign_AndRefused()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedRowAsync<SplitTextEntity>(new TableEntity(Pk, "r1~0001")
+        {
+            [SystemColumnNames.SplitOf] = "another",
+            [SystemColumnNames.SplitIndex] = 1,
+            ["Title"] = "theirs",
+        });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.CreateAsync(Text("r1", SplitText), Ct));
+
+        Assert.Contains("'r1~0001'", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(["r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal("theirs", await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+    }
+
+    [Fact]
+    public async Task Delete_WithNoPrimaryRow_RemovesTheEntitysLeftoverContinuationRows_AndNothingElse()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r1", ThreePartText);
+        // Neighbours in the same key range: another entity with a continuation row, an entity whose key
+        // starts with "r1", and a row at a continuation key of r1 that is not r1's.
+        await store.CreateAsync(Text("r2", SplitText), Ct);
+        await store.CreateAsync(Text("r1x", "small"), Ct);
+        await SeedForeignRowAsync<SplitTextEntity>("r1~0009", "foreign");
+
+        await store.DeleteAsync(Id("r1"), Ct);
+
+        Assert.Equal(["r1x", "r1~0009", "r2", "r2~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal("foreign", await PhysicalTitleAsync<SplitTextEntity>("r1~0009"));
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r2"), Ct))!.Body, StringComparer.Ordinal);
+
+        // Nothing left of r1: deleting it again changes nothing, and the key is free.
+        await store.DeleteAsync(Id("r1"), Ct);
+        await store.CreateAsync(Text("r1", SplitText), Ct);
+        Assert.Equal(["r1", "r1x", "r1~0001", "r1~0009", "r2", "r2~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+    }
+
+    [Fact]
+    public async Task Delete_OfALeftoverContinuationRowsOwnId_IsANoOp()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r1", SplitText);
+
+        await store.DeleteAsync(Id("r1~0001"), Ct);
+
+        Assert.Equal(["r1~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal(LeftoverMark, await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+    }
+
+    [Fact]
+    public async Task UpsertBatch_HittingAnOwnLeftover_Succeeds_AndLeavesNoStrayRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r2", ThreePartText);
+
+        var n = await store.UpsertBatchAsync([Text("r1", "a"), Text("r2", SplitText), Text("r3", "c")], Ct);
+
+        Assert.Equal(3, n);
+        Assert.Equal(["r1", "r2", "r2~0001", "r3"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r2~0001"));
+        Assert.Equal("a", (await store.OneAsync(Id("r1"), Ct))!.Body);
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r2"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Equal("c", (await store.OneAsync(Id("r3"), Ct))!.Body);
+    }
+
+    [Fact]
+    public async Task CreateBatch_HittingAnOwnLeftover_Succeeds_AndLeavesNoStrayRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r2", ThreePartText);
+
+        var n = await store.CreateBatchAsync([Text("r1", "a"), Text("r2", SplitText), Text("r3", "c")], Ct);
+
+        Assert.Equal(3, n);
+        Assert.Equal(["r1", "r2", "r2~0001", "r3"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r2"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task UpsertBatch_OwnLeftoverOfOneEntity_ForeignRowAtAnothers_FailsTheTransaction_AndKeepsEveryRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r1", SplitText);
+        await SeedForeignRowAsync<SplitTextEntity>("r2~0001", "foreign");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.UpsertBatchAsync([Text("r1", SplitText), Text("r2", SplitText)], Ct));
+
+        Assert.Contains("'r2~0001'", ex.Message, StringComparison.Ordinal);
+        // One transaction: nothing of r1 was written either, and its leftover is still the leftover.
+        Assert.Equal(["r1~0001", "r2~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal(LeftoverMark, await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+        Assert.Equal("foreign", await PhysicalTitleAsync<SplitTextEntity>("r2~0001"));
+    }
+
     [Fact]
     public async Task UpsertBatch_ShrinksSplitAndOffloadedRows_InOneTransaction_AndReleasesBlobs()
     {
@@ -553,6 +826,13 @@ public sealed class InMemoryLargeBatchContractTests : LargeBatchContract
     protected override Task<string?> PhysicalTitleAsync<T>(string rk) =>
         Task.FromResult(Typed<T>().PhysicalRow(Pk, rk) is { } row && row.TryGetValue("Title", out var title) ? title as string : null);
 
+    protected override Task SeedRowAsync<T>(TableEntity row)
+    {
+        Store<T>();
+        Typed<T>().SeedPhysicalRow(row);
+        return Task.CompletedTask;
+    }
+
     private readonly List<int> blobsAtCommits = [];
 
     protected override IReadOnlyList<int> BlobsAtCommits => blobsAtCommits;
@@ -685,6 +965,14 @@ public sealed class AzuriteLargeBatchContractTests : LargeBatchContract
     {
         var row = await tableService.GetTableClient(typeof(T).Name).GetEntityIfExistsAsync<TableEntity>(Pk, rk, cancellationToken: Ct);
         return row.HasValue && row.Value!.TryGetValue("Title", out var title) ? title as string : null;
+    }
+
+    protected override async Task SeedRowAsync<T>(TableEntity row)
+    {
+        tables.Add(typeof(T).Name);
+        var client = tableService.GetTableClient(typeof(T).Name);
+        await client.CreateIfNotExistsAsync(Ct);
+        await client.AddEntityAsync(row, Ct);
     }
 
     protected override IReadOnlyList<int> BlobsAtCommits => observer.BlobsAtCommits;

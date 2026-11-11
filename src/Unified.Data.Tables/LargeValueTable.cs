@@ -100,8 +100,10 @@ public sealed class LargeValueTable
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The error of a write that needs a new continuation
-    /// row at a key another row already holds (one written before the type opted in, or by a type sharing
-    /// the table): the write is refused rather than overwrite that row.
+    /// row at a key a foreign row already holds (one written before the type opted in, or by a type sharing
+    /// the table): the write is refused rather than overwrite that row. A row there that is a continuation
+    /// row of the same entity (its <c>_SplitOf</c> cell names the entity's row key) is not foreign: it is
+    /// the entity's own, left behind, and the write takes it back (<see cref="PlanOverOwnParts"/>).
     /// </summary>
     /// <param name="partitionKey">The entity's partition key.</param>
     /// <param name="rowKey">The entity's row key.</param>
@@ -229,7 +231,9 @@ public sealed class LargeValueTable
     /// primary row and its continuation rows, offloading values to blobs until the rows fit one
     /// entity-group transaction together with the deletes of the stored row's stale continuation rows.
     /// The existing continuation rows are asked for only when the stored row declares more than the new
-    /// plan writes.
+    /// plan writes. A continuation row beyond what the stored row declares is planned as new
+    /// (<see cref="LargeValueWritePlan.IsNewPart"/>): when the provider finds its key held by a
+    /// continuation row of the same entity, it plans again with <see cref="PlanOverOwnParts"/>.
     /// </summary>
     /// <param name="entity">The entity to write (prepared with <see cref="PrepareAsync"/>).</param>
     /// <param name="partitionKey">Its partition key.</param>
@@ -250,7 +254,7 @@ public sealed class LargeValueTable
         // A shrink deletes the continuation rows that actually exist beyond the new plan, found by the
         // caller rather than trusted from the part count, so a part already gone is never required.
         if (storedPartCount <= plan.Parts.Count)
-            return new LargeValueWritePlan(row, plan, pending, [], storedPartCount);
+            return new LargeValueWritePlan(row, plan, pending, [], storedPartCount, []);
 
         var existing = await existingPartRowKeys(ct);
         var stale = StaleParts(existing, plan);
@@ -260,7 +264,47 @@ public sealed class LargeValueTable
             (row, plan, pending) = coordinator.Serialize(entity, partitionKey, rowKey, extraActions: existing.Count);
             stale = StaleParts(existing, plan);
         }
-        return new LargeValueWritePlan(row, plan, pending, stale, storedPartCount);
+        return new LargeValueWritePlan(row, plan, pending, stale, storedPartCount, []);
+    }
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Plans a write as <see cref="PlanAsync"/> does, over
+    /// the continuation rows of the entity that exist now, whether its stored row declares them or not. A
+    /// continuation row whose <c>_SplitOf</c> cell names the entity is the entity's own even when no stored
+    /// row declares it: it was left behind by a writer that does not know split values, by a partition
+    /// delete that stopped halfway, or by a delete that raced a write. The plan writes over the ones the
+    /// new value needs (<see cref="LargeValueWritePlan.IsNewPart"/> is false for them) and deletes all
+    /// the others (<see cref="LargeValueWritePlan.StalePartRowKeys"/>) in the same atomic step, so no
+    /// stray row remains. A provider uses it once a plan from <see cref="PlanAsync"/> found the key of a
+    /// new continuation row held by such a row, and applies the plan only while those rows are still
+    /// the rows it was given (a row at such a key that is not the entity's is foreign:
+    /// <see cref="ContinuationKeyTaken"/>).
+    /// </summary>
+    /// <param name="entity">The entity to write (prepared with <see cref="PrepareAsync"/>).</param>
+    /// <param name="partitionKey">Its partition key.</param>
+    /// <param name="rowKey">Its row key.</param>
+    /// <param name="storedPartCount">The part count of the stored row (0 when there is none).</param>
+    /// <param name="ownPartRowKeys">
+    /// The row keys of every continuation row of the entity that exists now: the rows for which
+    /// <see cref="IsPartOf"/> is true.
+    /// </param>
+    /// <returns>The plan.</returns>
+    /// <exception cref="OversizedValueException">The entity cannot be stored within the limits.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public LargeValueWritePlan PlanOverOwnParts(
+        object entity, string partitionKey, string rowKey, int storedPartCount, IReadOnlyCollection<string> ownPartRowKeys)
+    {
+        ArgumentNullException.ThrowIfNull(entity);
+        ArgumentNullException.ThrowIfNull(ownPartRowKeys);
+        var (row, plan, pending) = coordinator.Serialize(entity, partitionKey, rowKey, extraActions: 0);
+        var stale = StaleParts(ownPartRowKeys, plan);
+        if (!SplitRowLayout.FitsOneTransaction(plan, stale.Count))
+        {
+            // Budget for deleting every existing part: the stale ones are a subset whatever the new plan.
+            (row, plan, pending) = coordinator.Serialize(entity, partitionKey, rowKey, extraActions: ownPartRowKeys.Count);
+            stale = StaleParts(ownPartRowKeys, plan);
+        }
+        return new LargeValueWritePlan(row, plan, pending, stale, storedPartCount, ownPartRowKeys);
     }
 
     /// <summary>
@@ -773,7 +817,7 @@ public sealed class LargeValueTable
     }
 
     // The existing continuation rows the new plan no longer writes.
-    private static List<string> StaleParts(IReadOnlyList<string> existing, SplitRowPlan plan)
+    private static List<string> StaleParts(IEnumerable<string> existing, SplitRowPlan plan)
     {
         var kept = new HashSet<string>(plan.Parts.Select(p => p.RowKey), StringComparer.Ordinal);
         return existing.Where(rk => !kept.Contains(rk)).ToList();
@@ -788,7 +832,12 @@ public sealed class LargeValueTable
 [EditorBrowsable(EditorBrowsableState.Never)]
 public sealed class LargeValueWritePlan
 {
-    internal LargeValueWritePlan(TableEntity logical, SplitRowPlan plan, IReadOnlyList<PendingBlob> pending, IReadOnlyList<string> stale, int storedPartCount)
+    // The continuation rows of the entity that existed when the plan was made over them (PlanOverOwnParts).
+    private readonly HashSet<string> ownParts;
+
+    internal LargeValueWritePlan(
+        TableEntity logical, SplitRowPlan plan, IReadOnlyList<PendingBlob> pending, IReadOnlyList<string> stale,
+        int storedPartCount, IEnumerable<string> ownPartRowKeys)
     {
         StoredPartCount = Math.Max(0, storedPartCount);
         Primary = plan.Primary;
@@ -797,6 +846,7 @@ public sealed class LargeValueWritePlan
         BlobPaths = LargeValueTable.BlobPaths(logical);
         Pending = pending;
         Plan = plan;
+        ownParts = new HashSet<string>(ownPartRowKeys, StringComparer.Ordinal);
     }
 
     /// <summary>Storage-provider SPI, not for application code. The primary row to insert or replace.</summary>
@@ -805,29 +855,43 @@ public sealed class LargeValueWritePlan
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The continuation rows to write, in index order:
-    /// those the stored row declares are replaced, the others (<see cref="IsNewPart"/>) inserted.
+    /// those the stored row declares, and the entity's own rows the plan was made over, are replaced; the
+    /// others (<see cref="IsNewPart"/>) are inserted.
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public IReadOnlyList<TableEntity> Parts { get; }
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The number of continuation rows the stored row
-    /// declared when the plan was made (0 when there was none): the entity's own rows.
+    /// declared when the plan was made (0 when there was none). They are the entity's own rows; so are
+    /// the continuation rows a plan from <see cref="LargeValueTable.PlanOverOwnParts"/> was made over.
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public int StoredPartCount { get; }
 
     /// <summary>
     /// Storage-provider SPI, not for application code. True when the part at <paramref name="position"/>
-    /// in <see cref="Parts"/> is beyond what the stored row declares: it must be inserted, never replace a
-    /// row already at its key (that row is not the entity's: <see cref="LargeValueTable.ContinuationKeyTaken"/>).
+    /// in <see cref="Parts"/> is beyond what the stored row declares and is not one of the entity's own
+    /// continuation rows the plan was made over: it must be inserted, never replace a row already at its
+    /// key. When a row is there, the provider reads the entity's own continuation rows: if that row is one
+    /// of them it plans again over them (<see cref="LargeValueTable.PlanOverOwnParts"/>), otherwise the
+    /// row is foreign (<see cref="LargeValueTable.ContinuationKeyTaken"/>).
     /// </summary>
     /// <param name="position">The zero-based position in <see cref="Parts"/> (the part's index less one).</param>
     /// <returns>Whether the part is new.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="position"/> is not a position in <see cref="Parts"/>.</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public bool IsNewPart(int position) => position + 1 > StoredPartCount;
+    public bool IsNewPart(int position)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(position, Parts.Count);
+        return position + 1 > StoredPartCount && !ownParts.Contains(Parts[position].RowKey);
+    }
 
-    /// <summary>Storage-provider SPI, not for application code. Row keys of the existing continuation rows to delete.</summary>
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Row keys of the existing continuation rows to
+    /// delete: the stored row's stale ones, and the entity's own leftover rows the new value does not need.
+    /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public IReadOnlyList<string> StalePartRowKeys { get; }
 
