@@ -286,6 +286,13 @@ public static class TableEntitySerializer
         // Cells of split values, grouped by their flattened base column ("Inner_Body").
         Dictionary<string, Dictionary<string, object>>? largeValues = null;
 
+        // A type that opts into nothing reads a column that merely has the name of a large-value cell
+        // ("Body__len" written by another program) as 0.8.3 read it. Only a group the library really
+        // wrote is a large value there: a well-formed manifest, or a cell that parses as a blob reference.
+        // For an aware type every such column is one (an incomplete group is damage, and throws).
+        var aware = TypeMetadataCache.IsLargeValueAware(type);
+        var genuine = aware ? null : GenuineLargeValueColumns(entity);
+
         foreach (var kv in entity)
         {
             // A column that is EXACTLY "__Json"/"__GZip"/"__Truncated" (no property name in front of
@@ -312,7 +319,8 @@ public static class TableEntitySerializer
 
             // A split value's cells ("Body__c0", "Body__chunks", ...) are parts of one value, not
             // properties: collect them and reassemble each value once the row has been read.
-            if (SplitCodec.TryParseLargeValueColumn(kv.Key, out var baseColumn, out _, out _))
+            if (SplitCodec.TryParseLargeValueColumn(kv.Key, out var baseColumn, out _, out _)
+                && (aware || (genuine?.Contains(baseColumn) ?? false)))
             {
                 largeValues ??= new Dictionary<string, Dictionary<string, object>>(StringComparer.Ordinal);
                 if (!largeValues.TryGetValue(baseColumn, out var cells))
@@ -339,6 +347,50 @@ public static class TableEntitySerializer
         // A polymorphic row's keys encode an aggregate version or a tick count, not an id — so
         // recomputing Id from them would overwrite the object's real id with "partition|row".
         return restoreId ? RestoreIdFromKeys(result, entity) : result;
+    }
+
+    // The base columns of the row whose large-value cells the library wrote: a complete, well-formed
+    // manifest (__chunks a positive count, __enc a known encoding, __sha256 a SHA-256 in hex, __len a
+    // non-negative length; its chunks may be missing, on continuation rows the read did not assemble), or a
+    // __blob cell that parses as a blob reference. Null when there is none.
+    private static HashSet<string>? GenuineLargeValueColumns(TableEntity row)
+    {
+        HashSet<string>? genuine = null;
+        foreach (var (key, value) in row)
+        {
+            if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _))
+                continue;
+            var isGenuine = kind switch
+            {
+                LargeValueCellKind.Count => IsWellFormedManifest(row, column),
+                LargeValueCellKind.BlobReference => IsBlobReference(column, value),
+                _ => false,
+            };
+            if (isGenuine)
+                (genuine ??= new HashSet<string>(StringComparer.Ordinal)).Add(column);
+        }
+        return genuine;
+    }
+
+    private static bool IsWellFormedManifest(TableEntity row, string column) =>
+        row.TryGetValue(column + SplitCodec.ChunksSuffix, out var chunks) && chunks is int and > 0 or long and > 0 and <= int.MaxValue
+        && row.TryGetValue(column + "__enc", out var enc) && enc is "text" or "gzip" or "utf16le" or "binary"
+        && row.TryGetValue(column + "__sha256", out var sha) && sha is string { Length: 64 } hex && hex.All(char.IsAsciiHexDigit)
+        && row.TryGetValue(column + "__len", out var length) && length is long and >= 0 or int and >= 0;
+
+    private static bool IsBlobReference(string column, object? cell)
+    {
+        if (cell is not string json)
+            return false;
+        try
+        {
+            _ = Providers.BlobReference.Parse(column, json);
+            return true;
+        }
+        catch (TableValueIntegrityException)
+        {
+            return false;
+        }
     }
 
     // Reassembles every split value (verifying its SHA-256) and sets it on its property. The property
