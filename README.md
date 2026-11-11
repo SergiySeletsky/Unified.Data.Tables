@@ -1355,11 +1355,12 @@ so a scaled-out app may register it in one instance only.
   that `QueryAsync(partition)` and `QueryAsync()` return (with caching off too). When the value is a
   string or a JSON-stored value that does not fit one cell even compressed, a trimming
   `OversizedCellPolicy` trims it in those copies (so a later `OneAsync` that the cache answers returns it
-  trimmed) and in the next save of the entity, which stores it trimmed; `OneAsync` when it reads the
-  table, and the other queries, return it whole. Under `Throw`, `QueryAsync(partition)`, `QueryAsync()`
-  and the save throw `OversizedCellException`, while `OneAsync` and the other queries return the value
-  whole and the entity is not cached. Once the type opts into nothing at all, a read of a row that holds
-  such a value in a blob or on continuation rows fails.
+  trimmed) and in the next save of the entity, which stores it trimmed (a JSON-stored value that is not a
+  list is dropped instead); `OneAsync` when it reads the table, and the other queries, return it whole.
+  Under `Throw`, `QueryAsync(partition)`, `QueryAsync()` and the save throw `OversizedCellException`,
+  while `OneAsync` and the other queries return the value whole and the entity is not cached. Once the
+  type opts into nothing at all, a read of a row that holds such a value in a blob or on continuation
+  rows fails.
 - **Back up and restore an entity as one unit**: its main row, its continuation rows (same partition,
   RowKeys `{RowKey}~NNNN`) and its blobs in the offload container, taken together. A row restored without
   its parts or blobs (or with those of another version) reads as `TableValueIntegrityException`.
@@ -1523,9 +1524,10 @@ so a scaled-out app may register it in one instance only.
   `QueryAsync(partition)` and `QueryAsync()` return (with caching off too). Under `TrimSilently` or
   `TrimWithMarker` a string or JSON-stored value that does not fit one cell even compressed is trimmed in
   those copies (so a later `OneAsync` that the cache answers and those two queries return it trimmed) and
-  in the next save of such an entity, which stores it trimmed; under `Throw` those two queries and the
-  save throw `OversizedCellException`, and the entity is not cached. `OneAsync` when it reads the table,
-  and the other queries, return the value whole. Read such rows through the opted-in type.
+  in the next save of such an entity, which stores it trimmed (a JSON-stored value that is not a list is
+  dropped instead); under `Throw` those two queries and the save throw `OversizedCellException`, and the
+  entity is not cached. `OneAsync` when it reads the table, and the other queries, return the value whole.
+  Read such rows through the opted-in type.
 - The store learns a type's large-value columns from its declared property types (along every path that
   does not pass through the same type twice) and from the objects a new entity holds. Three shapes fall
   outside that: a large value below a repeated type (`Head.Next.Body` when the node type refers to
