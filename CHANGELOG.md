@@ -325,8 +325,9 @@ Lossless storage of large values, opt-in per property.
   (before, only a 412 did); a cache that throws while it does (a disposed `MemoryCache` during shutdown)
   is logged as a warning and never replaces the call's own exception (on 0.8.3 a `Strict` update that met
   a 412 over a disposed cache threw `ObjectDisposedException`; it now throws
-  `ConcurrencyConflictException`). A call refused by its own checks before anything is sent drops nothing;
-  for a type with large values, a create, update or upsert that fails while its values are prepared (a
+  `ConcurrencyConflictException`). A call refused by its own checks before anything is sent (a builder
+  update of a large-value member, for one) drops nothing; for a type with large values, a create, update
+  or upsert that fails while its values are prepared (a
   stream that fails while it is read, a value too large to store, a cancelled token) also drops the entry,
   although nothing was written. After `UpdateAsync(id, builder)` the cached entity is kept warm as on
   0.8.3 only when the entry cached when the update was sent is still the cached entry (no read or other
