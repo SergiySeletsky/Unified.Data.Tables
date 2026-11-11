@@ -38,12 +38,10 @@ public partial class TableStorage<T>
     // one; the __blob reference columns are selected now so the offload tier can read them from the same
     // point read. The row's version is not a column and is never selected: the service returns it with
     // every entity (and as the response's ETag header), and may refuse a $select that names odata.etag.
-    private static readonly string[] PriorSelect =
-    [
-        SystemColumnNames.SplitParts,
-        SystemColumnNames.SplitOf,
-        .. TypeMetadataCache.LargeValueColumns(typeof(T)).Select(c => c + SplitCodec.BlobSuffix),
-    ];
+    // A type with more large-value columns than a projection may name reads the row whole (null). Built
+    // on first use by an operation, never by this type's initializer (listing the columns may construct
+    // the entity).
+    private static IReadOnlyList<string>? PriorSelect => LargeValueTable.PriorRowSelect(typeof(T));
 
     private static readonly string[] PartKeys = ["PartitionKey", "RowKey", SystemColumnNames.SplitOf];
 
@@ -73,7 +71,7 @@ public partial class TableStorage<T>
 
     /// <summary>
     /// The row at an entity's keys as the point read before a write or delete returns it (projected onto
-    /// <see cref="PriorSelect"/>), with its version. A continuation row has none here: nothing is ever
+    /// <see cref="PriorSelect"/>, or whole), with its version. A continuation row has none here: nothing is ever
     /// written or deleted on condition of it.
     /// </summary>
     private readonly record struct StoredRow(TableEntity Row, ETag ETag);
@@ -120,10 +118,12 @@ public partial class TableStorage<T>
     // A version a conditional write can name: not empty, and not the "any version" wildcard.
     private static bool IsVersion(ETag etag) => etag != ETag.All && !string.IsNullOrEmpty(etag.ToString());
 
-    // The blob names a stored row references; a malformed reference is logged and skipped. The keys are
-    // passed in: the projected row does not carry them.
+    // The blob names the prior read learns from a stored row (the references in the cells PriorSelect
+    // names, every cell when the row was read whole: the rule InMemoryStorage applies to its whole rows);
+    // a malformed reference is logged and skipped. The keys are passed in: the projected row does not
+    // carry them.
     private IReadOnlyList<string> BlobPaths(TableEntity row, string pk, string rk) =>
-        LargeValueTable.BlobPaths(row, (column, ex) =>
+        LargeValueTable.PriorRowBlobPaths(typeof(T), row, (column, ex) =>
             logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: ignoring a malformed blob reference in {Column}",
                 typeName, pk, rk, column));
 
@@ -623,7 +623,9 @@ public partial class TableStorage<T>
     /// declares a part already gone can still be deleted). When there is no row at the id, the entity's
     /// leftover continuation rows (if any) are deleted, so nothing of it stays behind; a continuation row
     /// addressed by its own id is not an entity and is left alone. A lost race re-reads and retries. Any
-    /// row key is accepted. Once the entity is deleted, the blobs it referenced are deleted (best effort).
+    /// row key is accepted. Once the entity is deleted, the blobs the read before the delete found it
+    /// referencing are deleted (best effort; see <see cref="BlobPaths"/>), the others are left for the
+    /// orphan sweep.
     /// </summary>
     private async Task DeleteLargeAsync(string pk, string rk, CancellationToken ct)
     {
