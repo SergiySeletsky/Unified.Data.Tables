@@ -1549,8 +1549,10 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // takes the merge's ETag only when the merge was conditional on exactly the cached version; otherwise
     // it keeps the cached entity's own, older ETag. An optimistic write of an entry with an older ETag
     // meets 412 and evicts; it never overwrites a change the entry has not seen.
-    // Every put and every hit goes through Clone, which copies each byte[]: an entry never holds an array a
-    // caller passed to the store or received from it.
+    // Every put and every hit goes through Clone, which copies each byte[] cell: an entry never holds a
+    // byte[] a caller passed to the store or received from it. The array of a TableBlobContent.FromBytes
+    // content is the exception: the clone keeps the content object (shared by design), and that content
+    // keeps reading the caller's array.
     // Writes by other processes are not seen, as before (see CachePolicy).
 
     private static readonly ConditionalWeakTable<IMemoryCache, WriteGenerations> GenerationsByCache = new();
