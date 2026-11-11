@@ -381,11 +381,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             return false;
 
         // A split or offloaded value is not assembled or downloaded just to answer "does it exist" - it
-        // is simply not cached.
+        // is simply not cached. Nor is a row whose part count cannot be read (a damaged row): it exists,
+        // and DeleteAsync can delete it, but its value cannot be read.
         // A plain type over a row another type wrote with large-value cells is not cached either: its
         // read would throw for an offloaded value, and existence needs no value.
         if (response.HasValue && (LargeValueAware
-            ? SplitRowLayout.PartCount(response.Value!) == 0 && !HasBlobReference(response.Value!)
+            ? DeclaresNoParts(response.Value!) && !HasBlobReference(response.Value!)
             : !TableEntitySerializer.HasLargeValueCells(response.Value!)))
         {
             var entity = response.Value!.FromTableEntity<T>();

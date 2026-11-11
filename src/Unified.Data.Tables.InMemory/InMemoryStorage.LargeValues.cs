@@ -584,6 +584,9 @@ public sealed partial class InMemoryStorage<T>
     private async Task<IReadOnlyList<T>> BoundedLargeAsync(QueryOptions options, CancellationToken ct) =>
         await MaterializeAllAsync(LogicalSnapshot(() => Bounded(options)), ct);
 
+    // Pages over the stored rows, as the service does for TableStorage: a continuation row (declared or
+    // leftover) takes a place in the page and is then skipped, so a page can hold fewer entities than its
+    // size, or none, and still carry a cursor; the cursor resumes after the last row of the page.
     private async Task<EntityPage<T>> PageLargeAsync(
         string? partition, string? rowKeyPrefix, int pageSize, string fingerprint,
         (string PartitionKey, string RowKey)? after, CancellationToken ct)
@@ -592,7 +595,7 @@ public sealed partial class InMemoryStorage<T>
         string? next = null;
         lock (gate)
         {
-            IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = LogicalRows()
+            IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = OrderedRows()
                 .Where(kv => partition is null || kv.Key.PartitionKey == partition)
                 .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal));
             if (after is { } a)
@@ -606,7 +609,7 @@ public sealed partial class InMemoryStorage<T>
                 var last = page[page.Count - 1].Key;
                 next = PageCursor.Encode(fingerprint, last.PartitionKey + "\0" + last.RowKey);
             }
-            pageRows = page.Select(kv => Assembled(kv.Value)).ToList();
+            pageRows = page.Where(kv => !LargeValueTable.IsPartRow(kv.Value.Data)).Select(kv => Assembled(kv.Value)).ToList();
         }
 
         return new EntityPage<T>(await MaterializeAllAsync(pageRows, ct), next);
