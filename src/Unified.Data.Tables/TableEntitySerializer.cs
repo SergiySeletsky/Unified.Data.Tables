@@ -346,7 +346,7 @@ public static class TableEntitySerializer
             var fmt = target.PropertyType == typeof(string) || target.PropertyType == typeof(byte[])
                 ? TableEntityValueFormat.Raw
                 : TableEntityValueFormat.Json;
-            result = SetProperty(result, new TableEntityValue(path, decoded, fmt));
+            result = SetProperty(result, new TableEntityValue(path, decoded, fmt) { IsLargeValue = true });
         }
         return result;
     }
@@ -840,6 +840,16 @@ internal sealed class TableEntityValue
     public object? Value { get; }
     public Type? Type { get; }
     public TableEntityValueFormat Format { get; private set; }
+
+    /// <summary>
+    /// True for a value reassembled from split cells or downloaded from a blob. It can be of any size, so
+    /// a failure message quotes at most <see cref="MaxDescribedChars"/> characters of it and states its
+    /// length; a value that came from one cell is named whole, as on 0.8.3.
+    /// </summary>
+    public bool IsLargeValue { get; init; }
+
+    /// <summary>How many characters of a large value a failure message quotes.</summary>
+    internal const int MaxDescribedChars = 200;
 
     /// <summary>
     /// Set by <see cref="TrySerialize"/> when the oversized-cell policy trimmed (or dropped) this
@@ -1397,7 +1407,22 @@ internal sealed class TableEntityValue
         return Encoding.UTF8.GetString(outMs.ToArray());
     }
 
-    public override string ToString() => $"{string.Join(Delim, Path)}={Value}";
+    public override string ToString()
+    {
+        var name = string.Join(Delim, Path);
+        if (IsLargeValue)
+        {
+            if (Value is string { Length: > MaxDescribedChars } text)
+            {
+                // Never end the excerpt on half a surrogate pair.
+                var cut = char.IsHighSurrogate(text[MaxDescribedChars - 1]) ? MaxDescribedChars - 1 : MaxDescribedChars;
+                return string.Create(CultureInfo.InvariantCulture, $"{name}={text.AsSpan(0, cut)}… ({text.Length:N0} characters)");
+            }
+            if (Value is byte[] bytes)
+                return string.Create(CultureInfo.InvariantCulture, $"{name}={Value} ({bytes.Length:N0} bytes)");
+        }
+        return $"{name}={Value}";
+    }
 }
 
 internal static class TypeMetadataCache
