@@ -1402,7 +1402,7 @@ internal sealed class TableEntityValue
 internal static class TypeMetadataCache
 {
     private static readonly ConcurrentDictionary<Type, TypeMetadata> _cache = new();
-    private static readonly ConcurrentDictionary<Type, IReadOnlyList<string>> _largeValueColumns = new();
+    private static readonly ConcurrentDictionary<Type, LargeValueInfo> _largeValues = new();
 
     public static TypeMetadata GetMetadata(Type t)
         => _cache.GetOrAdd(t, CreateMetadata);
@@ -1411,49 +1411,199 @@ internal static class TypeMetadataCache
     internal static bool HasMetadata(Type t) => _cache.ContainsKey(t);
 
     /// <summary>
+    /// The bound of the large-value walk: how many types it inspects below one entity type, and how many
+    /// steps the listing of the columns may take. No real entity comes near it; it keeps a type graph
+    /// with factorially many paths, or with no end (a generic type whose property is a deeper
+    /// instantiation of itself), from hanging or overflowing the stack in a store's static initializer.
+    /// </summary>
+    internal const int MaxLargeValueWalkSteps = 10_000;
+
+    /// <summary>The longest property name Azure Table Storage accepts: a longer path names no column.</summary>
+    private const int MaxColumnNameLength = 255;
+
+    /// <summary>
+    /// How deep a column of at most <see cref="MaxColumnNameLength"/> characters can lie: every level
+    /// adds a name of at least one character and the path delimiter.
+    /// </summary>
+    private const int MaxFlattenDepth = MaxColumnNameLength / 2 + 1;
+
+    /// <summary>
     /// True when <paramref name="t"/>, or any nested type it flattens into columns, has a
     /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property. Such a type may
     /// produce split cells or blob references; any other type takes none of the large-value branches.
     /// Never throws, whatever the type: a store asks this in its static initializer, where an exception
     /// would break the store type for the rest of the process.
     /// </summary>
-    internal static bool IsLargeValueAware(Type t) => LargeValueColumns(t).Count > 0;
+    internal static bool IsLargeValueAware(Type t) => LargeValues(t).Aware;
 
     /// <summary>
-    /// Every flattened base column of <paramref name="t"/> that can carry split cells or a blob
-    /// reference (<c>"Body"</c>, <c>"Inner_Body"</c>, <c>"Content"</c>). Never throws; empty for a type
-    /// that opts into nothing.
+    /// The flattened base columns of <paramref name="t"/> that can carry split cells or a blob reference
+    /// (<c>"Body"</c>, <c>"Inner_Body"</c>, <c>"Content"</c>): one for every path of declared types that
+    /// does not meet a type twice (a type that reaches itself ends the path) and whose name a column can
+    /// hold, in declaration order. A type graph too dense to list every such path within
+    /// <see cref="MaxLargeValueWalkSteps"/> lists the paths nearest the entity instead. Never throws;
+    /// empty for a type that opts into nothing.
     /// </summary>
-    internal static IReadOnlyList<string> LargeValueColumns(Type t)
+    internal static IReadOnlyList<string> LargeValueColumns(Type t) => LargeValues(t).Columns;
+
+    private static LargeValueInfo LargeValues(Type t)
     {
         ArgumentNullException.ThrowIfNull(t);
-        return _largeValueColumns.GetOrAdd(t, static type =>
-        {
-            var columns = new List<string>();
-            CollectLargeValueColumns(type, string.Empty, new HashSet<Type>(), columns);
-            return columns.AsReadOnly();
-        });
+        return _largeValues.GetOrAdd(t, static type => WalkLargeValues(type));
+    }
+
+    /// <summary>What the large-value walk found below one type.</summary>
+    private sealed class LargeValueInfo(bool aware, IReadOnlyList<string> columns)
+    {
+        public static readonly LargeValueInfo None = new(false, []);
+
+        public bool Aware { get; } = aware;
+
+        public IReadOnlyList<string> Columns { get; } = columns;
     }
 
     // Walks the property graph Flatten walks, by reflection alone: a large-value member is a column; a
-    // property whose declared type flattens into Owner_Child columns is walked (once per path, so a
-    // type that reaches itself does not recurse forever). It never builds flattening metadata
-    // (GetMetadata): 0.8.3 built that only when a value of a type was first serialized, and it throws
-    // for types the writer never flattens (JsonNode declares two indexers named Item).
-    private static void CollectLargeValueColumns(Type type, string prefix, HashSet<Type> visiting, List<string> columns)
+    // property whose declared type flattens into Owner_Child columns is walked. It never builds
+    // flattening metadata (GetMetadata): 0.8.3 built that only when a value of a type was first
+    // serialized, and it throws for types the writer never flattens (JsonNode declares two indexers
+    // named Item). Every type is inspected once, and a branch that leads to no large-value member is
+    // never listed, so a type that opts into nothing costs one pass over its types however many paths
+    // run through them.
+    private static LargeValueInfo WalkLargeValues(Type root)
     {
-        if (!visiting.Add(type))
-            return;
-
-        foreach (var member in LargeValueMembers(type))
+        // 1. The types below the root, each inspected once, nearest first.
+        var members = new Dictionary<Type, List<LargeValueMember>>();
+        var found = new Queue<(Type Type, int Depth)>();
+        found.Enqueue((root, 0));
+        while (members.Count < MaxLargeValueWalkSteps && found.TryDequeue(out var next))
         {
-            if (member.Flattened is not { } nested)
-                columns.Add(prefix + member.Name);
-            else
-                CollectLargeValueColumns(nested, prefix + member.Name + TableEntityValue.PathDelimiter, visiting, columns);
+            if (members.ContainsKey(next.Type))
+                continue;
+
+            var own = LargeValueMembers(next.Type);
+            members.Add(next.Type, own);
+            if (next.Depth >= MaxFlattenDepth)
+                continue;
+
+            foreach (var member in own)
+            {
+                if (member.Flattened is { } nested && !members.ContainsKey(nested))
+                    found.Enqueue((nested, next.Depth + 1));
+            }
         }
 
-        visiting.Remove(type);
+        // 2. The types that lead to a large-value member: those that have one, and every type above them.
+        var owners = new Dictionary<Type, List<Type>>();
+        var leads = new HashSet<Type>();
+        var reached = new Queue<Type>();
+        foreach (var (type, own) in members)
+        {
+            foreach (var member in own)
+            {
+                if (member.Flattened is not { } nested)
+                {
+                    if (leads.Add(type))
+                        reached.Enqueue(type);
+                    continue;
+                }
+
+                if (!owners.TryGetValue(nested, out var above))
+                    owners[nested] = above = [];
+                above.Add(type);
+            }
+        }
+        while (reached.TryDequeue(out var type))
+        {
+            if (!owners.TryGetValue(type, out var above))
+                continue;
+
+            foreach (var owner in above)
+            {
+                if (leads.Add(owner))
+                    reached.Enqueue(owner);
+            }
+        }
+        if (!leads.Contains(root))
+            return LargeValueInfo.None;
+
+        // 3. The columns: every path, or the nearest ones when there are too many paths to list.
+        var columns = new List<string>();
+        var steps = 0;
+        if (!TryListEveryPath(new WalkStep(root, string.Empty, null), members, leads, columns, ref steps))
+        {
+            columns.Clear();
+            ListNearestPaths(root, members, leads, columns);
+        }
+        return new LargeValueInfo(true, columns.AsReadOnly());
+    }
+
+    // Every path through the types that lead to a large-value member, depth first in declaration
+    // order. False when that takes more than MaxLargeValueWalkSteps. The column-name limit bounds the
+    // depth, so an endless chain of types ends too.
+    private static bool TryListEveryPath(
+        WalkStep step, Dictionary<Type, List<LargeValueMember>> members, HashSet<Type> leads, List<string> columns, ref int steps)
+    {
+        if (++steps > MaxLargeValueWalkSteps)
+            return false;
+
+        foreach (var member in members[step.Type])
+        {
+            var column = step.Prefix + member.Name;
+            if (column.Length > MaxColumnNameLength)
+                continue;
+
+            if (member.Flattened is not { } nested)
+                columns.Add(column);
+            else if (leads.Contains(nested) && !step.Meets(nested)
+                     && !TryListEveryPath(new WalkStep(nested, column + TableEntityValue.PathDelimiter, step), members, leads, columns, ref steps))
+                return false;
+        }
+
+        return true;
+    }
+
+    // The same paths breadth first, for a type graph with too many to list: the columns nearest the
+    // root come first, and the listing stops after MaxLargeValueWalkSteps.
+    private static void ListNearestPaths(
+        Type root, Dictionary<Type, List<LargeValueMember>> members, HashSet<Type> leads, List<string> columns)
+    {
+        var queue = new Queue<WalkStep>();
+        queue.Enqueue(new WalkStep(root, string.Empty, null));
+        for (var steps = 1; queue.TryDequeue(out var step); steps++)
+        {
+            foreach (var member in members[step.Type])
+            {
+                var column = step.Prefix + member.Name;
+                if (column.Length > MaxColumnNameLength)
+                    continue;
+
+                if (member.Flattened is not { } nested)
+                    columns.Add(column);
+                else if (leads.Contains(nested) && !step.Meets(nested) && steps + queue.Count < MaxLargeValueWalkSteps)
+                    queue.Enqueue(new WalkStep(nested, column + TableEntityValue.PathDelimiter, step));
+            }
+        }
+    }
+
+    /// <summary>One type on a path from the root, with the column prefix that leads to it.</summary>
+    private sealed class WalkStep(Type type, string prefix, WalkStep? owner)
+    {
+        public Type Type { get; } = type;
+
+        public string Prefix { get; } = prefix;
+
+        /// <summary>True when the path already passes through <paramref name="other"/>.</summary>
+        public bool Meets(Type other)
+        {
+            for (var step = this; step is not null; step = step.Owner)
+            {
+                if (step.Type == other)
+                    return true;
+            }
+            return false;
+        }
+
+        private WalkStep? Owner { get; } = owner;
     }
 
     /// <summary>
