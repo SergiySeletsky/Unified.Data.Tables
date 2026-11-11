@@ -556,7 +556,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// The <c>{column}__blob</c> cells of <paramref name="row"/> that hold something, with their base
     /// column. A null cell is not one of them: the service returns a selected property the row does not
     /// have as null (the storage emulator omits it), so null means "no reference", never a malformed one.
-    /// Every reader of a row's references goes through here.
+    /// The readers that decide which blobs a row references (the stored row's blob paths before a write
+    /// or delete, the orphan sweep, the cleanup after a partition delete, <see cref="References"/>) all
+    /// go through here.
     /// </summary>
     internal static IEnumerable<(string Column, object Cell)> ReferenceCells(TableEntity row)
     {

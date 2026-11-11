@@ -323,8 +323,9 @@ public sealed class LargeValueTable
     /// source row, so it goes to <paramref name="onForeign"/> and is left alone. Each delete is
     /// conditional on the blob not having been modified within
     /// <see cref="BlobOffloadOptions.CleanupGrace"/> before <paramref name="serviceNow"/>, so a blob a
-    /// concurrent writer has just touched survives. Best effort: a failure goes to
-    /// <paramref name="onFailure"/>.
+    /// concurrent writer has just touched survives; a grace that reaches back beyond the start of the
+    /// calendar (<see cref="TimeSpan.MaxValue"/>) makes no blob old enough, so nothing is deleted. Best
+    /// effort: a failure goes to <paramref name="onFailure"/>.
     /// </summary>
     /// <param name="partitionKey">The partition key of the row that was written or deleted.</param>
     /// <param name="rowKey">The row key of the row that was written or deleted.</param>
@@ -512,11 +513,12 @@ public sealed class LargeValueTable
     /// blobs stored under it that no row of the partition references NOW: a row another writer created
     /// while the partition was being deleted survives the delete, and keeps its blobs however long the
     /// delete took. A blob is a candidate when it was not modified within
-    /// <see cref="BlobOffloadOptions.CleanupGrace"/> (younger ones are left for the orphan sweep) and its
-    /// name has the exact offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>). The blobs are
-    /// listed first; the rows are read (once, through <paramref name="partitionRows"/>) only when some
-    /// blob is old enough; each delete is conditional on the blob not having been modified since it was
-    /// listed. Rows are never changed. Best effort: a failure goes to the callbacks.
+    /// <see cref="BlobOffloadOptions.CleanupGrace"/> (younger ones are left for the orphan sweep; a grace
+    /// that reaches back beyond the start of the calendar leaves them all) and its name has the exact
+    /// offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>). The blobs are listed first; the
+    /// rows are read (once, through <paramref name="partitionRows"/>) only when some blob is old enough;
+    /// each delete is conditional on the blob not having been modified since it was listed. Rows are
+    /// never changed. Best effort: a failure goes to the callbacks.
     /// </summary>
     /// <param name="partitionKey">The deleted partition, already normalized as the store stores it.</param>
     /// <param name="entityType">The store's entity type (its large-value columns are always read).</param>
