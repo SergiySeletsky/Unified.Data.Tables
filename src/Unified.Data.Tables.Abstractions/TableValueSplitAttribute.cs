@@ -11,6 +11,30 @@ namespace Unified.Data.Tables;
 /// ordinary key column. A derived class inherits the attribute of its base class and may declare its
 /// own. An attribute on a property wins over the one on its class, and a property that a derived class
 /// overrides or hides (<c>new</c>) keeps the attribute of the property it re-declares.
+/// <para>
+/// A store treats its entity type as large-value aware (it plans split cells, continuation rows and blobs)
+/// only when the declared types say so, read by reflection alone: the attribute on a property of the entity
+/// or of a type the entity flattens into columns, a <see cref="TableBlobContent"/> property there, or the
+/// attribute on the entity class itself. The last also applies when it covers none of the entity's own
+/// properties: it is how an entity opts in whose large values are members of an object whose type is known
+/// only at run time (an interface-, abstract- or base-class-typed property that holds a subtype with
+/// <c>[TableValueSplit]</c> or <see cref="TableBlobContent"/> members); it still covers the entity's own
+/// string, <c>byte[]</c> and JSON-stored properties as above. The store of such an entity
+/// constructs it once, when it first needs the columns of the objects its constructor puts in those
+/// properties; it never constructs a type that is not large-value aware. A type that is not large-value
+/// aware refuses to store a value in such a member below a runtime subtype, whatever its size, with
+/// <see cref="System.NotSupportedException"/>.
+/// </para>
+/// <para>
+/// A value too large for one cell is stored only where a read returns it. Below an object a read cannot
+/// create (a struct held in a nullable property, an interface- or abstract-typed property with no instance)
+/// the write is refused with <see cref="System.NotSupportedException"/> naming the column, before anything
+/// is stored; a value that fits one cell there stays an ordinary cell. A split value keeps four cells on
+/// the entity's main row besides its chunks, and a row with split values its part count, within the 252
+/// properties one entity holds besides its keys and timestamp: an entity with no other properties than
+/// those of <see cref="Entity"/> holds 62 split values, a wider one fewer. Beyond that the write throws
+/// <see cref="OversizedValueException"/>, which names the value and the properties its cells need.
+/// </para>
 /// </remarks>
 /// <param name="encoding">How the value is encoded once it has to be split.</param>
 [AttributeUsage(AttributeTargets.Property | AttributeTargets.Class, Inherited = true)]

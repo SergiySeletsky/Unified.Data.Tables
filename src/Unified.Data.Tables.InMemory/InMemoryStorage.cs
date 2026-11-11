@@ -801,11 +801,17 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         {
             var oldVal = prop.GetValue(stored);
             var newVal = prop.GetValue(entity);
-            if (!Equals(oldVal, newVal) && !(authorizer?.IsAllowed(attr.Roles) ?? false))
+            // As TableStorage: a large value is compared by content and never quoted; any other property
+            // keeps the comparison and the message of 0.8.3.
+            var large = ProtectedLargeValues.IsLargeValue(typeof(T), prop);
+            if (!(large ? ProtectedLargeValues.IsUnchanged(oldVal, newVal) : Equals(oldVal, newVal))
+                && !(authorizer?.IsAllowed(attr.Roles) ?? false))
             {
                 throw new UnauthorizedAccessException(
                     $"Property '{prop.Name}' on {typeof(T).Name} is protected (requires roles: {attr.Roles}). " +
-                    $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'.");
+                    (large
+                        ? ProtectedLargeValues.DescribeRefusedChange(oldVal, newVal)
+                        : $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'."));
             }
         }
     }
