@@ -536,9 +536,9 @@ Customer     back = row.FromTableEntity<Customer>();
 A table cell holds 64&nbsp;KB and a row 1&nbsp;MB. By default an oversized value throws
 (`OversizedCellPolicy.Throw`); nothing is ever trimmed. Opt a property in and it is stored
 losslessly instead. A type with a `[TableValueSplit]` or `TableBlobContent` member is called
-*split-aware* below. Types with neither produce the same columns and make the same SDK calls as before;
-the one request that differs from 0.8.3, for every type, is a projected query, whose `$select` no longer
-names `odata.etag` (the entities still carry their `ETag`).
+*split-aware* below. Types with neither produce the same columns and make the same SDK calls as in
+0.8.3, with one deliberate difference that applies to every type: a projected query no longer names
+`odata.etag` in its `$select` (the entities still carry their `ETag`).
 
 > **Roll forward only.** Rows written split or offloaded cannot be read correctly by 0.8.x or older.
 > Deploy the 0.9.0 package bump first with no attributes, and add `[TableValueSplit]` or
@@ -748,10 +748,10 @@ write: when the write fails after it has begun to read the stream and before its
 stream has been partly read or its temporary copy has been deleted, and every later write of that
 content throws `InvalidOperationException` before anything is read or uploaded (as it does for a
 seekable stream that can no longer be put back where the content starts, one disposed in the meantime,
-say). Create the content again from its source. So use `FromBytes` or a seekable stream wherever a write may be retried,
-in particular inside `MutateAsync` and `MutateOrCreateAsync`, which apply the mutation again with the
-same content instance after a conflict; with a non-seekable source, create the content inside the
-mutation from something that can be opened again.
+say). Create the content again from its source. So use `FromBytes` or a seekable stream wherever a
+write may be retried, in particular inside `MutateAsync` and `MutateOrCreateAsync`, which apply the
+mutation again with the same content instance after a conflict; with a non-seekable source, create the
+content inside the mutation from something that can be opened again.
 
 One content may be assigned to several properties or entities, and a content taken from a loaded entity
 may be written into another one: every row gets a blob of its own. A content that already streams a blob
