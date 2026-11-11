@@ -123,6 +123,20 @@ public abstract class AzuriteCleanupTestBase : IAsyncLifetime
             authorizer: null, options, BlobService);
     }
 
+    /// <summary>
+    /// A store of <typeparamref name="T"/> without blob offload: a value too large for one row is split
+    /// onto continuation rows (never offloaded). <paramref name="service"/> is the table client (the
+    /// plain one when null).
+    /// </summary>
+    protected TableStorage<T> SplitOnlyStore<T>(TableServiceClient? service = null) where T : class, IEntity, new()
+    {
+        tables.Add(typeof(T).Name);
+        var cache = new MemoryCache(new MemoryCacheOptions());
+        caches.Add(cache);
+        return new TableStorage<T>(service ?? TableService, cache, NullLogger<TableStorage<T>>.Instance,
+            authorizer: null, new UnifiedTableStorageOptions { Cache = CachePolicy.Disabled });
+    }
+
     /// <summary>The client of <paramref name="table"/>; its rows in this test's partition are deleted at the end.</summary>
     protected TableClient Table(string table)
     {

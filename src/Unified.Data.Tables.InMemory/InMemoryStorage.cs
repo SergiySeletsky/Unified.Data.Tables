@@ -111,12 +111,16 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     }
 
     /// <summary>
-    /// How many entity-group transactions the batch writes of a large-value-aware type have attempted,
-    /// committed or not (for tests; TableStorage sends one <c>$batch</c> request each).
+    /// How many entity-group transactions the batch writes and the partition deletes of a
+    /// large-value-aware type have attempted, committed or not (for tests; TableStorage sends one
+    /// <c>$batch</c> request each).
     /// </summary>
     internal int BatchTransactions { get; set; }
 
-    /// <summary>Runs after each large-value write or delete has committed, before its blob cleanup (for tests).</summary>
+    /// <summary>
+    /// Runs after each large-value write or delete has committed, before its blob cleanup (for tests);
+    /// a batch write and a partition delete run it after each of their transactions.
+    /// </summary>
     internal Action? AfterLargeCommit { get; set; }
 
     /// <summary>A copy of the stored row at these keys, continuation rows included (for tests); null when absent.</summary>

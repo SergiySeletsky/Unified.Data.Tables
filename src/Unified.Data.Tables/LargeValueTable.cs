@@ -437,6 +437,77 @@ public sealed class LargeValueTable
         new($"Blob cleanup stopped after the caller cancelled: {left} blob(s), this one included, are left for the orphan sweep.", ex, ex.CancellationToken);
 
     /// <summary>
+    /// Storage-provider SPI, not for application code. Packs the rows a partition delete listed, in the
+    /// order listed, into entity-group transactions of at most <see cref="BatchPlanner.DefaultMaxCount"/>
+    /// deletes. A primary row and its continuation rows (the rows whose <c>_SplitOf</c> cell is its row
+    /// key) are one unit, never divided between two transactions, so a failure or a cancellation between
+    /// two transactions leaves no continuation row without its primary. Continuation rows whose primary
+    /// is not among <paramref name="rows"/> are a unit of their own. An entity has at most 99
+    /// continuation rows, so its unit always fits one transaction; a larger group, which only rows this
+    /// library did not write can form, is divided, its continuation rows first and its primary last.
+    /// </summary>
+    /// <param name="rows">
+    /// The rows of one partition, each with its keys and, when it is a continuation row, its
+    /// <c>_SplitOf</c> cell (a null cell, as a projection returns it for a row without one, is not one).
+    /// </param>
+    /// <returns>The transactions, in order; each row is in exactly one of them.</returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static IReadOnlyList<IReadOnlyList<TableEntity>> PlanPartitionDelete(IReadOnlyList<TableEntity> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        const int max = BatchPlanner.DefaultMaxCount;
+
+        // The units, in the order their first row was listed. A unit's rows need not be adjacent in the
+        // listing: other rows can sort between a primary "a" and its continuation row "a~0001".
+        var units = new List<List<TableEntity>>();
+        var unitOf = new Dictionary<string, List<TableEntity>>(StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            ArgumentNullException.ThrowIfNull(row);
+            var key = PrimaryKeyOf(row) ?? row.RowKey ?? string.Empty;
+            if (!unitOf.TryGetValue(key, out var unit))
+            {
+                unitOf[key] = unit = [];
+                units.Add(unit);
+            }
+            unit.Add(row);
+        }
+
+        var transactions = new List<IReadOnlyList<TableEntity>>();
+        var current = new List<TableEntity>();
+        foreach (var unit in units)
+        {
+            if (unit.Count > max)
+            {
+                // More rows name this primary than a transaction holds: they cannot go together. The
+                // continuation rows go first and the primary last, so an interrupted delete leaves a
+                // primary that still deletes cleanly rather than continuation rows nothing owns.
+                Flush();
+                foreach (var chunk in unit.Where(r => PrimaryKeyOf(r) is not null).Concat(unit.Where(r => PrimaryKeyOf(r) is null)).Chunk(max))
+                    transactions.Add(chunk);
+                continue;
+            }
+            if (current.Count + unit.Count > max)
+                Flush();
+            current.AddRange(unit);
+        }
+        Flush();
+        return transactions;
+
+        void Flush()
+        {
+            if (current.Count == 0)
+                return;
+            transactions.Add(current);
+            current = [];
+        }
+    }
+
+    // The row key of the primary a continuation row belongs to (its _SplitOf cell); null for any other row.
+    private static string? PrimaryKeyOf(TableEntity row) =>
+        row.TryGetValue(SystemColumnNames.SplitOf, out var of) ? of as string : null;
+
+    /// <summary>
     /// Storage-provider SPI, not for application code. After a partition's rows are deleted, deletes the
     /// blobs stored under it that no row of the partition references NOW: a row another writer created
     /// while the partition was being deleted survives the delete, and keeps its blobs however long the

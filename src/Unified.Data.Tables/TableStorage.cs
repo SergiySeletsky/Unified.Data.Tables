@@ -275,18 +275,29 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         // Every row goes, continuation rows included; only logical entities are counted.
         var logicalCount = LargeValueAware ? entities.Count(e => !SplitRowLayout.IsPartRow(e)) : entities.Count;
 
-        // Azure Table batch: max 100 entities per transaction, same partition
-        foreach (var batch in entities.Chunk(100))
+        // Azure Table batch: max 100 entities per transaction, same partition. For a split-aware type a
+        // primary and its continuation rows are one unit that is never divided between two transactions,
+        // so a failure or a cancellation between transactions leaves no continuation row without its
+        // primary (rows nothing could read, and that would block the key).
+        IEnumerable<IReadOnlyList<TableEntity>> transactions =
+            LargeValueAware ? LargeValueTable.PlanPartitionDelete(entities) : entities.Chunk(100);
+        try
         {
-            var actions = batch.Select(e =>
-                new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
-            await client.SubmitTransactionAsync(actions, ct);
+            foreach (var batch in transactions)
+            {
+                var actions = batch.Select(e =>
+                    new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
+                await client.SubmitTransactionAsync(actions, ct);
+            }
         }
-
-        // Invalidate caches
-        foreach (var e in entities)
-            cache.Remove(EntityCacheKey($"{e.PartitionKey}{Separator}{e.RowKey}"));
-        InvalidateQueryCache(partition);
+        finally
+        {
+            // Invalidate caches, also when a transaction failed or was cancelled: the earlier ones stay
+            // committed, and a row they deleted must not be answered from the cache.
+            InvalidateQueryCache(partition);
+            foreach (var e in entities)
+                cache.Remove(EntityCacheKey($"{e.PartitionKey}{Separator}{e.RowKey}"));
+        }
 
         logger.LogInformation("Batch-deleted {Count} {Type} entities from partition {Partition}",
             logicalCount, typeName, partition);

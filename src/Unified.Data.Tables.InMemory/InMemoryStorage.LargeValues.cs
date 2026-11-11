@@ -342,21 +342,39 @@ public sealed partial class InMemoryStorage<T>
         await large.DeleteReleasedBlobsAsync(keys.PartitionKey, keys.RowKey, released, serviceNow: null, onForeign: null, onFailure: null, ct);
     }
 
+    /// <summary>
+    /// Deletes the partition as TableStorage does: the rows are listed, then removed in the same
+    /// transactions (<see cref="LargeValueTable.PlanPartitionDelete"/>: a primary and its continuation
+    /// rows always together, at most 100 rows each), each applied atomically under the gate. A token
+    /// cancelled between two transactions stops the delete there, with whole entities left; a row
+    /// written after the listing survives. Then the blobs no remaining row references are deleted.
+    /// </summary>
     private async Task<int> DeletePartitionLargeAsync(string partition, CancellationToken ct)
     {
-        int logical;
+        List<TableEntity> listed;
         lock (gate)
         {
-            var doomed = rows.Where(kv => kv.Key.PartitionKey == partition).ToList();
-            logical = doomed.Count(kv => !LargeValueTable.IsPartRow(kv.Value.Data));
-            foreach (var (key, _) in doomed)
-                rows.Remove(key);
+            listed = OrderedRows().Where(kv => kv.Key.PartitionKey == partition).Select(kv => kv.Value.Data).ToList();
+        }
+        // Every row goes, continuation rows included; only logical entities are counted.
+        var logical = listed.Count(row => !LargeValueTable.IsPartRow(row));
+
+        foreach (var transaction in LargeValueTable.PlanPartitionDelete(listed))
+        {
+            // A cancelled token fails a transaction before it is sent, as the SDK does.
+            ct.ThrowIfCancellationRequested();
+            lock (gate)
+            {
+                BatchTransactions++;
+                foreach (var row in transaction)
+                    rows.Remove((row.PartitionKey, row.RowKey));
+            }
+            AfterLargeCommit?.Invoke();
         }
 
         // The rows are gone: so are the blobs stored under the partition that no row references now (best
         // effort, after the grace; a row another writer created meanwhile keeps its blobs; a cancelled
         // token only bounds how long that may take, the rest is left to the orphan sweep).
-        AfterLargeCommit?.Invoke();
         await large.DeletePartitionBlobsAsync(partition, typeof(T), (_, _) => PartitionRowsAsync(partition), onListFailure: null, onFailure: null, ct);
         return logical;
     }
