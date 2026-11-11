@@ -239,6 +239,31 @@ public class ConsumedStreamStaysRememberedTests(ITestOutputHelper output)
         Assert.Equal(next, await ReadFileAsync(store, "b|1"));
     }
 
+    // Three writes over one stream object: the first commits; the second, with a new payload, fails after its
+    // upload; the third is the second's retry with a new content over the stream (empty now): refused, the row
+    // keeps nothing of the failed write. The second's own content, assigned again, stores the whole payload.
+    [Fact]
+    public async Task AfterACommittedWriteAndAFailedOne_ARetryWithANewContentIsRefused_AndTheFailedWritesContentIsStoredWhole()
+    {
+        var store = Store();
+        await store.CreateAsync(new FileEntity { Id = "p|taken", Title = "someone else's" }, Ct);
+        var body = new ReloadableForwardOnlyBody();
+        body.Load(RandomBytes(Size, seed: 96));
+        await store.UpsertAsync(new FileEntity { Id = "p|1", File = File(body) }, Ct);
+
+        var next = RandomBytes(Size, seed: 97);
+        body.Load(next);
+        var content = File(body);
+        await Assert.ThrowsAsync<DuplicateKeyException>(() => store.CreateAsync(new FileEntity { Id = "p|taken", File = content }, Ct));
+
+        RecycledForwardOnlyStreamTests.AssertConsumedAndEmpty(await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.UpsertAsync(new FileEntity { Id = "p|2", File = File(body) }, Ct)));
+        Assert.Null(await store.OneAsync("p|2", Ct));
+
+        await store.UpsertAsync(new FileEntity { Id = "p|2", File = content }, Ct);
+        Assert.Equal(next, await ReadFileAsync(store, "p|2"));
+    }
+
     // STREAMS-2. A write that read its forward-only stream to its end and was then cancelled (the token fires as
     // the read ends, before the temporary copy is flushed): the stream was read to its end, so a new payload on
     // that stream object is stored whole, and an empty one is refused as after any write that read it to its end.
@@ -384,6 +409,28 @@ public sealed class AzuriteConsumedStreamStaysRememberedTests(ITestOutputHelper 
         RecycledForwardOnlyStreamTests.AssertConsumedAndEmpty(Assert.IsType<InvalidOperationException>(retry));
         Assert.Equal(blobs, (await BlobsAsync<FileEntity>()).ConvertAll(b => b.Name));
         Assert.Equal(old, await ReadAsync(Store<FileEntity>(), failing));
+    }
+
+    // STREAMS-2 on TableStorage: a write cancelled as its read reached the stream's end lists the stream as read
+    // to its end, so a new payload on it is stored whole.
+    [Fact]
+    public async Task AForwardOnlyStreamReadToItsEnd_ByAWriteCancelledAfterTheRead_IsStoredWhenItDeliversANewPayload()
+    {
+        Assert.SkipUnless(Available, SkipReason);
+        var store = Store<FileEntity>(Offload(TimeSpan.Zero));
+        var body = new ReloadableForwardOnlyBody();
+        body.Load(RandomBytes(Size, seed: 98));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        body.OnEnd = cts.Cancel;
+        var first = await Record.ExceptionAsync(() => store.UpsertAsync(new FileEntity { Id = Id("1"), File = File(body) }, cts.Token));
+        output.WriteLine($"first write: {first?.GetType().Name}: {first?.Message}");
+        Assert.IsAssignableFrom<OperationCanceledException>(first);
+        body.OnEnd = null;
+
+        var next = RandomBytes(Size, seed: 99);
+        body.Load(next);
+        await store.UpsertAsync(new FileEntity { Id = Id("2"), File = File(body) }, Ct);
+        Assert.Equal(next, await ReadAsync(Store<FileEntity>(), Id("2")));
     }
 
     private static Task Batch(TableStorage<FileEntity> store, bool upsert, FileEntity[] batch) =>
