@@ -58,20 +58,60 @@ public sealed class TableBlobContent
     private const string TemporaryCopyReleased =
         "it was created from a non-seekable stream, and its temporary copy was released by a failed write";
 
-    // Why a NEW content over a stream that a write of this library has read cannot be written.
+    // What to do instead, named by every refusal of a stream an earlier write read (R9 point 5).
+    private const string StreamRemedy =
+        "Create the content once, outside a delegate that may run again, and assign that instance on every attempt; use a seekable stream "
+        + "or TableBlobContent.FromBytes; or open the source again for each attempt, which means a new source of the bytes (the file opened "
+        + "again, a new request), not a new wrapper over the stream an earlier attempt read. Only the content's own stream and the "
+        + "BufferedStream, GZipStream, DeflateStream, ZLibStream and BrotliStream wrappers below it are recognised: a new wrapper of "
+        + "another kind over a consumed stream is not, and stores whatever that stream still delivers, possibly nothing.";
+
+    // Why a NEW content over a stream that a write that has not committed read to its end cannot be written.
     private const string ForwardOnlyAlreadyRead =
-        "its source stream is not seekable and a write has already read from it, so the bytes it delivered cannot be read again. "
-        + "Create the content once and assign that instance on every attempt, use a seekable stream or TableBlobContent.FromBytes, "
-        + "or open the source again for each attempt (for example inside the MutateAsync delegate).";
+        "its source stream is not seekable, a write that has not stored its row (it failed, or it is still running, or it is this "
+        + "write) has already read it, or a stream it reads from, to its end, and it delivers nothing now, so it would store an empty file. ";
+
+    private const string ReadThroughAlreadyRead =
+        "a write that has not stored its row (it failed, or it is still running, or it is this write) has already read a stream its "
+        + "source reads from to its end, and it delivers nothing now, so it would store an empty file. ";
+
+    private const string StreamPartlyRead =
+        "its source stream, or a stream it reads from, was partly read by a write that failed or was cancelled, so only the rest of "
+        + "its bytes could be stored. ";
+
+    private const string StreamBeingRead =
+        "its source stream, or a stream it reads from, is being read by another write right now. ";
 
     private const string SeekableNotPutBack =
-        "a write read its source stream and could not put it back where that write's content started (the stream can no longer be repositioned). "
-        + "Open the source again, or use TableBlobContent.FromBytes.";
+        "a write read its source stream, or a stream it reads from, and could not put it back where that write's content started "
+        + "(the stream can no longer be repositioned). ";
 
-    // The callers' streams that a write has read and that no new content can be read from as the
-    // caller expects: a forward-only stream once read at all, a seekable one that could not be put
-    // back. Weak keys: a stream is not kept alive by being listed here.
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Stream, string> UnusableStreams = new();
+    // What a write did to a caller's stream (ruling R9). A stream read to its end is listed only until the
+    // write that read it commits (Committed); one read part-way, or not put back, stays listed.
+    private enum StreamState
+    {
+        Reading,
+        ReadToEnd,
+        PartlyRead,
+        NotPutBack,
+    }
+
+    // One listing of a caller's stream; the content that made it keeps it, to forget it when its write commits.
+    private sealed class StreamUse(Stream stream, StreamState state)
+    {
+        public WeakReference<Stream> Stream { get; } = new(stream);
+
+        public StreamState State { get; set; } = state;
+    }
+
+    // The callers' streams that a write has read and that a new content may not be read from as the caller
+    // expects: a forward-only stream (and every stream below it that the library can see) while the write
+    // that read it to its end has not committed, or for good once a write read only part of it; a seekable
+    // one that could not be put back. Weak keys: a stream is not kept alive by being listed here. Locked by itself.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Stream, StreamUse> UnusableStreams = new();
+
+    // The listings this content made (under the lock of UnusableStreams); forgotten when a write of it commits.
+    private List<StreamUse>? claimed;
 
     private readonly byte[]? bytes;
     private long length;
@@ -141,14 +181,35 @@ public sealed class TableBlobContent
     /// A non-seekable stream is copied to a temporary file once. A write that fails after it began to read
     /// the stream and before the content was uploaded releases that copy (or has partly read the stream),
     /// and the content cannot be written again; a write that fails later, for example on its row write,
-    /// leaves the content bound to its blob (above). A stream that a write has read cannot be read again,
-    /// so a new content over it is refused with <see cref="InvalidOperationException"/> before anything
-    /// is uploaded, and so are two contents over one such stream written by one write. For content whose write may be retried, create the content once and assign
-    /// that instance on every attempt, use a seekable stream or <see cref="FromBytes"/>, or open the
-    /// source again for each attempt. A content that can no longer be written (its temporary copy was
-    /// released, or its stream was partly read by a failed write and cannot be put back) makes every
-    /// later write of it throw <see cref="InvalidOperationException"/> before anything is uploaded;
+    /// leaves the content bound to its blob (above). A content that can no longer be written (its temporary
+    /// copy was released, or its stream was partly read by a failed write and cannot be put back) makes
+    /// every later write of it throw <see cref="InvalidOperationException"/> before anything is uploaded;
     /// create it again from the source.
+    /// </para>
+    /// <para>
+    /// The library remembers the stream objects a write has read. A stream a write read to its end is
+    /// remembered until that write commits: after a write that stored its row, a new content over the same
+    /// object is a new payload and is stored whatever it delivers, an empty one included (a web server, for
+    /// example, hands every request of one connection the same request-body object). After a write that
+    /// read the stream to its end and then failed, a new content over it is stored when the stream
+    /// delivers at least one byte (it was given a new payload), and refused with
+    /// <see cref="InvalidOperationException"/> before anything is uploaded when it delivers nothing (the
+    /// retry that would store an empty file; a recycled stream whose new payload is empty is refused in
+    /// that one case too). Two contents over one non-seekable stream written by one write are refused the
+    /// same way. A stream a failed write read only part of, and a seekable stream a write could not put
+    /// back, are refused for every later content. What is remembered about a stream holds for the streams
+    /// below it that the framework wrappers expose (<c>BufferedStream</c>, <c>GZipStream</c>,
+    /// <c>DeflateStream</c>, <c>ZLibStream</c>, <c>BrotliStream</c>, followed recursively), so a new such
+    /// wrapper over a stream an earlier attempt consumed is recognised. Only the content's own stream and
+    /// those wrappers are: a new wrapper of another kind (a user-written stream, a decryption stream) over
+    /// a consumed stream is not, and stores whatever that stream still delivers, possibly nothing.
+    /// </para>
+    /// <para>
+    /// For content whose write may be retried, create the content once, outside a delegate that may run
+    /// again (such as the one of <c>MutateAsync</c>), and assign that instance on every attempt; or use a
+    /// seekable stream or <see cref="FromBytes"/>; or open the source again for each attempt, which means a
+    /// new source of the bytes (the file opened again, a new request), not a new wrapper over the stream an
+    /// earlier attempt read.
     /// </para>
     /// <para>
     /// One content may be held by several writes at the same time (one content on several entities
@@ -368,35 +429,176 @@ public sealed class TableBlobContent
     }
 
     /// <summary>
-    /// Before a content reads its source for the first time: refuses a stream that a write has already
-    /// read and could not leave as the caller gave it (a forward-only stream read at all, a seekable one
-    /// that could not be put back), so a new content over it never stores the rest of it, or nothing.
-    /// A forward-only stream is listed from now on.
+    /// Before a content reads its source for the first time: checks every stream on the source's chain
+    /// (the source and the streams the framework wrappers below it read, see <see cref="ChainOf"/>)
+    /// against what earlier writes did to them. A stream a write read only part of, one that could not be
+    /// put back, and one another write is reading now are refused, so a new content over it never stores
+    /// the rest of it, or nothing. A stream that a write which has not committed read to its end may have
+    /// been given a new payload: the content is read, and refused when it delivers nothing (see
+    /// <see cref="RefuseEmptyAfterConsumed"/>). A forward-only source, and its chain, is listed from now on
+    /// as being read (<see cref="EndSourceRead"/> records how the read ended); nothing is read here.
     /// </summary>
     /// <param name="columnName">The column the content is being written to.</param>
+    /// <returns>True when a stream on the chain was read to its end by a write that has not committed.</returns>
     /// <exception cref="InvalidOperationException">The stream cannot deliver this content's bytes.</exception>
-    internal void ClaimSource(string columnName)
+    internal bool ClaimSource(string columnName)
     {
         var source = Source
             ?? throw new InvalidOperationException($"The TableBlobContent of '{columnName}' has no source stream to read.");
+        var chain = ChainOf(source);
         lock (UnusableStreams)
         {
-            if (UnusableStreams.TryGetValue(source, out var why))
-                throw new InvalidOperationException($"The TableBlobContent of '{columnName}' cannot be written: {why}");
+            var consumed = false;
+            foreach (var stream in chain)
+            {
+                if (!UnusableStreams.TryGetValue(stream, out var use))
+                    continue;
+                var why = use.State switch
+                {
+                    StreamState.ReadToEnd => null,
+                    StreamState.PartlyRead => StreamPartlyRead,
+                    StreamState.Reading => StreamBeingRead,
+                    _ => SeekableNotPutBack,
+                };
+                if (why is not null)
+                    throw new InvalidOperationException($"The TableBlobContent of '{columnName}' cannot be written: {why}{StreamRemedy}");
+                consumed = true;
+            }
+
+            // A seekable source is put back where its content starts whenever it has been read: not listed.
             if (!source.CanSeek)
-                UnusableStreams.Add(source, ForwardOnlyAlreadyRead);
+            {
+                foreach (var stream in chain)
+                    (claimed ??= []).Add(List(stream, StreamState.Reading));
+            }
+            return consumed;
         }
     }
 
-    // A caller's stream that a write read and could not put back (a temporary copy is nobody else's).
+    /// <summary>
+    /// After the forward-only source this content claimed (<see cref="ClaimSource"/>) has been read: to
+    /// its end (<paramref name="complete"/>), or only part of it by a read that failed or was cancelled.
+    /// </summary>
+    /// <param name="complete">True when the source was read to its end.</param>
+    internal void EndSourceRead(bool complete)
+    {
+        lock (UnusableStreams)
+        {
+            foreach (var use in claimed ?? [])
+            {
+                if (use.State == StreamState.Reading)
+                    use.State = complete ? StreamState.ReadToEnd : StreamState.PartlyRead;
+            }
+        }
+    }
+
+    /// <summary>
+    /// After a content whose chain holds a stream that a write which has not committed read to its end
+    /// (<see cref="ClaimSource"/> returned true) delivered nothing: that is the retry that would store an
+    /// empty file (BLOBS-2), not a new payload. The content can no longer be written.
+    /// </summary>
+    /// <param name="columnName">The column the content is being written to.</param>
+    /// <returns>The exception to throw; nothing has been uploaded.</returns>
+    internal InvalidOperationException RefuseEmptyAfterConsumed(string columnName)
+    {
+        var why = Source is { CanSeek: true } ? ReadThroughAlreadyRead : ForwardOnlyAlreadyRead;
+        sourceLost = why.TrimEnd(' ', '.');
+        EndSourceRead(complete: true);
+        return new InvalidOperationException($"The TableBlobContent of '{columnName}' cannot be written: {why}{StreamRemedy}");
+    }
+
+    /// <summary>
+    /// A write of this content committed: the streams it read to its end are forgotten (R9 point 1), so a
+    /// later content over the same object is a new payload. A listing another content made since, and a
+    /// stream read part-way or not put back, are kept.
+    /// </summary>
+    internal void Committed()
+    {
+        lock (UnusableStreams)
+        {
+            foreach (var use in claimed ?? [])
+            {
+                if (use.State == StreamState.ReadToEnd
+                    && use.Stream.TryGetTarget(out var stream)
+                    && UnusableStreams.TryGetValue(stream, out var listed)
+                    && ReferenceEquals(listed, use))
+                    UnusableStreams.Remove(stream);
+            }
+            claimed = null;
+        }
+    }
+
+    /// <summary>
+    /// A content given to a written property in place of <paramref name="original"/> (see <see cref="Bind"/>)
+    /// forgets the streams <paramref name="original"/> read when its own write commits, as the original would.
+    /// </summary>
+    /// <param name="original">The content the written property held.</param>
+    /// <returns>This content.</returns>
+    internal TableBlobContent KeepingStreamsOf(TableBlobContent original)
+    {
+        lock (UnusableStreams)
+        {
+            if (original.claimed is { } streams)
+                (claimed ??= []).AddRange(streams);
+        }
+        return this;
+    }
+
+    // Lists a stream (replacing what was listed about it); the caller holds the lock of UnusableStreams.
+    private static StreamUse List(Stream stream, StreamState state)
+    {
+        var use = new StreamUse(stream, state);
+        UnusableStreams.Remove(stream);
+        UnusableStreams.Add(stream, use);
+        return use;
+    }
+
+    /// <summary>
+    /// <paramref name="source"/> and the streams below it that the base-class-library wrappers expose
+    /// (the underlying stream of a <c>BufferedStream</c>, the base stream of the compression streams),
+    /// followed recursively. Only properties are read; nothing is read from or done to any stream.
+    /// </summary>
+    private static List<Stream> ChainOf(Stream source)
+    {
+        var chain = new List<Stream>();
+        for (Stream? stream = source; stream is not null && chain.Count < 32 && !chain.Contains(stream); stream = InnerOf(stream))
+            chain.Add(stream);
+        return chain;
+    }
+
+    private static Stream? InnerOf(Stream stream)
+    {
+        try
+        {
+            return stream switch
+            {
+                System.IO.Compression.GZipStream gzip => gzip.BaseStream,
+                System.IO.Compression.DeflateStream deflate => deflate.BaseStream,
+#if !NETSTANDARD2_0
+                BufferedStream buffered => buffered.UnderlyingStream,
+                System.IO.Compression.ZLibStream zlib => zlib.BaseStream,
+                System.IO.Compression.BrotliStream brotli => brotli.BaseStream,
+#endif
+                _ => null,
+            };
+        }
+        catch (ObjectDisposedException)
+        {
+            // A disposed wrapper no longer names its inner stream; it cannot be read either.
+            return null;
+        }
+    }
+
+    // A caller's stream that a write read and could not put back (a temporary copy is nobody else's),
+    // and every stream below it: refused for good.
     private void MarkUnusable(Stream source)
     {
         if (OwnsSource)
             return;
         lock (UnusableStreams)
         {
-            if (!UnusableStreams.TryGetValue(source, out _))
-                UnusableStreams.Add(source, SeekableNotPutBack);
+            foreach (var stream in ChainOf(source))
+                List(stream, StreamState.NotPutBack);
         }
     }
 
@@ -422,7 +624,11 @@ public sealed class TableBlobContent
     /// A forward-only source was partly consumed by a prepare attempt that failed or was cancelled: the
     /// content can no longer be written (see <see cref="ThrowIfNotWritable"/>).
     /// </summary>
-    internal void LoseSource() => sourceLost = PartlyReadForwardOnly;
+    internal void LoseSource()
+    {
+        sourceLost = PartlyReadForwardOnly;
+        EndSourceRead(complete: false);
+    }
 
     /// <summary>
     /// Refuses a content that can no longer be written, before anything of it is read or uploaded: one

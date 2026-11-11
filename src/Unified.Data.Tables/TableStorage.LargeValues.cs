@@ -144,7 +144,10 @@ public partial class TableStorage<T>
         {
             // Hash every TableBlobContent once (a non-seekable one is copied to a temporary file).
             await large.PrepareAsync(entity, ct);
-            return await WritePreparedAsync(entity, kind, ifMatch, pk, rk, ct);
+            var written = await WritePreparedAsync(entity, kind, ifMatch, pk, rk, ct);
+            // Committed: a stream its contents read to the end is a new payload next time (R9).
+            LargeValueTable.Committed(entity);
+            return written;
         }
         finally
         {
@@ -1075,6 +1078,7 @@ public partial class TableStorage<T>
             // batch has committed (a later transaction may still read one of them as a content's source).
             foreach (var unit in chunk)
             {
+                LargeValueTable.Committed(unit.Entity);
                 if (unit.Prior is { Blobs.Count: > 0 })
                     released.Add(new ReleasedBlobs(unit.Pk, unit.Rk, [.. unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal)], committedAt));
             }
