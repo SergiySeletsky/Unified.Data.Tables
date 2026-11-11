@@ -784,6 +784,9 @@ replaced.
 - Reads reassemble or download eagerly (`string`, `byte[]`) and verify the SHA-256. A mismatch, a missing
   chunk, continuation row or blob throws `TableValueIntegrityException`; partial data is never returned.
   A transport that transparently decompresses `Content-Encoding: gzip` would break the hash check.
+  A damaged row stays deletable: `DeleteAsync` removes it with the continuation rows it finds, also when
+  its part count (`_SplitParts`) cannot be read. A row in that last state cannot be upserted or updated
+  either, so delete it and create it again.
 - A read that races a replace or delete (the main row is read before its continuation rows and blobs) can
   see parts or a missing blob of another version, or have a blob deleted while it downloads it (a blob
   that is only touched, by a write that reuses its content, does not disturb the download). On such a
