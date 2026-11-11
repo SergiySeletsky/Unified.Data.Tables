@@ -25,6 +25,16 @@ namespace Unified.Data.Tables;
 /// aware refuses to store a value in such a member below a runtime subtype, whatever its size, with
 /// <see cref="System.NotSupportedException"/>.
 /// </para>
+/// <para>
+/// A value too large for one cell is stored only where a read returns it. Below an object a read cannot
+/// create (a struct held in a nullable property, an interface- or abstract-typed property with no instance)
+/// the write is refused with <see cref="System.NotSupportedException"/> naming the column, before anything
+/// is stored; a value that fits one cell there stays an ordinary cell. A split value keeps four cells on
+/// the entity's main row besides its chunks, and a row with split values its part count, within the 252
+/// properties one entity holds besides its keys and timestamp: an entity with no other properties than
+/// those of <see cref="Entity"/> holds 62 split values, a wider one fewer. Beyond that the write throws
+/// <see cref="OversizedValueException"/>, which names the value and the properties its cells need.
+/// </para>
 /// </remarks>
 /// <param name="encoding">How the value is encoded once it has to be split.</param>
 [AttributeUsage(AttributeTargets.Property | AttributeTargets.Class, Inherited = true)]
