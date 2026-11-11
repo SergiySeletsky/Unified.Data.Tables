@@ -144,6 +144,74 @@ public class BuilderUpdateOfAnInterfaceMarkedMemberTests
         return (thrown, (await stores.RawRowsAsync<T>(Table)).Single());
     }
 
+    // Shapes beyond the reproduction: an interface that inherits the marked one, and a struct that implements
+    // it, held as itself and as a nullable struct.
+    public interface IInheritedMarkedMemo : IMarkedMemo
+    {
+        string? Label { get; set; }
+    }
+
+    public sealed class InheritedMemoImpl : IInheritedMarkedMemo
+    {
+        public string? Notes { get; set; }
+
+        public string? Label { get; set; }
+    }
+
+    public sealed class MemoByInheritedInterface : Entity
+    {
+        public IInheritedMarkedMemo Doc { get; set; } = new InheritedMemoImpl();
+
+        public string? Title { get; set; }
+    }
+
+    public struct MarkedMemoStruct : IMarkedMemo
+    {
+        public string? Notes { get; set; }
+    }
+
+    public sealed class MemoByStruct : Entity
+    {
+        public MarkedMemoStruct Doc { get; set; }
+
+        public MarkedMemoStruct? Maybe { get; set; }
+
+        public string? Title { get; set; }
+    }
+
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task ABuilderUpdateThroughAnInheritedInterfaceOrAStruct_IsRefusedWithTheMisuse(string kind)
+    {
+        await using var stores = await LargeValueStores.OpenAsync(kind);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        var id = stores.Id("r");
+        await stores.Store<MemoRowWriter>(Table).CreateAsync(new MemoRowWriter { Id = id, Title = "t" }, Ct);
+        var notes = Ascii(200_000, 9);
+
+        var before = TableEntitySerializer.OversizedCellPolicy;
+        TableEntitySerializer.OversizedCellPolicy = OversizedCellPolicy.TrimWithMarker;
+        try
+        {
+            foreach (var (thrown, row) in new[]
+            {
+                await UpdateAsync<MemoByInheritedInterface>(stores, id, b => b.SetProperty(x => x.Doc.Notes, notes)),
+                await UpdateAsync<MemoByInheritedInterface>(stores, id, b => b.SetProperty(x => x.Doc.Label, "label")),
+                await UpdateAsync<MemoByStruct>(stores, id, b => b.SetProperty(x => x.Doc.Notes, notes)),
+                await UpdateAsync<MemoByStruct>(stores, id, b => b.SetProperty(x => x.Maybe!.Value.Notes, notes)),
+            })
+            {
+                Assert.True(thrown is InvalidOperationException, $"{thrown?.GetType().Name}: {thrown?.Message}");
+                Assert.Contains("[TableValueSplit] on IMarkedMemo.Notes", thrown!.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(row.Keys, k => k.StartsWith("Doc", StringComparison.Ordinal) || k.StartsWith("Maybe", StringComparison.Ordinal));
+            }
+        }
+        finally
+        {
+            TableEntitySerializer.OversizedCellPolicy = before;
+        }
+    }
+
     // A whole-entity write of the shape that implements the interface reports the same misuse (the control).
     [Theory]
     [MemberData(nameof(Stores))]

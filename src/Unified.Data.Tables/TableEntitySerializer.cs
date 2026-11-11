@@ -2646,7 +2646,7 @@ internal static class TypeMetadataCache
 #pragma warning restore CA1031
                 if (property is null)
                     return;
-                owner = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+                owner = property.PropertyType;
             }
             if (InterfaceMemberSplit(owner) is { } found)
                 throw new InvalidOperationException(InterfaceMemberSplitMisuse(owner, found.Contract, found.Marked));
