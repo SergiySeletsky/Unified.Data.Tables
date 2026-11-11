@@ -47,40 +47,80 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// source is hashed in one pass and rewound; a non-seekable one is copied while hashing to a
     /// delete-on-close temporary file that becomes the upload source. Content is never buffered in memory.
     /// </summary>
+    /// <remarks>
+    /// An attempt that fails or is cancelled never leaves a later one the unread tail of a source. A
+    /// seekable source is put back where its content starts, so a retry reads all of it; one that cannot
+    /// be put back, and a forward-only one that was partly consumed, make the content unusable: this and
+    /// every later write of it throws before anything is read or uploaded.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// A content can no longer be written: its source was partly read by a failed write and cannot be
+    /// read again from where the content starts.
+    /// </exception>
     internal async Task PrepareAsync(object entity, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entity);
-        foreach (var (column, content) in TableEntitySerializer.FindBlobContents(entity))
+        var contents = TableEntitySerializer.FindBlobContents(entity);
+        // Refused before any source is read and any blob uploaded.
+        foreach (var (column, content) in contents)
+            content.ThrowIfNotWritable(column);
+
+        foreach (var (column, content) in contents)
         {
             if (content.IsSealed) continue;
             var source = content.Source
                 ?? throw new InvalidOperationException($"The TableBlobContent of '{column}' has no content to read.");
-            if (source.CanSeek)
-            {
-                var origin = source.Position;
-                var (length, sha) = await CopyHashingAsync(source, null, ct);
-                source.Position = origin;
-                content.Seal(length, sha, origin);
-            }
+            // Before the first read: a write cancelled by now has not touched the source.
+            ct.ThrowIfCancellationRequested();
+            // A source that was seekable when it was first prepared stays on this path: it is read from
+            // the recorded origin or not at all, never from wherever it stands now.
+            if (content.HasSourceOrigin || source.CanSeek)
+                await HashSeekableAsync(column, content, source, ct);
             else
-            {
-                var spool = new FileStream(
-                    Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()),
-                    FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, CopyBufferBytes,
-                    FileOptions.DeleteOnClose | FileOptions.Asynchronous);
-                try
-                {
-                    var (length, sha) = await CopyHashingAsync(source, spool, ct);
-                    await spool.FlushAsync(ct);
-                    spool.Position = 0;
-                    content.Seal(length, sha, 0, spool);
-                }
-                catch
-                {
-                    await spool.DisposeAsync();
-                    throw;
-                }
-            }
+                await SpoolAsync(content, source, ct);
+        }
+    }
+
+    // Hashes a seekable source in one pass from where its content starts and puts it back there: for
+    // the upload when the pass succeeded, for a retry when it failed or was cancelled.
+    private static async Task HashSeekableAsync(string column, TableBlobContent content, Stream source, CancellationToken ct)
+    {
+        var origin = content.RewindSource(column);
+        long length;
+        string sha;
+        try
+        {
+            (length, sha) = await CopyHashingAsync(source, null, ct);
+            source.Position = origin;
+        }
+        catch
+        {
+            content.RestoreSource();
+            throw;
+        }
+        content.Seal(length, sha);
+    }
+
+    // Copies a forward-only source, while hashing it, to a delete-on-close temporary file that becomes
+    // the upload source. A copy that fails or is cancelled has consumed part of the source for good.
+    private static async Task SpoolAsync(TableBlobContent content, Stream source, CancellationToken ct)
+    {
+        var spool = new FileStream(
+            Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()),
+            FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, CopyBufferBytes,
+            FileOptions.DeleteOnClose | FileOptions.Asynchronous);
+        try
+        {
+            var (length, sha) = await CopyHashingAsync(source, spool, ct);
+            await spool.FlushAsync(ct);
+            spool.Position = 0;
+            content.Seal(length, sha, spool);
+        }
+        catch
+        {
+            await spool.DisposeAsync();
+            content.LoseSource();
+            throw;
         }
     }
 

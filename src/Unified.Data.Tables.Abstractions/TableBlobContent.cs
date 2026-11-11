@@ -16,11 +16,22 @@ namespace Unified.Data.Tables;
 public sealed class TableBlobContent
 {
 
+    // Why the source of a content that is not sealed can no longer be read from where its content starts.
+    private const string PartlyReadAndNotRewound =
+        "its source stream was partly read by a failed write and could not be put back where the content starts";
+
+    private const string PartlyReadForwardOnly =
+        "its source stream is not seekable and was partly read by a failed write";
+
+    private const string NotRewindable = "its source stream can no longer be put back where the content starts";
+
     private readonly byte[]? bytes;
     private long length;
     private string? sha256;
     private Func<CancellationToken, Task<Stream>>? open;
     private string? column;
+    private bool originRecorded;
+    private string? sourceLost;
 
     private TableBlobContent(string contentType, byte[]? bytes, Stream? source)
     {
@@ -45,6 +56,13 @@ public sealed class TableBlobContent
     /// kept as given: it is neither read nor disposed here, and the caller keeps owning it. A seekable
     /// stream is read from its current position; it must not change until the write completes.
     /// </summary>
+    /// <remarks>
+    /// A write that fails can be retried with the same content when the stream is seekable: every
+    /// attempt reads it again from the position it had at the first one. A stream that cannot be read
+    /// again (it is not seekable, or it cannot be put back) and was partly read by a failed write makes
+    /// the content unusable: every later write of it throws <see cref="InvalidOperationException"/>, and
+    /// the content has to be created again.
+    /// </remarks>
     /// <param name="content">A readable stream.</param>
     /// <param name="contentType">The MIME type to store the blob with.</param>
     /// <returns>The content.</returns>
@@ -84,8 +102,9 @@ public sealed class TableBlobContent
         if (bytes is not null)
             return new MemoryStream(bytes, writable: false);
         if (open is null)
-            throw new InvalidOperationException(Abandoned
-                ? "This TableBlobContent was created from a non-seekable stream, and its temporary copy was released when a write failed before uploading it. Create it again from the source."
+            throw new InvalidOperationException(
+                sourceLost is not null ? $"This TableBlobContent cannot be read: {sourceLost}. Create the content again from the source."
+                : Abandoned ? "This TableBlobContent was created from a non-seekable stream, and its temporary copy was released when a write failed before uploading it. Create it again from the source."
                 : "A TableBlobContent created from a stream can be read once the entity has been written.");
 
         var name = column ?? BoundPath!;
@@ -102,8 +121,17 @@ public sealed class TableBlobContent
     /// <summary>The caller's stream, or the spooled copy of it; null for in-memory or bound content.</summary>
     internal Stream? Source { get; private set; }
 
-    /// <summary>Where the source content starts in <see cref="Source"/>.</summary>
+    /// <summary>
+    /// Where the content starts in <see cref="Source"/>: the position a seekable source had when it was
+    /// first prepared (see <see cref="RewindSource"/>), 0 for a temporary copy.
+    /// </summary>
     internal long SourceOrigin { get; private set; }
+
+    /// <summary>
+    /// True once <see cref="SourceOrigin"/> is known. Such a source is read from that position or not at
+    /// all, never from wherever a failed attempt left it.
+    /// </summary>
+    internal bool HasSourceOrigin => originRecorded;
 
     /// <summary>The bytes of in-memory content.</summary>
     internal byte[]? Bytes => bytes;
@@ -117,21 +145,110 @@ public sealed class TableBlobContent
     /// <summary>Records the length and hash of the prepared content.</summary>
     /// <param name="length">The content length in bytes.</param>
     /// <param name="sha256">Lower-hex SHA-256.</param>
-    /// <param name="sourceOrigin">Where the content starts in the source stream.</param>
-    /// <param name="spool">A temporary copy that replaces a non-seekable source; owned and disposed by this content.</param>
-    internal void Seal(long length, string sha256, long sourceOrigin = 0, Stream? spool = null)
+    /// <param name="spool">
+    /// A temporary copy that replaces a non-seekable source; owned and disposed by this content. Its
+    /// content starts at position 0.
+    /// </param>
+    internal void Seal(long length, string sha256, Stream? spool = null)
     {
         this.length = length;
         Guard.NotNull(sha256, nameof(sha256));
         this.sha256 = sha256;
-        SourceOrigin = sourceOrigin;
         if (spool is not null)
         {
             ReleaseSpool();
             Source = spool;
             OwnsSource = true;
+            SourceOrigin = 0;
+            originRecorded = true;
         }
     }
+
+    /// <summary>
+    /// Puts a seekable source where its content starts. The first call records the current position;
+    /// every later one seeks back to it, so each prepare attempt and each upload reads the same bytes.
+    /// </summary>
+    /// <param name="columnName">The column named when the source cannot be put back.</param>
+    /// <returns>The position the content starts at.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The source can no longer be put where its content starts (it throws, or it is disposed). The
+    /// content can no longer be written: this and every later write refuses it.
+    /// </exception>
+    internal long RewindSource(string columnName)
+    {
+        var source = Source
+            ?? throw new InvalidOperationException($"The TableBlobContent of '{columnName}' has no source stream to read.");
+        if (!originRecorded)
+        {
+            SourceOrigin = source.Position;
+            originRecorded = true;
+            return SourceOrigin;
+        }
+
+        Exception? failure = null;
+        if (source.CanSeek)
+        {
+            try
+            {
+                source.Position = SourceOrigin;
+                return SourceOrigin;
+            }
+#pragma warning disable CA1031 // whatever the stream throws, it is not where the content starts: the content is given up
+            catch (Exception ex)
+#pragma warning restore CA1031
+            {
+                failure = ex;
+            }
+        }
+
+        sourceLost = NotRewindable;
+        throw new InvalidOperationException(NotWritable(columnName, NotRewindable), failure);
+    }
+
+    /// <summary>
+    /// After a prepare attempt over a seekable source failed or was cancelled part-way: puts the source
+    /// back where its content starts, so a retry reads all of it. A source that cannot be put back makes
+    /// the content unusable (see <see cref="ThrowIfNotWritable"/>) instead of leaving a retry the unread tail.
+    /// </summary>
+    internal void RestoreSource()
+    {
+        try
+        {
+            if (Source is { CanSeek: true } source)
+            {
+                source.Position = SourceOrigin;
+                return;
+            }
+        }
+#pragma warning disable CA1031 // whatever the stream throws, it is not where the content starts: the content is given up
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+        }
+
+        sourceLost = PartlyReadAndNotRewound;
+    }
+
+    /// <summary>
+    /// A forward-only source was partly consumed by a prepare attempt that failed or was cancelled: the
+    /// content can no longer be written (see <see cref="ThrowIfNotWritable"/>).
+    /// </summary>
+    internal void LoseSource() => sourceLost = PartlyReadForwardOnly;
+
+    /// <summary>
+    /// Refuses a content that can no longer be written, before anything of it is read or uploaded: one
+    /// whose source was partly read by a failed write and cannot be read again from where the content starts.
+    /// </summary>
+    /// <param name="columnName">The column the content is being written to.</param>
+    /// <exception cref="InvalidOperationException">The content has to be created again from its source.</exception>
+    internal void ThrowIfNotWritable(string columnName)
+    {
+        if (sourceLost is not null)
+            throw new InvalidOperationException(NotWritable(columnName, sourceLost));
+    }
+
+    private static string NotWritable(string columnName, string reason) =>
+        $"The TableBlobContent of '{columnName}' can no longer be written: {reason}. Create the content again from the source.";
 
     /// <summary>Points the content at the blob it was written to; reads now stream that blob.</summary>
     /// <param name="path">The blob name.</param>
