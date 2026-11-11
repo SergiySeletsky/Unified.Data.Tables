@@ -1006,22 +1006,28 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             throw;
         }
 
-        // Keep the cache coherent: if the entity is cached and every declared path maps onto a
-        // top-level property, a copy of it is patched and put with the new ETag, on the entry and on the
-        // entity a read hands back, so reads stay warm (a write's put: it gives way to another write or
-        // delete of the entity noted since the mark). Nested-path updates (or unknown names), and a
-        // response without a version (the cached one is known to be old), evict instead — the next
-        // OneAsync re-reads fresh.
+        // Keep the cache warm, as 0.8.3 did: if the entity is cached and every declared path maps onto a
+        // top-level property, a copy of it is patched, copied again (so that no value object the caller
+        // passed to the builder is reachable from the cache) and put (a write's put: it gives way to
+        // another write or delete of the entity noted since the mark). The merge was applied to the row
+        // the table holds, the patch to the row the cache holds; they are known to be the same row only
+        // when the merge was conditional on exactly the cached entity's version. Only then does the copy
+        // carry the merge's new ETag. Otherwise (an unconditional merge, a condition on another version, a
+        // response without a version) it keeps the ETag the cached entity had: never newer than its
+        // content, so an optimistic write with it meets 412, evicts and reads the row. Nested-path updates
+        // (or unknown names) evict instead — the next OneAsync re-reads fresh.
         var newETag = ReadETagHeader(resp);
-        if (cachePolicy.Enabled && newETag is { } updatedETag
+        if (cachePolicy.Enabled
             && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null
-            && PatchesTopLevelOnly(builder.Updates) && Snapshot(id, cached.Entity) is { } patched
-            && TryApplyUpdates(patched, builder.Updates))
+            && PatchesTopLevelOnly(builder.Updates) && Snapshot(id, cached.Entity) is { } copy
+            && TryApplyUpdates(copy, builder.Updates) && Snapshot(id, copy) is { } patched)
         {
             patched.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
             patched.Timestamp = null; // the row changed server-side; stale until re-read
-            patched.ETag = updatedETag.ToString();
-            PutWrite(id, new CachedEntity(patched, updatedETag), mark);
+            var onCachedVersion = newETag is not null && builder.ETag is not null
+                && string.Equals(builder.ETag, cached.Entity.ETag, StringComparison.Ordinal);
+            patched.ETag = onCachedVersion ? newETag!.Value.ToString() : cached.Entity.ETag;
+            PutWrite(id, new CachedEntity(patched, onCachedVersion ? newETag!.Value : cached.ETag), mark);
         }
         else
         {
@@ -1432,6 +1438,13 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // entry, since each touches the entry only after noting). So every other mutation was noted before
     // A's mark: it committed before A began, and A's version is the one the table holds. Two entities that
     // share a counter only make a write evict where it could have cached.
+    //
+    // An entry's ETag is never newer than its content: it is the version of the row whose content the
+    // entry holds, or an older one. The one put of an older one is a builder update's patched copy (see
+    // UpdateAsync(id, builder)): its merge was applied to the row the table holds, its patch to the row
+    // the cache holds, so the copy takes the merge's ETag only when the merge was conditional on exactly
+    // the cached version. An optimistic write of an entry with an older ETag meets 412 and evicts; it never
+    // overwrites a change the entry has not seen.
     // Writes by other processes are not seen, as before (see CachePolicy).
 
     private static readonly ConditionalWeakTable<IMemoryCache, WriteGenerations> GenerationsByCache = new();
