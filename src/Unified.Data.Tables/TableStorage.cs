@@ -1188,6 +1188,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     // A WRITE's put: the entity a create, update or upsert has just committed, under the version the
     // service returned for it. The write is noted before the entry is overwritten (see WriteGenerations).
+    // (An entity that cannot be copied for the cache is not put, and the entry of the version it replaced
+    // is left as it always was: evicting it would turn the next read into a failed one, because a row
+    // that cannot be copied cannot be read back either.)
     private void CacheEntity(string id, T entity, ETag etag)
     {
         Generations.NoteWrite(id);
