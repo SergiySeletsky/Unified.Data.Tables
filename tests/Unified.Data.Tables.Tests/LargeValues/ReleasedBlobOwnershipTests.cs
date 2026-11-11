@@ -318,14 +318,16 @@ public class ReleasedBlobOwnershipTests
         h.SetupGet(Pk, "r2", copyRow);
         h.SetupUpdate("W/\"v2\"");
         h.SetupDelete();
+        h.SetupTransaction();
 
         await h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r2", Body = NewText }, Ct);
+        await h.Store.UpsertBatchAsync([new SplitTextEntity { Id = "p|r2", Body = "small now" }], Ct);
         await h.Store.DeleteAsync("p|r2", Ct);
 
         Assert.Equal(0, blobs.Count("delete"));
         Assert.Contains(sourceBlob, inner.Names);
         var debug = logger.Entries.Where(e => e.Level == LogLevel.Debug && e.Message.Contains(sourceBlob, StringComparison.Ordinal)).ToList();
-        Assert.Equal(2, debug.Count); // once for the upsert, once for the delete
+        Assert.Equal(3, debug.Count); // once for the upsert, once for the batch, once for the delete
         Assert.DoesNotContain(logger.Entries, e => e.Level >= LogLevel.Warning);
     }
 

@@ -274,6 +274,42 @@ public class PartitionDeleteSurvivorTests
         Assert.Equal([false], blobs.DeleteResults);
     }
 
+    [Fact]
+    public async Task Core_RowsReadHangs_AfterTheCallerCancelled_StopsWithinTheBudget_AndDeletesNothing()
+    {
+        // The rows are read with the cleanup's own token: a cancelled caller still gets its rows read,
+        // but only for the cancelled-cleanup budget.
+        var blobs = new InMemoryOffloadBlobStore();
+        var table = new LargeValueTable("T", new BlobOffloadOptions(), blobs) { CancelledCleanupBudget = TimeSpan.FromMilliseconds(100) };
+        var old = Seed(blobs, "gone", "Body", "g", TimeSpan.FromHours(1));
+        var listFailures = new List<Exception>();
+        var failures = new List<string>();
+        var readTokens = new List<CancellationToken>();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+
+        await table.DeletePartitionBlobsAsync(Pk, typeof(SplitTextEntity),
+            (_, ct) =>
+            {
+                readTokens.Add(ct);
+                return Hanging(ct);
+            },
+            listFailures.Add, (name, _) => failures.Add(name), cts.Token);
+
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(20), $"cleanup took {watch.Elapsed}");
+        Assert.NotEqual(cts.Token, Assert.Single(readTokens));
+        Assert.IsAssignableFrom<OperationCanceledException>(Assert.Single(listFailures));
+        Assert.Empty(failures);
+        Assert.Equal([old], blobs.Names);
+
+        static async IAsyncEnumerable<TableEntity> Hanging([EnumeratorCancellation] CancellationToken ct)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            yield break;
+        }
+    }
+
     // ── TableStorage (mocked table) ────────────────────────────────────────
 
     private sealed class Rig : IDisposable
@@ -386,6 +422,24 @@ public class PartitionDeleteSurvivorTests
         var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
         Assert.IsType<RequestFailedException>(warning.Error);
         Assert.Contains("orphan sweep", warning.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TableStorage_NothingListed_StillKeepsTheBlobOfARowThatIsThereNow()
+    {
+        // The delete listed no row (and so deleted none), but a writer created one before the cleanup.
+        var inner = new InMemoryOffloadBlobStore();
+        var survivor = await StoredRowAsync(inner, Row("survivor", SurvivorText));
+        var orphan = ValueOffloadCoordinator.BlobName(nameof(SplitTextEntity), Pk, "crashed", "Body", Sha(Utf8("orphan")));
+        inner.Seed(orphan, Utf8("orphan"), Sha(Utf8("orphan")), DateTimeOffset.UtcNow.AddHours(-1));
+        using var rig = new Rig(inner);
+        rig.Listed();
+        rig.RowsAfterTheDelete(survivor);
+
+        Assert.Equal(0, await rig.Store.DeletePartitionAsync(Pk, Ct));
+
+        Assert.Equal([BlobOf(survivor)], inner.Names);
+        Assert.DoesNotContain("table:tx", rig.Log);
     }
 
     private sealed class ListLogger : ILogger<TableStorage<SplitTextEntity>>
