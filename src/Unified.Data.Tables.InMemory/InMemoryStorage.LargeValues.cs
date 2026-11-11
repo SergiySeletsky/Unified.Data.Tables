@@ -453,7 +453,8 @@ public sealed partial class InMemoryStorage<T>
 
     /// <summary>
     /// Deletes the entity and its continuation rows in one step under the gate; once it is gone, the blobs
-    /// it referenced are deleted (best effort, after the grace). When there is no row at the id, the
+    /// TableStorage's read before a delete finds it referencing (<see cref="LargeValueTable.PriorRowBlobPaths"/>)
+    /// are deleted (best effort, after the grace); any others are left for the orphan sweep. When there is no row at the id, the
     /// entity's leftover continuation rows (if any) are removed, so nothing of it stays behind; a
     /// continuation row addressed by its own id is not an entity and is left alone.
     /// </summary>
@@ -487,7 +488,7 @@ public sealed partial class InMemoryStorage<T>
                         rows.Remove((keys.PartitionKey, part));
                 }
                 rows.Remove(keys);
-                released = LargeValueTable.BlobPaths(stored.Data);
+                released = LargeValueTable.PriorRowBlobPaths(typeof(T), stored.Data);
             }
         }
 
@@ -692,10 +693,14 @@ public sealed partial class InMemoryStorage<T>
         }
     }
 
-    /// <summary>Under the gate: the stored entity row's version, part count and blobs; null when there is none.</summary>
+    /// <summary>
+    /// Under the gate: the stored entity row's version, part count and blobs; null when there is none. The
+    /// blobs are those TableStorage's point read before a write learns: the references in the cells it
+    /// selects (<see cref="LargeValueTable.PriorRowBlobPaths"/>); one in any other cell is left for the sweep.
+    /// </summary>
     private PriorRow? ReadPrior((string PartitionKey, string RowKey) keys) =>
         rows.TryGetValue(keys, out var row) && !LargeValueTable.IsPartRow(row.Data)
-            ? new PriorRow(row.Version, LargeValueTable.PartCount(row.Data), LargeValueTable.BlobPaths(row.Data))
+            ? new PriorRow(row.Version, LargeValueTable.PartCount(row.Data), LargeValueTable.PriorRowBlobPaths(typeof(T), row.Data))
             : null;
 
     /// <summary>Under the gate: the row keys of the continuation rows of <paramref name="keys"/> that exist now.</summary>
