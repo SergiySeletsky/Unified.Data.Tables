@@ -328,6 +328,29 @@ public static class TableEntitySerializer
         "Initialise the owning property with an instance of that runtime type, or declare the property with that type.";
 
     /// <summary>
+    /// The message for a large value in <paramref name="column"/> of <paramref name="root"/> that a member of
+    /// <paramref name="runtimeType"/> opts in, where a read of <paramref name="root"/> sets the column on a member of
+    /// a <paramref name="readType"/> that is not a large-value member (ruling R15): the value would come back into a
+    /// member that cannot carry it. <paramref name="subclass"/>: <paramref name="runtimeType"/> is the entity itself,
+    /// written through a store of its base type <paramref name="root"/>.
+    /// </summary>
+    internal static string LargeValueReadIntoAnOrdinaryMember(Type root, string column, Type readType, Type runtimeType, string member, bool subclass)
+    {
+        var where = subclass
+            ? $"This {runtimeType.Name} is written through an IStorage<{root.Name}>, and a read through that store creates a {root.Name}"
+            : $"A read of {root.Name} creates a {readType.Name} where this {runtimeType.Name} is (a read keeps the instance the " +
+              "constructor puts in a property and creates the declared type where there is none)";
+        var remedy = subclass
+            ? $"Store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}>, or mark {readType.Name}.{member} with [TableValueSplit]"
+            : $"Initialise the property that holds the {runtimeType.Name} with an instance of {runtimeType.Name} in the constructor of its " +
+              $"owner, declare that property as {runtimeType.Name}, or mark {readType.Name}.{member} with [TableValueSplit]";
+        return $"'{column}' of {root.Name} needs split cells or a blob: {runtimeType.Name}.{member} is a large-value member. {where}, " +
+               $"whose {member} is not a large-value member, so the value would be read back into a member that cannot carry it: the " +
+               "store's own copy of the entity it reads, and the next write of the entity that was read, would trim it or fail. " +
+               $"{remedy}. Nothing was stored.";
+    }
+
+    /// <summary>
     /// The message for a large value whose column a read of <paramref name="root"/> cannot resolve: the read
     /// fails at an owner it cannot create (a struct held in a nullable property, an interface or an abstract
     /// type with no instance), so every read of a row holding the value would fail.
@@ -1513,12 +1536,14 @@ internal sealed class TableEntityValue
                 columnName += JsonSuffix;
                 Format = TableEntityValueFormat.Json;
             }
-            state?.Ctx.Inline?.Add(new InlineValue(column, columnName, split.Encoding));
+            // Only a value a read carries back into a large-value member may be moved off the row (R15).
+            if (ReadTakesLargeValue(state, column))
+                state?.Ctx.Inline?.Add(new InlineValue(column, columnName, split.Encoding));
             value = payload;
             return true;
         }
 
-        RefuseUnreadable(state, columnName);
+        RefuseUnreadable(state, columnName, split: true);
 
         // Tier 3 (blob offload): only for a storage write, never for a clone or the public serializer.
         if (state is { Ctx: { IsClone: false } ctx } st && (ctx.Offload is not null || ctx.ForceOffload.Count > 0))
@@ -1562,19 +1587,38 @@ internal sealed class TableEntityValue
     // the object written is of the type a read creates (that type has the property); a subclass written
     // through a store of its base type may declare columns the base type does not read. A clone is read
     // back from the same object.
-    private void RefuseUnreadable(FlattenState? state, string columnName)
+    // A split value (split) is also stored only where the member a read sets the column on is a large-value
+    // member of the object the read creates there (ruling R15): a runtime subtype may opt in a member that
+    // the declared type a read creates in an empty property does not, and the value would come back into an
+    // ordinary member (the store's cache copy, and the next write of the entity that was read, trim it).
+    private void RefuseUnreadable(FlattenState? state, string columnName, bool split = false)
     {
         if (state is not { RootType: { } root, Ctx.IsClone: false } st)
             return;
         if (st.Subclass is { } subclass && !TypeMetadataCache.ReadsBack(root, Path[0]))
             throw new NotSupportedException(TableEntitySerializer.SubclassThroughBaseStoreRefusal(subclass, root, columnName, plainStore: false));
-        if (Path.Count < 2)
+        // A top-level member of the type a read creates is the member the value is written from.
+        if (Path.Count < 2 && st.Subclass is null)
             return;
-        if (!TypeMetadataCache.ReadsBack(root, columnName, out var unresolved))
+        if (Path.Count >= 2 && !TypeMetadataCache.ReadsBack(root, columnName, out var unresolved))
             throw new NotSupportedException(unresolved
                 ? TableEntitySerializer.UnresolvableLargeValue(root, columnName)
                 : TableEntitySerializer.UnreadableLargeValue(root, columnName));
+        if (split && !TypeMetadataCache.IsLargeValueOnRead(root, columnName, out var failure))
+            throw new NotSupportedException(failure is not null
+                ? TableEntitySerializer.UnresolvableLargeValue(root, columnName)
+                : TableEntitySerializer.LargeValueReadIntoAnOrdinaryMember(root, columnName,
+                    TypeMetadataCache.ReadTarget(root, columnName)?.ReflectedType ?? root, Parent?.Type ?? root, Path[^1],
+                    subclass: Path.Count < 2));
     }
+
+    // False when a read of the store's entity type would set the column of a split value on a member that is not
+    // a large-value member of the object it creates there, or cannot tell (see RefuseUnreadable): such a value
+    // stays in its cell when it fits one, and the planner never moves it off the row (ruling R15).
+    private bool ReadTakesLargeValue(FlattenState? state, string columnName) =>
+        state is not { RootType: { } root, Ctx: { IsClone: false, Inline: not null } } st
+        || (Path.Count < 2 && st.Subclass is null)
+        || TypeMetadataCache.IsLargeValueOnRead(root, columnName);
 
     // The writer stores a TableBlobContent as a blob because of the value; a read decides by the declared
     // type of the property it maps the column to, and only a property declared TableBlobContent gets the
