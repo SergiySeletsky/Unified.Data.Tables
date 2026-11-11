@@ -144,11 +144,27 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         if (!LargeValueAware || options?.BlobOffload is not { } offload)
             return null;
         var client = blobServiceClient ?? offload.ServiceClient
-            ?? throw new InvalidOperationException(
-                $"UnifiedTableStorageOptions.BlobOffload is set and {typeof(T).Name} has large-value members, but no {nameof(BlobServiceClient)} was supplied. " +
-                $"Set {nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.ServiceClient)}, set {nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.UseRegisteredServiceClient)} " +
-                $"to use the {nameof(BlobServiceClient)} registered in DI, use a connection-string or credential overload of AddUnifiedTableStorage that derives one, or pass one to the constructor.");
+            ?? throw new InvalidOperationException(MissingOffloadClientMessage(offload));
         return new AzureOffloadBlobStore(client.GetBlobContainerClient(offload.ContainerName));
+    }
+
+    // True for every way the client can be missing: a store constructed without one, options that ask for
+    // the host's client when none reaches the store, and registrations that offer none (a connection
+    // string whose blob endpoint is missing or malformed, options registered through a factory or a type).
+    private static string MissingOffloadClientMessage(BlobOffloadOptions offload)
+    {
+        var useRegistered = $"{nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.UseRegisteredServiceClient)}";
+        var why = offload.UseRegisteredServiceClient
+            ? $"{useRegistered} is set, but no {nameof(BlobServiceClient)} reached this store: register one in the container. Beside options " +
+              "registered through a factory or a type, the host's client is used only after a call of AddUnifiedTableStorage that offers a " +
+              "client of its own (see the remarks on AddUnifiedTableStorage). "
+            : string.Empty;
+        return $"UnifiedTableStorageOptions.BlobOffload is set and {typeof(T).Name} has large-value members, but no {nameof(BlobServiceClient)} was supplied. " +
+               why +
+               $"A store gets one from {nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.ServiceClient)}; from the {nameof(BlobServiceClient)} " +
+               $"registered in DI when {useRegistered} is set; from a connection-string or credential overload of AddUnifiedTableStorage only when " +
+               "its connection string or endpoint has a blob endpoint (a string whose blob endpoint is missing or malformed derives none, and the " +
+               "registered options must leave the client to the calls); or, constructed directly, pass one to the constructor.";
     }
 
     /// <summary>
