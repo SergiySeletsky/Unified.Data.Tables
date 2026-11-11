@@ -308,11 +308,11 @@ public class ProtectedLargeValueTests
     }
 
     /// <summary>
-    /// A plain <c>byte[]</c> keeps 0.8.3's comparison by reference: a new array with the same bytes is a change.
-    /// (In memory the stored array is handed back by a read, so the read entity is not a change.)
+    /// A plain <c>byte[]</c> keeps 0.8.3's message. Since ruling R13 (fix wave 5) no read hands back the stored
+    /// array, so it is compared by content: an untouched array is not a change, a changed one is refused.
     /// </summary>
     [Fact]
-    public async Task APlainProtectedByteArray_KeepsTheComparisonOf083()
+    public async Task APlainProtectedByteArray_IsComparedByContent_AndKeepsTheMessageOf083()
     {
         var store = new InMemoryStorage<Account>();
         await store.CreateAsync(new Account { Id = "p|r", Owner = "alice", Key = [1, 2, 3] }, Ct);
@@ -323,6 +323,10 @@ public class ProtectedLargeValueTests
 
         var again = await store.OneAsync("p|r", Ct);
         again!.Key = [1, 2, 3];
+        await store.UpdateAsync(again, Ct); // a new array with the same bytes is not a change
+
+        again = await store.OneAsync("p|r", Ct);
+        again!.Key = [1, 2, 4];
         var ex = await Assert.ThrowsAsync<UnauthorizedAccessException>(() => store.UpdateAsync(again, Ct));
         Assert.Equal(
             "Property 'Key' on Account is protected (requires roles: admin). The current caller is not authorised to change it from 'System.Byte[]' to 'System.Byte[]'.",

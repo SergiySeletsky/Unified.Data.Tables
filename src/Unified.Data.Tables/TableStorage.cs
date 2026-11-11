@@ -759,14 +759,21 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     }
 
     // A cache-isolated deep copy of an entity (serializer round-trip, like the in-memory fake), so a
-    // caller mutating a returned entity never corrupts the shared cached instance. ETag/Timestamp are
-    // not serialized as columns, so they are restored explicitly.
+    // caller mutating a returned entity never corrupts the shared cached instance. The serializer passes a
+    // byte[] cell through by reference both ways, so each one is copied: no array of the copy (at any
+    // depth) is an array of the entity. ETag/Timestamp are not serialized as columns, so they are
+    // restored explicitly.
     private static T Clone(T entity)
     {
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
         // The clone context keeps a cached split value a plain in-process bag, never re-encoded for storage.
-        var copy = TableEntitySerializer.ToTableEntity(entity, partitionKey, rowKey, ValueWriteContext.ForClone, pending: null)
-            .FromTableEntity<T>();
+        var row = TableEntitySerializer.ToTableEntity(entity, partitionKey, rowKey, ValueWriteContext.ForClone, pending: null);
+        foreach (var column in row.Keys.ToList())
+        {
+            if (row[column] is byte[] bytes)
+                row[column] = bytes.Clone();
+        }
+        var copy = row.FromTableEntity<T>();
         copy.ETag = entity.ETag;
         copy.Timestamp = entity.Timestamp;
         return copy;
@@ -1295,10 +1302,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         {
             var oldVal = prop.GetValue(stored);
             var newVal = prop.GetValue(entity);
-            // A large value (a file, an opted-in value) is compared by content and never quoted; any other
-            // property keeps the comparison and the message of 0.8.3.
+            // A large value (a file, an opted-in value) is compared by content and never quoted. A byte[] is
+            // compared by content too (a read never hands back the stored array, so a comparison by
+            // reference would see a change in every write); any other property keeps the comparison of 0.8.3,
+            // and every value that is not large keeps its message.
             var large = ProtectedLargeValues.IsLargeValue(typeof(T), prop);
-            if (!(large ? ProtectedLargeValues.IsUnchanged(oldVal, newVal) : Equals(oldVal, newVal))
+            if (!(large || oldVal is byte[] ? ProtectedLargeValues.IsUnchanged(oldVal, newVal) : Equals(oldVal, newVal))
                 && !(authorizer?.IsAllowed(attr.Roles) ?? false))
             {
                 throw new UnauthorizedAccessException(
@@ -1514,6 +1523,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // takes the merge's ETag only when the merge was conditional on exactly the cached version; otherwise
     // it keeps the cached entity's own, older ETag. An optimistic write of an entry with an older ETag
     // meets 412 and evicts; it never overwrites a change the entry has not seen.
+    // Every put and every hit goes through Clone, which copies each byte[]: an entry never holds an array a
+    // caller passed to the store or received from it.
     // Writes by other processes are not seen, as before (see CachePolicy).
 
     private static readonly ConditionalWeakTable<IMemoryCache, WriteGenerations> GenerationsByCache = new();
