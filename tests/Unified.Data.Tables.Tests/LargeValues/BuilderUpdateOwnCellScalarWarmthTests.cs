@@ -419,8 +419,9 @@ public class BuilderUpdateOwnCellScalarWarmthTests
     }
 
     // A decimal whose double cell does not convert back to a decimal at all (it rounds above the decimal
-    // range): the row cannot be read; the update must not keep the entity warm (0.8.3 did, answering a value
-    // the row cannot return), so the next read fetches the row and fails as a fresh read does.
+    // range): the row cannot be read; the update must not keep the entity warm (0.8.3 kept it, and its next
+    // read threw the SerializationException a fresh read throws), so the next read fetches the row and fails
+    // as a fresh read does.
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

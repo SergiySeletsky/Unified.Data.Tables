@@ -164,9 +164,10 @@ shares one), and for the cached `QueryAsync(partition)` lists:
   the storage call produced, or the library's translation of it (`DuplicateKeyException`,
   `ConcurrencyConflictException`). A call refused by its own checks before anything is sent (an argument,
   a missing ETag in `Strict` mode, a protected property, a value of a plain type that cannot be
-  serialized) drops nothing. For a type with large values, a create, update or upsert that fails while its
-  values are prepared (a stream that fails while it is read, a value too large to store, a cancelled
-  token) also drops the entry, although nothing was written; the next read goes to the table;
+  serialized, a builder update of a large-value member) drops nothing. For a type with large values, a
+  create, update or upsert that fails while its values are prepared (a stream that fails while it is
+  read, a value too large to store, a cancelled token) also drops the entry, although nothing was
+  written; the next read goes to the table;
 - after `UpdateAsync(id, builder)` the store keeps the entity cached with the update applied, as 0.8.3
   did, only when all of this holds: the entity was cached when the update was sent, and no read or other
   write has put another version of it into the cache since; every path of the builder names a top-level
@@ -175,11 +176,13 @@ shares one), and for the cached `QueryAsync(partition)` lists:
   `OversizedCellPolicy` did not trim or compress, a `bool`, `int`, `uint`, `long`, `ulong`, `byte`,
   `double`, `Guid`, `TimeSpan` or enum (or the nullable form of one), a `decimal` that its stored `double`
   converts back to, a `DateTimeOffset` other than the instant 1601-01-01T00:00Z, or a `DateTime` that is
-  neither local nor that instant. Equal means equal by the type's own equality, as on 0.8.3: the entity
-  kept cached holds each value as it was set, so a `decimal` keeps its scale (`7.50`, where a read returns
-  `7.5`), a `DateTimeOffset` its offset (the table service returns the instant in UTC) and a `DateTime`
-  its `Kind` (a read returns `Unspecified`). Then the store copies the cached entity once (its constructor
-  and getters run once, as on 0.8.3) and sets the values on the copy. In every other case the store drops
+  neither local nor that instant. Equal means equal by the type's own equality (a `decimal` whatever its
+  scale, a `DateTime` whatever its `Kind`, a `DateTimeOffset` by its instant). A read the cache answers
+  returns each value as a read of the row converts it: a `decimal` with the scale a read gives (`7.5` for
+  `7.50`), a `DateTime` with `Kind` `Unspecified`. A `DateTimeOffset` keeps the offset it was set with,
+  where the table service returns the instant in UTC. 0.8.3 does the same. Then the store copies the
+  cached entity once (its constructor and getters run once, as on 0.8.3) and sets the values on the copy.
+  In every other case the store drops
   the entry without copying the entity, and the next read fetches the row: a nested path or a name that
   maps to no property, a null put into `Updates`, an object, a collection or another JSON-stored value
   (a `float`, `short`, `char`, `sbyte` or `ushort` is stored as JSON), a `byte[]`, a trimmed or compressed
