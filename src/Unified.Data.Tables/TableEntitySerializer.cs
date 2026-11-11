@@ -2480,6 +2480,7 @@ internal static class TypeMetadataCache
     // [TableValueSplit] per property; see SplitFor. A misused attribute fails here, on first use of the type.
     private static Dictionary<string, TableValueSplitAttribute> BuildSplitOptions(Type t, ImmutableList<PropertyInfo> props)
     {
+        RefuseInterfaceMemberSplit(t);
         var options = new Dictionary<string, TableValueSplitAttribute>(StringComparer.Ordinal);
         var classLevel = ClassLevelSplit(t);
         foreach (var prop in props)
@@ -2489,6 +2490,42 @@ internal static class TypeMetadataCache
         }
 
         return options;
+    }
+
+    // [TableValueSplit] on a member declared on an interface that t implements is a misused attribute: .NET
+    // does not pass the attributes of an interface member to the implementing class, so the writer, which
+    // reads the members of the runtime type, would store the value as an ordinary cell (and a trimming
+    // OversizedCellPolicy would trim it). It opts nothing in (SplitFor ignores it) and fails here, on every
+    // use of a type that implements the interface. Attributes are read by reflection alone; an interface
+    // whose members cannot be read is skipped (the serializer never reads its attributes otherwise).
+    private static void RefuseInterfaceMemberSplit(Type t)
+    {
+        if (t.IsInterface)
+            return;
+
+        foreach (var contract in t.GetInterfaces())
+        {
+            PropertyInfo? marked;
+#pragma warning disable CA1031 // an interface the check cannot read has no attribute it could report
+            try
+            {
+                marked = Array.Find(contract.GetProperties(BindingFlags.Public | BindingFlags.Instance),
+                    static p => p.IsDefined(typeof(TableValueSplitAttribute), inherit: false));
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+#pragma warning restore CA1031
+            if (marked is not null)
+                throw new InvalidOperationException(
+                    $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface that {t.Name} implements: " +
+                    ".NET does not pass the attributes of an interface member to the implementing class, so the attribute cannot be " +
+                    $"honoured (the value would be stored as an ordinary cell, and could be trimmed). Put [TableValueSplit] on " +
+                    $"{t.Name}.{marked.Name} (the property of the implementing class), or on the class {t.Name}, and remove it from " +
+                    $"{contract.Name}. Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
+                    "mark the entity class with [TableValueSplit] as well, so that the entity is large-value aware.");
+        }
     }
 
     // The class-level [TableValueSplit] that applies to t: the nearest one, on t itself or on a base
@@ -2514,8 +2551,12 @@ internal static class TypeMetadataCache
     // nothing to split; one on an interface or abstract type that may flatten at runtime cannot be
     // honoured. With validate such a misuse throws (the serializer, on first use of the type); without,
     // the property is simply not opted in (the large-value walk, which must not throw).
+    // A member declared on an interface (t is the interface) is never opted in: the writer reads the
+    // members of the implementing class, where the attribute is not visible (RefuseInterfaceMemberSplit).
     private static TableValueSplitAttribute? SplitFor(Type t, PropertyInfo prop, TableValueSplitAttribute? classLevel, bool validate)
     {
+        if (t.IsInterface)
+            return null;
         // The property's type is resolved only for a property an attribute may cover: the metadata of
         // a type that opts into nothing is built from property names and attributes alone, as on 0.8.3.
         if (PropertyLevelSplit(prop) is not { } own)
