@@ -29,16 +29,16 @@ public partial class TableStorage<T>
         .. TypeMetadataCache.LargeValueColumns(typeof(T)).Select(c => c + SplitCodec.BlobSuffix),
     ];
 
-    private static readonly string[] KeysOnly = ["PartitionKey", "RowKey"];
-
     private static readonly string[] PartKeys = ["PartitionKey", "RowKey", SystemColumnNames.SplitOf];
 
     /// <summary>
-    /// The version a split-aware write produced, whether the written entity may be cached under it, and
-    /// the service time of the commit (its response <c>Date</c>; null when unknown). A transaction's
-    /// version comes from a separate re-read that may already see another writer's row, so only a single
-    /// call's own response version is cacheable. The cleanup of released blobs is timed by the commit,
-    /// not by that later re-read or the client clock.
+    /// The version a split-aware write produced (<c>default</c> when its response did not carry one),
+    /// whether the written entity is cached under it, and the service time of the commit (its response
+    /// <c>Date</c>; null when unknown). The version is always the write's own: the ETag of the single
+    /// call's response, or of the transaction's sub-response for the primary row. It is never read back
+    /// afterwards, because a later read can already return another writer's version. An entity written
+    /// through a transaction is not cached (the next read fetches it). The cleanup of released blobs is
+    /// timed by the commit, not by the client clock.
     /// </summary>
     private readonly record struct LargeWriteResult(ETag ETag, bool Cacheable, DateTimeOffset? CommittedAt);
 
@@ -116,8 +116,8 @@ public partial class TableStorage<T>
     /// must go, otherwise one transaction holding the primary, its parts and the deletes of stale parts.
     /// The blobs the row references are uploaded (create-only) before the entity write; once the write
     /// succeeded, the blobs the replaced row referenced and the new one does not are deleted (best
-    /// effort). A failed write deletes no blob. Returns the new ETag (<c>default</c> when it could not be
-    /// read back) and whether it is the write's own response version.
+    /// effort). A failed write deletes no blob. Returns the version the write itself produced
+    /// (<c>default</c> when its response did not carry one) and whether the entity is cached under it.
     /// </summary>
     private async Task<LargeWriteResult> WriteLargeAsync(T entity, LargeWriteKind kind, ETag ifMatch, CancellationToken ct)
     {
@@ -224,11 +224,24 @@ public partial class TableStorage<T>
         {
             throw LargeValueTable.ContinuationKeyTaken(pk, rk, taken, ex);
         }
-        // Taken from the commit itself, before the (slower) re-read below.
-        var committedAt = HeaderDate(RawResponse(committed));
-        // Transaction sub-responses are not correlated back to their actions: re-read the version. The
-        // write has committed, so the caller's token no longer applies.
-        return new LargeWriteResult(await ReadETagAfterCommitAsync(pk, rk), Cacheable: false, committedAt);
+        // The version is the one this transaction gave the primary: its own sub-response. The row is
+        // not read again: by then another writer may have committed, and its version on this writer's
+        // content would let the next optimistic update replace that writer's row without a conflict.
+        return new LargeWriteResult(PrimaryETag(committed), Cacheable: false, HeaderDate(RawResponse(committed)));
+    }
+
+    // The ETag of a committed transaction's sub-response for its first action, the primary row
+    // (sub-responses are in action order); default when the response carries none (a test double).
+    private static ETag PrimaryETag(Response<IReadOnlyList<Response>>? committed)
+    {
+        try
+        {
+            return committed?.Value is { Count: > 0 } responses ? HeaderETag(responses[0]) ?? default : default;
+        }
+        catch
+        {
+            return default;
+        }
     }
 
     // A continuation row the stored row declares is the entity's own and is replaced; a new one is an
@@ -351,28 +364,6 @@ public partial class TableStorage<T>
     private static bool IsPrimaryFailure(RequestFailedException ex) =>
         ex is not TableTransactionFailedException tx || tx.FailedTransactionActionIndex is null or 0;
 
-    /// <summary>
-    /// The version of a row a transaction has just committed, read without the caller's token; any
-    /// failure of the read (a transient error, a timeout) yields <c>default</c>, an unknown version,
-    /// which the write already reports as a null ETag and never caches.
-    /// </summary>
-    private async Task<ETag> ReadETagAfterCommitAsync(string pk, string rk)
-    {
-        try
-        {
-            var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, KeysOnly, CancellationToken.None);
-            return response is { HasValue: true, Value: not null } ? response.Value.ETag : default;
-        }
-#pragma warning disable CA1031 // the write has committed: failing to read its version must not report it as failed
-        catch (Exception ex)
-#pragma warning restore CA1031
-        {
-            logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: the write committed but its version could not be read back",
-                typeName, pk, rk);
-            return default;
-        }
-    }
-
     // The service time of a response (its Date header), tolerating test doubles that have none.
     private static DateTimeOffset? HeaderDate(Response? response)
     {
@@ -455,9 +446,10 @@ public partial class TableStorage<T>
 
     /// <summary>
     /// Stamps the outcome of a split-aware write on <paramref name="entity"/> and keeps the caches
-    /// coherent. Only a single call's own response version is cached; a transaction's re-read version
-    /// (which may already be another writer's) and an unknown version evict the entry instead, so the
-    /// next read goes to the store.
+    /// coherent. The entity gets the version the write itself produced, or null when that is unknown
+    /// (re-read before an optimistic update, as after a batch). Only a single call's result is cached; a
+    /// transaction's result and an unknown version evict the entry instead, so the next read goes to the
+    /// store.
     /// </summary>
     private void CommitLargeWrite(T entity, string partitionKey, LargeWriteResult result)
     {

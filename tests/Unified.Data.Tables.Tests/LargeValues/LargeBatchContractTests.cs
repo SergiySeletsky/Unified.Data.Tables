@@ -400,7 +400,7 @@ public abstract class LargeBatchContract : IAsyncLifetime
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
         CancelAfterNextCommit<SplitTextEntity>(cts);
 
-        // The new value needs a continuation row: the write is a transaction, then a version re-read.
+        // The new value needs a continuation row: the write is a transaction, then the blob cleanup.
         await store.UpsertAsync(Text("r1", SplitText), cts.Token);
 
         Assert.True(cts.IsCancellationRequested);
