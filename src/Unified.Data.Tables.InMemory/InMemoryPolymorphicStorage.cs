@@ -414,7 +414,8 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     }
 
     // Isolation: a caller mutating a returned row must not reach into the store, and a stored row
-    // must not change under a caller who is still holding the object they wrote.
+    // must not change under a caller who is still holding the object they wrote. A byte[] cell is the
+    // one mutable cell value, so each array is copied too, on the way in and on the way out.
     private static TableEntity CopyOf(TableEntity source)
     {
         var copy = new TableEntity(source.PartitionKey, source.RowKey);
@@ -423,7 +424,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
             if (Array.IndexOf(ReservedCells, cell.Key) >= 0)
                 continue;
 
-            copy[cell.Key] = cell.Value;
+            copy[cell.Key] = cell.Value is byte[] bytes ? bytes.Clone() : cell.Value;
         }
 
         return copy;

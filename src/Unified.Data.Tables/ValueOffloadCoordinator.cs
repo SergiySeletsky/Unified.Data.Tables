@@ -211,14 +211,17 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         }
         catch
         {
-            await spool.DisposeAsync();
+            // How the read ended is recorded first: if releasing the temporary file threw, the stream
+            // would otherwise stay listed as being read.
             content.LoseSource(readToEnd);
+            await spool.DisposeAsync();
             throw;
         }
         if (consumed && length == 0)
         {
+            var refusal = content.RefuseEmptyAfterConsumed(column);
             await spool.DisposeAsync();
-            throw content.RefuseEmptyAfterConsumed(column);
+            throw refusal;
         }
         content.EndSourceRead(complete: true);
         content.Seal(length, sha, spool);
