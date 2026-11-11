@@ -1322,11 +1322,28 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     // A write or delete whose storage call threw may or may not have committed (a timeout, a cancellation,
     // a connection dropped after the commit). The entity's entry and its partition's cached lists go
-    // (noted first), so the next read asks the table.
+    // (noted first), so the next read asks the table. It runs while the write's exception is leaving, and
+    // never replaces it: a cache that throws (a disposed MemoryCache during shutdown) is logged.
     private void EvictAfterFailedWrite(string id, string partitionKey)
     {
-        cache.Remove(EntityCacheKey(id));
-        InvalidateQueryCache(partitionKey);
+        try
+        {
+            cache.Remove(EntityCacheKey(id));
+        }
+#pragma warning disable CA1031 // the caller gets the storage call's exception; the eviction's failure is logged
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "{Type} id={Id}: the cached entity could not be evicted after a failed write", typeName, id);
+        }
+        try
+        {
+            InvalidateQueryCache(partitionKey);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "{Type} partition={Partition}: the cached lists could not be evicted after a failed write", typeName, partitionKey);
+        }
+#pragma warning restore CA1031
     }
 
     // The large-value write of a create, update or upsert; when it throws, the entry and the partition's
