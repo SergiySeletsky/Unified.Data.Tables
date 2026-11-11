@@ -15,9 +15,12 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// <summary>
 /// What the Blobs SDK's open-read stream does when the blob changes under it, scripted: it serves
 /// <paramref name="data"/> from <paramref name="start"/> and, once <paramref name="failAfter"/> bytes
-/// were handed out, every further read throws <paramref name="failure"/> (a ranged GET the service refused).
+/// were handed out, every further read throws <paramref name="failure"/> (a ranged GET the service
+/// refused). With <paramref name="atEnd"/>, a read at the end of the data throws it: the SDK's unpinned
+/// stream asks the service whether the blob has grown there, and the blob may be gone by then.
 /// </summary>
-internal sealed class ScriptedBlobReadStream(byte[] data, long start, int failAfter = int.MaxValue, Exception? failure = null) : Stream
+internal sealed class ScriptedBlobReadStream(
+    byte[] data, long start, int failAfter = int.MaxValue, Exception? failure = null, Exception? atEnd = null) : Stream
 {
     private long position = start;
     private int delivered;
@@ -26,7 +29,8 @@ internal sealed class ScriptedBlobReadStream(byte[] data, long start, int failAf
 
     public override bool CanRead => true;
 
-    public override bool CanSeek => false;
+    // As the SDK's stream: seekable, with the blob's length (the store only ever reads it forward).
+    public override bool CanSeek => true;
 
     public override bool CanWrite => false;
 
@@ -43,6 +47,8 @@ internal sealed class ScriptedBlobReadStream(byte[] data, long start, int failAf
         ObjectDisposedException.ThrowIf(Disposed, this);
         if (failure is not null && delivered >= failAfter)
             throw failure;
+        if (atEnd is not null && position >= data.Length)
+            throw atEnd;
         var n = (int)Math.Min(Math.Min(buffer.Length, data.Length - position), failAfter - delivered);
         data.AsSpan((int)position, n).CopyTo(buffer);
         position += n;
@@ -129,13 +135,22 @@ public class OpenReadDuringWriteTests
         /// <summary>The position each open asked for, in order.</summary>
         public List<long> Opens { get; } = [];
 
+        /// <summary>Whether each open pinned the read to the blob's ETag (allowModifications: false), in order.</summary>
+        public List<bool> Pinned { get; } = [];
+
         /// <summary>The streams handed out, in order.</summary>
         public List<Stream> Streams { get; } = [];
+
+        // The SDK keeps the constructor argument in a non-public property.
+        private static readonly System.Reflection.PropertyInfo AllowModifications =
+            typeof(BlobOpenReadOptions).GetProperty("AllowModifications", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("BlobOpenReadOptions.AllowModifications was not found: the SDK changed.");
 
         private Task<Stream> Open(BlobOpenReadOptions options)
         {
             var step = Script[Math.Min(Opens.Count, Script.Count - 1)];
             Opens.Add(options.Position);
+            Pinned.Add(!(bool)AllowModifications.GetValue(options)!);
             try
             {
                 var stream = step(options.Position);
@@ -191,9 +206,42 @@ public class OpenReadDuringWriteTests
 
         Assert.Equal(rig.Data, read);
         Assert.Equal([0L, 30_000L], rig.Opens);
+        // Pinned to the blob's version at first; once that version is gone, the rest is read without the condition.
+        Assert.Equal([true, false], rig.Pinned);
         Assert.True(((ScriptedBlobReadStream)rig.Streams[0]).Disposed, "the refused stream is released");
         Assert.False(stream.CanSeek);
         Assert.Equal(Size, stream.Position);
+    }
+
+    [Theory]
+    [InlineData(ReadKind.Sync)]
+    [InlineData(ReadKind.Async)]
+    public async Task AfterAnETagChange_TheSdkStreamIsNeverReadAtTheBlobsEnd(ReadKind kind)
+    {
+        var rig = new Rig(RandomBytes(Size, seed: 133));
+        rig.Script.Add(rig.FailingAfter(30_000, Status(412, "ConditionNotMet")));
+        // Read at its end, the SDK's unpinned stream asks the service whether the blob has grown. These
+        // blobs never grow, and this one is gone by then (replaced right after its last byte was read).
+        rig.Script.Add(position => new ScriptedBlobReadStream(rig.Data, position, atEnd: Status(404, "BlobNotFound")));
+
+        await using var stream = await rig.Store.OpenReadAsync("File", Name, Ct);
+
+        // Every byte arrived, so the read ends: it does not fail on a question nobody needs answered.
+        Assert.Equal(rig.Data, await ReadToEndAsync(stream, kind));
+        Assert.Equal(0, kind == ReadKind.Sync ? stream.Read(new byte[8], 0, 8) : await stream.ReadAsync(new byte[8], Ct));
+    }
+
+    [Fact]
+    public async Task WithoutAnETagChange_TheReadStaysPinned_AndTheSdkStreamAnswersTheEnd()
+    {
+        var rig = new Rig(RandomBytes(Size, seed: 134));
+        rig.Script.Add(rig.Whole);
+
+        await using var stream = await rig.Store.OpenReadAsync("File", Name, Ct);
+
+        Assert.Equal(rig.Data, await ReadToEndAsync(stream, ReadKind.Async));
+        Assert.Equal([0L], rig.Opens);
+        Assert.Equal([true], rig.Pinned);
     }
 
     [Theory]
@@ -515,7 +563,8 @@ public sealed class AzuriteOpenReadDuringWriteTests : AzuriteContentTestBase
         var blob = Container.GetBlobClient(name);
         var before = (await blob.GetPropertiesAsync(cancellationToken: Ct)).Value.ETag;
 
-        var reader = await Store<FileEntity>().OneAsync(Id("f1"), Ct);
+        var requests = new BlobRequests();
+        var reader = await Store<FileEntity>(blobs: BlobServiceWith(requests)).OneAsync(Id("f1"), Ct);
         await using var stream = await reader!.File!.OpenReadAsync(Ct);
         var head = new byte[16];
         await stream.ReadExactlyAsync(head, Ct);
@@ -533,6 +582,32 @@ public sealed class AzuriteOpenReadDuringWriteTests : AzuriteContentTestBase
         Assert.Equal(FileSize, head.Length + rest.Length);
         Assert.True(data.AsSpan(0, 16).SequenceEqual(head));
         Assert.True(data.AsSpan(16).SequenceEqual(rest), "the bytes read after the touch are the file's");
+
+        // What the reader sent: the first range pinned to the ETag; the next one refused once (412); from
+        // then on ranges without the condition, so a later touch could not interrupt the read again. Two
+        // HEADs in all (the open, and the open after the refusal): none to ask whether the blob has grown.
+        var gets = requests.Log.Where(r => r.Method == "GET").ToList();
+        Assert.Equal(1, gets.Count(r => r.Status == 412));
+        var refused = gets.FindIndex(r => r.Status == 412);
+        Assert.All(gets.Take(refused + 1), r => Assert.True(r.IfMatch, "pinned until the ETag changed"));
+        Assert.NotEmpty(gets.Skip(refused + 1));
+        Assert.All(gets.Skip(refused + 1), r => Assert.False(r.IfMatch, "unpinned after the ETag changed"));
+        Assert.All(gets.Skip(refused + 1), r => Assert.Equal(206, r.Status));
+        Assert.Equal(2, requests.Log.Count(r => r.Method == "HEAD"));
+    }
+
+    /// <summary>Records each request a blob client sends below the table's prefix: method, whether it carried If-Match, and the status.</summary>
+    private sealed class BlobRequests : HttpPipelineSynchronousPolicy
+    {
+        public List<(string Method, bool IfMatch, int Status)> Log { get; } = [];
+
+        public override void OnReceivedResponse(HttpMessage message)
+        {
+            if (!message.Request.Uri.Path.Contains("/" + nameof(FileEntity) + "/", StringComparison.Ordinal))
+                return;
+            lock (Log)
+                Log.Add((message.Request.Method.Method, message.Request.Headers.TryGetValue("If-Match", out _), message.Response.Status));
+        }
     }
 
     [Fact]

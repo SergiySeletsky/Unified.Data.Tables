@@ -25,8 +25,9 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
 
     /// <summary>
     /// How many times in a row a read opens the blob again after the service refused a range because the
-    /// blob's ETag had changed, before that failure is reported. A read that delivers bytes starts the
-    /// count again, so a long read survives any number of touches.
+    /// blob's ETag had changed, before that failure is reported. After the first of them the read no
+    /// longer depends on the ETag, so each further one in a row takes a request that failed and was
+    /// retried by the SDK; a read that delivers bytes starts the count again.
     /// </summary>
     internal const int MaxReadReopens = 5;
 
@@ -108,58 +109,67 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     /// The SDK's stream reads the blob in ranges, each conditional on the ETag the blob had when the stream
     /// was opened. A blob's name contains the SHA-256 of its bytes and blobs are written create-only, so
     /// the bytes under a name never change: its ETag changes only when a write that reuses the content
-    /// re-sets its metadata (<see cref="TouchAsync"/>), and the blob can be deleted. So a range refused
-    /// because the ETag changed is read again from the same position at the blob's current version, and
-    /// a blob that is gone by then fails the read with <see cref="TableValueIntegrityException"/>, as a
-    /// missing blob fails the open. The caller verifies length and hash in any case.
+    /// re-sets its metadata (<see cref="TouchAsync"/>), and the blob can be deleted. So when a range is
+    /// refused because the ETag changed, the read goes on from the same position without that condition,
+    /// and a blob that is gone by then fails the read with <see cref="TableValueIntegrityException"/>, as
+    /// a missing blob fails the open. The caller verifies length and hash in any case.
     /// </remarks>
     public async Task<Stream> OpenReadAsync(string column, string name, CancellationToken ct)
     {
         var blob = Blob(name);
-        return new PinnedReadStream(blob, column, name, await OpenPinnedAsync(blob, column, name, 0, reading: false, ct).ConfigureAwait(false));
+        return new BlobReadStream(blob, column, name, await OpenAsync(blob, column, name, 0, pinned: true, ct).ConfigureAwait(false));
     }
 
-    // allowModifications: false pins the ranges the stream reads to one version of the blob.
-    private static BlobOpenReadOptions PinnedFrom(long position) => new(allowModifications: false) { Position = position };
+    // pinned (allowModifications: false): every range the stream reads is conditional on the ETag the
+    // blob has now, and the stream's buffer is no larger than the blob. A read that is under way goes
+    // on unpinned instead, from the position it reached.
+    private static BlobOpenReadOptions ReadFrom(long position, bool pinned) => new(allowModifications: !pinned) { Position = position };
+
+    private static async Task<Stream> OpenAsync(BlobClient blob, string column, string name, long position, bool pinned, CancellationToken ct)
+    {
+        try
+        {
+            return await blob.OpenReadAsync(ReadFrom(position, pinned), ct).ConfigureAwait(false);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            throw Missing(column, name, reading: !pinned);
+        }
+    }
+
+    private static Stream Open(BlobClient blob, string column, string name, long position, bool pinned)
+    {
+        try
+        {
+            return blob.OpenRead(ReadFrom(position, pinned), CancellationToken.None);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            throw Missing(column, name, reading: !pinned);
+        }
+    }
 
     // reading: the blob was open already, so a blob that is not there now was deleted meanwhile.
-    private static async Task<Stream> OpenPinnedAsync(BlobClient blob, string column, string name, long position, bool reading, CancellationToken ct)
-    {
-        try
-        {
-            return await blob.OpenReadAsync(PinnedFrom(position), ct).ConfigureAwait(false);
-        }
-        catch (RequestFailedException ex) when (ex.Status == 404)
-        {
-            throw Missing(column, name, reading);
-        }
-    }
-
-    private static Stream OpenPinned(BlobClient blob, string column, string name, long position)
-    {
-        try
-        {
-            return blob.OpenRead(PinnedFrom(position), CancellationToken.None);
-        }
-        catch (RequestFailedException ex) when (ex.Status == 404)
-        {
-            throw Missing(column, name, reading: true);
-        }
-    }
-
     private static TableValueIntegrityException Missing(string column, string name, bool reading) =>
         new(column, reading ? $"blob '{name}' was deleted while it was being read." : $"blob '{name}' is missing.");
 
     /// <summary>
-    /// A forward-only read of one blob over the SDK's version-pinned stream. A range the service refuses
-    /// because the blob's ETag changed (412) is read again through a stream opened at the position
-    /// reached; a blob that was deleted (404, from the range or from that open) fails the read with
-    /// <see cref="TableValueIntegrityException"/>. Any other failure surfaces as it is.
+    /// A forward-only read of one blob over the SDK's stream, which starts out pinned to the blob's ETag.
+    /// When the service refuses a range because the ETag changed (412: the blob's metadata was re-set,
+    /// its bytes are the same), the read goes on through an unpinned stream opened at the position
+    /// reached, so no later change of the ETag interrupts it again. A blob that was deleted (404, from a
+    /// range or from that open) fails the read with <see cref="TableValueIntegrityException"/>. Any other
+    /// failure surfaces as it is.
     /// </summary>
-    private sealed class PinnedReadStream(BlobClient blob, string column, string name, Stream opened) : Stream
+    private sealed class BlobReadStream(BlobClient blob, string column, string name, Stream opened) : Stream
     {
         private Stream inner = opened;
         private long position;
+
+        // Known once the read goes on unpinned: where the blob ends. Read at its end, the SDK's unpinned
+        // stream asks the service whether the blob has grown; these blobs never grow, and the blob may
+        // be gone by then although every byte of it was delivered.
+        private long? end;
 
         public override bool CanRead => true;
 
@@ -179,6 +189,8 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
         {
             for (var reopened = 0; ; reopened++)
             {
+                if (position >= end)
+                    return 0;
                 try
                 {
                     var n = inner.Read(buffer, offset, count);
@@ -191,10 +203,10 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
                 }
                 catch (RequestFailedException ex) when (ex.Status == 412 && reopened < MaxReadReopens)
                 {
-                    // The ETag moved on (or, for some services, the blob is gone: the open below says so).
-                    var next = OpenPinned(blob, column, name, position);
+                    // The ETag moved on (or, for some services, the blob is gone: the open says so).
+                    var next = Open(blob, column, name, position, pinned: false);
                     inner.Dispose();
-                    inner = next;
+                    Continue(next);
                 }
             }
         }
@@ -206,6 +218,8 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
         {
             for (var reopened = 0; ; reopened++)
             {
+                if (position >= end)
+                    return 0;
                 try
                 {
                     var n = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -218,11 +232,25 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
                 }
                 catch (RequestFailedException ex) when (ex.Status == 412 && reopened < MaxReadReopens)
                 {
-                    // The ETag moved on (or, for some services, the blob is gone: the open below says so).
-                    var next = await OpenPinnedAsync(blob, column, name, position, reading: true, cancellationToken).ConfigureAwait(false);
+                    // The ETag moved on (or, for some services, the blob is gone: the open says so).
+                    var next = await OpenAsync(blob, column, name, position, pinned: false, cancellationToken).ConfigureAwait(false);
                     await inner.DisposeAsync().ConfigureAwait(false);
-                    inner = next;
+                    Continue(next);
                 }
+            }
+        }
+
+        // The read goes on through an unpinned stream, up to the blob's length as that stream knows it.
+        private void Continue(Stream unpinned)
+        {
+            inner = unpinned;
+            try
+            {
+                end = unpinned.Length;
+            }
+            catch (NotSupportedException)
+            {
+                end = null;
             }
         }
 

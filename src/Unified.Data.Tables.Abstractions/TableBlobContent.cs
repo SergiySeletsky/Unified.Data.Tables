@@ -10,9 +10,18 @@ namespace Unified.Data.Tables;
 /// the read that would return the last byte throws instead when the content does not match.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Requires blob offload to be configured on the storage (<c>UnifiedTableStorageOptions.BlobOffload</c>).
 /// A <see cref="TableBlobContent"/> property cannot be filtered on, written by a partial update, or
 /// placed inside a collection or a JSON-stored object.
+/// </para>
+/// <para>
+/// One content may be assigned to several properties or entities, and a content read from one row may
+/// be written into another: every row gets a blob of its own. A content that already streams a blob
+/// keeps streaming that one. When it is written somewhere else, the property that was written is
+/// given a new <see cref="TableBlobContent"/> that streams the blob of its own row, so the entity it
+/// came from (and any cached copy of it) is not affected by what later happens to the other row.
+/// </para>
 /// </remarks>
 public sealed class TableBlobContent
 {
