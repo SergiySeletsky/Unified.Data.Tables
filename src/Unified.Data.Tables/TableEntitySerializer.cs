@@ -1147,7 +1147,8 @@ internal sealed class TableEntityValue
     }
 
     // An opted-in value: one ordinary cell when it fits (a string or byte[] raw, never __GZip; JSON
-    // text as __Json), otherwise split cells. Never trims and never consults OversizedCellPolicy.
+    // text as __Json), otherwise split cells; a column the planner moved (ValueWriteContext.ForceSplit)
+    // is split whatever its size. Never trims and never consults OversizedCellPolicy.
     // False for a value that is not string, byte[] or JSON-stored (a scalar, or an object that
     // flattens into columns) — it takes the ordinary path.
     private bool TrySerializeLarge(
@@ -1177,13 +1178,18 @@ internal sealed class TableEntityValue
                 break;
         }
 
-        if (SplitCodec.FitsOneCell(payload, split.Encoding))
+        // A value that fits one cell stays in its cell, unless the planner moved the column off a first
+        // row that was too full: then it takes the split form below, like a value too large for one cell.
+        var moved = state is { Ctx: { } planned } && (planned.ForceSplit.Contains(columnName) || planned.ForceOffload.Contains(columnName));
+        if (!moved && SplitCodec.FitsOneCell(payload, split.Encoding))
         {
+            var column = columnName;
             if (isJson)
             {
                 columnName += JsonSuffix;
                 Format = TableEntityValueFormat.Json;
             }
+            state?.Ctx.Inline?.Add(new InlineValue(column, columnName, split.Encoding));
             value = payload;
             return true;
         }
