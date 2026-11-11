@@ -973,7 +973,7 @@ public class RuntimeSubtypeSplitTests
     [Theory]
     [InlineData(LargeValueStores.Memory)]
     [InlineData(LargeValueStores.Azurite)]
-    public async Task FileOnASubclassARead_CannotMapBack_IsRefused(string store)
+    public async Task FileOnASubclassAReadCannotMapBack_IsRefused(string store)
     {
         await using var stores = await LargeValueStores.OpenAsync(store);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
