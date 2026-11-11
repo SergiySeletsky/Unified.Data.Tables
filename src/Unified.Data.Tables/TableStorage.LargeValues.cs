@@ -20,12 +20,12 @@ public partial class TableStorage<T>
 
     // _SplitParts says how many continuation rows the stored row owns, _SplitOf marks the row itself as
     // one; the __blob reference columns are selected now so the offload tier can read them from the same
-    // point read.
+    // point read. The row's version is not a column and is never selected: the service returns it with
+    // every entity (and as the response's ETag header), and may refuse a $select that names odata.etag.
     private static readonly string[] PriorSelect =
     [
         SystemColumnNames.SplitParts,
         SystemColumnNames.SplitOf,
-        "odata.etag",
         .. TypeMetadataCache.LargeValueColumns(typeof(T)).Select(c => c + SplitCodec.BlobSuffix),
     ];
 
@@ -55,21 +55,61 @@ public partial class TableStorage<T>
         Replace,
     }
 
-    /// <summary>One point read of the stored row's ETag and part count; null when the row does not exist.</summary>
-    private async Task<PriorRow?> ReadPriorAsync(string pk, string rk, CancellationToken ct)
+    /// <summary>
+    /// The row at an entity's keys as the point read before a write or delete returns it (projected onto
+    /// <see cref="PriorSelect"/>), with its version. A continuation row has none here: nothing is ever
+    /// written or deleted on condition of it.
+    /// </summary>
+    private readonly record struct StoredRow(TableEntity Row, ETag ETag);
+
+    /// <summary>
+    /// One point read of the row at these keys; null when there is none. An entity row's version is its
+    /// own ETag (the service sends it with every entity, whatever the projection) or, when the row
+    /// carries none, the ETag header of the response.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The row exists and neither it nor the response carries a version: a replace or delete of it could
+    /// only be unconditional, so nothing is written.
+    /// </exception>
+    private async Task<StoredRow?> ReadStoredAsync(string pk, string rk, CancellationToken ct)
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, PriorSelect, ct);
-        // A continuation row is not an entity: addressing one by id finds nothing.
-        if (!response.HasValue || response.Value is null || SplitRowLayout.IsPartRow(response.Value))
+        if (!response.HasValue || response.Value is not { } row)
             return null;
-        return new PriorRow(response.Value.ETag, SplitRowLayout.PartCount(response.Value), BlobPaths(response.Value));
+        if (SplitRowLayout.IsPartRow(row))
+            return new StoredRow(row, default);
+
+        var etag = row.ETag;
+        if (!IsVersion(etag))
+            etag = HeaderETag(RawResponse(response)) ?? default;
+        if (!IsVersion(etag))
+            throw new InvalidOperationException(
+                $"The stored version (ETag) of {typeName} '{pk}{Separator}{rk}' could not be read: neither the row nor the response "
+                + "of its point read carried one. Nothing was written: a replace or delete without a version would be unconditional.");
+        return new StoredRow(row, etag);
     }
 
-    // The blob names a stored row references; a malformed reference is logged and skipped.
-    private IReadOnlyList<string> BlobPaths(TableEntity row) =>
+    /// <summary>
+    /// One point read of the stored row's version, part count and blob references; null when the row
+    /// does not exist.
+    /// </summary>
+    private async Task<PriorRow?> ReadPriorAsync(string pk, string rk, CancellationToken ct)
+    {
+        // A continuation row is not an entity: addressing one by id finds nothing.
+        if (await ReadStoredAsync(pk, rk, ct) is not { } stored || SplitRowLayout.IsPartRow(stored.Row))
+            return null;
+        return new PriorRow(stored.ETag, SplitRowLayout.PartCount(stored.Row), BlobPaths(stored.Row, pk, rk));
+    }
+
+    // A version a conditional write can name: not empty, and not the "any version" wildcard.
+    private static bool IsVersion(ETag etag) => etag != ETag.All && !string.IsNullOrEmpty(etag.ToString());
+
+    // The blob names a stored row references; a malformed reference is logged and skipped. The keys are
+    // passed in: the projected row does not carry them.
+    private IReadOnlyList<string> BlobPaths(TableEntity row, string pk, string rk) =>
         LargeValueTable.BlobPaths(row, (column, ex) =>
             logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: ignoring a malformed blob reference in {Column}",
-                typeName, row.PartitionKey, row.RowKey, column));
+                typeName, pk, rk, column));
 
     /// <summary>
     /// Writes a split-aware entity: one SDK call when the value fits one row and no continuation rows
@@ -358,8 +398,20 @@ public partial class TableStorage<T>
         }
     }
 
+    private static Response? RawResponse(NullableResponse<TableEntity>? response)
+    {
+        try
+        {
+            return response?.GetRawResponse();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     // Same header-first, tolerate-test-doubles read the single-row Create and Upsert paths use.
-    private static ETag? HeaderETag(Response response)
+    private static ETag? HeaderETag(Response? response)
     {
         try
         {
