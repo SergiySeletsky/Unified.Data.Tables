@@ -315,13 +315,14 @@ public class BlobContentRetryTests
     public async Task SourceFailingOnceDuringTheUpload_RetryStoresEveryByte_ForASeekableSource()
     {
         var data = RandomBytes(Size, seed: 48);
-        // The hashing pass gets through; the upload's pass fails at the same offset, leaving the source mid-way.
+        // The hashing pass gets through; the upload's pass fails at the same offset. The failed upload puts
+        // the source back where the content starts (BLOBS-2), not where the read stopped.
         var source = new FaultyContentStream(data, seekable: true) { FailAt = FailAt, PassesBeforeFailure = 1, FailuresLeft = 1 };
         var entity = Entity(source);
         var store = Store();
 
         await Assert.ThrowsAsync<IOException>(() => store.CreateAsync(entity, Ct));
-        Assert.Equal(FailAt, source.Position);
+        Assert.Equal(0, source.Position);
         AssertNothingStored(store);
 
         await store.CreateAsync(entity, Ct);
@@ -578,10 +579,11 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
         var failing = new FailFirstUpload();
         var store = Store<FileEntity>(blobs: BlobServiceWith(failing));
 
-        // The SDK had read the whole source before the request failed.
+        // The SDK had read the whole source before the request failed; the failed upload put it back
+        // where the content starts (BLOBS-2).
         await Assert.ThrowsAsync<IOException>(() => store.CreateAsync(entity, Ct));
         Assert.Equal(1, failing.Failures);
-        Assert.Equal(Size, source.Position);
+        Assert.Equal(0, source.Position);
         await AssertNothingStoredAsync();
 
         await store.CreateAsync(entity, Ct);
@@ -600,7 +602,8 @@ public sealed class AzuriteBlobContentRetryTests : AzuriteContentTestBase
 
         var ex = await Assert.ThrowsAnyAsync<Exception>(() => store.CreateAsync(entity, Ct));
         Assert.True(ex is IOException || ex.GetBaseException() is IOException, ex.ToString());
-        Assert.Equal(FailAt, source.Position);
+        // Put back where the content starts by the failed upload (BLOBS-2).
+        Assert.Equal(0, source.Position);
         await AssertNothingStoredAsync();
 
         await store.CreateAsync(entity, Ct);

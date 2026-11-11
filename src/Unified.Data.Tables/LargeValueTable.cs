@@ -103,6 +103,13 @@ public sealed class LargeValueTable
     }
 
     /// <summary>
+    /// Lets a store with a cache stop answering a row from it once a lazy content it materialized for
+    /// that row found its blob missing (see <see cref="ValueOffloadCoordinator.BlobMissing"/>).
+    /// </summary>
+    /// <param name="forget">Called with the row's partition and row key; what it throws is swallowed.</param>
+    internal void OnBlobMissing(Action<string, string> forget) => coordinator.BlobMissing = forget;
+
+    /// <summary>
     /// Storage-provider SPI, not for application code. True when <paramref name="entityType"/> has a
     /// member that may be stored as split cells, continuation rows or a blob.
     /// </summary>

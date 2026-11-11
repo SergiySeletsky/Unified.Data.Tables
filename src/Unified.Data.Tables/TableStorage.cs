@@ -133,6 +133,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         client = serviceClient.GetTableClient(tableName);
         tableInitializer = new TableInitializer(client);
         large = new LargeValueTable(tableName, opts.BlobOffload, blobs);
+        large.OnBlobMissing(ForgetRowWithMissingBlob);
     }
 
     // The Azure blob container for this store's offloaded values. Built only for a type that can carry

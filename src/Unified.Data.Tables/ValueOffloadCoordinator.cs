@@ -24,6 +24,14 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     private static readonly IReadOnlyDictionary<string, object> NothingResolved = new Dictionary<string, object>(StringComparer.Ordinal);
 
     /// <summary>
+    /// Called with a row's partition and row key when a lazy content this coordinator materialized (on a
+    /// read or a write of that row) found its blob missing: the entity it was handed out with is stale,
+    /// and the store stops answering that row from its caches. Null when the store has no cache. It is
+    /// called before the integrity failure is thrown, and whatever it throws is swallowed.
+    /// </summary>
+    internal Action<string, string>? BlobMissing { get; set; }
+
+    /// <summary>
     /// <c>{table}/{partitionKey}/{rowKey}/{column}/{sha256}</c>, each segment escaped by
     /// <see cref="OffloadBlobNames.EscapeSegment"/> (so no segment is ever <c>.</c>, <c>..</c> or empty).
     /// </summary>
@@ -52,39 +60,73 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// seekable source is put back where its content starts, so a retry reads all of it; one that cannot
     /// be put back, and a forward-only one that was partly consumed, make the content unusable: this and
     /// every later write of it throws before anything is read or uploaded. So does a content whose
-    /// temporary copy an earlier failed write released (<see cref="ReleasePrepared"/>).
+    /// temporary copy an earlier failed write released (<see cref="ReleasePrepared"/>), and a new content
+    /// over a stream that a write has already read (a forward-only stream, or a seekable one that could
+    /// not be put back where its content started).
+    /// <para>
+    /// A content held by several writes at once is prepared by one of them; the others wait for it and
+    /// find it prepared. Each content is waited for on its own, never two at a time.
+    /// </para>
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// A content can no longer be written: its source was partly read by a failed write and cannot be
-    /// read again from where the content starts, or its temporary copy was released by a failed write.
+    /// read again from where the content starts, its temporary copy was released by a failed write, or
+    /// its source stream was already read by another write and cannot deliver its bytes again.
     /// </exception>
     internal async Task PrepareAsync(object entity, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entity);
         var contents = TableEntitySerializer.FindBlobContents(entity);
-        // Refused before any source is read and any blob uploaded.
+        // Counted before anything can fail: the write's ReleasePrepared ends each of them once.
+        foreach (var (_, content) in contents)
+            content.Enlist();
+
+        // Refused before any source is read and any blob uploaded. A content another write is using is
+        // waited for (one write at a time hashes, copies, uploads from or binds a content).
         foreach (var (column, content) in contents)
         {
-            content.ThrowIfNotWritable(column);
-            // A source prepared by an earlier write that failed must still be there to upload from: one the
-            // caller has closed since is found now, not after other blobs of this write were uploaded.
-            if (content.IsSealed && content.Source is not null)
-                content.RewindSource(column);
+            await content.WaitTurnAsync(ct);
+            try
+            {
+                content.ThrowIfNotWritable(column);
+                // A source prepared by an earlier write that failed must still be there to upload from: one the
+                // caller has closed since is found now, not after other blobs of this write were uploaded.
+                if (content.IsSealed && content.Source is not null)
+                    content.RewindSource(column);
+            }
+            finally
+            {
+                content.EndTurn();
+            }
         }
 
         foreach (var (column, content) in contents)
         {
-            if (content.IsSealed) continue;
-            var source = content.Source
-                ?? throw new InvalidOperationException($"The TableBlobContent of '{column}' has no content to read.");
-            // Before the first read: a write cancelled by now has not touched the source.
-            ct.ThrowIfCancellationRequested();
-            // A source that was seekable when it was first prepared stays on this path: it is read from
-            // the recorded origin or not at all, never from wherever it stands now.
-            if (content.HasSourceOrigin || source.CanSeek)
-                await HashSeekableAsync(column, content, source, ct);
-            else
-                await SpoolAsync(content, source, ct);
+            await content.WaitTurnAsync(ct);
+            try
+            {
+                // Another write may have prepared the content, or given it up, while this one waited.
+                content.ThrowIfNotWritable(column);
+                if (content.IsSealed) continue;
+                var source = content.Source
+                    ?? throw new InvalidOperationException($"The TableBlobContent of '{column}' has no content to read.");
+                // Before the first read: a write cancelled by now has not touched the source.
+                ct.ThrowIfCancellationRequested();
+                // A stream a write has already read (a forward-only one, or one it could not put back) is
+                // refused before this content reads any of it.
+                if (!content.HasSourceOrigin)
+                    content.ClaimSource(column);
+                // A source that was seekable when it was first prepared stays on this path: it is read from
+                // the recorded origin or not at all, never from wherever it stands now.
+                if (content.HasSourceOrigin || source.CanSeek)
+                    await HashSeekableAsync(column, content, source, ct);
+                else
+                    await SpoolAsync(content, source, ct);
+            }
+            finally
+            {
+                content.EndTurn();
+            }
         }
     }
 
@@ -239,8 +281,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// Makes every pending blob exist: one with the same name and hash is touched (refreshing its
     /// <c>Last-Modified</c>) and its bytes are not sent again; an absent one is uploaded create-only
     /// through a read that verifies the bytes still match what was prepared. Each
-    /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob
-    /// stays bound there, and the property it was written from gets a content bound to this one.
+    /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob (or
+    /// a blob of the same name through another blob store) stays bound there, and the property it was
+    /// written from gets a content bound to this one.
+    /// An upload reads a content's source, and a content is bound, while this write holds the content,
+    /// so concurrent writes of one content take turns; a caller's seekable stream is put back where the
+    /// content starts after every upload, whether it succeeded or not.
     /// </summary>
     /// <exception cref="BlobOffloadNotConfiguredException">Blob offload is not configured.</exception>
     /// <exception cref="InvalidOperationException">A source changed after it was prepared.</exception>
@@ -284,8 +330,22 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 continue;
             var name = blob.Reference.Path;
             var column = blob.Column;
-            Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, c);
-            if (content.Bind(name, open, column))
+            var keys = RowKeysOf(name);
+            Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, keys, c);
+            // Bound while this write holds the content: of several writes binding it at once, exactly one
+            // binds the shared instance. The property is assigned after the turn ends (no lock across a setter).
+            // A content bound through another store keeps that store's blob, even under the same name.
+            bool bound;
+            await content.WaitTurnAsync(ct);
+            try
+            {
+                bound = content.Bind(name, open, column, store);
+            }
+            finally
+            {
+                content.EndTurn();
+            }
+            if (bound)
                 continue;
 
             // The content already streams another blob: it was read from another row, or it is on another
@@ -294,7 +354,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             // written gets a content of its own, bound to the blob its own row references. A property that
             // cannot be assigned keeps the instance as it is.
             blob.Assign?.Invoke(TableBlobContent.Bound(
-                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column));
+                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column, store));
         }
     }
 
@@ -362,26 +422,43 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     private static async Task UploadOneAsync(IOffloadBlobStore store, PendingBlob blob, CancellationToken ct)
     {
-        var column = blob.Column;
-        var source = await blob.OpenSource(ct);
-        await using var verified = new HashingReadStream(source, blob.Reference.Length, blob.Reference.Sha256,
-            reason => new InvalidOperationException(
-                $"The content of '{column}' changed after it was prepared for writing ({reason})."),
-            leaveOpen: false);
+        // One upload at a time reads a content's prepared source (two reading one stream at once would
+        // each get part of it), and none while another write hashes, copies or binds the content.
+        var content = blob.Content;
+        if (content is not null)
+            await content.WaitTurnAsync(ct);
         try
         {
-            await store.UploadCreateOnlyAsync(blob.Reference.Path, verified, blob.Reference, blob.ContentEncoding, ct);
+            var column = blob.Column;
+            var source = await blob.OpenSource(ct);
+            await using var verified = new HashingReadStream(source, blob.Reference.Length, blob.Reference.Sha256,
+                reason => new InvalidOperationException(
+                    $"The content of '{column}' changed after it was prepared for writing ({reason})."),
+                leaveOpen: false);
+            try
+            {
+                await store.UploadCreateOnlyAsync(blob.Reference.Path, verified, blob.Reference, blob.ContentEncoding, ct);
+            }
+            catch when (verified.Mismatch is not null)
+            {
+                // The SDK pipeline wraps (or retries past) what the content stream throws: report the cause.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(verified.Mismatch).Throw();
+                throw;
+            }
+            // A store that swallowed the failure, or stopped reading before the end, still gets the content checked.
+            if (verified.Mismatch is { } mismatch)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(mismatch).Throw();
+            await verified.DrainAndVerifyAsync(ct);
         }
-        catch when (verified.Mismatch is not null)
+        finally
         {
-            // The SDK pipeline wraps (or retries past) what the content stream throws: report the cause.
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(verified.Mismatch).Throw();
-            throw;
+            if (content is not null)
+            {
+                // Done reading the caller's stream, whatever happened: it goes back where the content starts.
+                content.EndUploadRead();
+                content.EndTurn();
+            }
         }
-        // A store that swallowed the failure, or stopped reading before the end, still gets the content checked.
-        if (verified.Mismatch is { } mismatch)
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(mismatch).Throw();
-        await verified.DrainAndVerifyAsync(ct);
     }
 
     /// <summary>
@@ -432,20 +509,23 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         if (anyLazy)
         {
             var store = blobs;
+            (string, string)? keys = row.PartitionKey is { } pk && row.RowKey is { } rk ? (pk, rk) : null;
+            // The content remembers the store it reads through (BLOBS-3); null when this store cannot open it.
             lazy = (column, reference) => TableBlobContent.Bound(
                 reference.Length, reference.Sha256, reference.ContentType, reference.Path,
                 c => store is not null
-                    ? OpenLazyAsync(store, column, reference.Path, c)
+                    ? OpenLazyAsync(store, column, reference.Path, keys, c)
                     : throw new BlobOffloadNotConfiguredException(tableName, column),
-                column);
+                column, store);
         }
         return new ValueReadContext(resolved ?? NothingResolved, lazy, projectedColumns);
     }
 
     // A lazy TableBlobContent opens its blob long after the row was read, perhaps from the entity cache:
     // a replace or delete since then may have deleted the blob (blobs are content-addressed, so it can
-    // only be missing, never hold other bytes). Say so instead of reporting a bare missing blob.
-    private static async Task<Stream> OpenLazyAsync(IOffloadBlobStore store, string column, string path, CancellationToken ct)
+    // only be missing, never hold other bytes). The store then stops answering the row from its caches
+    // (BLOBS-4), so reading the entity again reads the table; the failure itself still reaches the caller.
+    private async Task<Stream> OpenLazyAsync(IOffloadBlobStore store, string column, string path, (string Pk, string Rk)? keys, CancellationToken ct)
     {
         try
         {
@@ -453,10 +533,39 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         }
         catch (TableValueIntegrityException ex)
         {
+            ForgetRow(keys);
             throw new TableValueIntegrityException(column,
                 $"blob '{path}' could not be opened ({ex.Reason}). The row may have been replaced or deleted since this " +
-                "entity was read (a cached entity can outlive its blob): read the entity again.");
+                "entity was read: read the entity again (the store that returned it no longer answers it from its cache).");
         }
+    }
+
+    // Never throws into, or replaces, the integrity failure being reported.
+    private void ForgetRow((string Pk, string Rk)? keys)
+    {
+        if (keys is not { } row || BlobMissing is not { } forget)
+            return;
+        try
+        {
+            forget(row.Pk, row.Rk);
+        }
+#pragma warning disable CA1031 // the eviction is a courtesy to the next read; the caller gets the integrity failure
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+        }
+    }
+
+    // The partition and row key a blob name of this library holds ({table}/{pk}/{rk}/{column}/{sha256});
+    // null for a name of another shape.
+    private static (string Pk, string Rk)? RowKeysOf(string path)
+    {
+        var segments = path.Split('/');
+        return segments.Length == 5
+            && OffloadBlobNames.TryUnescapeSegment(segments[1], out var pk)
+            && OffloadBlobNames.TryUnescapeSegment(segments[2], out var rk)
+                ? (pk, rk)
+                : null;
     }
 
     /// <summary>The most reference columns a sweep names in a projection before it reads whole rows instead.</summary>
