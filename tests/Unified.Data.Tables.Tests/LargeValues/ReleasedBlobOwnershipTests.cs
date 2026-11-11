@@ -507,6 +507,32 @@ public sealed class AzuriteReleasedBlobOwnershipTests : AzuriteCleanupTestBase
     }
 
     [Fact]
+    public async Task BlobContent_UpsertThroughARekeyedCopy_KeepsTheSourceRowsBlob()
+    {
+        SkipUnlessAvailable();
+        // A file: read lazily, so the save through the copy uploads the copy's blob FROM the source's.
+        var bytes = RandomBytes(5_000, seed: 63);
+        var store = Store<FileEntity>(TimeSpan.Zero);
+        await store.CreateAsync(new FileEntity { Id = Id("r"), File = TableBlobContent.FromBytes(bytes, "image/png"), Title = "source" }, Ct);
+        var sourceBlob = Assert.Single(await BlobNamesAsync());
+        await CopyRowRawAsync(nameof(FileEntity), "r", nameof(FileEntity), "r2");
+        await BlobsOlderThanAsync(TimeSpan.Zero);
+
+        var loaded = await store.OneAsync(Id("r2"), Ct);
+        loaded!.Title = "copy";
+        await store.UpsertAsync(loaded, Ct);
+
+        var copyBlob = $"{nameof(FileEntity)}/{Pk}/r2/File/{Sha(bytes)}";
+        Assert.Equal(new[] { sourceBlob, copyBlob }.Order(StringComparer.Ordinal), await BlobNamesAsync());
+        foreach (var rk in new[] { "r", "r2" })
+        {
+            var read = await Store<FileEntity>(TimeSpan.Zero).OneAsync(Id(rk), Ct);
+            await using var stream = await read!.File!.OpenReadAsync(Ct);
+            Assert.Equal(bytes, await ReadAllAsync(stream));
+        }
+    }
+
+    [Fact]
     public async Task OwnBlobs_AreStillDeleted_OnReplaceAndOnDelete()
     {
         SkipUnlessAvailable();
