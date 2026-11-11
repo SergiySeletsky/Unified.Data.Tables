@@ -19,11 +19,16 @@ Lossless storage of large values, opt-in per property.
   service) remains. Values that each fit one cell are not exempt: an entity whose opted-in values together
   exceed one entity is written with split cells and continuation rows too.
 - Do not remove `[TableValueSplit]` from a property while rows hold large values of it (split cells,
-  continuation rows or a blob): a read would bring such a value into a member that is no longer a large
-  value, which `TableStorage<T>`'s cache copy of the entity and the next save of it write as an ordinary
-  cell, so a value that does not fit one cell even compressed is then trimmed under a trimming
-  `OversizedCellPolicy` and fails the read or the save under `Throw`. Once the type opts into nothing at
-  all, a read of a row that holds such a value in a blob or on continuation rows fails.
+  continuation rows or a blob). A read brings such a value into a member that is no longer a large value,
+  and `TableStorage<T>` copies the entity it read as ordinary cells: the copy it caches, and every entity
+  that `QueryAsync(partition)` and `QueryAsync()` return (with caching off too). When the value is a
+  string or a JSON-stored value that does not fit one cell even compressed, a trimming
+  `OversizedCellPolicy` trims it in those copies (so a later `OneAsync` that the cache answers returns it
+  trimmed) and in the next save of the entity, which stores it trimmed; `OneAsync` when it reads the
+  table, and the other queries, return it whole. Under `Throw`, `QueryAsync(partition)`, `QueryAsync()`
+  and the save throw `OversizedCellException`, while `OneAsync` and the other queries return the value
+  whole and the entity is not cached. Once the type opts into nothing at all, a read of a row that holds
+  such a value in a blob or on continuation rows fails.
 - Back up and restore an entity's main row, continuation rows and offload blobs together. A table copied
   raw shares the source's blobs (the references hold the source table's blob paths). Writes through the
   copy never delete them, but the source's own replaces, deletes, partition deletes and sweeps can: give

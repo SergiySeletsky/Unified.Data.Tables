@@ -1333,6 +1333,17 @@ so a scaled-out app may register it in one instance only.
   what 0.8.3 wrote; then, once no older reader remains (swapped slots drained, rollback no longer to a
   pre-0.9.0 build, every service that reads the table upgraded), the attributes. Rolling back past the
   second deploy needs the data rewritten first.
+- **Do not remove `[TableValueSplit]` from a property while rows hold large values of it** (split cells,
+  continuation rows or a blob). A read brings such a value into a member that is no longer a large value,
+  and `TableStorage<T>` copies the entity it read as ordinary cells: the copy it caches, and every entity
+  that `QueryAsync(partition)` and `QueryAsync()` return (with caching off too). When the value is a
+  string or a JSON-stored value that does not fit one cell even compressed, a trimming
+  `OversizedCellPolicy` trims it in those copies (so a later `OneAsync` that the cache answers returns it
+  trimmed) and in the next save of the entity, which stores it trimmed; `OneAsync` when it reads the
+  table, and the other queries, return it whole. Under `Throw`, `QueryAsync(partition)`, `QueryAsync()`
+  and the save throw `OversizedCellException`, while `OneAsync` and the other queries return the value
+  whole and the entity is not cached. Once the type opts into nothing at all, a read of a row that holds
+  such a value in a blob or on continuation rows fails.
 - **Back up and restore an entity as one unit**: its main row, its continuation rows (same partition,
   RowKeys `{RowKey}~NNNN`) and its blobs in the offload container, taken together. A row restored without
   its parts or blobs (or with those of another version) reads as `TableValueIntegrityException`.
