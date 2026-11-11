@@ -18,7 +18,7 @@ public class OffloadSerializerTests
         new(new InMemoryOffloadBlobStore(), new BlobOffloadOptions(), "T");
 
     private static JsonElement Reference(TableEntity row, string column) =>
-        JsonDocument.Parse(Assert.IsType<string>(row[column + "__blob"])).RootElement;
+        JsonElement.Parse(Assert.IsType<string>(row[column + "__blob"]));
 
     private static string[] ColumnsOf(TableEntity row, string baseColumn) =>
         row.Keys.Where(k => k.StartsWith(baseColumn + "__", StringComparison.Ordinal)).ToArray();
