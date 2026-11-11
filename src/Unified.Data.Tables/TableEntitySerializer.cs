@@ -183,6 +183,20 @@ public static class TableEntitySerializer
         "return it. Declare the owning property with a type a read can create (the struct itself rather than its " +
         "nullable form, or a class), or initialise the property with an instance in the constructor. Nothing was stored.";
 
+    /// <summary>
+    /// The message for a <see cref="TableBlobContent"/> held by <paramref name="property"/>, which a read
+    /// does not give a <see cref="TableBlobContent"/> back to: it is not declared as one (it can only be
+    /// <see cref="object"/>, since the content type is sealed).
+    /// </summary>
+    internal static string BlobContentInAnotherType(string column, PropertyInfo property)
+    {
+        var owner = (property.ReflectedType ?? property.DeclaringType)?.Name;
+        var name = owner is null ? property.Name : $"{owner}.{property.Name}";
+        return $"'{column}' holds a TableBlobContent, but {name} is declared as {property.PropertyType.Name}: a read gives a " +
+               "TableBlobContent back only to a property declared as TableBlobContent, and would download this blob as a value " +
+               $"that {name} cannot take, so no read of the row could return it. Declare {name} as TableBlobContent. Nothing was stored.";
+    }
+
     /// <summary>Late-bound deserialize; requires the row to have been written with <c>persistType: true</c>.</summary>
     /// <remarks>
     /// This overload performs <b>no base-type check</b>: it resolves whatever assembly-qualified name
@@ -1361,6 +1375,29 @@ internal sealed class TableEntityValue
                 : TableEntitySerializer.UnreadableLargeValue(root, columnName));
     }
 
+    // The writer stores a TableBlobContent as a blob because of the value; a read decides by the declared
+    // type of the property it maps the column to, and only a property declared TableBlobContent gets the
+    // content back (any other has the blob downloaded as a value it cannot take). So a content is stored
+    // only through such a property. (A column the read cannot resolve was refused by RefuseUnreadable.)
+    private static void RefuseContentReadAsAnotherType(FlattenState? state, string columnName)
+    {
+        if (state is not { RootType: { } root, Ctx.IsClone: false })
+            return;
+        PropertyInfo? target;
+#pragma warning disable CA1031 // RefuseUnreadable reports a column the read cannot resolve
+        try
+        {
+            target = TypeMetadataCache.ReadTarget(root, columnName);
+        }
+        catch (Exception)
+        {
+            return;
+        }
+#pragma warning restore CA1031
+        if (target is not null && target.PropertyType != typeof(TableBlobContent))
+            throw new NotSupportedException(TableEntitySerializer.BlobContentInAnotherType(columnName, target));
+    }
+
     private static string BlobName(ValueWriteContext ctx, FlattenState state, string columnName, string sha256) =>
         ValueOffloadCoordinator.BlobName(
             ctx.TableName ?? throw new InvalidOperationException("A blob offload write needs the table name."),
@@ -1388,6 +1425,7 @@ internal sealed class TableEntityValue
             return true;
         }
         RefuseUnreadable(state, columnName);
+        RefuseContentReadAsAnotherType(state, columnName);
         if (ctx.Offload is null)
             throw new OversizedValueException(columnName, blob.IsSealed ? blob.Length : 0,
                 "a TableBlobContent is always stored in blob storage and blob offload is not configured");
