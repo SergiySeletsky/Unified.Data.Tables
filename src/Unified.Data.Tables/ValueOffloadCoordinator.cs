@@ -281,8 +281,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// Makes every pending blob exist: one with the same name and hash is touched (refreshing its
     /// <c>Last-Modified</c>) and its bytes are not sent again; an absent one is uploaded create-only
     /// through a read that verifies the bytes still match what was prepared. Each
-    /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob
-    /// stays bound there, and the property it was written from gets a content bound to this one.
+    /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob (or
+    /// a blob of the same name through another blob store) stays bound there, and the property it was
+    /// written from gets a content bound to this one.
     /// An upload reads a content's source, and a content is bound, while this write holds the content,
     /// so concurrent writes of one content take turns; a caller's seekable stream is put back where the
     /// content starts after every upload, whether it succeeded or not.

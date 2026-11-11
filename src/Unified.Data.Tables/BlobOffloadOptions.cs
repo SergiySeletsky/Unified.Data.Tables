@@ -61,6 +61,21 @@ public sealed class BlobOffloadOptions
     /// not modified within this grace, and leaves a recently touched one for
     /// <c>SweepOrphanBlobsAsync</c>. Keep it longer than a write takes from its blob touch to its row commit.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The grace is not a delay after the change: a replaced or deleted blob that was last written or
+    /// touched longer ago than the grace is deleted at once. The grace is counted back from the storage
+    /// service's time of the commit (the <c>Date</c> of its response, which has one-second resolution, or
+    /// else the blob service's time), not from the client's clock, which is used only when neither is
+    /// known.
+    /// </para>
+    /// <para>
+    /// A grace of zero, or below one second, protects nothing: a blob that another writer touched in the
+    /// same second as the commit, and is about to reference, can be deleted under it. Such values are for
+    /// tests only. <see cref="TimeSpan.MaxValue"/> switches the cleanup after writes and deletes off:
+    /// every replaced or released blob is left to <c>SweepOrphanBlobsAsync</c>.
+    /// </para>
+    /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
     public TimeSpan CleanupGrace
     {

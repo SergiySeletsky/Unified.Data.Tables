@@ -18,9 +18,24 @@ namespace Unified.Data.Tables;
 /// <para>
 /// One content may be assigned to several properties or entities, and a content read from one row may
 /// be written into another: every row gets a blob of its own. A content that already streams a blob
-/// keeps streaming that one. When it is written somewhere else, the property that was written is
-/// given a new <see cref="TableBlobContent"/> that streams the blob of its own row, so the entity it
-/// came from (and any cached copy of it) is not affected by what later happens to the other row.
+/// keeps streaming that one, through the store it was read or written through. When it is written
+/// somewhere else (another row, or the same row through another store, whose container holds a blob
+/// of the same name), the property that was written is given a new <see cref="TableBlobContent"/> that
+/// streams the blob of its own row in its own store, so the entity it came from (and any cached copy of
+/// it) is not affected by what later happens to the other blob. A content read by a store without blob
+/// offload is the exception: it becomes readable through the store that saves it to its own row.
+/// </para>
+/// <para>
+/// A property whose owner the entity holds by value (a struct) cannot be given a new content: it keeps
+/// its content object when the entity is written into another row. The row written still references a
+/// blob of its own, but the written entity, and the store's cached copy of it, go on streaming the blob
+/// of the row the content came from until the entity is read from the table.
+/// </para>
+/// <para>
+/// When the blob of a content is gone (the row was replaced or deleted since the entity was read,
+/// perhaps by another process), <see cref="OpenReadAsync"/> throws
+/// <see cref="TableValueIntegrityException"/>, and the store that returned the entity stops answering
+/// that row from its cache: reading the entity again returns the current row.
 /// </para>
 /// </remarks>
 [System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1001:Types that own disposable fields should be disposable",
@@ -87,7 +102,12 @@ public sealed class TableBlobContent
     /// <exception cref="InvalidOperationException">The content was created from a stream that has not been written yet.</exception>
     public string Sha256 => sha256 ?? throw UnknownUntilWritten("SHA-256");
 
-    /// <summary>The MIME type the blob is stored with, e.g. <c>image/png</c>.</summary>
+    /// <summary>The MIME type recorded in the row for this content, e.g. <c>image/png</c>.</summary>
+    /// <remarks>
+    /// The blob's own <c>Content-Type</c> header is set when its bytes are first uploaded. Saving the same
+    /// bytes again into the same property with another type changes the type recorded in the row (and
+    /// this property of a later read) but not the header of the existing blob.
+    /// </remarks>
     public string ContentType { get; }
 
     /// <summary>
@@ -99,11 +119,21 @@ public sealed class TableBlobContent
     /// <para>
     /// A seekable stream is read from the position it had when the content was first written, and the
     /// library puts it back there whenever it is done reading it (after hashing, after an upload, and
-    /// after a write that failed or was cancelled). So a write that fails can be retried with the same
-    /// content, and a retry that creates a new content over the same stream (for example inside a
-    /// <c>MutateAsync</c> delegate that runs again after a conflict) stores the same bytes. A stream
-    /// that can no longer be put back (seeking throws, or it was disposed) makes the content, and any
-    /// new content over that stream, throw <see cref="InvalidOperationException"/> when written.
+    /// after a write that failed or was cancelled). So a write that fails before its upload finished can
+    /// be retried with the same content, and a retry that creates a new content over the same stream (for
+    /// example inside a <c>MutateAsync</c> delegate that runs again after a conflict) stores the same
+    /// bytes. A stream that can no longer be put back (seeking throws, or it was disposed) makes the
+    /// content, and any new content over that stream, throw <see cref="InvalidOperationException"/> when
+    /// written.
+    /// </para>
+    /// <para>
+    /// Once an attempt has uploaded the content's blob, the content streams that blob and no longer reads
+    /// the stream (seekable or not): a retry with the same content, for example after the row write
+    /// failed, reuses that blob. So the retry has
+    /// to come before the blob is collected (by an orphan sweep whose age has passed, or a partition
+    /// delete's cleanup); after that the write throws <see cref="TableValueIntegrityException"/> saying
+    /// that the blob this content was uploaded to is gone, nothing is written, and the content must be
+    /// created again (over the same seekable stream, which stands where the content started).
     /// </para>
     /// <para>
     /// A non-seekable stream is copied to a temporary file once. A write that fails releases that copy,
@@ -164,7 +194,11 @@ public sealed class TableBlobContent
     /// The content was created from a stream and has not been written yet, or can no longer be written
     /// or read because a write of it failed (see <see cref="FromStream"/>).
     /// </exception>
-    /// <exception cref="TableValueIntegrityException">The blob is missing (the row was replaced or deleted since the entity was read).</exception>
+    /// <exception cref="TableValueIntegrityException">
+    /// The blob is missing (the row was replaced or deleted since the entity was read). The store that
+    /// returned the entity no longer answers that row from its cache, so reading the entity again returns
+    /// the current row.
+    /// </exception>
     public async Task<Stream> OpenReadAsync(CancellationToken ct = default)
     {
         if (bytes is not null)
