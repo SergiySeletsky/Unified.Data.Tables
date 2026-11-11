@@ -25,6 +25,10 @@ public sealed class TableBlobContent
 
     private const string NotRewindable = "its source stream can no longer be put back where the content starts";
 
+    // Why a sealed content has nothing left it could be uploaded from.
+    private const string TemporaryCopyReleased =
+        "it was created from a non-seekable stream, and its temporary copy was released by a failed write";
+
     private readonly byte[]? bytes;
     private long length;
     private string? sha256;
@@ -58,10 +62,13 @@ public sealed class TableBlobContent
     /// </summary>
     /// <remarks>
     /// A write that fails can be retried with the same content when the stream is seekable: every
-    /// attempt reads it again from the position it had at the first one. A stream that cannot be read
-    /// again (it is not seekable, or it cannot be put back) and was partly read by a failed write makes
-    /// the content unusable: every later write of it throws <see cref="InvalidOperationException"/>, and
-    /// the content has to be created again.
+    /// attempt reads it again from the position it had at the first one. A non-seekable stream is
+    /// copied to a temporary file once, and a write that fails releases that copy, so its content
+    /// cannot be written again: use a seekable stream (or <see cref="FromBytes"/>) for content whose
+    /// write may be retried, for example by <c>MutateAsync</c> after a conflict. A content that can no
+    /// longer be written (its temporary copy was released, or its stream was partly read by a failed
+    /// write and cannot be put back) makes every later write of it throw
+    /// <see cref="InvalidOperationException"/> before anything is uploaded; create it again from the source.
     /// </remarks>
     /// <param name="content">A readable stream.</param>
     /// <param name="contentType">The MIME type to store the blob with.</param>
@@ -104,7 +111,7 @@ public sealed class TableBlobContent
         if (open is null)
             throw new InvalidOperationException(
                 sourceLost is not null ? $"This TableBlobContent cannot be read: {sourceLost}. Create the content again from the source."
-                : Abandoned ? "This TableBlobContent was created from a non-seekable stream, and its temporary copy was released when a write failed before uploading it. Create it again from the source."
+                : Abandoned ? $"This TableBlobContent cannot be read: {TemporaryCopyReleased}. Create the content again from the source."
                 : "A TableBlobContent created from a stream can be read once the entity has been written.");
 
         var name = column ?? BoundPath!;
@@ -237,7 +244,8 @@ public sealed class TableBlobContent
 
     /// <summary>
     /// Refuses a content that can no longer be written, before anything of it is read or uploaded: one
-    /// whose source was partly read by a failed write and cannot be read again from where the content starts.
+    /// whose source was partly read by a failed write and cannot be read again from where the content
+    /// starts, or one whose temporary copy a failed write released (<see cref="Abandoned"/>).
     /// </summary>
     /// <param name="columnName">The column the content is being written to.</param>
     /// <exception cref="InvalidOperationException">The content has to be created again from its source.</exception>
@@ -245,10 +253,39 @@ public sealed class TableBlobContent
     {
         if (sourceLost is not null)
             throw new InvalidOperationException(NotWritable(columnName, sourceLost));
+        if (Abandoned)
+            throw new InvalidOperationException(NotWritable(columnName, TemporaryCopyReleased)
+                + " Content created from a seekable stream or from bytes can be written again after a failed write.");
     }
 
     private static string NotWritable(string columnName, string reason) =>
         $"The TableBlobContent of '{columnName}' can no longer be written: {reason}. Create the content again from the source.";
+
+    /// <summary>
+    /// Opens the bytes a write uploads, decided at the moment of the upload rather than when the write
+    /// was planned: the in-memory bytes; the prepared source (the caller's seekable stream, or the
+    /// temporary copy), read from where the content starts; or, once the content is bound, the blob it
+    /// streams. So an upload that follows the one that bound the content (the same content on another
+    /// entity of a batch) still has something to read.
+    /// </summary>
+    /// <param name="columnName">The column the content is being written to, named by a failure.</param>
+    /// <param name="ct">Cancels opening the blob of a bound content.</param>
+    /// <returns>A stream the caller disposes; disposing it never closes the source.</returns>
+    /// <exception cref="InvalidOperationException">The content can no longer be written (see <see cref="ThrowIfNotWritable"/>).</exception>
+    internal async Task<Stream> OpenUploadSourceAsync(string columnName, CancellationToken ct)
+    {
+        if (bytes is not null)
+            return new MemoryStream(bytes, writable: false);
+        if (Source is { } source)
+        {
+            RewindSource(columnName);
+            // The caller (or this content, for its temporary copy) owns the stream: hand out a non-closing view.
+            return new HashingReadStream(source, null, null, reason => new InvalidOperationException(reason), leaveOpen: true);
+        }
+
+        ThrowIfNotWritable(columnName);
+        return await OpenReadAsync(ct).ConfigureAwait(false);
+    }
 
     /// <summary>Points the content at the blob it was written to; reads now stream that blob.</summary>
     /// <param name="path">The blob name.</param>
@@ -278,8 +315,8 @@ public sealed class TableBlobContent
 
     /// <summary>
     /// Deletes the temporary copy a write made of a non-seekable source, when the write failed before
-    /// the content was bound to its blob. The content stays sealed: a later write finds its blob if the
-    /// upload got that far, and otherwise reports that the content can no longer be read.
+    /// the content was bound to its blob. The content stays sealed but has nothing left to be uploaded
+    /// from: every later write refuses it (<see cref="ThrowIfNotWritable"/>) before anything is uploaded.
     /// </summary>
     internal void ReleasePrepared()
     {
@@ -290,7 +327,10 @@ public sealed class TableBlobContent
         }
     }
 
-    /// <summary>True when the temporary copy of a non-seekable source was released before being uploaded.</summary>
+    /// <summary>
+    /// True when the temporary copy of a non-seekable source was released by a write that failed before
+    /// the content was bound to its blob. Such a content can be neither written nor read any more.
+    /// </summary>
     internal bool Abandoned { get; private set; }
 
     private void ReleaseSpool()

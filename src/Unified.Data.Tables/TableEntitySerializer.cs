@@ -1135,27 +1135,10 @@ internal sealed class TableEntityValue
         var st = state!.Value;
         var reference = new Providers.BlobReference(
             BlobName(ctx, st, columnName, blob.Sha256), blob.Sha256, blob.Length, blob.ContentType, "binary");
-        st.AddPending(new PendingBlob(columnName, reference, null, OpenSource(blob)) { Content = blob });
+        // The content says what to upload from when the upload runs (its prepared source, or the blob it is bound to by then).
+        st.AddPending(new PendingBlob(columnName, reference, null, c => blob.OpenUploadSourceAsync(columnName, c)) { Content = blob });
         largeCells = [new(columnName + SplitCodec.BlobSuffix, reference.ToJson())];
         return true;
-    }
-
-    // The bytes of in-memory content, the (rewound) prepared stream, or the blob the content is bound to.
-    private static Func<CancellationToken, Task<Stream>> OpenSource(TableBlobContent blob)
-    {
-        if (blob.Bytes is { } bytes)
-            return _ => Task.FromResult<Stream>(new MemoryStream(bytes, writable: false));
-        if (blob.Source is { } source)
-        {
-            var origin = blob.SourceOrigin;
-            return _ =>
-            {
-                if (source.CanSeek) source.Position = origin;
-                // The caller (or the content's spool) owns the stream: hand out a non-closing view.
-                return Task.FromResult<Stream>(new HashingReadStream(source, null, null, r => new InvalidOperationException(r), leaveOpen: true));
-            };
-        }
-        return blob.OpenReadAsync;
     }
 
     // A TableBlobContent is stored as its own blob, never inside a collection or a JSON-stored object.

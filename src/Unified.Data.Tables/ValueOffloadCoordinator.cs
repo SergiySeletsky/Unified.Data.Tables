@@ -51,11 +51,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// An attempt that fails or is cancelled never leaves a later one the unread tail of a source. A
     /// seekable source is put back where its content starts, so a retry reads all of it; one that cannot
     /// be put back, and a forward-only one that was partly consumed, make the content unusable: this and
-    /// every later write of it throws before anything is read or uploaded.
+    /// every later write of it throws before anything is read or uploaded. So does a content whose
+    /// temporary copy an earlier failed write released (<see cref="ReleasePrepared"/>).
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// A content can no longer be written: its source was partly read by a failed write and cannot be
-    /// read again from where the content starts.
+    /// read again from where the content starts, or its temporary copy was released by a failed write.
     /// </exception>
     internal async Task PrepareAsync(object entity, CancellationToken ct)
     {
@@ -235,6 +236,8 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// <summary>
     /// Releases the temporary copies <see cref="PrepareAsync"/> made for the contents of
     /// <paramref name="entity"/> that were not bound to a blob (the write failed before uploading them).
+    /// Such a content has nothing left to be uploaded from: <see cref="PrepareAsync"/> refuses it in every
+    /// later write. A content from a seekable stream or from bytes is not affected and can be written again.
     /// </summary>
     internal static void ReleasePrepared(object entity)
     {

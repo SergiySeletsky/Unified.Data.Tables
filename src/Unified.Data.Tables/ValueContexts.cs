@@ -62,7 +62,10 @@ internal sealed class ValueReadContext
 /// <param name="Column">The flattened base column (<c>Inner_Body</c>).</param>
 /// <param name="Reference">The reference the row holds; its path is the blob name.</param>
 /// <param name="ContentEncoding">The blob's <c>Content-Encoding</c> (<c>gzip</c>), or null.</param>
-/// <param name="OpenSource">Opens the bytes to upload; the stream is disposed after the upload.</param>
+/// <param name="OpenSource">
+/// Opens the bytes to upload; the stream is disposed after the upload. It is called when the upload
+/// runs, and a <see cref="TableBlobContent"/> decides then what it is read from.
+/// </param>
 internal sealed record PendingBlob(
     string Column,
     BlobReference Reference,
