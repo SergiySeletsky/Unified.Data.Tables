@@ -28,7 +28,8 @@ copy-pasted into each one.
 - **Large values & blob offload** — `[TableValueSplit]` stores strings and byte arrays far beyond the
   64&nbsp;KB cell limit as split cells, continuation rows or an Azure Blob, SHA-256 verified on read;
   `TableBlobContent` stores files as blobs with a lazy stream; an optional hosted sweep removes orphan
-  blobs. Opt-in; types that use neither are unchanged (roll forward only once a type opts in).
+  blobs. Opt-in; types that use neither are stored exactly as before (roll forward only once a type
+  opts in).
 - **Configurable caching** — reads are served from `IMemoryCache` per a registration-time `CachePolicy`
   (`Sliding`, `Absolute`, or `Disabled` — per entity type or globally); writes keep the entity cache
   coherent and invalidate the relevant query caches automatically.
@@ -144,11 +145,17 @@ Within one process the cache follows the writes made through it. A read that is 
 or delete of the same entity completes may still return the version it fetched, but it does not leave
 that version in the cache: a read that starts after the write or delete has returned is not served it.
 The same holds for the cached `QueryAsync(partition)` lists, and across all stores of one entity type
-that share an `IMemoryCache` (the DI registration shares one). Two limits remain. A write made by
-another process, or through a store over another `IMemoryCache`, is not seen until the cache entry
-expires, hence the note above. And two writes of the same entity that run at the same time each cache
-their own version when they return, so the earlier one's can be the one that stays: use ETags
-(`ConcurrencyMode.Strict`, `MutateAsync`) for an entity that several callers write at once.
+that share an `IMemoryCache` (the DI registration shares one). What that does not cover:
+
+- a write made by another process, or through a store over another `IMemoryCache`: it is not seen until
+  the cache entry expires, hence the note above;
+- two writes of the same entity that run at the same time: each caches its own version when it returns,
+  so the earlier one's can be the one that stays. Use ETags (`ConcurrencyMode.Strict`, `MutateAsync`)
+  for an entity that several callers write at once;
+- a single-entity write or delete that fails (a timeout, say): it does no cache maintenance, even when
+  the service has applied it. Only a conflict on an update or upsert evicts the entry;
+- a write of an entity that does not round-trip through the serializer (it could not be read back
+  either): it caches nothing and leaves the cached copy of the version it replaced.
 
 ### 3. Use it
 

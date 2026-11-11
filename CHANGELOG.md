@@ -187,8 +187,9 @@ Lossless storage of large values, opt-in per property.
   entity has completed since the read began, and a list only if nothing was written in its partition
   (anywhere in the table, for the whole-table list). After such an overlap the next read goes to the
   table; nothing else changes. Writes made by another process, or through another `IMemoryCache`, are
-  still not seen until the entry expires, and two concurrent writes of one entity can still leave the
-  earlier one's version cached.
+  still not seen until the entry expires; two concurrent writes of one entity can still leave the
+  earlier one's version cached; and a write of an entity that cannot be copied for the cache still
+  leaves the cached copy of the version it replaced.
 - The entity cache holds one entry per row, however its id is spelled. `"a"` and `"a|a"` address the
   same row but had separate entries, so a write or delete under one spelling left the entry cached under
   the other, and `DeletePartitionAsync` did not evict an entity whose id has one segment: it stayed
