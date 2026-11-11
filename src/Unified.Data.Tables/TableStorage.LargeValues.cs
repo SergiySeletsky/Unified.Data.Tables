@@ -10,35 +10,51 @@ namespace Unified.Data.Tables;
 // ({RowKey}~0001...) in ONE entity-group transaction, and reads hide continuation rows and reassemble
 // the value before deserializing. Every branch here is reached only for a split-aware T (one with a
 // [TableValueSplit] member), except the IsPartRow skip on reads, which is a no-op for any other type.
+//
+// Whose row is it? A continuation row is the entity's own when the stored primary declares it, or when
+// its _SplitOf cell names the entity (a leftover: the primary was deleted or replaced by a writer that
+// does not know continuation rows, a partition delete stopped halfway, or a delete raced a write). A
+// write replaces its own rows and deletes the ones it no longer needs; any other row at a continuation
+// key is foreign and is never overwritten. Leftovers are looked for only when one is in the way.
 public partial class TableStorage<T>
 {
     /// <summary>True when <typeparamref name="T"/> has a member that may be stored as split cells.</summary>
     private static readonly bool LargeValueAware = TypeMetadataCache.IsLargeValueAware(typeof(T));
 
-    /// <summary>How many times a write that lost its condition to a concurrent writer re-reads and retries.</summary>
-    private const int MaxLargeWriteAttempts = 3;
+    /// <summary>
+    /// How many times in all a write, a delete or a batch transaction that keeps losing its condition to
+    /// concurrent writers is attempted (the number every provider uses).
+    /// </summary>
+    private const int MaxLargeWriteAttempts = LargeValueTable.MaxWriteAttempts;
+
+    /// <summary>Waits between two attempts of a write that lost a race (for tests).</summary>
+    internal Func<TimeSpan, CancellationToken, Task> LargeValueRetryDelay
+    {
+        get => large.RetryDelay;
+        set => large.RetryDelay = value;
+    }
 
     // _SplitParts says how many continuation rows the stored row owns, _SplitOf marks the row itself as
     // one; the __blob reference columns are selected now so the offload tier can read them from the same
-    // point read.
+    // point read. The row's version is not a column and is never selected: the service returns it with
+    // every entity (and as the response's ETag header), and may refuse a $select that names odata.etag.
     private static readonly string[] PriorSelect =
     [
         SystemColumnNames.SplitParts,
         SystemColumnNames.SplitOf,
-        "odata.etag",
         .. TypeMetadataCache.LargeValueColumns(typeof(T)).Select(c => c + SplitCodec.BlobSuffix),
     ];
-
-    private static readonly string[] KeysOnly = ["PartitionKey", "RowKey"];
 
     private static readonly string[] PartKeys = ["PartitionKey", "RowKey", SystemColumnNames.SplitOf];
 
     /// <summary>
-    /// The version a split-aware write produced, whether the written entity may be cached under it, and
-    /// the service time of the commit (its response <c>Date</c>; null when unknown). A transaction's
-    /// version comes from a separate re-read that may already see another writer's row, so only a single
-    /// call's own response version is cacheable. The cleanup of released blobs is timed by the commit,
-    /// not by that later re-read or the client clock.
+    /// The version a split-aware write produced (<c>default</c> when its response did not carry one),
+    /// whether the written entity is cached under it, and the service time of the commit (its response
+    /// <c>Date</c>; null when unknown). The version is always the write's own: the ETag of the single
+    /// call's response, or of the transaction's sub-response for the primary row. It is never read back
+    /// afterwards, because a later read can already return another writer's version. An entity written
+    /// through a transaction is not cached (the next read fetches it). The cleanup of released blobs is
+    /// timed by the commit, not by the client clock.
     /// </summary>
     private readonly record struct LargeWriteResult(ETag ETag, bool Cacheable, DateTimeOffset? CommittedAt);
 
@@ -55,29 +71,69 @@ public partial class TableStorage<T>
         Replace,
     }
 
-    /// <summary>One point read of the stored row's ETag and part count; null when the row does not exist.</summary>
-    private async Task<PriorRow?> ReadPriorAsync(string pk, string rk, CancellationToken ct)
+    /// <summary>
+    /// The row at an entity's keys as the point read before a write or delete returns it (projected onto
+    /// <see cref="PriorSelect"/>), with its version. A continuation row has none here: nothing is ever
+    /// written or deleted on condition of it.
+    /// </summary>
+    private readonly record struct StoredRow(TableEntity Row, ETag ETag);
+
+    /// <summary>
+    /// One point read of the row at these keys; null when there is none. An entity row's version is its
+    /// own ETag (the service sends it with every entity, whatever the projection) or, when the row
+    /// carries none, the ETag header of the response.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The row exists and neither it nor the response carries a version: a replace or delete of it could
+    /// only be unconditional, so nothing is written.
+    /// </exception>
+    private async Task<StoredRow?> ReadStoredAsync(string pk, string rk, CancellationToken ct)
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, PriorSelect, ct);
-        // A continuation row is not an entity: addressing one by id finds nothing.
-        if (!response.HasValue || response.Value is null || SplitRowLayout.IsPartRow(response.Value))
+        if (!response.HasValue || response.Value is not { } row)
             return null;
-        return new PriorRow(response.Value.ETag, SplitRowLayout.PartCount(response.Value), BlobPaths(response.Value));
+        if (SplitRowLayout.IsPartRow(row))
+            return new StoredRow(row, default);
+
+        var etag = row.ETag;
+        if (!IsVersion(etag))
+            etag = HeaderETag(RawResponse(response)) ?? default;
+        if (!IsVersion(etag))
+            throw new InvalidOperationException(
+                $"The stored version (ETag) of {typeName} '{pk}{Separator}{rk}' could not be read: neither the row nor the response "
+                + "of its point read carried one. Nothing was written: a replace or delete without a version would be unconditional.");
+        return new StoredRow(row, etag);
     }
 
-    // The blob names a stored row references; a malformed reference is logged and skipped.
-    private IReadOnlyList<string> BlobPaths(TableEntity row) =>
+    /// <summary>
+    /// One point read of the stored row's version, part count and blob references; null when the row
+    /// does not exist.
+    /// </summary>
+    private async Task<PriorRow?> ReadPriorAsync(string pk, string rk, CancellationToken ct)
+    {
+        // A continuation row is not an entity: addressing one by id finds nothing.
+        if (await ReadStoredAsync(pk, rk, ct) is not { } stored || SplitRowLayout.IsPartRow(stored.Row))
+            return null;
+        return new PriorRow(stored.ETag, SplitRowLayout.PartCount(stored.Row), BlobPaths(stored.Row, pk, rk));
+    }
+
+    // A version a conditional write can name: not empty, and not the "any version" wildcard.
+    private static bool IsVersion(ETag etag) => etag != ETag.All && !string.IsNullOrEmpty(etag.ToString());
+
+    // The blob names a stored row references; a malformed reference is logged and skipped. The keys are
+    // passed in: the projected row does not carry them.
+    private IReadOnlyList<string> BlobPaths(TableEntity row, string pk, string rk) =>
         LargeValueTable.BlobPaths(row, (column, ex) =>
             logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: ignoring a malformed blob reference in {Column}",
-                typeName, row.PartitionKey, row.RowKey, column));
+                typeName, pk, rk, column));
 
     /// <summary>
     /// Writes a split-aware entity: one SDK call when the value fits one row and no continuation rows
     /// must go, otherwise one transaction holding the primary, its parts and the deletes of stale parts.
     /// The blobs the row references are uploaded (create-only) before the entity write; once the write
     /// succeeded, the blobs the replaced row referenced and the new one does not are deleted (best
-    /// effort). A failed write deletes no blob. Returns the new ETag (<c>default</c> when it could not be
-    /// read back) and whether it is the write's own response version.
+    /// effort). A failed write deletes no blob. Returns the version the write itself produced
+    /// (<c>default</c> when its response did not carry one) and whether the entity is cached under it.
     /// </summary>
     private async Task<LargeWriteResult> WriteLargeAsync(T entity, LargeWriteKind kind, ETag ifMatch, CancellationToken ct)
     {
@@ -103,9 +159,20 @@ public partial class TableStorage<T>
         // A Replace without one (last-writer-wins) and an Upsert retry on a lost race instead.
         var strict = kind == LargeWriteKind.Replace && ifMatch != ETag.All;
         RequestFailedException? lost = null;
+        // Once the key of a new continuation row turned out to be held by a leftover continuation row of
+        // this very entity, every attempt is planned over the entity's own continuation rows as they are
+        // then (ownParts: the rows just read for the next attempt, read again for any later one).
+        var takeBack = false;
+        Dictionary<string, ETag>? ownParts = null;
+        var lostRace = false;
 
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
+            // After a lost race: a short, growing, jittered pause, so that writers that collided do not
+            // collide again in step. (Taking an own leftover back is no race, and does not wait.)
+            if (lostRace)
+                await large.WaitBeforeRetryAsync(attempt, ct);
+            lostRace = false;
             var prior = kind == LargeWriteKind.Create ? null : await ReadPriorAsync(pk, rk, ct);
             if (kind == LargeWriteKind.Replace)
             {
@@ -115,26 +182,48 @@ public partial class TableStorage<T>
                     throw new ConcurrencyConflictException(typeName, entity.Id, null);
             }
 
-            var plan = await large.PlanAsync(entity, pk, rk, prior?.Parts ?? 0, c => ExistingPartKeysAsync(pk, rk, c), ct);
+            var own = ownParts ?? (takeBack ? await OwnPartsAsync(pk, rk, ct) : null);
+            ownParts = null;
+            var plan = own is null
+                ? await large.PlanAsync(entity, pk, rk, prior?.Parts ?? 0, c => ExistingPartKeysAsync(pk, rk, c), ct)
+                : large.PlanOverOwnParts(entity, pk, rk, prior?.Parts ?? 0, own.Keys);
             // Every blob exists (uploaded, or touched when already there) before the row that references it.
             await large.UploadAsync(plan, ct);
             // null = insert (no stored row); otherwise replace conditional on the version just read.
             ETag? condition = prior is null ? null : strict ? ifMatch : prior.ETag;
+            var actions = TransactionActions(plan, condition, own, pk);
 
             LargeWriteResult result;
             try
             {
-                result = await SubmitPlanAsync(plan, condition, pk, rk, ct);
+                result = actions is null ? await WriteRowAsync(plan.Primary, condition, ct) : await SubmitAsync(actions, ct);
             }
-            catch (RequestFailedException ex) when (LostCondition(ex, kind))
+            catch (RequestFailedException ex) when (actions is not null && TakenPartKey(ex, actions) is { } taken)
             {
-                if (kind == LargeWriteKind.Create)
-                    throw new DuplicateKeyException(typeName, entity.Id, ex);
-                // A strict replace may not retry its own condition; a vanished row surfaces as the service's
-                // own 404. A stale part removed meanwhile (404 past action 0) is re-planned by any write.
-                if (strict && IsPrimaryFailure(ex))
-                    throw ex.Status == 404 ? ex : new ConcurrencyConflictException(typeName, entity.Id, ex);
+                // A row holds the key of a new continuation row. A continuation row of this very entity
+                // is its own, left behind: the write is planned again over the entity's own rows. Any
+                // other row is foreign: the write is refused and that row is left as it is.
+                ownParts = await OwnPartsAsync(pk, rk, ct);
+                if (!ownParts.ContainsKey(taken))
+                    throw LargeValueTable.ContinuationKeyTaken(pk, rk, taken, ex);
+                takeBack = true;
                 lost = ex;
+                continue;
+            }
+            catch (RequestFailedException ex) when (LostRace(ex, kind))
+            {
+                if (IsPrimaryFailure(ex))
+                {
+                    if (kind == LargeWriteKind.Create)
+                        throw new DuplicateKeyException(typeName, entity.Id, ex);
+                    // A strict replace may not retry its own condition; a vanished row surfaces as the
+                    // service's own 404.
+                    if (strict)
+                        throw ex.Status == 404 ? ex : new ConcurrencyConflictException(typeName, entity.Id, ex);
+                }
+                // Any write plans again when a continuation row it counted on is gone or has changed.
+                lost = ex;
+                lostRace = true;
                 continue;
             }
 
@@ -142,7 +231,7 @@ public partial class TableStorage<T>
             // written again maps to the same name, which the new row still references). A committed write
             // is never reported as failed: a cancelled token only bounds how long its cleanup may take.
             if (prior is { Blobs.Count: > 0 })
-                await DeleteBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), result.CommittedAt, ct);
+                await DeleteBlobsAsync(pk, rk, prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), result.CommittedAt, ct);
             return result;
         }
 
@@ -153,57 +242,101 @@ public partial class TableStorage<T>
     private async Task<IReadOnlyList<string>> ExistingPartKeysAsync(string pk, string rk, CancellationToken ct) =>
         (await QueryPartsAsync(pk, rk, PartKeys, ct)).Select(p => p.RowKey).ToList();
 
-    private async Task<LargeWriteResult> SubmitPlanAsync(
-        LargeValueWritePlan plan, ETag? condition, string pk, string rk, CancellationToken ct)
+    /// <summary>
+    /// The entity's own continuation rows that exist now, whether its primary declares them or not (one
+    /// range query: the rows in its continuation-row key range whose <c>_SplitOf</c> names it), each with
+    /// the version it was read at.
+    /// </summary>
+    private async Task<Dictionary<string, ETag>> OwnPartsAsync(string pk, string rk, CancellationToken ct)
     {
-        var stale = plan.StalePartRowKeys;
-        if (plan.Parts.Count == 0 && stale.Count == 0)
-        {
-            var response = condition is ETag c
-                ? await client.UpdateEntityAsync(plan.Primary, c, TableUpdateMode.Replace, ct)
-                : await client.AddEntityAsync(plan.Primary, ct);
-            return new LargeWriteResult(HeaderETag(response) ?? plan.Primary.ETag, Cacheable: true, HeaderDate(response));
-        }
-
-        var actions = new List<TableTransactionAction>(1 + plan.Parts.Count + stale.Count)
-        {
-            condition is ETag c2
-                ? new TableTransactionAction(TableTransactionActionType.UpdateReplace, plan.Primary, c2)
-                : new TableTransactionAction(TableTransactionActionType.Add, plan.Primary),
-        };
-        AddPartActions(actions, plan);
-        foreach (var partKey in stale)
-            actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, partKey), ETag.All));
-
-        Response<IReadOnlyList<Response>> committed;
-        try
-        {
-            committed = await client.SubmitTransactionAsync(actions, ct);
-        }
-        catch (RequestFailedException ex) when (TakenPartKey(ex, actions) is { } taken)
-        {
-            throw LargeValueTable.ContinuationKeyTaken(pk, rk, taken, ex);
-        }
-        // Taken from the commit itself, before the (slower) re-read below.
-        var committedAt = HeaderDate(RawResponse(committed));
-        // Transaction sub-responses are not correlated back to their actions: re-read the version. The
-        // write has committed, so the caller's token no longer applies.
-        return new LargeWriteResult(await ReadETagAfterCommitAsync(pk, rk), Cacheable: false, committedAt);
+        var own = new Dictionary<string, ETag>(StringComparer.Ordinal);
+        foreach (var part in await QueryPartsAsync(pk, rk, PartKeys, ct))
+            own[part.RowKey] = part.ETag;
+        return own;
     }
 
-    // A continuation row the stored row declares is the entity's own and is replaced; a new one is an
-    // insert, so a row already at its key (not the entity's) fails the transaction instead of being lost.
-    private static void AddPartActions(List<TableTransactionAction> actions, LargeValueWritePlan plan)
+    /// <summary>
+    /// The actions of the transaction that applies <paramref name="plan"/>: the primary first (so its
+    /// sub-response is the first), then its continuation rows and the deletes of the ones it no longer
+    /// needs. Null when one SDK call does it: no continuation row to write and none to delete.
+    /// </summary>
+    private static List<TableTransactionAction>? TransactionActions(
+        LargeValueWritePlan plan, ETag? condition, Dictionary<string, ETag>? own, string pk)
+    {
+        if (plan.Parts.Count == 0 && plan.StalePartRowKeys.Count == 0)
+            return null;
+        var actions = new List<TableTransactionAction>(1 + plan.Parts.Count + plan.StalePartRowKeys.Count)
+        {
+            condition is ETag c
+                ? new TableTransactionAction(TableTransactionActionType.UpdateReplace, plan.Primary, c)
+                : new TableTransactionAction(TableTransactionActionType.Add, plan.Primary),
+        };
+        AddPartActions(actions, plan, own, pk);
+        return actions;
+    }
+
+    // One SDK call: the insert, or the replace on condition of the version read.
+    private async Task<LargeWriteResult> WriteRowAsync(TableEntity primary, ETag? condition, CancellationToken ct)
+    {
+        var response = condition is ETag c
+            ? await client.UpdateEntityAsync(primary, c, TableUpdateMode.Replace, ct)
+            : await client.AddEntityAsync(primary, ct);
+        return new LargeWriteResult(HeaderETag(response) ?? primary.ETag, Cacheable: true, HeaderDate(response));
+    }
+
+    private async Task<LargeWriteResult> SubmitAsync(List<TableTransactionAction> actions, CancellationToken ct)
+    {
+        var committed = await client.SubmitTransactionAsync(actions, ct);
+        // The version is the one this transaction gave the primary: its own sub-response. The row is
+        // not read again: by then another writer may have committed, and its version on this writer's
+        // content would let the next optimistic update replace that writer's row without a conflict.
+        return new LargeWriteResult(PrimaryETag(committed), Cacheable: false, HeaderDate(RawResponse(committed)));
+    }
+
+    // The ETag of a committed transaction's sub-response for its first action, the primary row
+    // (sub-responses are in action order); default when the response carries none (a test double).
+    private static ETag PrimaryETag(Response<IReadOnlyList<Response>>? committed)
+    {
+        try
+        {
+            return committed?.Value is { Count: > 0 } responses ? HeaderETag(responses[0]) ?? default : default;
+        }
+        catch
+        {
+            return default;
+        }
+    }
+
+    // Appends a plan's continuation-row actions: the rows it writes, in order, then the deletes of the
+    // ones it no longer needs. A continuation row the stored row declares is the entity's own and is
+    // replaced. A new one is an insert, so a row already at its key fails the transaction instead of
+    // being lost. When the plan was made over the entity's own rows as they were read (own), each of
+    // those is replaced or deleted on condition of the version it was read at: a row that changed in
+    // between (it may be another writer's by now) fails the transaction instead of being overwritten.
+    private static void AddPartActions(
+        List<TableTransactionAction> actions, LargeValueWritePlan plan, Dictionary<string, ETag>? own, string pk)
     {
         for (var i = 0; i < plan.Parts.Count; i++)
         {
+            var part = plan.Parts[i];
+            actions.Add(ReadVersion(own, part.RowKey) is ETag version
+                ? new TableTransactionAction(TableTransactionActionType.UpdateReplace, part, version)
+                : new TableTransactionAction(
+                    plan.IsNewPart(i) ? TableTransactionActionType.Add : TableTransactionActionType.UpsertReplace, part));
+        }
+        foreach (var partKey in plan.StalePartRowKeys)
+        {
             actions.Add(new TableTransactionAction(
-                plan.IsNewPart(i) ? TableTransactionActionType.Add : TableTransactionActionType.UpsertReplace, plan.Parts[i]));
+                TableTransactionActionType.Delete, new TableEntity(pk, partKey), ReadVersion(own, partKey) ?? ETag.All));
         }
     }
 
-    // The key of the new continuation row a transaction failed on with 409 (another row holds it); null
-    // for any other failure. Only a primary or a new part is an insert, and the primary is never one here.
+    // The version one of the entity's own continuation rows was read at, when the plan was made over them.
+    private static ETag? ReadVersion(Dictionary<string, ETag>? own, string partKey) =>
+        own is not null && own.TryGetValue(partKey, out var version) && IsVersion(version) ? version : null;
+
+    // The key of the new continuation row a transaction failed on with 409 (a row already holds it); null
+    // for any other failure. Only a primary or a new part is an insert, and a primary is not a part row.
     private static string? TakenPartKey(RequestFailedException ex, List<TableTransactionAction> actions) =>
         ex.Status == 409
         && ex is TableTransactionFailedException { FailedTransactionActionIndex: int i }
@@ -214,30 +347,40 @@ public partial class TableStorage<T>
             : null;
 
     /// <summary>
-    /// Deletes blobs no row references any more, after the write or delete that released them has
-    /// committed, each on condition that it was not modified within the cleanup grace (a concurrent
-    /// writer that reuses the same content touches the blob before committing its row; the orphan sweep
-    /// collects a blob that really is unreferenced). Best effort: a failure is logged, never thrown. A
-    /// cancelled token gives it a few more seconds, then leaves the rest to the orphan sweep.
+    /// Deletes the blobs the row <paramref name="pk"/>|<paramref name="rk"/> no longer references, after
+    /// the write or delete that released them has committed, each on condition that it was not modified
+    /// within the cleanup grace (a concurrent writer that reuses the same content touches the blob before
+    /// committing its row; the orphan sweep collects a blob that really is unreferenced). Only the row's
+    /// own blobs go: a path outside its <c>{table}/{pk}/{rk}/</c> prefix (the row was copied from another
+    /// table or key and still referenced the source row's blob) is left alone. Best effort: a failure is
+    /// logged, never thrown. A cancelled token gives it a few more seconds, then leaves the rest to the
+    /// orphan sweep.
     /// </summary>
-    private Task DeleteBlobsAsync(IEnumerable<string> paths, DateTimeOffset? committedAt, CancellationToken ct) =>
-        large.DeleteReleasedBlobsAsync(paths, committedAt, LogBlobDeleteFailure, ct);
+    private Task DeleteBlobsAsync(string pk, string rk, IEnumerable<string> paths, DateTimeOffset? committedAt, CancellationToken ct) =>
+        large.DeleteReleasedBlobsAsync(pk, rk, paths, committedAt,
+            path => logger.LogDebug(
+                "{Type} {PartitionKey}|{RowKey}: blob {Blob} is not under this row's own prefix (the row was copied from another table or key); it is left alone",
+                typeName, pk, rk, path),
+            LogBlobDeleteFailure, ct);
 
     private void LogBlobDeleteFailure(string path, Exception ex) =>
         logger.LogWarning(ex, "{Type}: could not delete blob {Blob}; an orphan sweep will remove it", typeName, path);
 
     /// <summary>
-    /// After a partition's rows are deleted, deletes every blob stored under it (best effort), each on
-    /// condition that it was modified neither within the cleanup grace nor since it was listed, so a blob
-    /// a concurrent write has just touched for a new row survives. The deletion committed, so a cancelled
-    /// token does not fail it: cleanup gets a few more seconds, then leaves the rest to the orphan sweep.
+    /// After a partition's rows are deleted, deletes the blobs stored under it that no row of the
+    /// partition references now (best effort): the rows that are there once the deletes are done are
+    /// read again, so a row another writer created meanwhile keeps its blob however long the deletes
+    /// took. Each delete is on condition that the blob was modified neither within the cleanup grace nor
+    /// since it was listed, so a blob a concurrent write has just touched for a new row survives too. The
+    /// deletion committed, so a cancelled token does not fail it: cleanup gets a few more seconds (the
+    /// rows are read with the cleanup's own token), then leaves the rest to the orphan sweep.
     /// </summary>
     private Task DeletePartitionBlobsAsync(string partition, CancellationToken ct)
     {
         if (!LargeValueAware)
             return Task.CompletedTask;
-        return large.DeletePartitionBlobsAsync(partition,
-            ex => logger.LogWarning(ex, "{Type}: could not list the blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition),
+        return large.DeletePartitionBlobsAsync(partition, typeof(T), (select, c) => PartitionRowsAsync(partition, select, c),
+            ex => logger.LogWarning(ex, "{Type}: could not find the unreferenced blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition),
             LogBlobDeleteFailure, ct);
     }
 
@@ -287,41 +430,27 @@ public partial class TableStorage<T>
         return false;
     }
 
-    // The failures a concurrent writer causes: the insert found a row (409), the conditional replace
-    // found another version (412), or a row the write expected (the primary or a stale part) is gone (404);
-    // a retry re-reads the primary and re-queries the parts, so a part that is gone is not required again.
-    private static bool LostCondition(RequestFailedException ex, LargeWriteKind kind) => kind switch
-    {
-        LargeWriteKind.Create => ex.Status == 409 && IsPrimaryFailure(ex),
-        _ => ex.Status == 404 || (IsPrimaryFailure(ex) && ex.Status is 409 or 412),
-    };
+    // The failures a concurrent writer causes. On the primary (a single SDK call, or action 0): the
+    // insert found a row (409), the conditional replace found another version (412) or no row (404). On
+    // any other action: a continuation row the write counted on is gone (404: a stale one another writer
+    // removed, or one of the entity's own it was replacing or deleting) or has changed since it was read
+    // (412). A retry reads the primary and the continuation rows again, so a row that is gone is not
+    // required again.
+    private static bool LostRace(RequestFailedException ex, LargeWriteKind kind) =>
+        IsPrimaryFailure(ex)
+            ? kind == LargeWriteKind.Create ? ex.Status == 409 : ex.Status is 409 or 412 || IsMissingRow(ex)
+            : ex.Status == 412 || IsMissingRow(ex);
 
-    // A transaction fails at one action. Only the primary (action 0) is an insert or conditional
-    // replace, so a 409/412 is the primary's; a single SDK call is always the primary.
+    // A 404 that says a row is gone: the service's code for a missing entity ("ResourceNotFound";
+    // "EntityNotFound" is the other one it documents), or no code at all. A 404 that names anything
+    // else is no lost race: when the table itself is gone ("TableNotFound") reading again cannot help,
+    // and the caller must see the service's own error, not a concurrency conflict.
+    private static bool IsMissingRow(RequestFailedException ex) =>
+        ex.Status == 404 && (string.IsNullOrEmpty(ex.ErrorCode) || ex.ErrorCode is "ResourceNotFound" or "EntityNotFound");
+
+    // A transaction fails at one action; the primary is action 0, and a single SDK call is always the primary.
     private static bool IsPrimaryFailure(RequestFailedException ex) =>
         ex is not TableTransactionFailedException tx || tx.FailedTransactionActionIndex is null or 0;
-
-    /// <summary>
-    /// The version of a row a transaction has just committed, read without the caller's token; any
-    /// failure of the read (a transient error, a timeout) yields <c>default</c>, an unknown version,
-    /// which the write already reports as a null ETag and never caches.
-    /// </summary>
-    private async Task<ETag> ReadETagAfterCommitAsync(string pk, string rk)
-    {
-        try
-        {
-            var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, KeysOnly, CancellationToken.None);
-            return response is { HasValue: true, Value: not null } ? response.Value.ETag : default;
-        }
-#pragma warning disable CA1031 // the write has committed: failing to read its version must not report it as failed
-        catch (Exception ex)
-#pragma warning restore CA1031
-        {
-            logger.LogWarning(ex, "{Type} {PartitionKey}|{RowKey}: the write committed but its version could not be read back",
-                typeName, pk, rk);
-            return default;
-        }
-    }
 
     // The service time of a response (its Date header), tolerating test doubles that have none.
     private static DateTimeOffset? HeaderDate(Response? response)
@@ -348,8 +477,20 @@ public partial class TableStorage<T>
         }
     }
 
+    private static Response? RawResponse(NullableResponse<TableEntity>? response)
+    {
+        try
+        {
+            return response?.GetRawResponse();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     // Same header-first, tolerate-test-doubles read the single-row Create and Upsert paths use.
-    private static ETag? HeaderETag(Response response)
+    private static ETag? HeaderETag(Response? response)
     {
         try
         {
@@ -393,9 +534,10 @@ public partial class TableStorage<T>
 
     /// <summary>
     /// Stamps the outcome of a split-aware write on <paramref name="entity"/> and keeps the caches
-    /// coherent. Only a single call's own response version is cached; a transaction's re-read version
-    /// (which may already be another writer's) and an unknown version evict the entry instead, so the
-    /// next read goes to the store.
+    /// coherent. The entity gets the version the write itself produced, or null when that is unknown
+    /// (re-read before an optimistic update, as after a batch). Only a single call's result is cached; a
+    /// transaction's result and an unknown version evict the entry instead, so the next read goes to the
+    /// store.
     /// </summary>
     private void CommitLargeWrite(T entity, string partitionKey, LargeWriteResult result)
     {
@@ -458,33 +600,60 @@ public partial class TableStorage<T>
     /// <summary>
     /// Deletes a split-aware entity and its continuation rows: one conditional delete when it has none,
     /// otherwise one transaction over the parts that exist (found by a range query, so a primary that
-    /// declares a part already gone can still be deleted). A missing row is a no-op; a lost race
-    /// re-reads and retries. Any row key is accepted. Once the entity is deleted, the blobs it referenced are deleted (best effort).
+    /// declares a part already gone can still be deleted). When there is no row at the id, the entity's
+    /// leftover continuation rows (if any) are deleted, so nothing of it stays behind; a continuation row
+    /// addressed by its own id is not an entity and is left alone. A lost race re-reads and retries. Any
+    /// row key is accepted. Once the entity is deleted, the blobs it referenced are deleted (best effort).
     /// </summary>
     private async Task DeleteLargeAsync(string pk, string rk, CancellationToken ct)
     {
-        // No row-key check: a row written before the type opted in may carry any key and stays
-        // deletable; a continuation row addressed by id reads as missing below, so it is never deleted.
+        // No row-key check: a row written before the type opted in may carry any key and stays deletable.
         RequestFailedException? lost = null;
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
-            var prior = await ReadPriorAsync(pk, rk, ct);
-            if (prior is null)
+            // Every retry here follows a lost race: a short, growing, jittered pause first.
+            if (attempt > 1)
+                await large.WaitBeforeRetryAsync(attempt, ct);
+            var stored = await ReadStoredAsync(pk, rk, ct);
+            List<TableEntity> leftovers = [];
+            if (stored is null)
+            {
+                // No primary row: all that can be left of the entity are continuation rows nothing
+                // declares (one range query, in this case only). When there are none, nothing to do.
+                leftovers = await LeftoverPartsAsync(pk, rk, ct);
+                if (leftovers.Count == 0)
+                    return;
+                // They are leftovers only if there is still no primary now that they are listed: a
+                // writer may have created the entity after the first read, and the rows listed are then
+                // that entity's own. With no primary after the listing, a writer that creates the entity
+                // later rewrites every row it declares, so the versions just listed no longer match.
+                stored = await ReadStoredAsync(pk, rk, ct);
+            }
+            // A continuation row addressed by its own id is not an entity: nothing is deleted.
+            if (stored is { } found && SplitRowLayout.IsPartRow(found.Row))
                 return;
 
-            DateTimeOffset? committedAt;
+            IReadOnlyList<string> blobs = [];
+            DateTimeOffset? committedAt = null;
             try
             {
-                var parts = prior.Parts == 0 ? [] : await QueryPartsAsync(pk, rk, PartKeys, ct);
+                if (stored is not { } row)
+                {
+                    await DeleteLeftoverPartsAsync(pk, leftovers, ct);
+                    return;
+                }
+
+                blobs = BlobPaths(row.Row, pk, rk);
+                var parts = DeclaresNoParts(row.Row) ? [] : await QueryPartsAsync(pk, rk, PartKeys, ct);
                 if (parts.Count == 0)
                 {
-                    committedAt = HeaderDate(await client.DeleteEntityAsync(pk, rk, prior.ETag, ct));
+                    committedAt = HeaderDate(await client.DeleteEntityAsync(pk, rk, row.ETag, ct));
                 }
                 else
                 {
                     var actions = new List<TableTransactionAction>(1 + parts.Count)
                     {
-                        new(TableTransactionActionType.Delete, new TableEntity(pk, rk), prior.ETag),
+                        new(TableTransactionActionType.Delete, new TableEntity(pk, rk), row.ETag),
                     };
                     foreach (var part in parts)
                         actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), ETag.All));
@@ -498,11 +667,62 @@ public partial class TableStorage<T>
             }
 
             // The entity is gone: the blobs it referenced follow (best effort; a cancelled token only bounds it).
-            await DeleteBlobsAsync(prior.Blobs, committedAt, ct);
+            await DeleteBlobsAsync(pk, rk, blobs, committedAt, ct);
             return;
         }
 
         throw new ConcurrencyConflictException(typeName, $"{pk}{Separator}{rk}", lost);
+    }
+
+    // True when the stored row says it has no continuation rows. A part count that cannot be read (a
+    // damaged row) is not "none": the delete looks for the rows that are there, so a row no read can
+    // return is still deletable.
+    private static bool DeclaresNoParts(TableEntity row)
+    {
+        try
+        {
+            return SplitRowLayout.PartCount(row) == 0;
+        }
+        catch (TableValueIntegrityException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The continuation rows of an entity that has no primary row: what a writer that does not know
+    /// continuation rows, an interrupted partition delete or a delete that raced a write left of it. A
+    /// table that is not there has none (the point read of a missing table reads as "no row"; only the
+    /// query says the table is gone), so deleting from it is a no-op, as for any other type.
+    /// </summary>
+    private async Task<List<TableEntity>> LeftoverPartsAsync(string pk, string rk, CancellationToken ct)
+    {
+        try
+        {
+            return await QueryPartsAsync(pk, rk, PartKeys, ct);
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Deletes leftover continuation rows in transactions of at most 100, each row on condition of the
+    /// version it was listed at. A writer that takes the same rows back for a new value at that moment
+    /// commits as a whole or not at all, and so does this delete: the one that loses fails its condition
+    /// (the caller reads again and retries). These transactions hold no primary row to put a condition
+    /// on, so a row whose version is unknown is never deleted here (the service always sends one): it
+    /// stays, invisible, for the next write or delete of the entity.
+    /// </summary>
+    private async Task DeleteLeftoverPartsAsync(string pk, List<TableEntity> leftovers, CancellationToken ct)
+    {
+        foreach (var chunk in leftovers.Where(part => IsVersion(part.ETag)).Chunk(BatchPlanner.DefaultMaxCount))
+        {
+            var actions = chunk.Select(part => new TableTransactionAction(
+                TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), part.ETag));
+            await client.SubmitTransactionAsync(actions, ct);
+        }
     }
 
     /// <summary>
@@ -528,8 +748,11 @@ public partial class TableStorage<T>
     private static readonly string[] SplitSystemColumns =
         [SystemColumnNames.SplitOf, SystemColumnNames.SplitIndex, SystemColumnNames.SplitParts];
 
-    /// <summary>One entity of a split-aware batch: the stored row it was planned against and its rows.</summary>
-    private sealed record BatchUnit(T Entity, string Pk, string Rk, PriorRow? Prior, LargeValueWritePlan Plan);
+    /// <summary>
+    /// One entity of a split-aware batch: the stored row it was planned against, its rows and, when it was
+    /// planned over the entity's own continuation rows, those rows with the versions they were read at.
+    /// </summary>
+    private sealed record BatchUnit(T Entity, string Pk, string Rk, PriorRow? Prior, LargeValueWritePlan Plan, Dictionary<string, ETag>? OwnParts);
 
     /// <summary>
     /// A split-aware batch, with the plain batch's contract: per partition, each entity's rows (primary,
@@ -541,8 +764,11 @@ public partial class TableStorage<T>
     /// key repeated in a create batch throws <see cref="DuplicateKeyException"/> before anything is
     /// written; in an upsert batch its last occurrence is written. An existing key fails its create
     /// transaction (<see cref="DuplicateKeyException"/>); earlier transactions stay committed. An upsert
-    /// transaction that lost a race to another writer is planned again from the re-read rows and retried;
-    /// after three lost races it throws <see cref="ConcurrencyConflictException"/>.
+    /// transaction that lost a race to another writer is planned again from the re-read rows and retried
+    /// after a short pause; after five lost races it throws <see cref="ConcurrencyConflictException"/>. A transaction that
+    /// finds the key of a new continuation row held by a leftover continuation row of the same entity is
+    /// planned again over that entity's own rows (they are replaced or deleted in the retried
+    /// transaction); a foreign row at such a key fails the transaction, and is left as it is.
     /// </summary>
     private async Task WriteBatchLargeAsync(IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
@@ -562,8 +788,8 @@ public partial class TableStorage<T>
                 await large.PrepareAsync(entity, ct);
             foreach (var group in writes.GroupBy(e => GetEntityKeys(e.Id).PartitionKey, StringComparer.Ordinal))
             {
-                var units = await PlanBatchUnitsAsync([.. group], kind, ct);
-                await SubmitBatchUnitsAsync(units, kind, attempt: 1, ct);
+                var units = await PlanBatchUnitsAsync([.. group], kind, takeBack: null, ct);
+                await SubmitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, ct);
             }
         }
         finally
@@ -574,15 +800,17 @@ public partial class TableStorage<T>
     }
 
     // A create batch refuses a repeated key up front (the same DuplicateKeyException the in-memory store
-    // throws); an upsert batch writes each key once, with its last occurrence (last writer wins).
+    // throws); an upsert batch writes each key once, with its last occurrence (last writer wins). The
+    // key is the row an id addresses, its (partition key, row key) pair, not the id's spelling: "a" and
+    // "a|a" are the same row, and one transaction cannot hold a row twice.
     private List<T> DistinctBatchKeys(IReadOnlyCollection<T> entities, LargeWriteKind kind)
     {
         if (kind == LargeWriteKind.Create)
         {
-            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var seen = new HashSet<(string PartitionKey, string RowKey)>();
             foreach (var entity in entities)
             {
-                if (!seen.Add(entity.Id))
+                if (!seen.Add(GetEntityKeys(entity.Id)))
                     throw new DuplicateKeyException(typeName, entity.Id,
                         new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}"));
             }
@@ -590,26 +818,41 @@ public partial class TableStorage<T>
         }
 
         var list = entities.ToList();
-        var last = new Dictionary<string, int>(StringComparer.Ordinal);
+        var last = new Dictionary<(string PartitionKey, string RowKey), int>();
         for (var i = 0; i < list.Count; i++)
-            last[list[i].Id] = i;
-        return list.Where((e, i) => last[e.Id] == i).ToList();
+            last[GetEntityKeys(list[i].Id)] = i;
+        return list.Where((e, i) => last[GetEntityKeys(e.Id)] == i).ToList();
     }
 
-    private async Task<List<BatchUnit>> PlanBatchUnitsAsync(List<T> entities, LargeWriteKind kind, CancellationToken ct)
+    /// <summary>
+    /// Plans the entities of one partition. <paramref name="takeBack"/> names (by row key) the entities
+    /// that are planned over their own continuation rows because a leftover held a key of theirs: each
+    /// with the rows just read for it, used once, or null to read them now.
+    /// </summary>
+    private async Task<List<BatchUnit>> PlanBatchUnitsAsync(
+        List<T> entities, LargeWriteKind kind, Dictionary<string, Dictionary<string, ETag>?>? takeBack, CancellationToken ct)
     {
         var units = new List<BatchUnit>(entities.Count);
         foreach (var entity in entities)
         {
             var (pk, rk) = GetEntityKeys(entity.Id);
             var prior = kind == LargeWriteKind.Create ? null : await ReadPriorAsync(pk, rk, ct);
-            var plan = await large.PlanAsync(entity, pk, rk, prior?.Parts ?? 0, c => ExistingPartKeysAsync(pk, rk, c), ct);
-            units.Add(new BatchUnit(entity, pk, rk, prior, plan));
+            Dictionary<string, ETag>? own = null;
+            if (takeBack is not null && takeBack.TryGetValue(rk, out var read))
+            {
+                own = read ?? await OwnPartsAsync(pk, rk, ct);
+                takeBack[rk] = null; // a later attempt reads them again
+            }
+            var plan = own is null
+                ? await large.PlanAsync(entity, pk, rk, prior?.Parts ?? 0, c => ExistingPartKeysAsync(pk, rk, c), ct)
+                : large.PlanOverOwnParts(entity, pk, rk, prior?.Parts ?? 0, own.Keys);
+            units.Add(new BatchUnit(entity, pk, rk, prior, plan, own));
         }
         return units;
     }
 
-    private async Task SubmitBatchUnitsAsync(List<BatchUnit> units, LargeWriteKind kind, int attempt, CancellationToken ct)
+    private async Task SubmitBatchUnitsAsync(
+        List<BatchUnit> units, LargeWriteKind kind, int attempt, Dictionary<string, Dictionary<string, ETag>?>? takeBack, CancellationToken ct)
     {
         foreach (var range in LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList()))
         {
@@ -627,22 +870,45 @@ public partial class TableStorage<T>
             }
             catch (RequestFailedException ex) when (TakenPartKey(ex, actions) is { } taken)
             {
+                // A row holds the key of a new continuation row of one entity. Its own leftover: the
+                // transaction (nothing of it committed) is planned again with that entity over its own
+                // continuation rows. A foreign row: refused, and that row is left as it is.
                 var unit = chunk[owners[((TableTransactionFailedException)ex).FailedTransactionActionIndex!.Value]];
-                throw LargeValueTable.ContinuationKeyTaken(unit.Pk, unit.Rk, taken, ex);
+                var own = await OwnPartsAsync(unit.Pk, unit.Rk, ct);
+                if (!own.ContainsKey(taken))
+                    throw LargeValueTable.ContinuationKeyTaken(unit.Pk, unit.Rk, taken, ex);
+                if (attempt >= MaxLargeWriteAttempts)
+                    throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
+                var taking = takeBack is null
+                    ? new Dictionary<string, Dictionary<string, ETag>?>(StringComparer.Ordinal)
+                    : new Dictionary<string, Dictionary<string, ETag>?>(takeBack, StringComparer.Ordinal);
+                taking[unit.Rk] = own;
+                // Leftovers come in numbers (a partition delete that stopped, a writer that does not know
+                // continuation rows): every other entity of the transaction that inserts a continuation
+                // row is planned over its own rows too, so one retry takes them all back.
+                foreach (var other in chunk)
+                {
+                    if (InsertsAPart(other.Plan))
+                        taking.TryAdd(other.Rk, null);
+                }
+                var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, ct);
+                continue;
             }
             catch (RequestFailedException ex) when (kind == LargeWriteKind.Create && ex.Status == 409 && IsBatchPrimaryFailure(ex, owners))
             {
                 throw new DuplicateKeyException(typeName, FailedId(ex, owners, chunk), ex);
             }
-            catch (RequestFailedException ex) when (kind == LargeWriteKind.Upsert
-                && (ex.Status == 404 || (ex.Status is 409 or 412 && IsBatchPrimaryFailure(ex, owners))))
+            catch (RequestFailedException ex) when (BatchLostRace(ex, kind, owners))
             {
                 // The whole transaction failed: nothing of it committed, so it is planned again from the
-                // rows as they are now. A stale part removed meanwhile (404) is not required again.
+                // rows as they are now, after a short pause. A continuation row removed meanwhile (404)
+                // is not required again.
                 if (attempt >= MaxLargeWriteAttempts)
                     throw new ConcurrencyConflictException(typeName, FailedId(ex, owners, chunk), ex);
-                var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, ct);
-                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, ct);
+                await large.WaitBeforeRetryAsync(attempt + 1, ct);
+                var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, ct);
                 continue;
             }
 
@@ -651,7 +917,7 @@ public partial class TableStorage<T>
             foreach (var unit in chunk)
             {
                 if (unit.Prior is { Blobs.Count: > 0 })
-                    await DeleteBlobsAsync(unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), committedAt, ct);
+                    await DeleteBlobsAsync(unit.Pk, unit.Rk, unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), committedAt, ct);
             }
         }
     }
@@ -670,16 +936,22 @@ public partial class TableStorage<T>
                 : new TableTransactionAction(TableTransactionActionType.UpdateReplace, unit.Plan.Primary, unit.Prior.ETag));
             owners.Add(~i);
             var partsFrom = actions.Count;
-            AddPartActions(actions, unit.Plan);
+            AddPartActions(actions, unit.Plan, unit.OwnParts, unit.Pk);
             for (var p = partsFrom; p < actions.Count; p++)
                 owners.Add(i);
-            foreach (var partKey in unit.Plan.StalePartRowKeys)
-            {
-                actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(unit.Pk, partKey), ETag.All));
-                owners.Add(i);
-            }
         }
         return (actions, owners);
+    }
+
+    // True when the plan inserts a continuation row: one beyond what the stored row declares.
+    private static bool InsertsAPart(LargeValueWritePlan plan)
+    {
+        for (var i = 0; i < plan.Parts.Count; i++)
+        {
+            if (plan.IsNewPart(i))
+                return true;
+        }
+        return false;
     }
 
     // A failure the service attributes to no action, or to a primary (an insert or conditional replace).
@@ -687,6 +959,14 @@ public partial class TableStorage<T>
         ex is not TableTransactionFailedException { FailedTransactionActionIndex: int i }
         || i < 0 || i >= owners.Count
         || owners[i] < 0;
+
+    // As LostRace, for a batch transaction. On a primary (or a failure the service attributes to no
+    // action) only an upsert loses a race: a create's 409 is a duplicate key. On any other action a
+    // continuation row the transaction counted on is gone (404) or has changed since it was read (412).
+    private static bool BatchLostRace(RequestFailedException ex, LargeWriteKind kind, List<int> owners) =>
+        IsBatchPrimaryFailure(ex, owners)
+            ? kind == LargeWriteKind.Upsert && (ex.Status is 409 or 412 || IsMissingRow(ex))
+            : ex.Status == 412 || IsMissingRow(ex);
 
     // The id of the entity whose action failed ("{partition}|?" when the service did not say).
     private string FailedId(RequestFailedException ex, List<int> owners, List<BatchUnit> chunk)

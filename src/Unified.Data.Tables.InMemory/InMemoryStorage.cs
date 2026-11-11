@@ -39,8 +39,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     // large-value branch below is reached only for such a T; any other T behaves exactly as before.
     private static readonly bool LargeValueAware = LargeValueTable.IsLargeValueAware(typeof(T));
 
-    /// <summary>How many times a write that lost its condition to a concurrent writer re-reads and retries (as TableStorage).</summary>
-    private const int MaxLargeWriteAttempts = 3;
+    /// <summary>How many times in all a write that keeps losing its condition to concurrent writers is attempted (the number TableStorage uses).</summary>
+    private const int MaxLargeWriteAttempts = LargeValueTable.MaxWriteAttempts;
 
     private readonly Dictionary<(string PartitionKey, string RowKey), StoredRow> rows = [];
     private readonly object gate = new();
@@ -111,12 +111,16 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     }
 
     /// <summary>
-    /// How many entity-group transactions the batch writes of a large-value-aware type have attempted,
-    /// committed or not (for tests; TableStorage sends one <c>$batch</c> request each).
+    /// How many entity-group transactions the batch writes and the partition deletes of a
+    /// large-value-aware type have attempted, committed or not (for tests; TableStorage sends one
+    /// <c>$batch</c> request each).
     /// </summary>
     internal int BatchTransactions { get; set; }
 
-    /// <summary>Runs after each large-value write or delete has committed, before its blob cleanup (for tests).</summary>
+    /// <summary>
+    /// Runs after each large-value write or delete has committed, before its blob cleanup (for tests);
+    /// a batch write and a partition delete run it after each of their transactions.
+    /// </summary>
     internal Action? AfterLargeCommit { get; set; }
 
     /// <summary>A copy of the stored row at these keys, continuation rows included (for tests); null when absent.</summary>

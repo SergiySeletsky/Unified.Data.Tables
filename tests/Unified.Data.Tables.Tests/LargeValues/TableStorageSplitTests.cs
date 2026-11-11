@@ -53,10 +53,29 @@ public class TableStorageSplitTests
             .Returns(resp);
     }
 
-    /// <summary>A transaction failure at <paramref name="index"/>, as the SDK reports it (the index rides on the inner exception's Data).</summary>
+    /// <summary>
+    /// Like <see cref="CaptureTransactions"/>, with the answer the service gives: one sub-response per action, in
+    /// action order, the first (the primary's) carrying <paramref name="primaryETag"/>.
+    /// </summary>
+    private static void CaptureTransactions(StorageHarness<SplitTextEntity> h, List<List<TableTransactionAction>> sink, string primaryETag) =>
+        h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var actions = call.Arg<IEnumerable<TableTransactionAction>>().ToList();
+                sink.Add(actions);
+                return Response.FromValue<IReadOnlyList<Response>>(
+                    [.. actions.Select((_, i) => (Response)new FakeResponse(i == 0 ? primaryETag : "W/\"part\""))], new FakeResponse());
+            });
+
+    /// <summary>
+    /// A transaction failure at <paramref name="index"/>, as the SDK reports it (the index rides on the inner
+    /// exception's Data), with the error code the service gives that status: a 404 at an action is a
+    /// missing row (<c>ResourceNotFound</c>; a missing table is <c>TableNotFound</c> and is no lost race).
+    /// </summary>
     private static TableTransactionFailedException TxFailed(int status, int index = 0)
     {
-        var inner = new RequestFailedException(status, "failed", status == 409 ? "EntityAlreadyExists" : "UpdateConditionNotSatisfied", null);
+        var code = status switch { 409 => "EntityAlreadyExists", 404 => "ResourceNotFound", _ => "UpdateConditionNotSatisfied" };
+        var inner = new RequestFailedException(status, "failed", code, null);
         inner.Data["FailedEntity"] = index.ToString(System.Globalization.CultureInfo.InvariantCulture);
         var ex = new TableTransactionFailedException(inner);
         Assert.Equal(index, ex.FailedTransactionActionIndex);
@@ -101,8 +120,9 @@ public class TableStorageSplitTests
     {
         using var h = new StorageHarness<SplitTextEntity>();
         var tx = new List<List<TableTransactionAction>>();
-        CaptureTransactions(h, tx);
-        h.SetupGet("p", "r", new TableEntity("p", "r") { ETag = new ETag("W/\"after\"") });
+        CaptureTransactions(h, tx, primaryETag: "W/\"after\"");
+        // What a read after the commit would return once another writer has replaced the row.
+        h.SetupGet("p", "r", new TableEntity("p", "r") { ETag = new ETag("W/\"another writer\"") });
 
         var created = await h.Store.CreateAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct);
 
@@ -114,8 +134,10 @@ public class TableStorageSplitTests
         Assert.Equal(TableTransactionActionType.Add, actions[1].ActionType);
         Assert.Equal("r~0001", actions[1].Entity.RowKey);
         await h.Table.DidNotReceiveWithAnyArgs().AddEntityAsync<TableEntity>(default!, default);
-        // The transaction's sub-responses are not correlated, so the ETag comes from a keys-only re-read.
+        // The ETag is the one the transaction's own sub-response reports for the primary (action 0); the
+        // row is not read again, since a later read may already return another writer's version.
         Assert.Equal("W/\"after\"", created.ETag);
+        await h.Table.DidNotReceiveWithAnyArgs().GetEntityIfExistsAsync<TableEntity>(default!, default!, default, default);
     }
 
     [Fact]
@@ -222,7 +244,7 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task Upsert_LosesRaceThreeTimes_ThrowsConcurrencyConflict()
+    public async Task Upsert_LosesRaceFiveTimes_ThrowsConcurrencyConflict()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r", PriorPrimary("p", "r", 0, "W/\"prior\""));
@@ -232,8 +254,9 @@ public class TableStorageSplitTests
         await Assert.ThrowsAsync<ConcurrencyConflictException>(
             () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = "small" }, Ct));
 
-        await h.Table.Received(3).UpdateEntityAsync(Arg.Any<TableEntity>(), new ETag("W/\"prior\""), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
-        await h.Table.Received(3).GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+        // Five attempts in all (it was three), each a point read and a conditional replace.
+        await h.Table.Received(5).UpdateEntityAsync(Arg.Any<TableEntity>(), new ETag("W/\"prior\""), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+        await h.Table.Received(5).GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -544,7 +567,7 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task UpsertBatch_LosesThreeRaces_ThrowsConcurrencyConflictForThatEntity()
+    public async Task UpsertBatch_LosesFiveRaces_ThrowsConcurrencyConflictForThatEntity()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet(PriorPrimary("p", "r1", 0, "W/\"v1\""));
@@ -559,24 +582,25 @@ public class TableStorageSplitTests
         ], Ct));
 
         Assert.Equal("p|r2", ex.Id);
-        await h.Table.ReceivedWithAnyArgs(3).SubmitTransactionAsync(default!, default);
+        // Five attempts in all (it was three).
+        await h.Table.ReceivedWithAnyArgs(5).SubmitTransactionAsync(default!, default);
     }
 
     [Fact]
-    public async Task Upsert_Committed_VersionReReadFails_ReportsSuccessWithAnUnknownVersion()
+    public async Task Upsert_Committed_ResponseCarriesNoVersion_ReportsSuccessWithAnUnknownVersion()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r", null);
         var tx = new List<List<TableTransactionAction>>();
+        // The transaction's response carries no ETag for the primary; the write itself has committed.
         CaptureTransactions(h, tx);
-        // The keys-only re-read after the commit fails transiently; the write itself has committed.
-        h.Table.GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Is<IEnumerable<string>>(s => s != null && s.Count() == 2), Arg.Any<CancellationToken>())
-            .ThrowsAsync(new RequestFailedException(503, "ServerBusy"));
 
         var written = await h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct);
 
         Assert.Single(tx);
         Assert.Null(written.ETag);
+        // The version is unknown: it is not replaced by a read after the commit (only the point read before it was made).
+        await h.Table.Received(1).GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     // ── point reads ────────────────────────────────────────────────────────
@@ -968,11 +992,11 @@ public class TableStorageSplitTests
         var rows = StoredRows("p", "r", TwoRowText);
         h.SetupGet("p", "r", rows[0]);
         h.SetupQueryByFilter([.. rows]);
-        CaptureTransactions(h, []);
+        CaptureTransactions(h, [], primaryETag: "W/\"written\"");
 
         Assert.NotNull(await h.Store.OneAsync("p|r", Ct));          // warms the cache
         var written = await h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText + "b" }, Ct);
-        Assert.Equal("W/\"stored\"", written.ETag);               // the re-read version is still reported
+        Assert.Equal("W/\"written\"", written.ETag);              // the transaction's own version is reported
 
         Assert.NotNull(await h.Store.OneAsync("p|r", Ct));          // not served from the cache
         await h.Table.Received(2).GetEntityIfExistsAsync<TableEntity>("p", "r", null, Arg.Any<CancellationToken>());

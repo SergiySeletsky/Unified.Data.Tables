@@ -9,7 +9,15 @@ namespace Unified.Data.Tables;
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
 public interface IStorage<T> where T : class, IEntity, new()
 {
-    /// <summary>Delete a single document by its composite id.</summary>
+    /// <summary>
+    /// Delete a single document by its composite id. For a type with large values (a
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property) the call reads
+    /// the row first, to find its continuation rows and blobs, and deletes it on condition of the version
+    /// it read: a delete that loses a race to another writer reads again and retries after a short
+    /// pause, and can throw <see cref="ConcurrencyConflictException"/> after five lost races. For such a
+    /// type, when no row has the id, the call also looks for continuation rows left behind for it and
+    /// removes them.
+    /// </summary>
     /// <param name="id">Composite document identifier (<c>"{PartitionKey}|{RowKey}"</c>).</param>
     /// <param name="ct">Cancellation token.</param>
     Task DeleteAsync(string id, CancellationToken ct = default);
@@ -37,6 +45,12 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// use <see cref="UpdateAsync(T, CancellationToken)"/>. <see cref="Entity.CreatedAt"/> is
     /// preserved when the caller supplies it (e.g. a read-modify-write flow) and stamped with
     /// UtcNow when left at its default; <see cref="Entity.UpdatedAt"/> is always stamped.
+    /// For a type with large values (a <see cref="TableValueSplitAttribute"/> or
+    /// <see cref="TableBlobContent"/> property) it is not a single round trip: the call reads the row
+    /// first, to find the continuation rows and blobs the new value replaces, and writes on condition of
+    /// the version it read. The caller's ETag is still ignored and the last writer still wins, but an
+    /// upsert that loses a race to another writer reads again and retries after a short pause, and can
+    /// throw <see cref="ConcurrencyConflictException"/> after five lost races.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -65,7 +79,7 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <c>StorageExtensions.MutateAsync</c> for values derived from the current row.
     /// For a type with a <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property,
     /// a <see cref="ConcurrencyMode.LastWriterWins"/> update reads the row first and can throw
-    /// <see cref="ConcurrencyConflictException"/> after three lost races.
+    /// <see cref="ConcurrencyConflictException"/> after five lost races.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="mode">The optimistic-concurrency behaviour to apply.</param>
@@ -184,8 +198,8 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// (including deletes of stale continuation rows) are one unit that never straddles two chunks, and a
     /// key repeated within the batch is written once, with its last occurrence. Such a type reads each row
     /// first and replaces it conditionally: a chunk that loses a race to another writer is re-read and
-    /// retried, and after three lost races the call throws <see cref="ConcurrencyConflictException"/>
-    /// (chunks already written stay written).
+    /// retried after a short pause, and after five lost races the call throws
+    /// <see cref="ConcurrencyConflictException"/> (chunks already written stay written).
     /// </summary>
     /// <param name="entities">The entities to upsert.</param>
     /// <param name="ct">Cancellation token.</param>

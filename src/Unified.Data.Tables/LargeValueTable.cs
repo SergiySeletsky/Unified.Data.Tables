@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Security.Cryptography;
 using Azure.Data.Tables;
 
 namespace Unified.Data.Tables.Providers;
@@ -29,6 +30,52 @@ public sealed class LargeValueTable
 
     /// <summary>The client clock, used only when the service time is unknown (replaced by tests).</summary>
     internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. How many times in all a write, a delete or a batch
+    /// transaction of a large-value type is attempted when it keeps losing its condition to concurrent
+    /// writers, before it throws <see cref="ConcurrencyConflictException"/>. Every provider uses this
+    /// number.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public const int MaxWriteAttempts = 5;
+
+    /// <summary>The pause before the first retry; it doubles with every further one.</summary>
+    internal static readonly TimeSpan RetryBaseDelay = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>The longest pause before a retry.</summary>
+    internal static readonly TimeSpan RetryMaxDelay = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>Waits between two attempts (replaced by tests).</summary>
+    internal Func<TimeSpan, CancellationToken, Task> RetryDelay { get; set; } = Task.Delay;
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Waits before attempt <paramref name="attempt"/> of
+    /// a write, delete or batch transaction that lost a race to a concurrent writer: about
+    /// 10&#160;ms before the first retry, doubling with each further one and never more than
+    /// 250&#160;ms, each pause a random length between half of that and all of it, so that writers that
+    /// collided do not collide again in step.
+    /// </summary>
+    /// <param name="attempt">The attempt about to be made: 2 for the first retry.</param>
+    /// <param name="ct">Cancels the wait.</param>
+    /// <returns>A task that completes when the attempt may be made.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="attempt"/> is less than 2.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled during the wait.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task WaitBeforeRetryAsync(int attempt, CancellationToken ct) => RetryDelay(RetryBackoff(attempt), ct);
+
+    /// <summary>
+    /// The pause before attempt <paramref name="attempt"/> (2 = the first retry): a random length between
+    /// half of and the whole of <see cref="RetryBaseDelay"/> doubled once per earlier retry, the whole
+    /// capped at <see cref="RetryMaxDelay"/>.
+    /// </summary>
+    internal static TimeSpan RetryBackoff(int attempt)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(attempt, 2);
+        var ceiling = (int)Math.Min(RetryMaxDelay.TotalMilliseconds, RetryBaseDelay.TotalMilliseconds * Math.Pow(2, Math.Min(attempt - 2, 30)));
+        // Not a secret: the generator is only the one at hand that needs no instance and no lock.
+        return TimeSpan.FromMilliseconds(RandomNumberGenerator.GetInt32(ceiling / 2, ceiling + 1));
+    }
 
     /// <summary>
     /// How much longer the blob cleanup that follows a committed change keeps going once the caller's token
@@ -100,8 +147,10 @@ public sealed class LargeValueTable
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The error of a write that needs a new continuation
-    /// row at a key another row already holds (one written before the type opted in, or by a type sharing
-    /// the table): the write is refused rather than overwrite that row.
+    /// row at a key a foreign row already holds (one written before the type opted in, or by a type sharing
+    /// the table): the write is refused rather than overwrite that row. A row there that is a continuation
+    /// row of the same entity (its <c>_SplitOf</c> cell names the entity's row key) is not foreign: it is
+    /// the entity's own, left behind, and the write takes it back (<see cref="PlanOverOwnParts"/>).
     /// </summary>
     /// <param name="partitionKey">The entity's partition key.</param>
     /// <param name="rowKey">The entity's row key.</param>
@@ -178,7 +227,9 @@ public sealed class LargeValueTable
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The blob names a stored row references. A
-    /// malformed reference cannot name a blob and must not block a write that replaces it: it is
+    /// reference cell that is null is no reference (the service returns a selected property the row does
+    /// not have as null): it is skipped silently. A malformed reference (a cell that holds something
+    /// that is not a reference) cannot name a blob and must not block a write that replaces it: it is
     /// reported to <paramref name="onMalformed"/> and skipped.
     /// </summary>
     /// <param name="row">A stored (primary or logical) row.</param>
@@ -189,13 +240,11 @@ public sealed class LargeValueTable
     {
         ArgumentNullException.ThrowIfNull(row);
         var paths = new List<string>();
-        foreach (var (key, value) in row)
+        foreach (var (column, cell) in ValueOffloadCoordinator.ReferenceCells(row))
         {
-            if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
-                continue;
             try
             {
-                paths.Add(BlobReference.Parse(column, value as string ?? string.Empty).Path);
+                paths.Add(ValueOffloadCoordinator.ParseReference(column, cell).Path);
             }
             catch (TableValueIntegrityException ex)
             {
@@ -229,7 +278,9 @@ public sealed class LargeValueTable
     /// primary row and its continuation rows, offloading values to blobs until the rows fit one
     /// entity-group transaction together with the deletes of the stored row's stale continuation rows.
     /// The existing continuation rows are asked for only when the stored row declares more than the new
-    /// plan writes.
+    /// plan writes. A continuation row beyond what the stored row declares is planned as new
+    /// (<see cref="LargeValueWritePlan.IsNewPart"/>): when the provider finds its key held by a
+    /// continuation row of the same entity, it plans again with <see cref="PlanOverOwnParts"/>.
     /// </summary>
     /// <param name="entity">The entity to write (prepared with <see cref="PrepareAsync"/>).</param>
     /// <param name="partitionKey">Its partition key.</param>
@@ -250,7 +301,7 @@ public sealed class LargeValueTable
         // A shrink deletes the continuation rows that actually exist beyond the new plan, found by the
         // caller rather than trusted from the part count, so a part already gone is never required.
         if (storedPartCount <= plan.Parts.Count)
-            return new LargeValueWritePlan(row, plan, pending, [], storedPartCount);
+            return new LargeValueWritePlan(row, plan, pending, [], storedPartCount, []);
 
         var existing = await existingPartRowKeys(ct);
         var stale = StaleParts(existing, plan);
@@ -260,7 +311,47 @@ public sealed class LargeValueTable
             (row, plan, pending) = coordinator.Serialize(entity, partitionKey, rowKey, extraActions: existing.Count);
             stale = StaleParts(existing, plan);
         }
-        return new LargeValueWritePlan(row, plan, pending, stale, storedPartCount);
+        return new LargeValueWritePlan(row, plan, pending, stale, storedPartCount, []);
+    }
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Plans a write as <see cref="PlanAsync"/> does, over
+    /// the continuation rows of the entity that exist now, whether its stored row declares them or not. A
+    /// continuation row whose <c>_SplitOf</c> cell names the entity is the entity's own even when no stored
+    /// row declares it: it was left behind by a writer that does not know split values, by a partition
+    /// delete that stopped halfway, or by a delete that raced a write. The plan writes over the ones the
+    /// new value needs (<see cref="LargeValueWritePlan.IsNewPart"/> is false for them) and deletes all
+    /// the others (<see cref="LargeValueWritePlan.StalePartRowKeys"/>) in the same atomic step, so no
+    /// stray row remains. A provider uses it once a plan from <see cref="PlanAsync"/> found the key of a
+    /// new continuation row held by such a row, and applies the plan only while those rows are still
+    /// the rows it was given (a row at such a key that is not the entity's is foreign:
+    /// <see cref="ContinuationKeyTaken"/>).
+    /// </summary>
+    /// <param name="entity">The entity to write (prepared with <see cref="PrepareAsync"/>).</param>
+    /// <param name="partitionKey">Its partition key.</param>
+    /// <param name="rowKey">Its row key.</param>
+    /// <param name="storedPartCount">The part count of the stored row (0 when there is none).</param>
+    /// <param name="ownPartRowKeys">
+    /// The row keys of every continuation row of the entity that exists now: the rows for which
+    /// <see cref="IsPartOf"/> is true.
+    /// </param>
+    /// <returns>The plan.</returns>
+    /// <exception cref="OversizedValueException">The entity cannot be stored within the limits.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public LargeValueWritePlan PlanOverOwnParts(
+        object entity, string partitionKey, string rowKey, int storedPartCount, IReadOnlyCollection<string> ownPartRowKeys)
+    {
+        ArgumentNullException.ThrowIfNull(entity);
+        ArgumentNullException.ThrowIfNull(ownPartRowKeys);
+        var (row, plan, pending) = coordinator.Serialize(entity, partitionKey, rowKey, extraActions: 0);
+        var stale = StaleParts(ownPartRowKeys, plan);
+        if (!SplitRowLayout.FitsOneTransaction(plan, stale.Count))
+        {
+            // Budget for deleting every existing part: the stale ones are a subset whatever the new plan.
+            (row, plan, pending) = coordinator.Serialize(entity, partitionKey, rowKey, extraActions: ownPartRowKeys.Count);
+            stale = StaleParts(ownPartRowKeys, plan);
+        }
+        return new LargeValueWritePlan(row, plan, pending, stale, storedPartCount, ownPartRowKeys);
     }
 
     /// <summary>
@@ -314,18 +405,28 @@ public sealed class LargeValueTable
     }
 
     /// <summary>
-    /// Storage-provider SPI, not for application code. Deletes blobs no row references any more, after
-    /// the write or delete that released them has committed. Each delete is conditional on the blob not
-    /// having been modified within <see cref="BlobOffloadOptions.CleanupGrace"/> before
-    /// <paramref name="serviceNow"/>, so a blob a concurrent writer has just touched survives. Best
+    /// Storage-provider SPI, not for application code. Deletes the blobs the row
+    /// (<paramref name="partitionKey"/>, <paramref name="rowKey"/>) no longer references, after the write
+    /// or delete that released them has committed. Only the row's own blobs are deleted: names of the
+    /// exact offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) under
+    /// <c>{table}/{partitionKey}/{rowKey}/</c> of this table. A row copied cell for cell from another
+    /// table, or to another row key, still references the source row's blobs; such a path belongs to the
+    /// source row, so it goes to <paramref name="onForeign"/> and is left alone. Each delete is
+    /// conditional on the blob not having been modified within
+    /// <see cref="BlobOffloadOptions.CleanupGrace"/> before <paramref name="serviceNow"/>, so a blob a
+    /// concurrent writer has just touched survives; a grace that reaches back beyond the start of the
+    /// calendar (<see cref="TimeSpan.MaxValue"/>) makes no blob old enough, so nothing is deleted. Best
     /// effort: a failure goes to <paramref name="onFailure"/>.
     /// </summary>
-    /// <param name="paths">The released blob names.</param>
+    /// <param name="partitionKey">The partition key of the row that was written or deleted.</param>
+    /// <param name="rowKey">The row key of the row that was written or deleted.</param>
+    /// <param name="paths">The blob names the row referenced and no longer does.</param>
     /// <param name="serviceNow">
     /// The storage service's time of the commit that released them (its response <c>Date</c>), or null
     /// to ask the blob store (<see cref="IOffloadBlobStore.GetServiceTimeAsync"/>); only when neither is
     /// known is the client clock used, less <see cref="ClientClockMargin"/>.
     /// </param>
+    /// <param name="onForeign">Called with each path that is not the row's own blob; it is not deleted.</param>
     /// <param name="onFailure">
     /// Called with the blob name and the error of each failed delete; when cleanup stops after the caller
     /// cancelled, called once more, with the first blob not deleted and an
@@ -338,19 +439,25 @@ public sealed class LargeValueTable
     /// <returns>A task that completes when every delete was attempted, or cleanup stopped.</returns>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public async Task DeleteReleasedBlobsAsync(
-        IEnumerable<string> paths, DateTimeOffset? serviceNow, Action<string, Exception>? onFailure, CancellationToken ct)
+        string partitionKey, string rowKey, IEnumerable<string> paths, DateTimeOffset? serviceNow,
+        Action<string>? onForeign, Action<string, Exception>? onFailure, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(partitionKey);
+        ArgumentNullException.ThrowIfNull(rowKey);
         ArgumentNullException.ThrowIfNull(paths);
-        if (blobs is null)
+        if (blobs is null || NeverCleansUp)
             return;
-        var released = paths.ToList();
+        var released = OwnBlobs(partitionKey, rowKey, paths, onForeign);
         if (released.Count == 0)
             return;
         using var budget = new CleanupBudget(ct, CancelledCleanupBudget);
         var next = 0;
         try
         {
-            var unmodifiedSince = (serviceNow ?? await ServiceNowAsync(budget.Token)) - cleanupGrace;
+            var unmodifiedSince = Cutoff(serviceNow ?? await ServiceNowAsync(budget.Token), cleanupGrace);
+            // No blob is old enough: none is asked for (rather than sent a condition no blob can meet).
+            if (unmodifiedSince == DateTimeOffset.MinValue)
+                return;
             for (; next < released.Count; next++)
                 await DeleteBlobAsync(released[next], unmodifiedSince, onFailure, budget.Token);
         }
@@ -358,6 +465,34 @@ public sealed class LargeValueTable
         {
             onFailure?.Invoke(released[next], CleanupStopped(released.Count - next, ex));
         }
+    }
+
+    // The paths that are blobs of the row itself: offload-shaped names under {table}/{pk}/{rk}/. Every
+    // blob a write of the row uploads has such a name, so anything else was not written for this row: a
+    // row copied raw from another table, or to another row key, still references the source row's
+    // blobs. Those are the source's to release, so they are reported and never deleted here. A key that
+    // is not well-formed UTF-16 names no blob at all (writes refuse one).
+    private List<string> OwnBlobs(string partitionKey, string rowKey, IEnumerable<string> paths, Action<string>? onForeign)
+    {
+        string? partitionPrefix = null;
+        string? rowPrefix = null;
+        if (SplitCodec.IsWellFormedUtf16(partitionKey) && SplitCodec.IsWellFormedUtf16(rowKey))
+        {
+            partitionPrefix = ValueOffloadCoordinator.PartitionPrefix(tableName, partitionKey);
+            rowPrefix = ValueOffloadCoordinator.RowPrefix(tableName, partitionKey, rowKey);
+        }
+
+        var own = new List<string>();
+        foreach (var path in paths)
+        {
+            if (rowPrefix is not null
+                && path.StartsWith(rowPrefix, StringComparison.Ordinal)
+                && OffloadBlobNames.IsOffloadBlobName(path, partitionPrefix!))
+                own.Add(path);
+            else
+                onForeign?.Invoke(path);
+        }
+        return own;
     }
 
     // Cleanup after a committed change ignores the caller's token until CancelledCleanupBudget has passed
@@ -394,13 +529,98 @@ public sealed class LargeValueTable
         new($"Blob cleanup stopped after the caller cancelled: {left} blob(s), this one included, are left for the orphan sweep.", ex, ex.CancellationToken);
 
     /// <summary>
-    /// Storage-provider SPI, not for application code. After a partition's rows are deleted, deletes
-    /// every blob stored under it, each on condition that it was modified neither within the cleanup
-    /// grace nor since it was listed. Only names of the exact offload shape
-    /// (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) are deleted. Best effort: a failure goes to the callbacks.
+    /// Storage-provider SPI, not for application code. Packs the rows a partition delete listed, in the
+    /// order listed, into entity-group transactions of at most <see cref="BatchPlanner.DefaultMaxCount"/>
+    /// deletes. A primary row and its continuation rows (the rows whose <c>_SplitOf</c> cell is its row
+    /// key) are one unit, never divided between two transactions, so a failure or a cancellation between
+    /// two transactions leaves no continuation row without its primary. Continuation rows whose primary
+    /// is not among <paramref name="rows"/> are a unit of their own. An entity has at most 99
+    /// continuation rows, so its unit always fits one transaction; a larger group, which only rows this
+    /// library did not write can form, is divided, its continuation rows first and its primary last.
     /// </summary>
-    /// <param name="partitionKey">The deleted partition.</param>
-    /// <param name="onListFailure">Called when the blobs cannot be listed.</param>
+    /// <param name="rows">
+    /// The rows of one partition, each with its keys and, when it is a continuation row, its
+    /// <c>_SplitOf</c> cell (a null cell, as a projection returns it for a row without one, is not one).
+    /// </param>
+    /// <returns>The transactions, in order; each row is in exactly one of them.</returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static IReadOnlyList<IReadOnlyList<TableEntity>> PlanPartitionDelete(IReadOnlyList<TableEntity> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        const int max = BatchPlanner.DefaultMaxCount;
+
+        // The units, in the order their first row was listed. A unit's rows need not be adjacent in the
+        // listing: other rows can sort between a primary "a" and its continuation row "a~0001".
+        var units = new List<List<TableEntity>>();
+        var unitOf = new Dictionary<string, List<TableEntity>>(StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            ArgumentNullException.ThrowIfNull(row);
+            var key = PrimaryKeyOf(row) ?? row.RowKey ?? string.Empty;
+            if (!unitOf.TryGetValue(key, out var unit))
+            {
+                unitOf[key] = unit = [];
+                units.Add(unit);
+            }
+            unit.Add(row);
+        }
+
+        var transactions = new List<IReadOnlyList<TableEntity>>();
+        var current = new List<TableEntity>();
+        foreach (var unit in units)
+        {
+            if (unit.Count > max)
+            {
+                // More rows name this primary than a transaction holds: they cannot go together. The
+                // continuation rows go first and the primary last, so an interrupted delete leaves a
+                // primary that still deletes cleanly rather than continuation rows nothing owns.
+                Flush();
+                foreach (var chunk in unit.Where(r => PrimaryKeyOf(r) is not null).Concat(unit.Where(r => PrimaryKeyOf(r) is null)).Chunk(max))
+                    transactions.Add(chunk);
+                continue;
+            }
+            if (current.Count + unit.Count > max)
+                Flush();
+            current.AddRange(unit);
+        }
+        Flush();
+        return transactions;
+
+        void Flush()
+        {
+            if (current.Count == 0)
+                return;
+            transactions.Add(current);
+            current = [];
+        }
+    }
+
+    // The row key of the primary a continuation row belongs to (its _SplitOf cell); null for any other row.
+    private static string? PrimaryKeyOf(TableEntity row) =>
+        row.TryGetValue(SystemColumnNames.SplitOf, out var of) ? of as string : null;
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. After a partition's rows are deleted, deletes the
+    /// blobs stored under it that no row of the partition references NOW: a row another writer created
+    /// while the partition was being deleted survives the delete, and keeps its blobs however long the
+    /// delete took. A blob is a candidate when it was not modified within
+    /// <see cref="BlobOffloadOptions.CleanupGrace"/> (younger ones are left for the orphan sweep; a grace
+    /// that reaches back beyond the start of the calendar leaves them all) and its name has the exact
+    /// offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>). The blobs are listed first; the
+    /// rows are read (once, through <paramref name="partitionRows"/>) only when some blob is old enough;
+    /// each delete is conditional on the blob not having been modified since it was listed. Rows are
+    /// never changed. Best effort: a failure goes to the callbacks.
+    /// </summary>
+    /// <param name="partitionKey">The deleted partition, already normalized as the store stores it.</param>
+    /// <param name="entityType">The store's entity type (its large-value columns are always read).</param>
+    /// <param name="partitionRows">
+    /// Returns every stored row that is in the partition now, continuation rows included, projected onto
+    /// the given columns, or whole when the projection is null. Called at most once, with the cleanup's
+    /// own token (not the caller's, which may be cancelled already).
+    /// </param>
+    /// <param name="onListFailure">
+    /// Called when the blobs cannot be listed or the rows cannot be read: nothing is deleted then.
+    /// </param>
     /// <param name="onFailure">
     /// Called with the blob name and the error of each failed delete; when cleanup stops after the caller
     /// cancelled, called once more, with the first blob not deleted and an
@@ -413,28 +633,33 @@ public sealed class LargeValueTable
     /// <returns>A task that completes when every delete was attempted, or cleanup stopped.</returns>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public async Task DeletePartitionBlobsAsync(
-        string partitionKey, Action<Exception>? onListFailure, Action<string, Exception>? onFailure, CancellationToken ct)
+        string partitionKey, Type entityType,
+        Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows,
+        Action<Exception>? onListFailure, Action<string, Exception>? onFailure, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(partitionKey);
+        ArgumentNullException.ThrowIfNull(entityType);
+        ArgumentNullException.ThrowIfNull(partitionRows);
         // No blob is ever named after a key that is not well-formed UTF-16 (writes refuse one).
-        if (blobs is null || !SplitCodec.IsWellFormedUtf16(partitionKey))
+        if (blobs is null || NeverCleansUp || !SplitCodec.IsWellFormedUtf16(partitionKey))
             return;
-        var prefix = ValueOffloadCoordinator.PartitionPrefix(tableName, partitionKey);
         using var budget = new CleanupBudget(ct, CancelledCleanupBudget);
         var token = budget.Token;
-        var doomed = new List<(string Name, DateTimeOffset UnmodifiedSince)>();
+        IReadOnlyList<(string Name, DateTimeOffset LastModified)> orphans = [];
         var next = 0;
         try
         {
             // The service time before the listing: no later than any time the listing could report.
-            var cutoff = await ServiceNowAsync(token) - cleanupGrace;
+            var cutoff = Cutoff(await ServiceNowAsync(token), cleanupGrace);
+            // No blob is old enough: nothing is listed or asked for.
+            if (cutoff == DateTimeOffset.MinValue)
+                return;
             try
             {
-                await foreach (var (name, lastModified) in blobs.ListAsync(prefix, token).WithCancellation(token))
-                {
-                    if (OffloadBlobNames.IsOffloadBlobName(name, prefix))
-                        doomed.Add((name, lastModified < cutoff ? lastModified : cutoff));
-                }
+                // Never "every blob under the prefix": a row that is in the partition now (one a
+                // concurrent writer created after the delete listed its rows) keeps what it references.
+                orphans = await coordinator.OrphansAsync(
+                    partitionKey, cutoff, includeCutoff: true, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, token);
             }
 #pragma warning disable CA1031 // the rows are already deleted: a cleanup failure must not turn that into an error
             catch (Exception ex) when (!(ex is OperationCanceledException && token.IsCancellationRequested))
@@ -443,13 +668,13 @@ public sealed class LargeValueTable
                 onListFailure?.Invoke(ex);
                 return;
             }
-            for (; next < doomed.Count; next++)
-                await DeleteBlobAsync(doomed[next].Name, doomed[next].UnmodifiedSince, onFailure, token);
+            for (; next < orphans.Count; next++)
+                await DeleteBlobAsync(orphans[next].Name, orphans[next].LastModified, onFailure, token);
         }
         catch (OperationCanceledException ex) when (token.IsCancellationRequested)
         {
-            if (next < doomed.Count)
-                onFailure?.Invoke(doomed[next].Name, CleanupStopped(doomed.Count - next, ex));
+            if (next < orphans.Count)
+                onFailure?.Invoke(orphans[next].Name, CleanupStopped(orphans.Count - next, ex));
             else
                 onListFailure?.Invoke(ex);
         }
@@ -498,12 +723,18 @@ public sealed class LargeValueTable
     }
 
     // Ages are measured on the service clock, read before the listing (so never later than it).
-    private async Task<DateTimeOffset> SweepCutoffAsync(TimeSpan olderThan, CancellationToken ct)
-    {
-        var now = await ServiceNowAsync(ct);
-        // An age beyond the start of the calendar makes no blob old enough (instead of overflowing).
-        return olderThan >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - olderThan;
-    }
+    private async Task<DateTimeOffset> SweepCutoffAsync(TimeSpan olderThan, CancellationToken ct) =>
+        Cutoff(await ServiceNowAsync(ct), olderThan);
+
+    // The instant before which a blob is old enough for a cleanup or a sweep: now less the age. An age
+    // that reaches back beyond the start of the calendar makes no blob old enough
+    // (DateTimeOffset.MinValue) instead of overflowing the subtraction. Every cutoff is computed here.
+    private static DateTimeOffset Cutoff(DateTimeOffset now, TimeSpan age) =>
+        age >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - age;
+
+    // A cleanup grace longer than the calendar ("never clean up after a write", TimeSpan.MaxValue): no
+    // blob can be that old whatever the time is, so the service is not even asked for it.
+    private bool NeverCleansUp => cleanupGrace >= DateTimeOffset.MaxValue - DateTimeOffset.MinValue;
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The core of
@@ -633,7 +864,7 @@ public sealed class LargeValueTable
     }
 
     // The existing continuation rows the new plan no longer writes.
-    private static List<string> StaleParts(IReadOnlyList<string> existing, SplitRowPlan plan)
+    private static List<string> StaleParts(IEnumerable<string> existing, SplitRowPlan plan)
     {
         var kept = new HashSet<string>(plan.Parts.Select(p => p.RowKey), StringComparer.Ordinal);
         return existing.Where(rk => !kept.Contains(rk)).ToList();
@@ -648,7 +879,12 @@ public sealed class LargeValueTable
 [EditorBrowsable(EditorBrowsableState.Never)]
 public sealed class LargeValueWritePlan
 {
-    internal LargeValueWritePlan(TableEntity logical, SplitRowPlan plan, IReadOnlyList<PendingBlob> pending, IReadOnlyList<string> stale, int storedPartCount)
+    // The continuation rows of the entity that existed when the plan was made over them (PlanOverOwnParts).
+    private readonly HashSet<string> ownParts;
+
+    internal LargeValueWritePlan(
+        TableEntity logical, SplitRowPlan plan, IReadOnlyList<PendingBlob> pending, IReadOnlyList<string> stale,
+        int storedPartCount, IEnumerable<string> ownPartRowKeys)
     {
         StoredPartCount = Math.Max(0, storedPartCount);
         Primary = plan.Primary;
@@ -657,6 +893,7 @@ public sealed class LargeValueWritePlan
         BlobPaths = LargeValueTable.BlobPaths(logical);
         Pending = pending;
         Plan = plan;
+        ownParts = new HashSet<string>(ownPartRowKeys, StringComparer.Ordinal);
     }
 
     /// <summary>Storage-provider SPI, not for application code. The primary row to insert or replace.</summary>
@@ -665,29 +902,43 @@ public sealed class LargeValueWritePlan
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The continuation rows to write, in index order:
-    /// those the stored row declares are replaced, the others (<see cref="IsNewPart"/>) inserted.
+    /// those the stored row declares, and the entity's own rows the plan was made over, are replaced; the
+    /// others (<see cref="IsNewPart"/>) are inserted.
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public IReadOnlyList<TableEntity> Parts { get; }
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The number of continuation rows the stored row
-    /// declared when the plan was made (0 when there was none): the entity's own rows.
+    /// declared when the plan was made (0 when there was none). They are the entity's own rows; so are
+    /// the continuation rows a plan from <see cref="LargeValueTable.PlanOverOwnParts"/> was made over.
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public int StoredPartCount { get; }
 
     /// <summary>
     /// Storage-provider SPI, not for application code. True when the part at <paramref name="position"/>
-    /// in <see cref="Parts"/> is beyond what the stored row declares: it must be inserted, never replace a
-    /// row already at its key (that row is not the entity's: <see cref="LargeValueTable.ContinuationKeyTaken"/>).
+    /// in <see cref="Parts"/> is beyond what the stored row declares and is not one of the entity's own
+    /// continuation rows the plan was made over: it must be inserted, never replace a row already at its
+    /// key. When a row is there, the provider reads the entity's own continuation rows: if that row is one
+    /// of them it plans again over them (<see cref="LargeValueTable.PlanOverOwnParts"/>), otherwise the
+    /// row is foreign (<see cref="LargeValueTable.ContinuationKeyTaken"/>).
     /// </summary>
     /// <param name="position">The zero-based position in <see cref="Parts"/> (the part's index less one).</param>
     /// <returns>Whether the part is new.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="position"/> is not a position in <see cref="Parts"/>.</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public bool IsNewPart(int position) => position + 1 > StoredPartCount;
+    public bool IsNewPart(int position)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(position, Parts.Count);
+        return position + 1 > StoredPartCount && !ownParts.Contains(Parts[position].RowKey);
+    }
 
-    /// <summary>Storage-provider SPI, not for application code. Row keys of the existing continuation rows to delete.</summary>
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Row keys of the existing continuation rows to
+    /// delete: the stored row's stale ones, and the entity's own leftover rows the new value does not need.
+    /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public IReadOnlyList<string> StalePartRowKeys { get; }
 
