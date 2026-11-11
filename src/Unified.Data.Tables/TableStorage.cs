@@ -306,14 +306,16 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
         id = NormalizeId(id);
 
-        var cacheKey = EntityCacheKey(id);
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(cacheKey, out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.OneAsync id={Id}", typeName, id);
             return Clone(cached.Entity);
         }
 
         logger.LogDebug("[Cache MISS] {Type}.OneAsync id={Id} — fetching from Table Storage", typeName, id);
+        // Taken before the first storage call: what this read finds is cached only if no write or delete
+        // of the entity has completed in between (see WriteGenerations).
+        var mark = BeginRead(id);
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
@@ -337,8 +339,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
         entity.ETag = row.ETag.ToString();
         entity.Timestamp = row.Timestamp;
-        CacheEntity(id, entity, row.ETag);
-        // `entity` is now caller-private (CacheEntity snapshotted its own copy), so hand it back as-is.
+        CacheRead(id, entity, row.ETag, mark);
+        // `entity` is now caller-private (CacheRead snapshotted its own copy), so hand it back as-is.
         return entity;
     }
 
@@ -351,13 +353,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
         id = NormalizeId(id);
 
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.ExistsAsync id={Id}", typeName, id);
             return true;
         }
 
         logger.LogDebug("[Cache MISS] {Type}.ExistsAsync id={Id} — fetching from Table Storage", typeName, id);
+        var mark = BeginRead(id); // before the first storage call, as in OneAsync
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
@@ -376,7 +379,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             var entity = response.Value!.FromTableEntity<T>();
             entity.ETag = response.Value!.ETag.ToString();
             entity.Timestamp = response.Value!.Timestamp;
-            CacheEntity(id, entity, response.Value!.ETag);
+            CacheRead(id, entity, response.Value!.ETag, mark);
         }
 
         return response.HasValue;
@@ -399,6 +402,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
 
         logger.LogDebug("[Cache MISS] {Type}.QueryAsync partition={Partition} — fetching from Table Storage", typeName, partition ?? "*");
+        // Taken before the first storage call: the list, and each entity it warms, is cached only if no
+        // write or delete it could have missed has completed in between (see WriteGenerations).
+        var mark = BeginScan();
         await EnsureTableAsync(ct);
         var results = new List<T>();
         var query = string.IsNullOrWhiteSpace(partition)
@@ -428,13 +434,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             results.Add(entity);
 
             // Warm the individual entity cache with fresh ETags
-            CacheEntity(entity.Id, entity, tableEntity.ETag);
+            CacheRead(entity.Id, entity, tableEntity.ETag, mark);
         }
 
         if (cachePolicy.Enabled)
             // Sized by row count so a SizeLimit-bounded cache actually accounts for a large (or
-            // whole-table) result list instead of counting it as one unit.
-            cache.Set(cacheKey, (IEnumerable<T>)results, CacheEntryOptions(Math.Max(1, results.Count)));
+            // whole-table) result list instead of counting it as one unit. Not cached when a write to
+            // the partition (to any partition, for the whole table) completed while it was read.
+            Generations.PutListIfUnchanged(mark, partition, cache, cacheKey, (IEnumerable<T>)results, CacheEntryOptions(Math.Max(1, results.Count)));
 
         // Hand back isolated copies so a caller mutating a result never corrupts the cached instances.
         return results.Select(Clone).ToList();
@@ -541,6 +548,10 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     private async IAsyncEnumerable<T> StreamAsync(string? filter, int? take, bool warmCache,
         [EnumeratorCancellation] CancellationToken ct, IEnumerable<string>? select = null, bool assemble = false)
     {
+        // Taken before the first storage call, once for the whole stream: an entity it yields is cached
+        // only if no write or delete of that entity has completed since the stream began (see
+        // WriteGenerations), however long the caller takes to consume it.
+        var mark = warmCache ? BeginScan() : default;
         await EnsureTableAsync(ct);
 
         var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
@@ -560,13 +571,13 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 if (await ReadLargeAsync(queried, ct) is not { } read)
                     continue;
                 var entity = Stamp(read.Entity, read.Row);
-                if (warmCache) CacheEntity(entity.Id, entity, read.Row.ETag);
+                if (warmCache) CacheRead(entity.Id, entity, read.Row.ETag, mark);
                 yield return entity;
             }
             else
             {
                 // A projection that omits every large value: nothing outside the row is read.
-                yield return warmCache ? Materialize(queried) : Deserialize(queried, projection);
+                yield return warmCache ? Materialize(queried, mark) : Deserialize(queried, projection);
             }
 
             if (take is int max && ++yielded >= max)
@@ -595,10 +606,13 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var fingerprint = PageCursor.Fingerprint(partition, rowKeyPrefix, pageSize);
         var innerToken = options.ContinuationToken is null ? null : PageCursor.Decode(options.ContinuationToken, fingerprint);
 
+        var select = BuildSelect(options);
+        // Taken before the first storage call (a projected page caches nothing): an entity of the page
+        // is cached only if no write or delete of it has completed in between (see WriteGenerations).
+        var mark = select is null ? BeginScan() : default;
         await EnsureTableAsync(ct);
 
         var filter = BuildFilter(partition, rowKeyPrefix);
-        var select = BuildSelect(options);
         var assemble = LargeValueAware && select is null;
         var pageable = client.QueryAsync<TableEntity>(filter, pageSize, select, ct);
 
@@ -622,11 +636,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 if (await ReadLargeAsync(queried, ct) is not { } read)
                     continue;
                 var entity = Stamp(read.Entity, read.Row);
-                CacheEntity(entity.Id, entity, read.Row.ETag);
+                CacheRead(entity.Id, entity, read.Row.ETag, mark);
                 items.Add(entity);
             }
             else
-                items.Add(Materialize(queried));
+                items.Add(Materialize(queried, mark));
         }
         var next = page.ContinuationToken is null ? null : PageCursor.Encode(fingerprint, page.ContinuationToken);
         return new EntityPage<T>(items, next);
@@ -659,11 +673,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         return entity;
     }
 
-    // Deserialize and warm the per-entity cache with the fresh ETag.
-    private T Materialize(TableEntity row)
+    // Deserialize and warm the per-entity cache with the fresh ETag (a read's put: see CacheRead).
+    private T Materialize(TableEntity row, ReadMark mark)
     {
         var entity = Deserialize(row);
-        CacheEntity(entity.Id, entity, row.ETag);
+        CacheRead(entity.Id, entity, row.ETag, mark);
         return entity;
     }
 
@@ -1144,22 +1158,52 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // (e.g. "vision|execution|agent" → partition "vision", row "execution|agent").
     private static (string PartitionKey, string RowKey) GetEntityKeys(string id) => EntityId.Split(id);
 
-    private string EntityCacheKey(string id) => $"{cacheKeyPrefix}:entity:{id}";
+    // The cache key of an entity, for a read: a lookup, or the read's own put (CacheRead).
+    private string EntityKey(string id) => $"{cacheKeyPrefix}:entity:{id}";
+
+    // The cache key of an entity, for a MUTATION: every caller has just committed (or lost) a write or
+    // delete of the entity and is about to evict or patch its entry. The write is noted here, before the
+    // entry is touched: that order is what keeps a read that raced the write from leaving the older
+    // version behind (see WriteGenerations). Reads use EntityKey.
+    private string EntityCacheKey(string id)
+    {
+        Generations.NoteWrite(id);
+        return EntityKey(id);
+    }
+
     private string QueryCacheKey(string? partition) => $"{cacheKeyPrefix}:query:{partition ?? "*"}";
 
+    // A WRITE's put: the entity a create, update or upsert has just committed, under the version the
+    // service returned for it. The write is noted before the entry is overwritten (see WriteGenerations).
     private void CacheEntity(string id, T entity, ETag etag)
     {
-        if (!cachePolicy.Enabled)
-            return;
+        Generations.NoteWrite(id);
+        if (cachePolicy.Enabled && Snapshot(id, entity) is { } snapshot)
+            cache.Set(EntityKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
+    }
 
-        // Store a private snapshot, never the caller-visible instance. Every read path (OneAsync,
-        // QueryAsync, the Materialize-based predicate/stream/page paths) and every write path
-        // (Create/Update/Upsert) hands its entity to the caller too; caching a clone here is the one
-        // choke point that keeps a caller mutating a returned/written entity from corrupting the cache.
-        T snapshot;
+    // A READ's put: the entity a point read, a query, a page or a stream found. It is cached only while
+    // no write or delete of it has been noted since the read took its mark, which it did before its
+    // first storage call; otherwise what it found may already be the older version.
+    private void CacheRead(string id, T entity, ETag etag, ReadMark mark)
+    {
+        // Asked before the snapshot too: an entity that will not be cached is not copied.
+        if (!cachePolicy.Enabled || !Generations.Unchanged(mark, id))
+            return;
+        if (Snapshot(id, entity) is { } snapshot)
+            Generations.PutEntityIfUnchanged(mark, id, cache, EntityKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
+    }
+
+    // A private snapshot for the cache, never the caller-visible instance. Every read path (OneAsync,
+    // QueryAsync, the Materialize-based predicate/stream/page paths) and every write path
+    // (Create/Update/Upsert) hands its entity to the caller too; caching a clone here is the one
+    // choke point that keeps a caller mutating a returned/written entity from corrupting the cache.
+    // Null when the entity cannot be cloned.
+    private T? Snapshot(string id, T entity)
+    {
         try
         {
-            snapshot = Clone(entity);
+            return Clone(entity);
         }
         catch (Exception ex) when (ex is SerializationException or InvalidOperationException or NotSupportedException)
         {
@@ -1168,10 +1212,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // cell), skip the cache rather than failing an already-successful write — such an entity is
             // not cacheable anyway, and a later read goes to the backend (its own concern).
             logger.LogDebug(ex, "[Cache SKIP] {Type} id={Id} — entity is not round-trippable for caching", typeName, id);
-            return;
+            return null;
         }
-
-        cache.Set(EntityCacheKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
     }
 
     // Size makes every entry countable so the store works with a SizeLimit-bounded IMemoryCache
@@ -1183,6 +1225,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     private void InvalidateQueryCache(string partitionKey)
     {
+        // The write is noted before its lists are evicted (see WriteGenerations), so a query that read
+        // the partition before the write committed cannot put its list back afterwards.
+        Generations.NotePartitionWrite(partitionKey);
         // A write to one partition can only affect that partition's cached query and the whole-table
         // ("all") query — never another partition's filtered results — so evict exactly those two.
         // (This replaces the old "evict every tracked partition" sweep and its unbounded tracked set.)
@@ -1191,4 +1236,185 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     }
 
     private sealed record CachedEntity(T Entity, ETag ETag);
+
+    // ── Read-cache coherence ────────────────────────────────────────────────
+    //
+    // A read puts what it read into the cache some time after it read it: the response is in flight, and
+    // a split-aware read still queries the continuation rows and downloads the blobs. A write or delete
+    // that commits in between must not be followed by the read caching the older version: later reads
+    // would be served it from memory, and a deleted entity would stay readable. So:
+    //
+    //   - a mutation, once it has committed, NOTES itself (advances a write generation) before it evicts
+    //     or overwrites a cache entry: the entity's generation in EntityCacheKey and CacheEntity, before
+    //     the entity's entry goes or is replaced; the partition's in InvalidateQueryCache, before the
+    //     cached lists go. Every mutating path goes through those helpers;
+    //   - a read takes a ReadMark (the generations it depends on) before its first storage call and puts
+    //     its result only while they are unchanged. Comparing and putting are one critical section with
+    //     the advance.
+    //
+    // Why that is enough: take a read that fetched an older version than a write committed. It took its
+    // mark before that commit, hence before the write's advance. Either the advance came before the
+    // read's compare-and-put, and the read puts nothing; or it came after, and then the write evicts or
+    // overwrites what the read put, because it touches the entry only after advancing. So once the write
+    // has returned, nothing older than it is in the cache, or was ever visible there after that moment.
+    // Writes by other processes are not seen, as before (see CachePolicy).
+
+    private static readonly ConditionalWeakTable<IMemoryCache, WriteGenerations> GenerationsByCache = new();
+
+    private WriteGenerations? generations;
+
+    // One per cache and entity type: two stores of T over one IMemoryCache share its entries, so they
+    // share the generations that guard them. (A store built without a cache has nothing to guard.)
+    private WriteGenerations Generations => generations ??= cache is null
+        ? new WriteGenerations()
+        : GenerationsByCache.GetValue(cache, static _ => new WriteGenerations());
+
+    /// <summary>The mark of a read of one entity; taken before the read's first storage call.</summary>
+    private ReadMark BeginRead(string id) => cachePolicy.Enabled ? Generations.MarkEntity(id) : default;
+
+    /// <summary>The mark of a read of many entities; taken before the read's first storage call.</summary>
+    private ReadMark BeginScan() => cachePolicy.Enabled ? Generations.MarkAll() : default;
+
+    /// <summary>
+    /// What a read noted before its first storage call: the write generation of the one entity it reads
+    /// (<see cref="Stripe"/>, <see cref="Generation"/>), or every generation (<see cref="All"/>) for a
+    /// read of many entities. The default value marks nothing: a read that carries it caches nothing.
+    /// </summary>
+    private readonly struct ReadMark(int stripe, long generation, long[]? all)
+    {
+        public bool Taken { get; } = true;
+
+        public int Stripe { get; } = stripe;
+
+        public long Generation { get; } = generation;
+
+        public long[]? All { get; } = all;
+    }
+
+    /// <summary>
+    /// The write generations of one cache: counters that a mutation advances and a read compares. An
+    /// entity and a partition each map onto one of a fixed number of counters, so memory stays bounded
+    /// however many keys are written; two keys that share a counter only make a read that raced a write
+    /// of the OTHER key skip its put.
+    /// </summary>
+    private sealed class WriteGenerations
+    {
+        private const int Stripes = 256;
+        private const uint HashSeed = 2166136261;
+
+        private readonly Lock gate = new();
+        private readonly long[] counters = new long[Stripes];
+
+        /// <summary>Notes a committed write or delete of the entity <paramref name="id"/>, before its entry is touched.</summary>
+        public void NoteWrite(ReadOnlySpan<char> id)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                counters[stripe]++;
+            }
+        }
+
+        /// <summary>Notes a committed write or delete somewhere in the partition, before its lists are evicted.</summary>
+        public void NotePartitionWrite(ReadOnlySpan<char> partitionKey)
+        {
+            var stripe = PartitionStripe(partitionKey);
+            lock (gate)
+            {
+                counters[stripe]++;
+            }
+        }
+
+        /// <summary>The mark of a read of the entity <paramref name="id"/> alone.</summary>
+        public ReadMark MarkEntity(ReadOnlySpan<char> id)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                return new ReadMark(stripe, counters[stripe], null);
+            }
+        }
+
+        /// <summary>The mark of a read of many entities (a partition, a page, a predicate, the table).</summary>
+        public ReadMark MarkAll()
+        {
+            lock (gate)
+            {
+                return new ReadMark(-1, 0, (long[])counters.Clone());
+            }
+        }
+
+        /// <summary>True while no write or delete of the entity <paramref name="id"/> was noted since <paramref name="mark"/>.</summary>
+        public bool Unchanged(ReadMark mark, ReadOnlySpan<char> id)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                return EntityUnchanged(mark, stripe);
+            }
+        }
+
+        /// <summary>
+        /// Caches what a read found for the entity <paramref name="id"/>, unless a write or delete of it
+        /// was noted since <paramref name="mark"/>. One critical section with <see cref="NoteWrite"/>.
+        /// </summary>
+        public bool PutEntityIfUnchanged<TItem>(
+            ReadMark mark, ReadOnlySpan<char> id, IMemoryCache cache, string key, TItem value, MemoryCacheEntryOptions options)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                if (!EntityUnchanged(mark, stripe))
+                    return false;
+                cache.Set(key, value, options);
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Caches the list a query read for <paramref name="partitionKey"/> (null: the whole table),
+        /// unless a write or delete in that partition (anywhere, for the whole table) was noted since
+        /// <paramref name="mark"/>. One critical section with the two Note methods.
+        /// </summary>
+        public bool PutListIfUnchanged<TItem>(
+            ReadMark mark, string? partitionKey, IMemoryCache cache, string key, TItem value, MemoryCacheEntryOptions options)
+        {
+            // Only a read of many entities (MarkAll) caches a list.
+            if (mark.All is not { } all)
+                return false;
+            var stripe = partitionKey is null ? -1 : PartitionStripe(partitionKey);
+            lock (gate)
+            {
+                // Every mutation advances at least one counter, so "no counter moved" is "no write at all".
+                var unchanged = stripe < 0 ? counters.AsSpan().SequenceEqual(all) : counters[stripe] == all[stripe];
+                if (!unchanged)
+                    return false;
+                cache.Set(key, value, options);
+                return true;
+            }
+        }
+
+        // Called under the gate.
+        private bool EntityUnchanged(ReadMark mark, int stripe) => mark.All is { } all
+            ? counters[stripe] == all[stripe]
+            : mark.Taken && mark.Stripe == stripe && counters[stripe] == mark.Generation;
+
+        // The counter of an entity, by its keys however the id spells them ("a" and "a|a" are one row).
+        private static int EntityStripe(ReadOnlySpan<char> id) => Stripe(id.Contains(Separator)
+            ? Hash(HashSeed, id)
+            : Hash(Hash(Hash(HashSeed, id), [Separator]), id));
+
+        // The counter of a partition's cached list.
+        private static int PartitionStripe(ReadOnlySpan<char> partitionKey) => Stripe(Hash(HashSeed, partitionKey));
+
+        // FNV-1a over the UTF-16 code units: the same on every run, and nothing is allocated.
+        private static uint Hash(uint hash, ReadOnlySpan<char> text)
+        {
+            foreach (var c in text)
+                hash = (hash ^ c) * 16777619;
+            return hash;
+        }
+
+        private static int Stripe(uint hash) => (int)((hash ^ (hash >> 16)) % Stripes);
+    }
 }
