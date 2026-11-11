@@ -142,13 +142,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 // A stream a write has read part-way, or could not put back, is refused before this content
                 // reads any of it. One that a write read to its end is read: a new payload is stored,
                 // nothing at all is refused (the retry that would store an empty file).
-                var consumed = !content.HasSourceOrigin && content.ClaimSource(column);
                 // A source that was seekable when it was first prepared stays on this path: it is read from
                 // the recorded origin or not at all, never from wherever it stands now.
                 if (content.HasSourceOrigin || source.CanSeek)
-                    await HashSeekableAsync(column, content, source, consumed, ct);
+                    await HashSeekableAsync(column, content, source, !content.HasSourceOrigin && content.ClaimSource(column), ct);
                 else
-                    await SpoolAsync(column, content, source, consumed, ct);
+                    await SpoolAsync(column, content, source, ct);
             }
             finally
             {
@@ -181,25 +180,39 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     // Copies a forward-only source, while hashing it, to a delete-on-close temporary file that becomes
     // the upload source. A copy that fails or is cancelled has consumed part of the source for good. A
-    // source whose chain a write read to its end (consumed) and that delivers nothing is refused.
-    private static async Task SpoolAsync(string column, TableBlobContent content, Stream source, bool consumed, CancellationToken ct)
+    // source whose chain a write read to its end (consumed) and that delivers nothing is refused. The source is
+    // claimed only once the temporary file exists: a copy that cannot be created leaves the stream as it was.
+    private static async Task SpoolAsync(string column, TableBlobContent content, Stream source, CancellationToken ct)
     {
         var spool = new FileStream(
             Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()),
             FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, CopyBufferBytes,
             FileOptions.DeleteOnClose | FileOptions.Asynchronous);
+        bool consumed;
+        try
+        {
+            consumed = content.ClaimSource(column);
+        }
+        catch
+        {
+            await spool.DisposeAsync();
+            throw;
+        }
         long length;
         string sha;
+        var readToEnd = false;
         try
         {
             (length, sha) = await CopyHashingAsync(source, spool, ct);
+            // The source was read to its end, whatever happens to the temporary copy now (STREAMS-2).
+            readToEnd = true;
             await spool.FlushAsync(ct);
             spool.Position = 0;
         }
         catch
         {
             await spool.DisposeAsync();
-            content.LoseSource();
+            content.LoseSource(readToEnd);
             throw;
         }
         if (consumed && length == 0)

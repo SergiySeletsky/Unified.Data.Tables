@@ -598,13 +598,15 @@ public sealed class TableBlobContent
     }
 
     /// <summary>
-    /// A forward-only source was partly consumed by a prepare attempt that failed or was cancelled: the
-    /// content can no longer be written (see <see cref="ThrowIfNotWritable"/>).
+    /// A prepare attempt over a forward-only source failed or was cancelled: it read only part of the source,
+    /// or read all of it and lost its temporary copy (<paramref name="readToEnd"/>). The content can no longer
+    /// be written (see <see cref="ThrowIfNotWritable"/>); the source is listed as read part-way or to its end.
     /// </summary>
-    internal void LoseSource()
+    /// <param name="readToEnd">True when the source had been read to its end.</param>
+    internal void LoseSource(bool readToEnd)
     {
-        sourceLost = PartlyReadForwardOnly;
-        EndSourceRead(complete: false);
+        sourceLost = readToEnd ? TemporaryCopyReleased : PartlyReadForwardOnly;
+        EndSourceRead(complete: readToEnd);
     }
 
     /// <summary>
