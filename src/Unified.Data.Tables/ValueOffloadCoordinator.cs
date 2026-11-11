@@ -88,9 +88,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// Serializes <paramref name="entity"/> and plans its rows.
     /// <para>
     /// An opted-in value that fits one cell stays in its cell. When the cells that must stay on the
-    /// first row then exceed one entity, the largest of those values are moved to split form (their
+    /// primary row then exceed one entity, the largest of those values are moved to split form (their
     /// property's encoding, the normal split cells), so their chunks can go to continuation rows, until
-    /// the first row fits; a row that needed this is also brought within the request budget of one
+    /// the primary row fits; a row that needed this is also brought within the request budget of one
     /// entity (<see cref="SplitRowLayout.MaxEntityWireBytes"/>) as far as moving such values can, like
     /// every row split cells are placed on. A row that fits one entity is left as it is.
     /// </para>
@@ -101,7 +101,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// </para>
     /// </summary>
     /// <exception cref="OversizedValueException">
-    /// Nothing more can be moved: the cells that are left on the first row exceed one entity, or no
+    /// Nothing more can be moved: the cells that are left on the primary row exceed one entity, or no
     /// value is left that may be offloaded. The exception names a column of the entity.
     /// </exception>
     internal (TableEntity Row, SplitRowPlan Plan, IReadOnlyList<PendingBlob> Blobs) Serialize(object entity, string pk, string rk, int extraActions)
@@ -117,7 +117,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             var row = TableEntitySerializer.ToTableEntity(entity, pk, rk, ctx, pending);
             if (SplitRowLayout.TryPlan(row, out var overflow) is not { } plan)
             {
-                // The cells that must stay on the first row exceed one entity, and opted-in values of
+                // The cells that must stay on the primary row exceed one entity, and opted-in values of
                 // one cell each are among them: move the largest, so their chunks can leave the row.
                 var gains = inline.ConvertAll(value => (value.Column, Gain: SplitRowLayout.PromotionGain(row, value).Bytes));
                 var moved = SplitRowLayout.ChoosePromotions(overflow!, gains);
@@ -127,7 +127,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 continue;
             }
 
-            // A row values were moved off is a split row: its first row is kept within the request
+            // A row values were moved off is a split row: its primary row is kept within the request
             // budget of one entity too, as far as moving more of them can. (Cells that cannot be moved
             // are held to the stored size alone, as on every row.)
             if (split.Count > 0 && inline.Count > 0)

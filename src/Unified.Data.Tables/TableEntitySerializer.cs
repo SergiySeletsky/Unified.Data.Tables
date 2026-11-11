@@ -1168,7 +1168,7 @@ internal sealed class TableEntityValue
                 break;
         }
 
-        // A value that fits one cell stays in its cell, unless the planner moved the column off a first
+        // A value that fits one cell stays in its cell, unless the planner moved the column off a primary
         // row that was too full: then it takes the split form below, like a value too large for one cell.
         var moved = state is { Ctx: { } planned } && (planned.ForceSplit.Contains(columnName) || planned.ForceOffload.Contains(columnName));
         if (!moved && SplitCodec.FitsOneCell(payload, split.Encoding))

@@ -529,6 +529,55 @@ public class RuntimeSubtypeSplitTests
     }
 
     [Theory]
+    [InlineData(LargeValueStores.Memory)]
+    [InlineData(LargeValueStores.Azurite)]
+    public async Task UpsertAndBatchWrites_OfARuntimeMember_RoundTrip_AndLeaveNoStaleRowsOrBlobs(string store)
+    {
+        await using var stores = await LargeValueStores.OpenAsync(store, cleanupGrace: TimeSpan.Zero);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        InterfaceHolder Make(string rowKey, string form, int seed)
+        {
+            var entity = new InterfaceHolder { Id = stores!.Id(rowKey), Title = form };
+            entity.Large.Notes = (string)Value("string", form, seed);
+            return entity;
+        }
+
+        async Task AssertReadsAsync(InterfaceHolder expected)
+        {
+            var read = await stores!.Store<InterfaceHolder>().OneAsync(expected.Id, Ct);
+            Assert.Equal(expected.Large.Notes, read!.Large.Notes, StringComparer.Ordinal);
+            Assert.Equal(expected.Title, read.Title);
+        }
+
+        // Upsert as insert, then over itself in every other form: blob, continuation rows, cells, one cell.
+        var id = stores!.Id("r1");
+        foreach (var (form, seed) in new[] { (Rows, 1), (Blob, 2), (Rows, 3), (Cells, 4), (Inline, 5) })
+        {
+            await stores.PastTheNewestBlobAsync<InterfaceHolder>();
+            var entity = Make("r1", form, seed);
+            await stores.Store<InterfaceHolder>().UpsertAsync(entity, Ct);
+            await AssertReadsAsync(entity);
+            await AssertStoredAsync<InterfaceHolder>(stores, "Shape_Notes", "string", form);
+        }
+
+        // Batches: created, then upserted over.
+        var batch = new[] { Make("b1", Rows, 11), Make("b2", Cells, 12), Make("b3", Blob, 13) };
+        Assert.Equal(3, await stores.Store<InterfaceHolder>().CreateBatchAsync(batch, Ct));
+        foreach (var entity in batch)
+            await AssertReadsAsync(entity);
+        var replaced = new[] { Make("b1", Cells, 21), Make("b2", Rows, 22), Make("b3", Inline, 23) };
+        await stores.PastTheNewestBlobAsync<InterfaceHolder>();
+        Assert.Equal(3, await stores.Store<InterfaceHolder>().UpsertBatchAsync(replaced, Ct));
+        foreach (var entity in replaced)
+            await AssertReadsAsync(entity);
+        Assert.Empty(await stores.BlobNamesAsync<InterfaceHolder>());
+        Assert.Equal(4, await stores.Store<InterfaceHolder>().CountAsync(stores.Pk, Ct));
+        Assert.Equal(
+            ["b1", "b2", "b2~0001", "b3", "r1"],
+            (await stores.RawRowsAsync<InterfaceHolder>()).Select(r => r.RowKey));
+    }
+
+    [Theory]
     [InlineData(LargeValueStores.Memory, 40_000)]
     [InlineData(LargeValueStores.Memory, 700_000)]
     [InlineData(LargeValueStores.Memory, 6_000_000)]

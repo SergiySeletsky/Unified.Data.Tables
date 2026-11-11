@@ -20,7 +20,7 @@ internal sealed record ValueWriteContext(
 
     /// <summary>
     /// Flattened base columns written in split form although the value fits one cell: the planner moved
-    /// them off a first row that was too full, so their chunks can go to continuation rows.
+    /// them off a primary row that was too full, so their chunks can go to continuation rows.
     /// </summary>
     public IReadOnlySet<string> ForceSplit { get; init; } = NoColumns;
 

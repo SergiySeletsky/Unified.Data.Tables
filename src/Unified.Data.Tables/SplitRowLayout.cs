@@ -9,7 +9,7 @@ namespace Unified.Data.Tables;
 internal sealed record SplitRowPlan(TableEntity Primary, IReadOnlyList<TableEntity> Parts);
 
 /// <summary>
-/// Why a logical row cannot be planned: the cells that must stay on its first row (every cell but the
+/// Why a logical row cannot be planned: the cells that must stay on its primary row (every cell but the
 /// chunks of split values, and the part count) exceed one entity.
 /// </summary>
 /// <param name="Properties">How many properties those cells are.</param>
@@ -63,7 +63,7 @@ internal static class SplitRowLayout
         _ => 8L,
     };
 
-    /// <summary>The cells a split value keeps on the first row: <c>__chunks</c>, <c>__sha256</c>, <c>__enc</c>, <c>__len</c>.</summary>
+    /// <summary>The cells a split value keeps on the primary row: <c>__chunks</c>, <c>__sha256</c>, <c>__enc</c>, <c>__len</c>.</summary>
     internal const int ManifestCells = 4;
 
     // The estimated size of those four cells for a column: their names (the column and the suffixes,
@@ -81,7 +81,7 @@ internal static class SplitRowLayout
         + TableRowSize.PropertyWireSize(column + "__len", 0L);
 
     /// <summary>
-    /// What moving <paramref name="value"/> to split form frees on the first row: its one cell goes
+    /// What moving <paramref name="value"/> to split form frees on the primary row: its one cell goes
     /// (its chunk can then sit on a continuation row) and four manifest cells come. In estimated bytes
     /// (<see cref="TableRowSize.Estimate"/>) and in bytes of the request (<see cref="TableRowSize.WireSize"/>);
     /// not positive for a value smaller than its manifest.
@@ -106,7 +106,7 @@ internal static class SplitRowLayout
 
     /// <summary>
     /// The opted-in values to move from one cell each to split form to free <paramref name="excess"/>
-    /// bytes on a first row of <paramref name="properties"/> properties: the largest gain first (the
+    /// bytes on a primary row of <paramref name="properties"/> properties: the largest gain first (the
     /// first of equal ones), as many as it takes and as the row has properties for, since a moved value
     /// leaves <see cref="ManifestCells"/> cells where its one cell was. Empty when nothing frees bytes
     /// or the row has no property left.
@@ -126,7 +126,7 @@ internal static class SplitRowLayout
     }
 
     /// <summary>
-    /// How far the cells that stay on the first row of <paramref name="plan"/> (every cell but the
+    /// How far the cells that stay on the primary row of <paramref name="plan"/> (every cell but the
     /// chunks, which are only placed there within the budget) exceed <see cref="MaxEntityWireBytes"/>,
     /// and how many properties they are. Not positive when they are within it.
     /// </summary>
@@ -157,7 +157,7 @@ internal static class SplitRowLayout
     internal static OversizedValueException PrimaryOverflowError(PrimaryOverflow overflow, int movable)
     {
         var reason = string.Create(CultureInfo.InvariantCulture,
-            $"the cells that must stay on the entity's first row ({overflow.Properties} properties, {overflow.Bytes:N0} estimated bytes) "
+            $"the cells that must stay on the entity's main row ({overflow.Properties} properties, {overflow.Bytes:N0} estimated bytes) "
             + $"exceed what one entity holds ({MaxPropertiesPerRow} properties, {MaxEntityBytes:N0} estimated bytes), "
             + $"and '{overflow.LargestColumn}' is the largest of them");
         if (movable > 0)
