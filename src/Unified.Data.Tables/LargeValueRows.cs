@@ -35,6 +35,9 @@ public static class LargeValueRows
     /// <exception cref="NotSupportedException">The update would write a large value, or whether it would
     /// cannot be decided (for a large-value aware type whose constructor or a getter throws while the path is
     /// resolved as a read would resolve it; the failure is the inner exception).</exception>
+    /// <exception cref="InvalidOperationException">The path meets a misused <see cref="TableValueSplitAttribute"/>,
+    /// such as one on a member declared on an interface that the entity type, or the declared type of a property
+    /// along the path, is or implements: the exception a whole-entity write of the type reports.</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public static Dictionary<string, object> FlattenPropertyForUpdate(Type ownerType, string columnPath, object value) =>
         TableEntitySerializer.FlattenProperty(ownerType, columnPath, value);
