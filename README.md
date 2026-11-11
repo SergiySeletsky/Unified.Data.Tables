@@ -438,7 +438,11 @@ aliases, so rows written by pre-0.3.0 serializers deserialize correctly out of t
 per-project opt-in needed.
 
 The canonical column wins unconditionally when both exist. Aliases cover the `__Json`/`__GZip` cell
-variants and are validated eagerly (collisions and unknown targets throw on first use of the type).
+variants and, for a `[TableValueSplit]` or `TableBlobContent` property, the split cells, continuation
+rows and blob reference stored under the old name (see
+[Large values](#large-values-split-and-blob-offload)). They apply to top-level columns only. A
+declaration is checked the first time the type is written or a row of it is read, not when the store is
+constructed: a collision or an unknown target then throws `InvalidOperationException`.
 
 ---
 
@@ -503,9 +507,10 @@ Customer     back = row.FromTableEntity<Customer>();
 - **A leading `_` is reserved.** `_`-prefixed columns belong to the storage layer and are never
   written into a property. Before 0.8.0, `_TypeName` was parsed as property path `["TypeName"]`, so a
   type declaring a `TypeName` property silently received the assembly-qualified name as its value —
-  the same held for any `_`-prefixed sentinel. The rule is enforced on **read** only: flattening still
-  names columns after the property verbatim, so a property called `_Foo` does write a column `_Foo`
-  (which is then skipped on the way back). Keep `_` out of property names.
+  the same held for any `_`-prefixed sentinel. A property cannot produce such a column either: `_` is
+  also the column-path delimiter, so since 0.8.1 the writer refuses any property whose name contains
+  `_` (`_Foo`, `Foo_Bar`) with `SerializationException` naming the property. Keep `_` out of property
+  names.
 - **`persistType: true` writes `_TypeName`** with `Type.AssemblyQualifiedName`. `FromTableEntity<TBase>(discriminator)`
   reads it back constrained to a base type, and `TryFromTableEntity<TBase>` additionally tolerates a
   row that carries no discriminator at all.
