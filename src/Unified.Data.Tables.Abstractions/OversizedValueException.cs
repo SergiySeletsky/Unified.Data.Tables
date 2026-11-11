@@ -4,7 +4,8 @@ namespace Unified.Data.Tables;
 
 /// <summary>
 /// A value marked <see cref="TableValueSplitAttribute"/> is too large to store in table rows and
-/// cannot be offloaded to blob storage.
+/// cannot be offloaded to blob storage, or the cells of an entity that cannot leave its main row
+/// (its ordinary cells among them) exceed one entity. The message ends with what can be done.
 /// </summary>
 /// <remarks>
 /// Derives from <see cref="SerializationException"/> so existing <c>catch (SerializationException)</c>
