@@ -966,17 +966,21 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
 
         // Keep the cache coherent: if the entity is cached and every declared path maps onto a
-        // top-level property, a copy of it is patched and put with the new ETag so reads stay warm (a
-        // write's put: it gives way to another write or delete of the entity noted since the mark).
-        // Nested-path updates (or unknown names) evict instead — the next OneAsync re-reads fresh.
+        // top-level property, a copy of it is patched and put with the new ETag, on the entry and on the
+        // entity a read hands back, so reads stay warm (a write's put: it gives way to another write or
+        // delete of the entity noted since the mark). Nested-path updates (or unknown names), and a
+        // response without a version (the cached one is known to be old), evict instead — the next
+        // OneAsync re-reads fresh.
         var newETag = ReadETagHeader(resp);
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null
+        if (cachePolicy.Enabled && newETag is { } updatedETag
+            && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null
             && PatchesTopLevelOnly(builder.Updates) && Snapshot(id, cached.Entity) is { } patched
             && TryApplyUpdates(patched, builder.Updates))
         {
             patched.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
             patched.Timestamp = null; // the row changed server-side; stale until re-read
-            PutWrite(id, new CachedEntity(patched, newETag ?? cached.ETag), mark);
+            patched.ETag = updatedETag.ToString();
+            PutWrite(id, new CachedEntity(patched, updatedETag), mark);
         }
         else
         {
