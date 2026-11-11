@@ -114,7 +114,10 @@ public sealed class LargeValueTable
     /// <paramref name="tableName"/> for a store of <paramref name="entityType"/>: a read of every row creates
     /// that type, so the write of a subclass instance through the store is refused (with
     /// <see cref="NotSupportedException"/>, before anything is uploaded or written) a value it would store as
-    /// split cells or a blob in a column <paramref name="entityType"/> maps to no property.
+    /// split cells or a blob in a column <paramref name="entityType"/> maps to no property. In
+    /// <c>CreateBatchAsync</c> and <c>UpsertBatchAsync</c> the refusal comes before anything of the refused
+    /// entity's partition is uploaded or written; the transactions of partitions the batch wrote before it
+    /// stay committed, as for any failing transaction of a batch.
     /// </summary>
     /// <param name="tableName">The store's resolved table name, the first segment of every blob name.</param>
     /// <param name="options">The blob offload settings; null when blob offload is not configured.</param>

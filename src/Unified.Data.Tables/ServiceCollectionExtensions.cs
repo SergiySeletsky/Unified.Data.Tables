@@ -13,9 +13,14 @@ namespace Unified.Data.Tables;
 public static partial class ServiceCollectionExtensions
 {
     /// <summary>
-    /// The DI key of the <see cref="BlobServiceClient"/> blob offload uses. The library registers it only
-    /// when <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set, so the host's own (unkeyed)
-    /// <see cref="BlobServiceClient"/> registration is never taken or shadowed.
+    /// The DI key of the <see cref="BlobServiceClient"/> blob offload uses. The library registers it when
+    /// the registered options set <see cref="UnifiedTableStorageOptions.BlobOffload"/>, and, beside options
+    /// the host registered through a factory or a type (which cannot be read at registration), whenever a
+    /// later call has a client to offer (a connection-string or credential overload, or its own
+    /// <see cref="BlobOffloadOptions"/> naming one), also when those options set no offload. On
+    /// a container that follows Microsoft's keyed-service rules the host's own (unkeyed)
+    /// <see cref="BlobServiceClient"/> registration is never taken or shadowed; on Lamar and the DryIoc
+    /// adapter that last case changes what the host's unkeyed client resolves to (see the README).
     /// </summary>
     internal const string OffloadBlobServiceClientKey = "Unified.Data.Tables.BlobOffload";
 

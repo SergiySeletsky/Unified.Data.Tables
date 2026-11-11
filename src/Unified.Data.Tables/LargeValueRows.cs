@@ -32,7 +32,9 @@ public static class LargeValueRows
     /// <param name="columnPath">The flattened column path, e.g. <c>"Inner_Body"</c>.</param>
     /// <param name="value">The new value.</param>
     /// <returns>The columns to merge.</returns>
-    /// <exception cref="NotSupportedException">The update would write a large value.</exception>
+    /// <exception cref="NotSupportedException">The update would write a large value, or whether it would
+    /// cannot be decided (for a large-value aware type whose constructor or a getter throws while the path is
+    /// resolved as a read would resolve it; the failure is the inner exception).</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public static Dictionary<string, object> FlattenPropertyForUpdate(Type ownerType, string columnPath, object value) =>
         TableEntitySerializer.FlattenProperty(ownerType, columnPath, value);

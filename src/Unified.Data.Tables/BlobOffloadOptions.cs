@@ -29,6 +29,12 @@ public sealed class BlobOffloadOptions
     /// <see cref="ServiceClient"/> or the client its connection-string or credential overload derives, which it
     /// keeps to itself, so the host's own <see cref="BlobServiceClient"/> registration is never taken or replaced.
     /// </summary>
+    /// <remarks>
+    /// Register the host's <see cref="BlobServiceClient"/> as a singleton. Every <c>TableStorage&lt;T&gt;</c> is a
+    /// singleton that takes the offload client when it is constructed, so with a scoped registration every
+    /// store, a plain one too, fails to resolve under <c>ValidateScopes</c> ("Cannot resolve scoped service ...
+    /// from root provider"), and without <c>ValidateScopes</c> the stores keep the root scope's instance.
+    /// </remarks>
     public bool UseRegisteredServiceClient { get; set; }
 
     /// <summary>The largest <see cref="ThresholdBytes"/>: the 4 MiB payload limit of one entity-group transaction.</summary>

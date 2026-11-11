@@ -12,6 +12,15 @@ namespace Unified.Data.Tables;
 /// own. An attribute on a property wins over the one on its class, and a property that a derived class
 /// overrides or hides (<c>new</c>) keeps the attribute of the property it re-declares.
 /// <para>
+/// On a property declared on an interface the attribute is a misuse: .NET does not pass the attributes of
+/// an interface member to the class that implements it, so it cannot be honoured. It makes no type
+/// large-value aware and lists no large-value column. Every write or read that meets a class implementing
+/// the interface throws <see cref="System.InvalidOperationException"/> before anything is stored (a value of
+/// such a class is never trimmed), naming the interface member and the remedy: put the attribute on the
+/// property of the implementing class, or on that class (and, where an entity holds the implementation in
+/// a property declared as the interface, on the entity class too).
+/// </para>
+/// <para>
 /// A store treats its entity type as large-value aware (it plans split cells, continuation rows and blobs)
 /// only when the declared types say so, read by reflection alone: the attribute on a property of the entity
 /// or of a type the entity flattens into columns, a <see cref="TableBlobContent"/> property there, or the

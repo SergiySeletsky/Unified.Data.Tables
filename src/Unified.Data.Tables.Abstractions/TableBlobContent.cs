@@ -26,6 +26,16 @@ namespace Unified.Data.Tables;
 /// streams the blob of its own row in its own store, so the entity it came from (and any cached copy of
 /// it) is not affected by what later happens to the other blob. A content read by a store without blob
 /// offload is the exception: it becomes readable through the store that saves it to its own row.
+/// The written property is given its new content as soon as the blob is uploaded, before the row is
+/// written; a write that then fails leaves the property streaming the blob uploaded for that row. Retry
+/// before an orphan sweep collects that blob, or assign the original content again (or read its row
+/// again) before retrying.
+/// </para>
+/// <para>
+/// A write refused because a read could not map a file's column back to a property (a
+/// <see cref="TableBlobContent"/> below an object whose runtime type a read does not recreate) may have
+/// read the file's source first; a content created from a non-seekable stream must then be created again
+/// from its source.
 /// </para>
 /// <para>
 /// A property whose owner the entity holds by value (a struct) cannot be given a new content: it keeps
@@ -197,7 +207,9 @@ public sealed class TableBlobContent
     /// retry that would store an empty file; a recycled stream whose new payload is empty is refused in
     /// that one case too). Two contents over one non-seekable stream written by one write are refused the
     /// same way. A stream a failed write read only part of, and a seekable stream a write could not put
-    /// back, are refused for every later content. What is remembered about a stream holds for the streams
+    /// back, are refused for every later content (so a server that reuses a request-body object which a
+    /// failed write read part-way refuses every later content over it: buffer the body into a seekable
+    /// stream, or close the connection after such a failure). What is remembered about a stream holds for the streams
     /// below it that the framework wrappers expose (<c>BufferedStream</c>, <c>GZipStream</c>,
     /// <c>DeflateStream</c>, <c>ZLibStream</c>, <c>BrotliStream</c>, followed recursively), so a new such
     /// wrapper over a stream an earlier attempt consumed is recognised. Only the content's own stream and
