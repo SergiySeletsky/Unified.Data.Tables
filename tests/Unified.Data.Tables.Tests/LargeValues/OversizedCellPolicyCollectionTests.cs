@@ -176,7 +176,7 @@ internal sealed class PolicyWriteScan
     private static IEnumerable<Type> WithNested(Type type) =>
         type.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic).SelectMany(WithNested).Prepend(type);
 
-    // The methods the body of <paramref name="method"/> refers to: calls, constructor calls and delegates.
+    // The methods a method's body refers to: calls, constructor calls and delegates.
     private static IEnumerable<MethodBase> Targets(MethodBase method)
     {
         // An async or iterator method only starts its state machine; its body, calls included, is compiled
