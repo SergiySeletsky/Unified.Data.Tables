@@ -24,6 +24,14 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     private static readonly IReadOnlyDictionary<string, object> NothingResolved = new Dictionary<string, object>(StringComparer.Ordinal);
 
     /// <summary>
+    /// Called with a row's partition and row key when a lazy content this coordinator materialized (on a
+    /// read or a write of that row) found its blob missing: the entity it was handed out with is stale,
+    /// and the store stops answering that row from its caches. Null when the store has no cache. It is
+    /// called before the integrity failure is thrown, and whatever it throws is swallowed.
+    /// </summary>
+    internal Action<string, string>? BlobMissing { get; set; }
+
+    /// <summary>
     /// <c>{table}/{partitionKey}/{rowKey}/{column}/{sha256}</c>, each segment escaped by
     /// <see cref="OffloadBlobNames.EscapeSegment"/> (so no segment is ever <c>.</c>, <c>..</c> or empty).
     /// </summary>
@@ -321,14 +329,16 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 continue;
             var name = blob.Reference.Path;
             var column = blob.Column;
-            Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, c);
+            var keys = RowKeysOf(name);
+            Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, keys, c);
             // Bound while this write holds the content: of several writes binding it at once, exactly one
             // binds the shared instance. The property is assigned after the turn ends (no lock across a setter).
+            // A content bound through another store keeps that store's blob, even under the same name.
             bool bound;
             await content.WaitTurnAsync(ct);
             try
             {
-                bound = content.Bind(name, open, column);
+                bound = content.Bind(name, open, column, store);
             }
             finally
             {
@@ -343,7 +353,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             // written gets a content of its own, bound to the blob its own row references. A property that
             // cannot be assigned keeps the instance as it is.
             blob.Assign?.Invoke(TableBlobContent.Bound(
-                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column));
+                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column, store));
         }
     }
 
@@ -498,20 +508,23 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         if (anyLazy)
         {
             var store = blobs;
+            (string, string)? keys = row.PartitionKey is { } pk && row.RowKey is { } rk ? (pk, rk) : null;
+            // The content remembers the store it reads through (BLOBS-3); null when this store cannot open it.
             lazy = (column, reference) => TableBlobContent.Bound(
                 reference.Length, reference.Sha256, reference.ContentType, reference.Path,
                 c => store is not null
-                    ? OpenLazyAsync(store, column, reference.Path, c)
+                    ? OpenLazyAsync(store, column, reference.Path, keys, c)
                     : throw new BlobOffloadNotConfiguredException(tableName, column),
-                column);
+                column, store);
         }
         return new ValueReadContext(resolved ?? NothingResolved, lazy, projectedColumns);
     }
 
     // A lazy TableBlobContent opens its blob long after the row was read, perhaps from the entity cache:
     // a replace or delete since then may have deleted the blob (blobs are content-addressed, so it can
-    // only be missing, never hold other bytes). Say so instead of reporting a bare missing blob.
-    private static async Task<Stream> OpenLazyAsync(IOffloadBlobStore store, string column, string path, CancellationToken ct)
+    // only be missing, never hold other bytes). The store then stops answering the row from its caches
+    // (BLOBS-4), so reading the entity again reads the table; the failure itself still reaches the caller.
+    private async Task<Stream> OpenLazyAsync(IOffloadBlobStore store, string column, string path, (string Pk, string Rk)? keys, CancellationToken ct)
     {
         try
         {
@@ -519,10 +532,39 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         }
         catch (TableValueIntegrityException ex)
         {
+            ForgetRow(keys);
             throw new TableValueIntegrityException(column,
                 $"blob '{path}' could not be opened ({ex.Reason}). The row may have been replaced or deleted since this " +
-                "entity was read (a cached entity can outlive its blob): read the entity again.");
+                "entity was read: read the entity again (the store that returned it no longer answers it from its cache).");
         }
+    }
+
+    // Never throws into, or replaces, the integrity failure being reported.
+    private void ForgetRow((string Pk, string Rk)? keys)
+    {
+        if (keys is not { } row || BlobMissing is not { } forget)
+            return;
+        try
+        {
+            forget(row.Pk, row.Rk);
+        }
+#pragma warning disable CA1031 // the eviction is a courtesy to the next read; the caller gets the integrity failure
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+        }
+    }
+
+    // The partition and row key a blob name of this library holds ({table}/{pk}/{rk}/{column}/{sha256});
+    // null for a name of another shape.
+    private static (string Pk, string Rk)? RowKeysOf(string path)
+    {
+        var segments = path.Split('/');
+        return segments.Length == 5
+            && OffloadBlobNames.TryUnescapeSegment(segments[1], out var pk)
+            && OffloadBlobNames.TryUnescapeSegment(segments[2], out var rk)
+                ? (pk, rk)
+                : null;
     }
 
     /// <summary>The most reference columns a sweep names in a projection before it reads whole rows instead.</summary>

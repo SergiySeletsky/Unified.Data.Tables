@@ -416,6 +416,9 @@ public sealed class TableBlobContent
     /// <param name="ct">Cancels opening the blob of a bound content.</param>
     /// <returns>A stream the caller disposes; disposing it never closes the source.</returns>
     /// <exception cref="InvalidOperationException">The content can no longer be written (see <see cref="ThrowIfNotWritable"/>).</exception>
+    /// <exception cref="TableValueIntegrityException">
+    /// The content is bound and the blob it streams is gone: it has to be created again from the source.
+    /// </exception>
     internal async Task<Stream> OpenUploadSourceAsync(string columnName, CancellationToken ct)
     {
         if (bytes is not null)
@@ -428,7 +431,19 @@ public sealed class TableBlobContent
         }
 
         ThrowIfNotWritable(columnName);
-        return await OpenReadAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await OpenReadAsync(ct).ConfigureAwait(false);
+        }
+        catch (TableValueIntegrityException) when (Volatile.Read(ref binding) is { } gone)
+        {
+            // This is a write, not a read of a cached entity (BLOBS-5): the bytes are nowhere else.
+            throw new TableValueIntegrityException(columnName,
+                $"the content cannot be written: the blob this content was uploaded to or read from, '{gone.Path}', is gone "
+                + "(an orphan sweep or a partition delete's cleanup may have removed it after an earlier write of this content failed, "
+                + "or the row it was read from was replaced or deleted), and the content keeps no other copy of its bytes. "
+                + "Create the content again from the source.");
+        }
     }
 
     /// <summary>
@@ -440,19 +455,26 @@ public sealed class TableBlobContent
     /// </summary>
     /// <param name="path">The blob name.</param>
     /// <param name="open">Opens the blob.</param>
-    /// <param name="columnName">The column named by an integrity failure; defaults to <paramref name="path"/>.</param>
+    /// <param name="columnName">The column named by an integrity failure; null names <paramref name="path"/>.</param>
+    /// <param name="store">
+    /// The blob store <paramref name="open"/> reads, compared by reference (never over the network): two
+    /// stores of one entity type over two containers or accounts give a blob the same name, and a content
+    /// keeps the blob of the store it was bound through. Null when the store that materialized the content
+    /// has no blob offload and cannot open it.
+    /// </param>
     /// <returns>
     /// True when the content serves reads of <paramref name="path"/>: it is bound to that blob now, or was
-    /// already (it then reads the blob through <paramref name="open"/>, the store that wrote it last),
-    /// or it keeps its bytes in memory and never reads a blob. False when it streams another blob and
-    /// was not changed; the caller then gives the written entity a content of its own.
+    /// already through the same <paramref name="store"/> or through a store that could not open it (it
+    /// then reads the blob through <paramref name="open"/>), or it keeps its bytes in memory and never
+    /// reads a blob. False when it streams another blob, or a blob of the same name through another
+    /// store, and was not changed; the caller then gives the written entity a content of its own.
     /// </returns>
     /// <remarks>
     /// A content that may be shared with another write is bound only while the binding write holds it
     /// (<see cref="WaitTurnAsync"/>), so of several writes that bind one content that streams no blob
     /// yet exactly one binds it and every other one is told to give its entity a content of its own.
     /// </remarks>
-    internal bool Bind(string path, Func<CancellationToken, Task<Stream>> open, string? columnName = null)
+    internal bool Bind(string path, Func<CancellationToken, Task<Stream>> open, string? columnName, object? store)
     {
         Guard.NotNull(path, nameof(path));
         Guard.NotNull(open, nameof(open));
@@ -461,6 +483,10 @@ public sealed class TableBlobContent
             if (bytes is not null)
                 return true;
             if (!string.Equals(bound.Path, path, StringComparison.Ordinal))
+                return false;
+            // The same name in another store's container is another blob (BLOBS-3): the entity this
+            // content came from, and every cached copy of it, keep reading the blob of their own store.
+            if (bound.Store is not null && !ReferenceEquals(bound.Store, store))
                 return false;
         }
         else
@@ -473,30 +499,42 @@ public sealed class TableBlobContent
             Source = null;
         }
 
-        // Name, column and opener in one step: a concurrent OpenReadAsync sees all of one binding. For a
-        // content already bound to this blob only the way to it changes (the row may have been read by
-        // a store that could not open it, and written by one that can).
-        Volatile.Write(ref binding, new Binding(path, columnName, open));
+        // Name, column, opener and store in one step: a concurrent OpenReadAsync sees all of one binding.
+        // For a content already bound to this blob only the way to it changes (the row may have been read
+        // by a store that could not open it, and written by one that can).
+        Volatile.Write(ref binding, new Binding(path, columnName, open, store));
         return true;
     }
 
-    /// <summary>The blob a content streams: its name, the column an integrity failure names, and the way to open it.</summary>
-    private sealed class Binding(string path, string? column, Func<CancellationToken, Task<Stream>> open)
+    /// <summary>
+    /// The blob a content streams: its name, the column an integrity failure names, the way to open it,
+    /// and the blob store it is opened through (null when that store has no blob offload).
+    /// </summary>
+    private sealed class Binding(string path, string? column, Func<CancellationToken, Task<Stream>> open, object? store)
     {
         public string Path { get; } = path;
 
         public string? Column { get; } = column;
 
         public Func<CancellationToken, Task<Stream>> Open { get; } = open;
+
+        public object? Store { get; } = store;
     }
 
     /// <summary>Content read from a row: known length, hash and type, streamed lazily from its blob.</summary>
+    /// <param name="length">The content length in bytes.</param>
+    /// <param name="sha256">Lower-hex SHA-256.</param>
+    /// <param name="contentType">The type recorded in the row.</param>
+    /// <param name="path">The blob name.</param>
+    /// <param name="open">Opens the blob.</param>
+    /// <param name="columnName">The column named by an integrity failure; null names <paramref name="path"/>.</param>
+    /// <param name="store">The blob store <paramref name="open"/> reads (see <see cref="Bind"/>); null when the reading store has no blob offload.</param>
     internal static TableBlobContent Bound(
-        long length, string sha256, string contentType, string path, Func<CancellationToken, Task<Stream>> open, string? columnName = null)
+        long length, string sha256, string contentType, string path, Func<CancellationToken, Task<Stream>> open, string? columnName, object? store)
     {
         var result = new TableBlobContent(contentType, null, null);
         result.Seal(length, sha256);
-        result.Bind(path, open, columnName);
+        result.Bind(path, open, columnName, store);
         return result;
     }
 
