@@ -1,6 +1,5 @@
 using System.Runtime.Serialization;
 using Azure.Data.Tables;
-using Unified.Data.Tables.InMemory;
 using static Unified.Data.Tables.Tests.LargeValues.OffloadTestSupport;
 
 namespace Unified.Data.Tables.Tests.LargeValues;
@@ -92,22 +91,29 @@ public class LargeValueSetFailureMessageTests
         Assert.InRange(ex.Message.Length, 1, MessageBound);
     }
 
-    [Fact]
-    public async Task OffloadedValue_ThatCannotBeSet_IsReportedBounded()
+    [Theory]
+    [InlineData(LargeValueStores.Memory, 40_000)]
+    [InlineData(LargeValueStores.Memory, 700_000)]
+    [InlineData(LargeValueStores.Memory, 3_500_000)]
+    [InlineData(LargeValueStores.Azurite, 40_000)]
+    [InlineData(LargeValueStores.Azurite, 700_000)]
+    [InlineData(LargeValueStores.Azurite, 3_500_000)]
+    public async Task StoredValue_ThatCannotBeSet_IsReportedBounded_OnBothStores(string store, int length)
     {
-        var body = Ascii(3_500_000);
-        var options = new UnifiedTableStorageOptions { BlobOffload = new BlobOffloadOptions(), TableNameResolver = _ => "SetFailure" };
-        var writer = new InMemoryStorage<SetFailureTextDoc>(null, options);
-        await writer.CreateAsync(new SetFailureTextDoc { Id = Id, Body = body }, Ct);
-        var blobName = Assert.Single(writer.OffloadedBlobNames());
+        await using var stores = await LargeValueStores.OpenAsync(store);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        const string Table = "SetFailure";
+        var id = stores!.Id("r1");
+        var body = Ascii(length);
+        await stores.Store<SetFailureTextDoc>(Table).CreateAsync(new SetFailureTextDoc { Id = id, Body = body }, Ct);
 
-        // The same row and blob, read through the type whose property cannot take a string.
-        var reader = new InMemoryStorage<SetFailureNumberDoc>(null, options);
-        reader.SeedPhysicalRow(writer.PhysicalRow(Pk, Rk)!);
-        await using (var stored = await writer.Blobs.OpenReadAsync("Body", blobName, Ct))
-            reader.Blobs.Seed(blobName, await ReadAllAsync(stored), Sha(Utf8(body)), DateTimeOffset.UtcNow);
-
-        AssertBounded(await Assert.ThrowsAsync<SerializationException>(() => reader.OneAsync(Id, Ct)), body);
+        // The same rows and blob, read through the type whose property cannot take a string: split
+        // cells, continuation rows and a downloaded blob all end in the same bounded message.
+        await stores.ShareTableAsync<SetFailureTextDoc, SetFailureNumberDoc>(Table);
+        AssertBounded(
+            await Assert.ThrowsAsync<SerializationException>(() => stores.Store<SetFailureNumberDoc>(Table).OneAsync(id, Ct)), body);
+        AssertBounded(
+            await Assert.ThrowsAsync<SerializationException>(() => stores.Store<SetFailureNumberDoc>(Table).QueryAsync(stores.Pk, Ct)), body);
     }
 
     [Fact]
