@@ -98,7 +98,7 @@ public class QueryProjectionTests
     [Fact]
     public void BuildSelect_AddsBackTheColumnsDeserializationCannotWorkWithout()
     {
-        // The trap: SELECT Content is a valid Tables query that returns rows with no keys, no ETag
+        // The trap: SELECT Content is a valid Tables query that returns rows with no keys, no Timestamp
         // and no type discriminator, which deserialize into a silently wrong entity.
         var select = TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = ["Content"] })!.ToArray();
 
@@ -106,8 +106,10 @@ public class QueryProjectionTests
         Assert.Contains("PartitionKey", select);
         Assert.Contains("RowKey", select);
         Assert.Contains("Timestamp", select);
-        Assert.Contains("odata.etag", select);
         Assert.Contains("_TypeName", select);
+        // The row's version is not a column: the service returns it with every entity, and the token
+        // is not sent in $select (0.8.x sent it).
+        Assert.DoesNotContain("odata.etag", select);
     }
 
     [Fact]

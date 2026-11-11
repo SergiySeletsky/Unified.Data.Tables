@@ -1021,8 +1021,9 @@ public class TableStorageSplitTests
         await h.Table.Received(1).DeleteEntityAsync("p", "r", default, Arg.Any<CancellationToken>());
         await h.Table.DidNotReceiveWithAnyArgs().SubmitTransactionAsync(default!, default);
         Assert.Equal(["PartitionKey"], Assert.Single(selects)!);
+        // (0.8.x also sent "odata.etag" here; the row's version is not a column and is no longer selected.)
         Assert.Equal(
-            ["PartitionKey", "RowKey", "Timestamp", "odata.etag", "_TypeName", "Name"],
+            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Name"],
             TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = ["Name"] })!);
     }
 }
