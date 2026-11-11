@@ -145,7 +145,7 @@ public class BuilderUpdateWhileTheConstructorFailsTests
         var id = stores.Id("r");
         var large = Ascii(40_000, 3);
 
-        T Make(int rank, string notes)
+        T Make(int rank, string? notes)
         {
             var entity = new T { Id = id };
             typeof(T).GetProperty("Rank")!.SetValue(entity, rank);
@@ -155,8 +155,10 @@ public class BuilderUpdateWhileTheConstructorFailsTests
 
         static FlakyShape ShapeOf(T entity) => (FlakyShape)typeof(T).GetProperty("Shape")!.GetValue(entity)!;
 
-        // 0. A row exists, whose member holds a one-cell value.
-        await store.CreateAsync(Make(1, "first"), Ct);
+        // 0. A row exists, whose member holds no value. (A write of a one-cell value in the member resolves the
+        //    column, to know whether it may leave the row (ruling R15), and a resolved column is remembered: the
+        //    update below would then be refused as a large value without needing the constructor.)
+        await store.CreateAsync(Make(1, null), Ct);
 
         // 1. While the constructor throws, the library cannot tell whether the column is a large value: the
         //    builder update is refused, and nothing is written.
@@ -173,7 +175,7 @@ public class BuilderUpdateWhileTheConstructorFailsTests
         var refused = Assert.IsType<NotSupportedException>(whileFailing);
         Assert.Contains("constructor or a getter", refused.Message, StringComparison.Ordinal);
         Assert.Contains("Shape_Notes", refused.Message, StringComparison.Ordinal);
-        Assert.Equal("first", ShapeOf((await store.OneAsync(id, Ct))!).Notes);
+        Assert.Null(ShapeOf((await store.OneAsync(id, Ct))!).Notes);
 
         // 2. The constructor works again: a whole-entity write stores a large value in the member (split cells).
         await store.UpsertAsync(Make(2, large), Ct);

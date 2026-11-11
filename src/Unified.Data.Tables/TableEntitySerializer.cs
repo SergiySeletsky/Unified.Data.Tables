@@ -255,15 +255,15 @@ public static class TableEntitySerializer
         return (outermost.Parent!.Type!, outermost.HeldBy!, outermost.Type!, holders);
     }
 
-    // The first property along ownerPath (property names from root, by reflection only) declared as a
-    // nullable struct, with the declared type that has it; null when there is none.
+    // The first property along ownerPath (property names from root, by reflection only, a member an interface
+    // inherits counting as one it declares) declared as a nullable struct, with the declared type that has it;
+    // null when there is none.
     private static (Type Owner, PropertyInfo Property, Type Struct)? NullableStructOnPath(Type root, IReadOnlyList<string> ownerPath)
     {
         var owner = root;
         foreach (var name in ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))
         {
-            var property = owner.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p => p.Name == name && p.GetIndexParameters().Length == 0);
+            var property = Array.Find(TypeMetadataCache.DeclaredProperties(owner), p => p.Name == name && p.GetIndexParameters().Length == 0);
             if (property is null)
                 return null;
             if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
@@ -326,6 +326,29 @@ public static class TableEntitySerializer
         $"'{column}' back to a property: the object that owns it has a runtime type a read does not recreate. A read " +
         "keeps the instance the constructor puts in a property and creates the declared type where there is none. " +
         "Initialise the owning property with an instance of that runtime type, or declare the property with that type.";
+
+    /// <summary>
+    /// The message for a large value in <paramref name="column"/> of <paramref name="root"/> that a member of
+    /// <paramref name="runtimeType"/> opts in, where a read of <paramref name="root"/> sets the column on a member of
+    /// a <paramref name="readType"/> that is not a large-value member (ruling R15): the value would come back into a
+    /// member that cannot carry it. <paramref name="subclass"/>: <paramref name="runtimeType"/> is the entity itself,
+    /// written through a store of its base type <paramref name="root"/>.
+    /// </summary>
+    internal static string LargeValueReadIntoAnOrdinaryMember(Type root, string column, Type readType, Type runtimeType, string member, bool subclass)
+    {
+        var where = subclass
+            ? $"This {runtimeType.Name} is written through an IStorage<{root.Name}>, and a read through that store creates a {root.Name}"
+            : $"A read of {root.Name} creates a {readType.Name} where this {runtimeType.Name} is (a read keeps the instance the " +
+              "constructor puts in a property and creates the declared type where there is none)";
+        var remedy = subclass
+            ? $"Store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}>, or mark {readType.Name}.{member} with [TableValueSplit]"
+            : $"Initialise the property that holds the {runtimeType.Name} with an instance of {runtimeType.Name} in the constructor of its " +
+              $"owner, declare that property as {runtimeType.Name}, or mark {readType.Name}.{member} with [TableValueSplit]";
+        return $"'{column}' of {root.Name} needs split cells or a blob: {runtimeType.Name}.{member} is a large-value member. {where}, " +
+               $"whose {member} is not a large-value member, so the value would be read back into a member that cannot carry it: the " +
+               "store's own copy of the entity it reads, and the next write of the entity that was read, would trim it or fail. " +
+               $"{remedy}. Nothing was stored.";
+    }
 
     /// <summary>
     /// The message for a large value whose column a read of <paramref name="root"/> cannot resolve: the read
@@ -1513,12 +1536,14 @@ internal sealed class TableEntityValue
                 columnName += JsonSuffix;
                 Format = TableEntityValueFormat.Json;
             }
-            state?.Ctx.Inline?.Add(new InlineValue(column, columnName, split.Encoding));
+            // Only a value a read carries back into a large-value member may be moved off the row (R15).
+            if (ReadTakesLargeValue(state, column))
+                state?.Ctx.Inline?.Add(new InlineValue(column, columnName, split.Encoding));
             value = payload;
             return true;
         }
 
-        RefuseUnreadable(state, columnName);
+        RefuseUnreadable(state, columnName, split: true);
 
         // Tier 3 (blob offload): only for a storage write, never for a clone or the public serializer.
         if (state is { Ctx: { IsClone: false } ctx } st && (ctx.Offload is not null || ctx.ForceOffload.Count > 0))
@@ -1562,19 +1587,38 @@ internal sealed class TableEntityValue
     // the object written is of the type a read creates (that type has the property); a subclass written
     // through a store of its base type may declare columns the base type does not read. A clone is read
     // back from the same object.
-    private void RefuseUnreadable(FlattenState? state, string columnName)
+    // A split value (split) is also stored only where the member a read sets the column on is a large-value
+    // member of the object the read creates there (ruling R15): a runtime subtype may opt in a member that
+    // the declared type a read creates in an empty property does not, and the value would come back into an
+    // ordinary member (the store's cache copy, and the next write of the entity that was read, trim it).
+    private void RefuseUnreadable(FlattenState? state, string columnName, bool split = false)
     {
         if (state is not { RootType: { } root, Ctx.IsClone: false } st)
             return;
         if (st.Subclass is { } subclass && !TypeMetadataCache.ReadsBack(root, Path[0]))
             throw new NotSupportedException(TableEntitySerializer.SubclassThroughBaseStoreRefusal(subclass, root, columnName, plainStore: false));
-        if (Path.Count < 2)
+        // A top-level member of the type a read creates is the member the value is written from.
+        if (Path.Count < 2 && st.Subclass is null)
             return;
-        if (!TypeMetadataCache.ReadsBack(root, columnName, out var unresolved))
+        if (Path.Count >= 2 && !TypeMetadataCache.ReadsBack(root, columnName, out var unresolved))
             throw new NotSupportedException(unresolved
                 ? TableEntitySerializer.UnresolvableLargeValue(root, columnName)
                 : TableEntitySerializer.UnreadableLargeValue(root, columnName));
+        if (split && !TypeMetadataCache.IsLargeValueOnRead(root, columnName, out var failure))
+            throw new NotSupportedException(failure is not null
+                ? TableEntitySerializer.UnresolvableLargeValue(root, columnName)
+                : TableEntitySerializer.LargeValueReadIntoAnOrdinaryMember(root, columnName,
+                    TypeMetadataCache.ReadTarget(root, columnName)?.ReflectedType ?? root, Parent?.Type ?? root, Path[^1],
+                    subclass: Path.Count < 2));
     }
+
+    // False when a read of the store's entity type would set the column of a split value on a member that is not
+    // a large-value member of the object it creates there, or cannot tell (see RefuseUnreadable): such a value
+    // stays in its cell when it fits one, and the planner never moves it off the row (ruling R15).
+    private bool ReadTakesLargeValue(FlattenState? state, string columnName) =>
+        state is not { RootType: { } root, Ctx: { IsClone: false, Inline: not null } } st
+        || (Path.Count < 2 && st.Subclass is null)
+        || TypeMetadataCache.IsLargeValueOnRead(root, columnName);
 
     // The writer stores a TableBlobContent as a blob because of the value; a read decides by the declared
     // type of the property it maps the column to, and only a property declared TableBlobContent gets the
@@ -1906,6 +1950,8 @@ internal static class TypeMetadataCache
     private static readonly ConcurrentDictionary<(Type Type, string Column), PropertyInfo?> _readTargets = new();
     private static readonly ConcurrentDictionary<(Type Type, string Column), bool> _largeOnRead = new();
     private static readonly ConcurrentDictionary<Type, (Type Contract, PropertyInfo Marked)?> _interfaceMemberSplits = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Column), (Type Owner, Type Contract, PropertyInfo Marked)?> _interfaceMemberSplitsOnPath = new();
+    private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _declaredProperties = new();
     private static readonly ConditionalWeakTable<Exception, Exception> _misuses = new();
 
     public static TypeMetadata GetMetadata(Type t)
@@ -2243,7 +2289,9 @@ internal static class TypeMetadataCache
             columns.Clear();
             ListNearestPaths(root, members, leads, columns);
         }
-        return new LargeValueInfo(true, columns.AsReadOnly());
+        // Two members of one name (an interface may inherit it from two interfaces, with different types) may
+        // lead to the same column: it is listed once.
+        return new LargeValueInfo(true, columns.Distinct(StringComparer.Ordinal).ToList().AsReadOnly());
     }
 
     // Every path through the types that lead to a large-value member, depth first in declaration
@@ -2333,7 +2381,7 @@ internal static class TypeMetadataCache
         try
         {
             var classLevel = ClassLevelSplit(type);
-            foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            foreach (var prop in DeclaredProperties(type))
             {
                 try
                 {
@@ -2374,7 +2422,7 @@ internal static class TypeMetadataCache
     /// </summary>
     internal static bool TryGetMember(Type owner, string name, out Type memberType, out bool largeValue)
     {
-        foreach (var prop in SerializedProperties(owner))
+        foreach (var prop in DeclaredSerializedProperties(owner))
         {
             if (prop.Name != name || prop.GetIndexParameters().Length > 0)
                 continue;
@@ -2459,7 +2507,7 @@ internal static class TypeMetadataCache
         {
             if (property is not null)
                 owner = property.PropertyType;
-            property = SerializedProperties(owner).FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
+            property = DeclaredSerializedProperties(owner).FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
             if (property is null)
                 return null;
         }
@@ -2553,6 +2601,52 @@ internal static class TypeMetadataCache
     private static IEnumerable<PropertyInfo> SerializedProperties(Type t) =>
         t.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(IsSerialized);
 
+    // SerializedProperties of a declared type, read through DeclaredProperties.
+    private static IEnumerable<PropertyInfo> DeclaredSerializedProperties(Type t) => DeclaredProperties(t).Where(IsSerialized);
+
+    /// <summary>
+    /// The public instance properties of <paramref name="t"/> as a declared type: for a class or a struct
+    /// those <see cref="Type.GetProperties(BindingFlags)"/> lists; for an interface also the members of every
+    /// interface it inherits, at any depth (<see cref="Type.GetProperties(BindingFlags)"/> lists only the
+    /// members an interface declares), so that a member an interface inherits counts in every walk of the
+    /// declared types as one it declares. A member declared again with the same name and type is listed
+    /// once, the nearest declaration first. Reflection alone, remembered per type; an inherited interface
+    /// whose members cannot be read is skipped. Throws what listing the type's own members throws.
+    /// </summary>
+    internal static PropertyInfo[] DeclaredProperties(Type t) =>
+        _declaredProperties.GetOrAdd(t, static type =>
+        {
+            var own = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            if (!type.IsInterface)
+                return own;
+            var all = new List<PropertyInfo>(own);
+#pragma warning disable CA1031 // an inherited interface the walk cannot read contributes nothing, as an unreadable type does
+            try
+            {
+                foreach (var inherited in type.GetInterfaces())
+                {
+                    try
+                    {
+                        foreach (var member in inherited.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                        {
+                            if (!all.Exists(p => p.Name == member.Name && p.PropertyType == member.PropertyType))
+                                all.Add(member);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // This inherited interface's members cannot be listed.
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // The inherited interfaces cannot be listed: the interface's own members stand.
+            }
+#pragma warning restore CA1031
+            return [.. all];
+        });
+
     private static bool IsSerialized(PropertyInfo p) =>
         p.CanRead && p.CanWrite
         && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
@@ -2621,11 +2715,27 @@ internal static class TypeMetadataCache
     /// Refuses a builder update of <paramref name="columnPath"/> of <paramref name="root"/> when
     /// <paramref name="root"/>, or the declared type of a property along the path, is or implements an
     /// interface that declares a member marked <see cref="TableValueSplitAttribute"/> (ruling R11): the update
-    /// would write that member as an ordinary cell. Declared types and attributes are read by reflection
-    /// alone (nothing is constructed, no getter is called, no metadata is built) and remembered per type.
+    /// would write that member as an ordinary cell. A member an interface-typed owner inherits from another
+    /// interface is found as one it declares (<see cref="DeclaredProperties"/>). Declared types and attributes
+    /// are read by reflection alone (nothing is constructed, no getter is called, no metadata is built); what
+    /// the walk finds is remembered per type and column path (up to <see cref="MaxRememberedReadTargets"/>).
     /// </summary>
     /// <exception cref="InvalidOperationException">The misuse, naming the interface member and the remedy.</exception>
     internal static void RefuseInterfaceMemberSplitOnPath(Type root, string columnPath)
+    {
+        if (!_interfaceMemberSplitsOnPath.TryGetValue((root, columnPath), out var found))
+        {
+            found = InterfaceMemberSplitOnPath(root, columnPath);
+            if (_interfaceMemberSplitsOnPath.Count < MaxRememberedReadTargets)
+                _interfaceMemberSplitsOnPath.TryAdd((root, columnPath), found);
+        }
+        if (found is { } misuse)
+            throw new InvalidOperationException(InterfaceMemberSplitMisuse(misuse.Owner, misuse.Contract, misuse.Marked));
+    }
+
+    // The first declared type along the path (root first) that is or implements an interface with a member
+    // marked [TableValueSplit], with that member; null when there is none.
+    private static (Type Owner, Type Contract, PropertyInfo Marked)? InterfaceMemberSplitOnPath(Type root, string columnPath)
     {
         var owner = root;
         foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries).Prepend(null))
@@ -2636,21 +2746,21 @@ internal static class TypeMetadataCache
 #pragma warning disable CA1031 // a type the check cannot read ends the walk: the update goes on as before
                 try
                 {
-                    property = owner.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                        .FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
+                    property = Array.Find(DeclaredProperties(owner), p => p.Name == segment && p.GetIndexParameters().Length == 0);
                 }
                 catch (Exception)
                 {
-                    return;
+                    return null;
                 }
 #pragma warning restore CA1031
                 if (property is null)
-                    return;
+                    return null;
                 owner = property.PropertyType;
             }
             if (InterfaceMemberSplit(owner) is { } found)
-                throw new InvalidOperationException(InterfaceMemberSplitMisuse(owner, found.Contract, found.Marked));
+                return (owner, found.Contract, found.Marked);
         }
+        return null;
     }
 
     // The first member marked [TableValueSplit] of an interface that t implements (or, t an interface, of t
