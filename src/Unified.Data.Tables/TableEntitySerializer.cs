@@ -464,6 +464,12 @@ public static class TableEntitySerializer
     internal static Dictionary<string, object> FlattenProperty(Type ownerType, string columnPath, object value)
     {
         ArgumentNullException.ThrowIfNull(ownerType);
+        // A type that opts into nothing has no member to refuse. It takes the path of 0.8.3, which builds
+        // no metadata for the declared types along the column path (one may be a type the serializer
+        // cannot build metadata for, such as an interface that declares two indexers).
+        if (!TypeMetadataCache.IsLargeValueAware(ownerType))
+            return FlattenProperty(columnPath, value);
+
         var owner = ownerType;
         foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries))
         {
@@ -1401,16 +1407,22 @@ internal static class TypeMetadataCache
     public static TypeMetadata GetMetadata(Type t)
         => _cache.GetOrAdd(t, CreateMetadata);
 
+    /// <summary>True when flattening metadata was built for <paramref name="t"/> (for tests).</summary>
+    internal static bool HasMetadata(Type t) => _cache.ContainsKey(t);
+
     /// <summary>
     /// True when <paramref name="t"/>, or any nested type it flattens into columns, has a
     /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property. Such a type may
     /// produce split cells or blob references; any other type takes none of the large-value branches.
+    /// Never throws, whatever the type: a store asks this in its static initializer, where an exception
+    /// would break the store type for the rest of the process.
     /// </summary>
     internal static bool IsLargeValueAware(Type t) => LargeValueColumns(t).Count > 0;
 
     /// <summary>
     /// Every flattened base column of <paramref name="t"/> that can carry split cells or a blob
-    /// reference (<c>"Body"</c>, <c>"Inner_Body"</c>, <c>"Content"</c>).
+    /// reference (<c>"Body"</c>, <c>"Inner_Body"</c>, <c>"Content"</c>). Never throws; empty for a type
+    /// that opts into nothing.
     /// </summary>
     internal static IReadOnlyList<string> LargeValueColumns(Type t)
     {
@@ -1423,24 +1435,63 @@ internal static class TypeMetadataCache
         });
     }
 
-    // Walks the same property graph Flatten does: a property in SplitOptions is a large-value column;
-    // a property whose type flattens into Owner_Child columns is walked (once per path, so a type that
-    // reaches itself does not recurse forever).
+    // Walks the property graph Flatten walks, by reflection alone: a large-value member is a column; a
+    // property whose declared type flattens into Owner_Child columns is walked (once per path, so a
+    // type that reaches itself does not recurse forever). It never builds flattening metadata
+    // (GetMetadata): 0.8.3 built that only when a value of a type was first serialized, and it throws
+    // for types the writer never flattens (JsonNode declares two indexers named Item).
     private static void CollectLargeValueColumns(Type type, string prefix, HashSet<Type> visiting, List<string> columns)
     {
         if (!visiting.Add(type))
             return;
 
-        var meta = GetMetadata(type);
-        foreach (var prop in meta.Properties)
+        foreach (var member in LargeValueMembers(type))
         {
-            if (meta.SplitOptions.ContainsKey(prop.Name) || prop.PropertyType == typeof(TableBlobContent))
-                columns.Add(prefix + prop.Name);
-            else if (FlattensIntoColumns(prop.PropertyType))
-                CollectLargeValueColumns(prop.PropertyType, prefix + prop.Name + TableEntityValue.PathDelimiter, visiting, columns);
+            if (member.Flattened is not { } nested)
+                columns.Add(prefix + member.Name);
+            else
+                CollectLargeValueColumns(nested, prefix + member.Name + TableEntityValue.PathDelimiter, visiting, columns);
         }
 
         visiting.Remove(type);
+    }
+
+    /// <summary>
+    /// One property of a type as the large-value walk sees it: a large-value column of its own
+    /// (<see cref="Flattened"/> is null), or a property whose declared type flattens into columns.
+    /// </summary>
+    private readonly record struct LargeValueMember(string Name, Type? Flattened);
+
+    // The properties of one type that are, or may lead to, large-value columns, in declaration order.
+    // Reflection over an arbitrary type can fail (a member type that does not load, a dynamic type);
+    // such a type contributes nothing, which costs no data: the serializer reflects over the same
+    // members before it writes a value of the type, and fails there.
+    private static List<LargeValueMember> LargeValueMembers(Type type)
+    {
+        var members = new List<LargeValueMember>();
+        try
+        {
+            var classLevel = ClassLevelSplit(type);
+            foreach (var prop in SerializedProperties(type))
+            {
+                // An indexer is never a column: the writer cannot read it without an index.
+                if (prop.GetIndexParameters().Length > 0)
+                    continue;
+
+                var propertyType = prop.PropertyType;
+                if (propertyType == typeof(TableBlobContent) || SplitFor(type, prop, classLevel, validate: false) is not null)
+                    members.Add(new LargeValueMember(prop.Name, Flattened: null));
+                else if (FlattensIntoColumns(propertyType))
+                    members.Add(new LargeValueMember(prop.Name, propertyType));
+            }
+        }
+#pragma warning disable CA1031 // deciding whether a type is large-value aware must not throw, whatever reflection does
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            members.Clear();
+        }
+        return members;
     }
 
     /// <summary>Resolves a flattened column path (<c>["Inner", "Body"]</c>) to its leaf property, or null.</summary>
@@ -1467,14 +1518,17 @@ internal static class TypeMetadataCache
     private static bool FlattensIntoColumns(Type type) =>
         !IsScalar(type) && TableEntitySerializer.FlattensToColumns(type);
 
+    // The public instance properties the serializer stores as columns (the rule of 0.8.3, unchanged).
+    private static IEnumerable<PropertyInfo> SerializedProperties(Type t) =>
+        t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+         .Where(p => p.CanRead && p.CanWrite
+                  && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
+                  && p.Name != nameof(TableEntity.ETag)
+                  && p.Name != nameof(TableEntity.Timestamp));
+
     private static TypeMetadata CreateMetadata(Type t)
     {
-        var props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                     .Where(p => p.CanRead && p.CanWrite
-                              && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
-                              && p.Name != nameof(TableEntity.ETag)
-                              && p.Name != nameof(TableEntity.Timestamp))
-                     .ToImmutableList();
+        var props = SerializedProperties(t).ToImmutableList();
 
         var map = props.ToDictionary(p => p.Name, p => p);
         // Prefer the real ctor (runs field initializers). For types WITHOUT a public parameterless
@@ -1488,61 +1542,72 @@ internal static class TypeMetadataCache
         return new TypeMetadata(props, map, BuildAliasMap(t, map), BuildSplitOptions(t, props), creator);
     }
 
-    // [TableValueSplit] per property. A property-level attribute wins. A class-level attribute covers
-    // every string, byte[] and JSON-stored property declared by the annotated class or a class
-    // derived from it - not members inherited from its bases (Entity.Id stays an ordinary, filterable
-    // key column). A property-level attribute on a scalar or on a concrete type that flattens into
-    // columns has nothing to split and fails on first use of the type; one on an interface or abstract
-    // type that may flatten at runtime cannot be honoured and fails (NotSupportedException) too.
+    // [TableValueSplit] per property; see SplitFor. A misused attribute fails here, on first use of the type.
     private static Dictionary<string, TableValueSplitAttribute> BuildSplitOptions(Type t, ImmutableList<PropertyInfo> props)
     {
         var options = new Dictionary<string, TableValueSplitAttribute>(StringComparer.Ordinal);
-
-        Type? annotated = null;
-        for (var cur = t; cur is not null; cur = cur.BaseType)
-        {
-            if (cur.IsDefined(typeof(TableValueSplitAttribute), inherit: false))
-            {
-                annotated = cur;
-                break;
-            }
-        }
-        var classLevel = annotated?.GetCustomAttribute<TableValueSplitAttribute>(inherit: false);
-
+        var classLevel = ClassLevelSplit(t);
         foreach (var prop in props)
         {
-            var type = prop.PropertyType;
-            if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
-            {
-                if (type == typeof(TableBlobContent))
-                    throw new InvalidOperationException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: a TableBlobContent is always stored in blob storage. Remove the attribute.");
-                if (IsScalar(type) && type != typeof(string) && type != typeof(byte[]))
-                    throw new InvalidOperationException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: a {type.Name} is a native cell and cannot be split. " +
-                        "Only string, byte[] and JSON-stored properties can.");
-                if (FlattensIntoColumns(type) && !type.IsInterface && !type.IsAbstract)
-                    throw new InvalidOperationException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is flattened into columns. " +
-                        "Put [TableValueSplit] on its members instead.");
-                // An interface or abstract type flattens or not depending on the runtime value; a
-                // flattened value would silently ignore the attribute (and could then be trimmed).
-                if (!IsSplittable(type))
-                    throw new NotSupportedException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is an interface or abstract type, which may be " +
-                        "flattened into columns at runtime, so the attribute cannot be honoured. Declare the property as " +
-                        "string, byte[] or a concrete type stored as JSON, or put [TableValueSplit] on the members of its implementations.");
-                options[prop.Name] = own;
-            }
-            else if (classLevel is not null
-                     && prop.DeclaringType is { } declaring && annotated!.IsAssignableFrom(declaring)
-                     && IsSplittable(type))
-            {
-                options[prop.Name] = classLevel;
-            }
+            if (SplitFor(t, prop, classLevel, validate: true) is { } split)
+                options[prop.Name] = split;
         }
 
         return options;
+    }
+
+    // The class-level [TableValueSplit] that applies to t and the class that declares it: the nearest
+    // one, on t itself or on a base class.
+    private static (Type Annotated, TableValueSplitAttribute Attribute)? ClassLevelSplit(Type t)
+    {
+        for (var cur = t; cur is not null; cur = cur.BaseType)
+        {
+            if (cur.GetCustomAttribute<TableValueSplitAttribute>(inherit: false) is { } attribute)
+                return (cur, attribute);
+        }
+        return null;
+    }
+
+    // The [TableValueSplit] that applies to one property of t, or null. A property-level attribute
+    // wins. A class-level attribute covers every string, byte[] and JSON-stored property declared by
+    // the annotated class or a class derived from it - not members inherited from its bases (Entity.Id
+    // stays an ordinary, filterable key column). A property-level attribute on a scalar or on a
+    // concrete type that flattens into columns has nothing to split; one on an interface or abstract
+    // type that may flatten at runtime cannot be honoured. With validate such a misuse throws (the
+    // serializer, on first use of the type); without, the property is simply not opted in (the
+    // large-value walk, which must not throw).
+    private static TableValueSplitAttribute? SplitFor(
+        Type t, PropertyInfo prop, (Type Annotated, TableValueSplitAttribute Attribute)? classLevel, bool validate)
+    {
+        var type = prop.PropertyType;
+        if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
+        {
+            if (type == typeof(TableBlobContent))
+                return !validate ? null : throw new InvalidOperationException(
+                    $"[TableValueSplit] on {t.Name}.{prop.Name}: a TableBlobContent is always stored in blob storage. Remove the attribute.");
+            if (IsScalar(type) && type != typeof(string) && type != typeof(byte[]))
+                return !validate ? null : throw new InvalidOperationException(
+                    $"[TableValueSplit] on {t.Name}.{prop.Name}: a {type.Name} is a native cell and cannot be split. " +
+                    "Only string, byte[] and JSON-stored properties can.");
+            if (FlattensIntoColumns(type) && !type.IsInterface && !type.IsAbstract)
+                return !validate ? null : throw new InvalidOperationException(
+                    $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is flattened into columns. " +
+                    "Put [TableValueSplit] on its members instead.");
+            // An interface or abstract type flattens or not depending on the runtime value; a
+            // flattened value would silently ignore the attribute (and could then be trimmed).
+            if (!IsSplittable(type))
+                return !validate ? null : throw new NotSupportedException(
+                    $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is an interface or abstract type, which may be " +
+                    "flattened into columns at runtime, so the attribute cannot be honoured. Declare the property as " +
+                    "string, byte[] or a concrete type stored as JSON, or put [TableValueSplit] on the members of its implementations.");
+            return own;
+        }
+
+        return classLevel is { } scope
+               && prop.DeclaringType is { } declaring && scope.Annotated.IsAssignableFrom(declaring)
+               && IsSplittable(type)
+            ? scope.Attribute
+            : null;
     }
 
     // string, byte[], or a type the serializer stores as one JSON cell.
