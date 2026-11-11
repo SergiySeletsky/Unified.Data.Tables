@@ -242,3 +242,13 @@ public class PlainJsonEvent : PlainEventBase
 {
     public JsonNode? Payload { get; set; }
 }
+
+/// <summary>
+/// An entity with an invalid alias declaration (the class-level form needs the property name): its
+/// metadata cannot be built, which 0.8.3 reports on the first read or write.
+/// </summary>
+[ColumnAlias("Legacy")]
+public class PlainBadAliasDoc : Entity
+{
+    public string? Name { get; set; }
+}

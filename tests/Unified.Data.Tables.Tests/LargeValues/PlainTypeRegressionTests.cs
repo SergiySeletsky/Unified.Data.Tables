@@ -489,6 +489,21 @@ public class PlainTypeRegressionTests
         Assert.Equal(0, await memory.CountAsync());
     }
 
+    [Fact]
+    public async Task EntityWithAnInvalidColumnAlias_StoresConstruct_AndWritesFailAs083()
+    {
+        // The metadata of this type cannot be built. 0.8.3 says so on the first read or write, with the
+        // alias message; the stores construct and the operations that do not serialize work.
+        await AssertWriteFailsAs083<PlainBadAliasDoc, InvalidOperationException>(
+            () => Stamped(new PlainBadAliasDoc { Name = "n" }),
+            "Class-level [ColumnAlias] on PlainBadAliasDoc must use the (propertyName, legacyColumnName) constructor.");
+
+        var memory = new InMemoryStorage<PlainBadAliasDoc>();
+        Assert.False(await memory.ExistsAsync(Id));
+        await memory.DeleteAsync(Id);
+        Assert.Equal(0, await memory.CountAsync());
+    }
+
     // ── Self-referencing types ───────────────────────────────────────────────
 
     [Fact]
@@ -909,7 +924,7 @@ public class PlainTypeRegressionTests
         typeof(PlainJsonDictionaryDoc), typeof(PlainJsonListDoc), typeof(PlainReadOnlyIndexerDoc), typeof(PlainIndexerDoc),
         typeof(PlainTwoIndexerDoc), typeof(PlainLookupDoc), typeof(PlainHiddenSameTypeDoc), typeof(PlainHiddenOtherTypeDoc),
         typeof(PlainHidingEntity), typeof(PlainTreeDoc), typeof(PlainLinkedDoc), typeof(PlainObjectDoc), typeof(PlainTypeDoc),
-        typeof(PlainDelegateDoc), typeof(PlainJsonEvent), typeof(PlainEventBase),
+        typeof(PlainDelegateDoc), typeof(PlainJsonEvent), typeof(PlainEventBase), typeof(PlainBadAliasDoc),
         // Not entity types at all: the answer is still "no", never an exception.
         typeof(JsonNode), typeof(JsonValue), typeof(JsonObject), typeof(JsonArray), typeof(JsonElement), typeof(JsonElement?),
         typeof(IPlainLookup), typeof(PlainTwoIndexed), typeof(PlainHiddenOtherType),
