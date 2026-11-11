@@ -437,13 +437,26 @@ public sealed class LargeValueTable
         new($"Blob cleanup stopped after the caller cancelled: {left} blob(s), this one included, are left for the orphan sweep.", ex, ex.CancellationToken);
 
     /// <summary>
-    /// Storage-provider SPI, not for application code. After a partition's rows are deleted, deletes
-    /// every blob stored under it, each on condition that it was modified neither within the cleanup
-    /// grace nor since it was listed. Only names of the exact offload shape
-    /// (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) are deleted. Best effort: a failure goes to the callbacks.
+    /// Storage-provider SPI, not for application code. After a partition's rows are deleted, deletes the
+    /// blobs stored under it that no row of the partition references NOW: a row another writer created
+    /// while the partition was being deleted survives the delete, and keeps its blobs however long the
+    /// delete took. A blob is a candidate when it was not modified within
+    /// <see cref="BlobOffloadOptions.CleanupGrace"/> (younger ones are left for the orphan sweep) and its
+    /// name has the exact offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>). The blobs are
+    /// listed first; the rows are read (once, through <paramref name="partitionRows"/>) only when some
+    /// blob is old enough; each delete is conditional on the blob not having been modified since it was
+    /// listed. Rows are never changed. Best effort: a failure goes to the callbacks.
     /// </summary>
-    /// <param name="partitionKey">The deleted partition.</param>
-    /// <param name="onListFailure">Called when the blobs cannot be listed.</param>
+    /// <param name="partitionKey">The deleted partition, already normalized as the store stores it.</param>
+    /// <param name="entityType">The store's entity type (its large-value columns are always read).</param>
+    /// <param name="partitionRows">
+    /// Returns every stored row that is in the partition now, continuation rows included, projected onto
+    /// the given columns, or whole when the projection is null. Called at most once, with the cleanup's
+    /// own token (not the caller's, which may be cancelled already).
+    /// </param>
+    /// <param name="onListFailure">
+    /// Called when the blobs cannot be listed or the rows cannot be read: nothing is deleted then.
+    /// </param>
     /// <param name="onFailure">
     /// Called with the blob name and the error of each failed delete; when cleanup stops after the caller
     /// cancelled, called once more, with the first blob not deleted and an
@@ -456,16 +469,19 @@ public sealed class LargeValueTable
     /// <returns>A task that completes when every delete was attempted, or cleanup stopped.</returns>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public async Task DeletePartitionBlobsAsync(
-        string partitionKey, Action<Exception>? onListFailure, Action<string, Exception>? onFailure, CancellationToken ct)
+        string partitionKey, Type entityType,
+        Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows,
+        Action<Exception>? onListFailure, Action<string, Exception>? onFailure, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(partitionKey);
+        ArgumentNullException.ThrowIfNull(entityType);
+        ArgumentNullException.ThrowIfNull(partitionRows);
         // No blob is ever named after a key that is not well-formed UTF-16 (writes refuse one).
         if (blobs is null || NeverCleansUp || !SplitCodec.IsWellFormedUtf16(partitionKey))
             return;
-        var prefix = ValueOffloadCoordinator.PartitionPrefix(tableName, partitionKey);
         using var budget = new CleanupBudget(ct, CancelledCleanupBudget);
         var token = budget.Token;
-        var doomed = new List<(string Name, DateTimeOffset UnmodifiedSince)>();
+        IReadOnlyList<(string Name, DateTimeOffset LastModified)> orphans = [];
         var next = 0;
         try
         {
@@ -476,11 +492,10 @@ public sealed class LargeValueTable
                 return;
             try
             {
-                await foreach (var (name, lastModified) in blobs.ListAsync(prefix, token).WithCancellation(token))
-                {
-                    if (OffloadBlobNames.IsOffloadBlobName(name, prefix))
-                        doomed.Add((name, lastModified < cutoff ? lastModified : cutoff));
-                }
+                // Never "every blob under the prefix": a row that is in the partition now (one a
+                // concurrent writer created after the delete listed its rows) keeps what it references.
+                orphans = await coordinator.OrphansAsync(
+                    partitionKey, cutoff, includeCutoff: true, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, token);
             }
 #pragma warning disable CA1031 // the rows are already deleted: a cleanup failure must not turn that into an error
             catch (Exception ex) when (!(ex is OperationCanceledException && token.IsCancellationRequested))
@@ -489,13 +504,13 @@ public sealed class LargeValueTable
                 onListFailure?.Invoke(ex);
                 return;
             }
-            for (; next < doomed.Count; next++)
-                await DeleteBlobAsync(doomed[next].Name, doomed[next].UnmodifiedSince, onFailure, token);
+            for (; next < orphans.Count; next++)
+                await DeleteBlobAsync(orphans[next].Name, orphans[next].LastModified, onFailure, token);
         }
         catch (OperationCanceledException ex) when (token.IsCancellationRequested)
         {
-            if (next < doomed.Count)
-                onFailure?.Invoke(doomed[next].Name, CleanupStopped(doomed.Count - next, ex));
+            if (next < orphans.Count)
+                onFailure?.Invoke(orphans[next].Name, CleanupStopped(orphans.Count - next, ex));
             else
                 onListFailure?.Invoke(ex);
         }

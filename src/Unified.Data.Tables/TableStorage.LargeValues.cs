@@ -234,17 +234,20 @@ public partial class TableStorage<T>
         logger.LogWarning(ex, "{Type}: could not delete blob {Blob}; an orphan sweep will remove it", typeName, path);
 
     /// <summary>
-    /// After a partition's rows are deleted, deletes every blob stored under it (best effort), each on
-    /// condition that it was modified neither within the cleanup grace nor since it was listed, so a blob
-    /// a concurrent write has just touched for a new row survives. The deletion committed, so a cancelled
-    /// token does not fail it: cleanup gets a few more seconds, then leaves the rest to the orphan sweep.
+    /// After a partition's rows are deleted, deletes the blobs stored under it that no row of the
+    /// partition references now (best effort): the rows that are there once the deletes are done are
+    /// read again, so a row another writer created meanwhile keeps its blob however long the deletes
+    /// took. Each delete is on condition that the blob was modified neither within the cleanup grace nor
+    /// since it was listed, so a blob a concurrent write has just touched for a new row survives too. The
+    /// deletion committed, so a cancelled token does not fail it: cleanup gets a few more seconds (the
+    /// rows are read with the cleanup's own token), then leaves the rest to the orphan sweep.
     /// </summary>
     private Task DeletePartitionBlobsAsync(string partition, CancellationToken ct)
     {
         if (!LargeValueAware)
             return Task.CompletedTask;
-        return large.DeletePartitionBlobsAsync(partition,
-            ex => logger.LogWarning(ex, "{Type}: could not list the blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition),
+        return large.DeletePartitionBlobsAsync(partition, typeof(T), (select, c) => PartitionRowsAsync(partition, select, c),
+            ex => logger.LogWarning(ex, "{Type}: could not find the unreferenced blobs of partition {Partition}; an orphan sweep will remove them", typeName, partition),
             LogBlobDeleteFailure, ct);
     }
 

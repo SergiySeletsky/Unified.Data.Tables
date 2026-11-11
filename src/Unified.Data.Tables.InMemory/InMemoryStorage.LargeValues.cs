@@ -353,10 +353,11 @@ public sealed partial class InMemoryStorage<T>
                 rows.Remove(key);
         }
 
-        // The rows are gone: so are the blobs stored under the partition (best effort, after the grace; a
-        // cancelled token only bounds how long that may take, the rest is left to the orphan sweep).
+        // The rows are gone: so are the blobs stored under the partition that no row references now (best
+        // effort, after the grace; a row another writer created meanwhile keeps its blobs; a cancelled
+        // token only bounds how long that may take, the rest is left to the orphan sweep).
         AfterLargeCommit?.Invoke();
-        await large.DeletePartitionBlobsAsync(partition, onListFailure: null, onFailure: null, ct);
+        await large.DeletePartitionBlobsAsync(partition, typeof(T), (_, _) => PartitionRowsAsync(partition), onListFailure: null, onFailure: null, ct);
         return logical;
     }
 

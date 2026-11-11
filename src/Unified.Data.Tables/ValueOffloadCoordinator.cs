@@ -373,11 +373,10 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     /// <summary>
     /// Deletes the blobs under <paramref name="pk"/> that no row of the partition references and whose
-    /// Last-Modified is before <paramref name="cutoff"/>; only names of the exact offload shape
-    /// (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) are candidates, anything else is left alone; returns how many were deleted (0 when blob
-    /// offload is not configured). The blobs are listed first and the table is read only when some are
-    /// old enough. Each delete is conditional on the blob not having been modified since it was listed,
-    /// so a blob a concurrent write touches to reuse it (before writing its row) is kept.
+    /// Last-Modified is before <paramref name="cutoff"/> (<see cref="OrphansAsync"/>); returns how many were
+    /// deleted (0 when blob offload is not configured). Each delete is conditional on the blob not having
+    /// been modified since it was listed, so a blob a concurrent write touches to reuse it (before writing
+    /// its row) is kept.
     /// </summary>
     /// <param name="pk">The (normalized) partition key.</param>
     /// <param name="cutoff">Only blobs last modified before this instant are candidates.</param>
@@ -397,16 +396,58 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         if (blobs is null)
             return 0;
 
+        // The orphans, each deleted only if it was not modified since it was listed.
+        var deleted = 0;
+        foreach (var (name, lastModified) in await OrphansAsync(pk, cutoff, includeCutoff: false, declaredColumns, partitionRows, ct))
+        {
+            if (await blobs.DeleteIfUnmodifiedAsync(name, lastModified, ct))
+                deleted++;
+        }
+        return deleted;
+    }
+
+    /// <summary>
+    /// The blobs under <paramref name="pk"/> that are old enough and that no row of the partition
+    /// references, each with the Last-Modified it was listed at (the condition its delete must carry).
+    /// Only names of the exact offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) are
+    /// candidates; anything else is left alone. The blobs are listed first and the rows are read (once)
+    /// only when some blob is old enough, so every row that is in the partition when the rows are read
+    /// keeps the blobs it references. Nothing is deleted here. Both the orphan sweep and the cleanup
+    /// after a partition delete decide through this method which blobs may go.
+    /// </summary>
+    /// <param name="pk">The (normalized) partition key.</param>
+    /// <param name="cutoff">Blobs last modified before this instant are old enough.</param>
+    /// <param name="includeCutoff">
+    /// True when a blob last modified exactly at <paramref name="cutoff"/> is old enough too, as for the
+    /// cleanup after a write (whose deletes are conditional on "not modified since the cutoff"); false
+    /// for the sweep, which takes only blobs strictly older than its age.
+    /// </param>
+    /// <param name="declaredColumns">The large-value columns of the store's entity type.</param>
+    /// <param name="partitionRows">
+    /// Every row of the partition (continuation rows included), projected onto the given columns, or
+    /// whole when the projection is null. Called at most once.
+    /// </param>
+    /// <param name="ct">Cancels the listing and the read.</param>
+    internal async Task<IReadOnlyList<(string Name, DateTimeOffset LastModified)>> OrphansAsync(
+        string pk, DateTimeOffset cutoff, bool includeCutoff, IReadOnlyList<string> declaredColumns,
+        Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(pk);
+        ArgumentNullException.ThrowIfNull(declaredColumns);
+        ArgumentNullException.ThrowIfNull(partitionRows);
+        var candidates = new List<(string Name, DateTimeOffset LastModified)>();
+        if (blobs is null)
+            return candidates;
+
         // (1) The candidates: the partition's blobs that are old enough, with the time they were listed at.
         var prefix = PartitionPrefix(tableName, pk);
-        var candidates = new List<(string Name, DateTimeOffset LastModified)>();
         await foreach (var (name, lastModified) in blobs.ListAsync(prefix, ct).WithCancellation(ct))
         {
-            if (lastModified < cutoff && OffloadBlobNames.IsOffloadBlobName(name, prefix))
+            if ((lastModified < cutoff || (includeCutoff && lastModified == cutoff)) && OffloadBlobNames.IsOffloadBlobName(name, prefix))
                 candidates.Add((name, lastModified));
         }
         if (candidates.Count == 0)
-            return 0;
+            return candidates;
 
         // (2) The references: one read of the partition's keys and reference cells.
         var referenced = new HashSet<string>(StringComparer.Ordinal);
@@ -433,16 +474,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             }
         }
 
-        // (3) The orphans, each deleted only if it was not modified since it was listed.
-        var deleted = 0;
-        foreach (var (name, lastModified) in candidates)
-        {
-            if (referenced.Contains(name) || IsGuarded(name, prefix.Length, guarded))
-                continue;
-            if (await blobs.DeleteIfUnmodifiedAsync(name, lastModified, ct))
-                deleted++;
-        }
-        return deleted;
+        // (3) The orphans: the candidates no row references.
+        candidates.RemoveAll(c => referenced.Contains(c.Name) || IsGuarded(c.Name, prefix.Length, guarded));
+        return candidates;
     }
 
     // True when a '/'-terminated prefix of the name (past the partition prefix) is a guarded cell:

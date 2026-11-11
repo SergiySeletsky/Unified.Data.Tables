@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using Azure.Data.Tables;
 using Unified.Data.Tables.Providers;
 
 namespace Unified.Data.Tables.Tests.LargeValues;
@@ -22,6 +23,13 @@ public class PostCommitCleanupTests
 
     private static LargeValueTable Table(IOffloadBlobStore blobs, TimeSpan budget) =>
         new("T", new BlobOffloadOptions { CleanupGrace = TimeSpan.Zero }, blobs) { CancelledCleanupBudget = budget };
+
+    // The partition's rows are deleted and no writer added one: no row references a blob.
+    private static async IAsyncEnumerable<TableEntity> NoRows(IReadOnlyList<string>? select, [EnumeratorCancellation] CancellationToken ct)
+    {
+        await Task.CompletedTask;
+        yield break;
+    }
 
     [Fact]
     public async Task ReleasedBlobs_CallerCancelled_StopAfterTheBudget_AndReportTheRestOnce()
@@ -82,7 +90,7 @@ public class PostCommitCleanupTests
         var watch = Stopwatch.StartNew();
 
         await Table(blobs, TimeSpan.FromMilliseconds(100))
-            .DeletePartitionBlobsAsync("p", listFailures.Add, (p, e) => failures.Add((p, e)), cts.Token);
+            .DeletePartitionBlobsAsync("p", typeof(SplitTextEntity), NoRows, listFailures.Add, (p, e) => failures.Add((p, e)), cts.Token);
 
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(20), $"cleanup took {watch.Elapsed}");
         Assert.Empty(listFailures);
@@ -100,7 +108,7 @@ public class PostCommitCleanupTests
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
 
-        await Table(blobs, TimeSpan.FromSeconds(30)).DeletePartitionBlobsAsync("p", null, null, cts.Token);
+        await Table(blobs, TimeSpan.FromSeconds(30)).DeletePartitionBlobsAsync("p", typeof(SplitTextEntity), NoRows, null, null, cts.Token);
 
         Assert.Equal(5, blobs.Deletes);
     }

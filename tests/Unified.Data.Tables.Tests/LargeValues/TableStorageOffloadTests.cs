@@ -239,7 +239,10 @@ public class TableStorageOffloadTests
         await rig.Store.DeletePartitionAsync(Pk, Ct);
 
         Assert.Single(inner.Names);
-        Assert.Equal([false], rig.Blobs.DeleteResults);
+        // Written moments ago (within the grace): it is not a cleanup candidate, so no delete is even
+        // attempted (the partition cleanup used to send one the grace condition was sure to refuse).
+        Assert.Empty(rig.Blobs.DeleteResults);
+        Assert.Equal(0, rig.Blobs.Count("delete"));
     }
 
     [Fact]
