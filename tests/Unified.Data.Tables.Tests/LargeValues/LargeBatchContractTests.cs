@@ -754,6 +754,14 @@ public abstract class LargeBatchContract : IAsyncLifetime
     // in these tests each of the other three callers commits exactly once: no caller can lose more than
     // three attempts, whatever the timing, so with five attempts every call must succeed in every round.
 
+    /// <summary>
+    /// The entity stored at <paramref name="rk"/>, read from the table itself. A bounded query never
+    /// answers from the entity cache, and these tests are about what is stored: when two writers of one
+    /// row finish close together, the cache can be left holding the entity of the one that committed first.
+    /// </summary>
+    private async Task<SplitTextEntity?> StoredAsync(IStorage<SplitTextEntity> store, string rk) =>
+        (await store.QueryAsync(new QueryOptions { Partition = Pk, RowKeyPrefix = rk }, Ct)).SingleOrDefault(e => e.Id == Id(rk));
+
     [Fact]
     public async Task FourConcurrentUpserts_OfOneRow_AllSucceed_InEveryRound()
     {
@@ -767,7 +775,7 @@ public abstract class LargeBatchContract : IAsyncLifetime
 
             await Task.WhenAll(bodies.Select(body => Task.Run(() => store.UpsertAsync(Text(rk, body), Ct), Ct)));
 
-            Assert.Contains((await store.OneAsync(Id(rk), Ct))!.Body, bodies);
+            Assert.Contains((await StoredAsync(store, rk))!.Body, bodies);
         }
         Assert.Equal(ConcurrentRounds, await store.CountAsync(Pk, Ct));
     }
@@ -788,7 +796,7 @@ public abstract class LargeBatchContract : IAsyncLifetime
 
             // Whichever write was last, the row holds exactly its value (the read verifies its hash), with
             // exactly the continuation rows that value needs.
-            var body = (await store.OneAsync(Id("r1"), Ct))!.Body!;
+            var body = (await StoredAsync(store, "r1"))!.Body!;
             Assert.Contains(body, bodies);
             var parts = body.Length <= 32_000 ? 0 : body.Length <= 960_000 ? 1 : 2;
             Assert.Equal(new[] { "r1" }.Concat(Enumerable.Range(1, parts).Select(i => $"r1~{i:D4}")), await PhysicalRowKeysAsync<SplitTextEntity>());
@@ -812,7 +820,7 @@ public abstract class LargeBatchContract : IAsyncLifetime
                 Task.Run(() => store.DeleteAsync(Id("r1"), Ct), Ct));
 
             // Deleted, or one whole value: never a continuation row without its primary.
-            var read = await store.OneAsync(Id("r1"), Ct);
+            var read = await StoredAsync(store, "r1");
             var keys = await PhysicalRowKeysAsync<SplitTextEntity>();
             if (read is null)
                 Assert.Empty(keys);
