@@ -1515,6 +1515,17 @@ so a scaled-out app may register it in one instance only.
 - A projection of a plain type (one that does not opt the property in) that names a property another type
   stored split or offloaded reads it as null: the plain store neither fetches nor recognises the value's
   cells. Read such rows through the opted-in type.
+- A type that maps a column another type stored split or offloaded to a member that is not a large-value
+  member (a plain type sharing the table, for one) reads the value into that member where it can read it
+  at all (a plain type reassembles split cells on the main row and fails to read a value on continuation
+  rows or in a blob, see [Ordering and integrity](#ordering-and-integrity)). `TableStorage<T>` then copies
+  the entity it read as that member would be stored: the copy it caches, and every entity that
+  `QueryAsync(partition)` and `QueryAsync()` return (with caching off too). Under `TrimSilently` or
+  `TrimWithMarker` a string or JSON-stored value that does not fit one cell even compressed is trimmed in
+  those copies (so a later `OneAsync` that the cache answers and those two queries return it trimmed) and
+  in the next save of such an entity, which stores it trimmed; under `Throw` those two queries and the
+  save throw `OversizedCellException`, and the entity is not cached. `OneAsync` when it reads the table,
+  and the other queries, return the value whole. Read such rows through the opted-in type.
 - The store learns a type's large-value columns from its declared property types (along every path that
   does not pass through the same type twice) and from the objects a new entity holds. Three shapes fall
   outside that: a large value below a repeated type (`Head.Next.Body` when the node type refers to
