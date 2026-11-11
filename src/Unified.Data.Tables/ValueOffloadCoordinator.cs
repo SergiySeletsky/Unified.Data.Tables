@@ -410,18 +410,13 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         var guarded = new HashSet<string>(StringComparer.Ordinal);
         await foreach (var row in partitionRows(SweepSelect(prefix, candidates, declaredColumns), ct).WithCancellation(ct))
         {
-            foreach (var (key, value) in row)
+            // A selected cell the row does not have comes back as null: no reference (for example a value
+            // replaced by an inline one), so the blobs it once referenced are orphans. ReferenceCells skips it.
+            foreach (var (column, cell) in ReferenceCells(row))
             {
-                if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
-                    continue;
-                // A selected cell the row does not have comes back as null: no reference (for example a
-                // value replaced by an inline one), so the blobs it once referenced are orphans.
-                if (value is null)
-                    continue;
                 try
                 {
-                    referenced.Add(BlobReference.Parse(column,
-                        value as string ?? throw new TableValueIntegrityException(column, "the blob reference is not a string.")).Path);
+                    referenced.Add(ParseReference(column, cell).Path);
                 }
                 catch (TableValueIntegrityException)
                 {
@@ -508,20 +503,39 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         return true;
     }
 
-    /// <summary>Every blob reference of <paramref name="row"/>.</summary>
+    /// <summary>Every blob reference of <paramref name="row"/>; a null reference cell is no reference.</summary>
     /// <exception cref="TableValueIntegrityException">A reference cell is malformed.</exception>
     internal static IReadOnlyList<BlobReference> References(TableEntity row)
     {
         ArgumentNullException.ThrowIfNull(row);
         var references = new List<BlobReference>();
-        foreach (var (key, value) in row)
-        {
-            if (SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) && kind == LargeValueCellKind.BlobReference)
-                references.Add(BlobReference.Parse(column,
-                    value as string ?? throw new TableValueIntegrityException(column, "the blob reference is not a string.")));
-        }
+        foreach (var (column, cell) in ReferenceCells(row))
+            references.Add(ParseReference(column, cell));
         return references;
     }
+
+    /// <summary>
+    /// The <c>{column}__blob</c> cells of <paramref name="row"/> that hold something, with their base
+    /// column. A null cell is not one of them: the service returns a selected property the row does not
+    /// have as null (the storage emulator omits it), so null means "no reference", never a malformed one.
+    /// Every reader of a row's references goes through here.
+    /// </summary>
+    internal static IEnumerable<(string Column, object Cell)> ReferenceCells(TableEntity row)
+    {
+        foreach (var (key, value) in row)
+        {
+            if (value is not null
+                && SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _)
+                && kind == LargeValueCellKind.BlobReference)
+                yield return (column, value);
+        }
+    }
+
+    /// <summary>The reference a non-null <c>{column}__blob</c> cell holds.</summary>
+    /// <exception cref="TableValueIntegrityException">The cell is not a string, or not a reference.</exception>
+    internal static BlobReference ParseReference(string column, object cell) =>
+        BlobReference.Parse(column,
+            cell as string ?? throw new TableValueIntegrityException(column, "the blob reference is not a string."));
 
     // A projection names the column itself, or an object that owns it (the same rule BuildSelect uses).
     internal static bool Projects(IReadOnlyCollection<string> projected, string column)

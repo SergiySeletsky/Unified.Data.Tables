@@ -178,7 +178,9 @@ public sealed class LargeValueTable
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The blob names a stored row references. A
-    /// malformed reference cannot name a blob and must not block a write that replaces it: it is
+    /// reference cell that is null is no reference (the service returns a selected property the row does
+    /// not have as null): it is skipped silently. A malformed reference (a cell that holds something
+    /// that is not a reference) cannot name a blob and must not block a write that replaces it: it is
     /// reported to <paramref name="onMalformed"/> and skipped.
     /// </summary>
     /// <param name="row">A stored (primary or logical) row.</param>
@@ -189,13 +191,11 @@ public sealed class LargeValueTable
     {
         ArgumentNullException.ThrowIfNull(row);
         var paths = new List<string>();
-        foreach (var (key, value) in row)
+        foreach (var (column, cell) in ValueOffloadCoordinator.ReferenceCells(row))
         {
-            if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
-                continue;
             try
             {
-                paths.Add(BlobReference.Parse(column, value as string ?? string.Empty).Path);
+                paths.Add(ValueOffloadCoordinator.ParseReference(column, cell).Path);
             }
             catch (TableValueIntegrityException ex)
             {
