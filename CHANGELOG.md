@@ -18,6 +18,12 @@ Lossless storage of large values, opt-in per property.
   `TableBlobContent` in a later deploy, once no older reader (a swapped slot, a rollback target, another
   service) remains. Values that each fit one cell are not exempt: an entity whose opted-in values together
   exceed one entity is written with split cells and continuation rows too.
+- Do not remove `[TableValueSplit]` from a property while rows hold large values of it (split cells,
+  continuation rows or a blob): a read would bring such a value into a member that is no longer a large
+  value, which `TableStorage<T>`'s cache copy of the entity and the next save of it write as an ordinary
+  cell, so a value that does not fit one cell even compressed is then trimmed under a trimming
+  `OversizedCellPolicy` and fails the read or the save under `Throw`. Once the type opts into nothing at
+  all, a read of a row that holds such a value in a blob or on continuation rows fails.
 - Back up and restore an entity's main row, continuation rows and offload blobs together. A table copied
   raw shares the source's blobs (the references hold the source table's blob paths). Writes through the
   copy never delete them, but the source's own replaces, deletes, partition deletes and sweeps can: give
@@ -70,31 +76,43 @@ Lossless storage of large values, opt-in per property.
     values: no LINQ filter and no builder partial update on them), or mark one of its own properties, or
     declare the property with the type that carries the member. A read keeps the instance and maps the
     columns through its type.
-  - A large value is stored only where a read returns it. These writes throw `NotSupportedException`
-    naming the column or property before anything is uploaded or stored: through a store of a plain type,
-    any value in a `[TableValueSplit]` member or a `TableBlobContent` below a runtime subtype, whatever its
-    size (a plain store stores no large-value form; a null member is not refused), also through a builder
-    update; a value that needs split cells or a blob below an object whose type a read would not recreate,
-    or that a read cannot create at all (a struct in a nullable property, an interface- or abstract-typed
-    property with no instance); a `TableBlobContent` in a property declared as `object`; and a subclass
-    written through an `IStorage<TBase>` whose large value a read of `TBase` would not return (any value of
-    a large-value member when `TBase` is plain; a value of a column only the subclass declares that would
-    leave its cell when `TBase` is aware, before the caller's stream is read). A value of one cell in such
-    places is an ordinary cell, as on 0.8.3. In `CreateBatchAsync` and `UpsertBatchAsync` the refusal comes
-    before anything of the refused entity's partition is uploaded or written; the transactions of
-    partitions the batch wrote before it stay committed, as for any failing transaction of a batch. A write
-    refused because a read could not map a file's column back to a property (a `TableBlobContent` below an
-    object whose runtime type a read does not recreate) may have read the file's source first; a content
-    created from a non-seekable stream must then be created again from its source.
+  - A large value is stored only where a read returns it into a large-value member. These writes throw
+    `NotSupportedException` naming the column or property before anything is uploaded or stored: through a
+    store of a plain type, any value in a `[TableValueSplit]` member or a `TableBlobContent` below a
+    runtime subtype, whatever its size (a plain store stores no large-value form; a null member is not
+    refused), also through a builder update; a value that needs split cells or a blob below an object whose
+    type a read would not recreate, when the object a read creates or keeps there (the declared type of a
+    property that is empty on a new entity, or the default instance) has no member of that name or one that
+    is not a large-value member (`public MemoBase? Doc { get; set; }` written holding a `MemoMarked` that
+    marks its `Notes`, which `MemoBase` does not), or that a read cannot create at all (a struct in a
+    nullable property, an interface- or abstract-typed property with no instance); a `TableBlobContent` in
+    a property declared as `object`; and a subclass written through an `IStorage<TBase>` whose large value
+    a read of `TBase` would not return into a large-value member (any value of a large-value member when
+    `TBase` is plain; when `TBase` is aware, a value that would leave its cell in a column only the
+    subclass declares, before the caller's stream is read, or in a member the subclass marks and `TBase`
+    declares without marking it). A value of one cell in such places is an ordinary cell, as on 0.8.3, and
+    is never moved to split form to make a crowded row fit. In `CreateBatchAsync` and `UpsertBatchAsync`
+    the refusal comes before anything of the refused entity's partition is uploaded or written; the
+    transactions of partitions the batch wrote before it stay committed, as for any failing transaction of
+    a batch. A write refused because a read could not map a file's column back to a property (a
+    `TableBlobContent` below an object whose runtime type a read does not recreate) may have read the
+    file's source first; a content created from a non-seekable stream must then be created again from its
+    source.
   - The refusal messages name only remedies that work for the shape: a builder update that would write a
     large value says that a partial update cannot write one on any store and to replace the entity; a
     `TableBlobContent` in an `object` property (refused on every store, aware or not) names the
     declaration as `TableBlobContent`; a value below a nullable struct names the declarations that work
     (the struct property not nullable, and the holder property with the type that has it), not a
-    class-level `[TableValueSplit]`, which does not help there.
+    class-level `[TableValueSplit]`, which does not help there; a value a read would bring into a member
+    that is not a large-value member names the column, the type a read creates there and the runtime type,
+    and the declarations that work (the property initialised with an instance of the runtime type in the
+    constructor of its owner, the property declared as the runtime type, or `[TableValueSplit]` on the
+    member of the declared type; for a subclass written through a store of its base type, an `IStorage` of
+    the subclass, or the attribute on the base type's member).
   - When many opted-in values that each fit one cell exceed one entity together, the largest are stored
-    in split form so that their chunks can go to continuation rows; a row that fits one entity is stored
-    as before, every value in its own cell.
+    in split form so that their chunks can go to continuation rows (never a value a read would not return
+    into a large-value member); a row that fits one entity is stored as before, every value in its own
+    cell.
   - `[ColumnAlias]` on a renamed `[TableValueSplit]` or `TableBlobContent` property reads the value
     stored under the old column in every form: one cell, `__Json`, `__GZip`, split cells, continuation
     rows or a blob reference. The next save stores it under the new column and removes the old blob
@@ -130,16 +148,18 @@ Lossless storage of large values, opt-in per property.
     stream to its end and then lost its temporary copy (it failed or was cancelled while finishing it)
     counts the stream as read to its end; a write that cannot create its temporary copy throws before it
     reads anything and leaves the stream as it was. Two contents over one such stream in one write are
-    refused the same way. A stream a failed or cancelled write read only part of, and a seekable stream a
-    write could not put back, are refused for every later content, also below a new framework wrapper; so
-    a server that reuses a request-body object which a failed write read part-way refuses every later
-    content over it (buffer the body into a seekable stream, or close the connection after such a
-    failure). A content whose write failed after it began to read the stream and before its upload is
-    refused for every later write. A new wrapper of another kind (a user-written or decryption stream)
-    over a consumed stream is not recognised and stores whatever that stream still delivers, possibly
-    nothing. Create the content once, outside a delegate that may run again, and assign that instance on
-    every attempt; use a seekable stream or `FromBytes`; or open the source again for each attempt (a new
-    source of the bytes, not a new wrapper).
+    refused the same way. A stream a failed or cancelled write read only part of (a write cancelled once
+    it began to read counts, also before the stream delivered a byte, since the library cannot tell
+    whether the stream took bytes it did not deliver), and a seekable stream a write could not put back,
+    are refused for every later content, also below a new framework wrapper; so a server that reuses a
+    request-body object which a failed write read part-way refuses every later content over it (buffer the
+    body into a seekable stream, or close the connection after such a failure). A content whose write
+    failed after it began to read the stream and before its upload is refused for every later write. A
+    new wrapper of another kind (a user-written or decryption stream) over a consumed stream is not
+    recognised and stores whatever that stream still delivers, possibly nothing. Create the content once,
+    outside a delegate that may run again, and assign that instance on every attempt; use a seekable
+    stream or `FromBytes`; or open the source again for each attempt (a new source of the bytes, not a new
+    wrapper).
   - Once an attempt has uploaded the content's blob, the content streams that blob: a retry with the same
     content reuses it, before the blob is collected by a sweep or a partition delete's cleanup; after
     that the write throws `TableValueIntegrityException` and the content must be created again. The
@@ -260,8 +280,9 @@ Lossless storage of large values, opt-in per property.
   know continuation rows, or a partition delete that raced an upsert) do not block the key: the write
   replaces the ones the new value needs and deletes the others in the same transaction, each on
   condition of the version it was read at, and `DeleteAsync` of an id that has no main row removes them.
-  A write looks for leftovers only when one holds a key it needs; reads, queries and `CountAsync` never
-  return them. A leftover that another caller removes between the write's failed transaction and its look
+  A write looks for leftovers only when one holds a key it needs; the reads and queries of every type never
+  return them, nor does `CountAsync` of the split-aware type (a plain type on the same table counts them,
+  as on 0.8.3). A leftover that another caller removes between the write's failed transaction and its look
   at the key is a lost race (retried within the five attempts); `InvalidOperationException` is thrown only
   when a row that is not the entity's own holds the key at that moment. A row another writer puts at a
   continuation key the entity already declares is treated as the entity's own and is replaced or deleted
@@ -277,7 +298,8 @@ Lossless storage of large values, opt-in per property.
   is not a column: the service returns it with every entity whatever `$select` names, so every projected
   entity still carries its `ETag`. A caller that names `odata.etag` in `QueryOptions.Select` has it
   dropped (a `Select` of that name alone is still a projection: the system columns and nothing else).
-  This is the one deliberate difference in the requests a plain type makes compared with 0.8.3.
+  This is the one deliberate difference in what a plain type's requests contain compared with 0.8.3; the
+  cache corrections below can add a point read where 0.8.3 answered from its cache.
 - The read cache no longer keeps a version that a write or delete has replaced, for every entity type. A
   read that overlapped a write or delete made through the same `IMemoryCache` could fetch the row, let the
   write commit, and then cache what it had fetched: later `OneAsync` calls returned the old version for
@@ -303,22 +325,26 @@ Lossless storage of large values, opt-in per property.
   although nothing was written. After `UpdateAsync(id, builder)` the cached entity is kept warm as on
   0.8.3 only when the entry cached when the update was sent is still the cached entry (no read or other
   write has put another since), every path names a top-level property, and every value is a non-null
-  scalar of the property's type that the update writes whole in its own column (a string the
-  `OversizedCellPolicy` did not trim or compress, a `bool`, `int`, `long`, `double`, `Guid`, enum,
-  `DateTimeOffset`, or a `DateTime` that is not local). Then the store copies the cached entity once,
-  constructing it once as 0.8.3 did, and sets the values on the copy; the copy takes the update's ETag
-  only when the update was conditional on exactly the cached entity's version and the response carried
-  one, and otherwise keeps the ETag it had, as on 0.8.3, so an optimistic write with it meets a conflict
-  and reads the row. Every other builder update (a nested path, an object, a collection or other
-  JSON-stored value, a `byte[]`, a trimmed string, a null, a `decimal`) evicts the entry, and the next
-  read fetches the row; on 0.8.3 any update with top-level paths patched the cached entity. If the copy or
-  the cache put throws, the entry is evicted before the exception leaves the call, which has stored the
-  update. Each of these can cost one more point read. None changes a cell or the request of a write; what
-  a read returns changes only from a stale version to the current one. Writes made by another process, or
-  through another `IMemoryCache`, are still not seen until the entry expires; a store with
-  `CachePolicy.Disabled` over a shared cache still does not evict on a successful create, update or
-  upsert; and a write of an entity that cannot be copied for the cache still leaves the cached copy of the
-  version it replaced.
+  scalar of the property's type that the update writes as one cell in its own column and that a read
+  converts back to an equal value (by the type's own equality, as on 0.8.3): a string the
+  `OversizedCellPolicy` did not trim or compress, a `bool`, `int`, `uint`, `long`, `ulong`, `byte`,
+  `double`, `Guid`, `TimeSpan` or enum (nullable forms included), a `decimal` that its stored `double`
+  converts back to, a `DateTimeOffset` other than the instant 1601-01-01T00:00Z, or a `DateTime` that is
+  neither local nor that instant. Then the store copies the cached entity once, constructing it once as
+  0.8.3 did, and sets the values on the copy; the copy takes the update's ETag only when the update was
+  conditional on exactly the cached entity's version and the response carried one, and otherwise keeps
+  the ETag it had, as on 0.8.3, so an optimistic write with it meets a conflict and reads the row. Every
+  other builder update (a nested path, an object, a collection or other JSON-stored value, `float`,
+  `short`, `char`, `sbyte` and `ushort` included, a `byte[]`, a trimmed or compressed string, a null, a
+  `decimal` that its stored `double` does not convert back to, the 1601-01-01 instant, which is stored as
+  an unset date, a local `DateTime`) evicts the entry, and the next read fetches the row; on 0.8.3 any
+  update with top-level paths patched the cached entity. If the copy or the cache put throws, the entry is
+  evicted before the exception leaves the call, which has stored the update. Each of these can cost one
+  more point read. None changes a cell or the request of a write; what a read returns changes only from a
+  stale version to the current one. Writes made by another process, or through another `IMemoryCache`,
+  are still not seen until the entry expires; a store with `CachePolicy.Disabled` over a shared cache
+  still does not evict on a successful create, update or upsert; and a write of an entity that cannot be
+  copied for the cache still leaves the cached copy of the version it replaced.
 - The entity cache holds one entry per row, however its id is spelled. `"a"` and `"a|a"` address the
   same row but had separate entries, so a write or delete under one spelling left the entry cached under
   the other, and `DeletePartitionAsync` did not evict an entity whose id has one segment: it stayed
@@ -333,9 +359,11 @@ Lossless storage of large values, opt-in per property.
   of its large-value columns, to learn the columns of the objects the constructor puts in its properties;
   an exception from the constructor or a getter is ignored (the declared columns stand for that operation)
   and a later use tries again, after which replaces and deletes release the blobs of members of runtime
-  subtypes again. A builder partial update of such a type may construct it once per column it first names;
-  while the constructor or a getter throws (or an object along the path cannot be created), a builder
-  update that names a column not resolved before (a top-level one too) is refused with
+  subtypes again. A write of such a type may construct it for each column of a `[TableValueSplit]` value
+  below a nested object that is not resolved yet, to learn whether a read returns that column into a
+  large-value member. A builder partial update of such a type may construct it once per column it first
+  names; while the constructor or a getter throws (or an object along the path cannot be created), a
+  builder update that names a column not resolved before (a top-level one too) is refused with
   `NotSupportedException` before anything is written, because whether the column is a large value cannot
   be decided. Its inner exception is the failure (a `TargetInvocationException` whose inner exception is
   the constructor's); a misused `[TableValueSplit]` met there is reported as itself, as a whole-entity
@@ -353,7 +381,9 @@ Lossless storage of large values, opt-in per property.
   longer changes what the store answers or what an optimistic write sends (on 0.8.3 it could store bytes
   that were never written). A `[ProtectedProperty]` `byte[]` is therefore compared by content on both
   stores: an array with the same bytes is not a change (on 0.8.3 an array read from the table on a cache
-  miss counted as one).
+  miss counted as one). A `TableBlobContent` is not copied: the cached entity holds the content object
+  that was written or read, and a `TableBlobContent.FromBytes` content keeps reading the caller's array,
+  which therefore must not be changed after the write.
 - A projection (`QueryOptions.Select`) of a split-aware type is narrowed only when every name is a system
   column or resolves to an ordinary property; otherwise the whole row is fetched and whole entities are
   returned. A name of a large value in any form (its column, an object that owns it, one of its cells)
@@ -423,11 +453,15 @@ Lossless storage of large values, opt-in per property.
   that class), before anything is stored; such a value is never trimmed. A builder partial update, on both
   stores, is refused with the same exception before anything is written when the entity type, or the
   declared type of a property along the updated path, is or implements such an interface, at every size
-  and under every policy. Two cases are not checked: an instance held in a JSON-stored property (a
-  collection, or a type stored as one JSON cell) is written as JSON like every other value of that cell,
-  and a trimming `OversizedCellPolicy` can trim that cell; and a builder update of a plain type through a
-  property declared as a base class or `object` whose value at run time is such a class writes an
-  ordinary cell (the check reads declared types only).
+  and under every policy (`InMemoryStorage<T>` looks at the row first and throws the 404 of a missing row,
+  or the conflict of a `WithETag` that names another version, as for every builder update;
+  `TableStorage<T>` reports the misuse in both cases). Two cases are not checked: an instance held in a
+  JSON-stored property (a collection, or a type stored as one JSON cell) is written as JSON like every
+  other value of that cell, and a trimming `OversizedCellPolicy` can trim that cell; and a builder update
+  through a property declared as a base class or `object` whose value at run time is such a class writes
+  an ordinary cell (the check reads declared types), unless the entity type is large-value aware and its
+  constructor puts an instance of the implementing class in that property. When the constructor of a
+  plain type puts one there, every later read of the row reports the misuse.
 - A create-only blob upload that conflicts with an orphan which a sweep deletes before the follow-up state
   read, or between that read and the touch, uploads again (three attempts in all) instead of failing the
   write with an integrity error.
