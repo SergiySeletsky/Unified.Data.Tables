@@ -258,20 +258,18 @@ public static class TableEntitySerializer
         return (outermost.Parent!.Type!, outermost.HeldBy!, outermost.Type!, holders);
     }
 
-    // The first property along ownerPath (property names from root, by reflection only, a member an interface
-    // inherits counting as one it declares) declared as a nullable struct, with the declared type that has it;
-    // null when there is none.
+    // The first property along ownerPath (property names from root, by reflection only, through the members the
+    // declared types store: TypeMetadataCache.DeclaredPath, every member of each name) declared as a nullable
+    // struct, with the declared type that has it; null when there is none.
     private static (Type Owner, PropertyInfo Property, Type Struct)? NullableStructOnPath(Type root, IReadOnlyList<string> ownerPath)
     {
-        var owner = root;
-        foreach (var name in ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))
+        foreach (var step in TypeMetadataCache.DeclaredPath(root, ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)), forMisuse: false))
         {
-            var property = Array.Find(TypeMetadataCache.DeclaredProperties(owner), p => p.Name == name && p.GetIndexParameters().Length == 0);
-            if (property is null)
-                return null;
-            if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
-                return (owner, property, underlying);
-            owner = property.PropertyType;
+            foreach (var (owner, property) in step)
+            {
+                if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
+                    return (owner, property, underlying);
+            }
         }
         return null;
     }
@@ -848,9 +846,10 @@ public static class TableEntitySerializer
     /// overload cannot see. For a large-value aware type whose read-side resolution of the path throws (its
     /// constructor or a getter fails), the path may name one, so it is refused too. A path that meets a
     /// misused <see cref="TableValueSplitAttribute"/> is refused with the misuse: for every type, when
-    /// <paramref name="ownerType"/> or the declared type of a property along the path is or implements an
-    /// interface with a member marked <see cref="TableValueSplitAttribute"/> (by reflection alone); for an aware
-    /// type, also when the read-side resolution meets a type whose attribute is misused.
+    /// <paramref name="ownerType"/> or the declared type of a property along the path (each property of a
+    /// segment's name, when a declared type has several) is or implements an interface with a member marked
+    /// <see cref="TableValueSplitAttribute"/> (by reflection alone); for an aware type, also when the read-side
+    /// resolution meets a type whose attribute is misused.
     /// </summary>
     /// <exception cref="NotSupportedException">
     /// The path names a large-value member, or (aware type) resolving it failed, so whether it does is not known.
@@ -876,17 +875,11 @@ public static class TableEntitySerializer
 
         // The entity type is one the serializer flattens: its metadata is built here as on any first
         // use, so a misused attribute is reported. The types further along the path are declared types,
-        // which the serializer may never flatten, so they are read by reflection alone.
+        // which the serializer may never flatten, so they are read by reflection alone, every member of
+        // each segment's name followed.
         _ = TypeMetadataCache.GetMetadata(ownerType);
-        var owner = ownerType;
-        foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries))
-        {
-            if (!TypeMetadataCache.TryGetMember(owner, segment, out var memberType, out var largeValue))
-                break;
-            if (largeValue)
-                throw new NotSupportedException(PartialUpdateRefusal(columnPath));
-            owner = memberType;
-        }
+        if (TypeMetadataCache.DeclaredPathMeetsLargeValue(ownerType, columnPath))
+            throw new NotSupportedException(PartialUpdateRefusal(columnPath));
 
         // The same question for the object a read finds along the path: a default instance may be of a
         // runtime type that opts the member in although the declared type's member is ordinary. A plain
@@ -2407,8 +2400,7 @@ internal static class TypeMetadataCache
 
     private static LargeValueMember? LargeValueMemberOf(Type type, PropertyInfo prop, TableValueSplitAttribute? classLevel)
     {
-        // An indexer is never a column: the writer cannot read it without an index.
-        if (!IsSerialized(prop) || prop.GetIndexParameters().Length > 0)
+        if (!IsDeclaredColumn(type, prop))
             return null;
 
         var propertyType = prop.PropertyType;
@@ -2418,27 +2410,100 @@ internal static class TypeMetadataCache
     }
 
     /// <summary>
-    /// The stored property of <paramref name="owner"/> named <paramref name="name"/>, read by reflection
-    /// alone (no flattening metadata is built for <paramref name="owner"/>, which may be a declared type
-    /// the serializer never flattens): its declared type, and whether it is a large-value member. False
-    /// when the type stores no such property.
+    /// The stored properties of <paramref name="owner"/> named <paramref name="name"/> (every one,
+    /// <see cref="IsDeclaredColumn"/>), read by reflection alone (no flattening metadata is built for
+    /// <paramref name="owner"/>, which may be a declared type the serializer never flattens): the declared type
+    /// of the first one listed, and whether any of them is a large-value member. False when the type stores no
+    /// such property.
     /// </summary>
     internal static bool TryGetMember(Type owner, string name, out Type memberType, out bool largeValue)
     {
-        foreach (var prop in DeclaredSerializedProperties(owner))
-        {
-            if (prop.Name != name || prop.GetIndexParameters().Length > 0)
-                continue;
-
-            memberType = prop.PropertyType;
-            largeValue = memberType == typeof(TableBlobContent)
-                         || SplitFor(owner, prop, ClassLevelSplit(owner), validate: false) is not null;
-            return true;
-        }
-
+        var found = false;
         memberType = typeof(object);
         largeValue = false;
+        foreach (var prop in DeclaredProperties(owner))
+        {
+            if (prop.Name != name || !IsDeclaredColumn(owner, prop))
+                continue;
+
+            if (!found)
+                memberType = prop.PropertyType;
+            found = true;
+            largeValue |= IsLargeValueMember(owner, prop);
+        }
+        return found;
+    }
+
+    // A member of the declared type owner that holds a large value: a TableBlobContent, or one owner opts in.
+    private static bool IsLargeValueMember(Type owner, PropertyInfo prop) =>
+        prop.PropertyType == typeof(TableBlobContent) || SplitFor(owner, prop, ClassLevelSplit(owner), validate: false) is not null;
+
+    /// <summary>
+    /// True when a member that <paramref name="columnPath"/> (<c>"Inner_Body"</c>) names through the declared
+    /// types from <paramref name="root"/> is a large-value member (<see cref="TryGetMember"/>), on any path the
+    /// declared types allow (<see cref="DeclaredPath"/>: every member of each segment's name). Reflection alone.
+    /// </summary>
+    internal static bool DeclaredPathMeetsLargeValue(Type root, string columnPath)
+    {
+        foreach (var step in DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: false))
+        {
+            foreach (var (owner, member) in step)
+            {
+                if (IsLargeValueMember(owner, member))
+                    return true;
+            }
+        }
         return false;
+    }
+
+    /// <summary>
+    /// The members a column path names through the declared types from <paramref name="root"/>, one list per
+    /// segment, in path order: at each segment, every member of that name (<see cref="IsDeclaredColumn"/>) of
+    /// every declared type the path can be at, with that type; those are the declared types of the members of the
+    /// previous segment. A declared type can have more than one member of a name (an interface inherits it from two
+    /// interfaces, or re-declares it with <c>new</c> and another type; a class hides a base property with
+    /// <c>new</c> and another type), the order in which they are listed is not specified, and a column path
+    /// carries the name only: so every one of them is taken, and the walk follows each. It ends at a segment that
+    /// no such type has. Reflection alone; what listing a type's members throws is thrown.
+    /// <paramref name="forMisuse"/>: the walk of ruling R11, which takes every member a path can name (no index
+    /// parameters), also one the writer does not store (a get-only property of a class is "a property along the
+    /// updated path"), and skips a declared type whose members cannot be listed (it has nothing the check could
+    /// report).
+    /// </summary>
+    internal static IEnumerable<List<(Type Owner, PropertyInfo Member)>> DeclaredPath(Type root, IEnumerable<string> segments, bool forMisuse)
+    {
+        var owners = new List<Type> { root };
+        foreach (var segment in segments)
+        {
+            var step = new List<(Type Owner, PropertyInfo Member)>();
+            var next = new List<Type>();
+            foreach (var owner in owners)
+            {
+                PropertyInfo[] members;
+#pragma warning disable CA1031 // the R11 walk skips a type it cannot read: it has no attribute the check could report
+                try
+                {
+                    members = DeclaredProperties(owner);
+                }
+                catch (Exception) when (forMisuse)
+                {
+                    continue;
+                }
+#pragma warning restore CA1031
+                foreach (var member in members)
+                {
+                    if (member.Name != segment || (forMisuse ? member.GetIndexParameters().Length > 0 : !IsDeclaredColumn(owner, member)))
+                        continue;
+                    step.Add((owner, member));
+                    if (!next.Contains(member.PropertyType))
+                        next.Add(member.PropertyType);
+                }
+            }
+            if (step.Count == 0)
+                yield break;
+            yield return step;
+            owners = next;
+        }
     }
 
     /// <summary>
@@ -2498,23 +2563,22 @@ internal static class TypeMetadataCache
     }
 
     // The property the column names when every owner along it is of its declared type: reflection only,
-    // no flattening metadata, nothing constructed.
+    // no flattening metadata, nothing constructed. Every member of each segment's name is followed
+    // (DeclaredPath); null when no path the declared types allow reaches the column, otherwise the first
+    // member listed at its last segment.
     private static PropertyInfo? DeclaredReadTarget(Type type, string column)
     {
         var path = TableEntityValue.Create(column, string.Empty).Path;
         if (path.IsEmpty)
             return null;
-        var owner = type;
+        var steps = 0;
         PropertyInfo? property = null;
-        foreach (var segment in path)
+        foreach (var step in DeclaredPath(type, path, forMisuse: false))
         {
-            if (property is not null)
-                owner = property.PropertyType;
-            property = DeclaredSerializedProperties(owner).FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
-            if (property is null)
-                return null;
+            steps++;
+            property = step[0].Member;
         }
-        return property;
+        return steps == path.Count ? property : null;
     }
 
     /// <summary>
@@ -2604,17 +2668,30 @@ internal static class TypeMetadataCache
     private static IEnumerable<PropertyInfo> SerializedProperties(Type t) =>
         t.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(IsSerialized);
 
-    // SerializedProperties of a declared type, read through DeclaredProperties.
-    private static IEnumerable<PropertyInfo> DeclaredSerializedProperties(Type t) => DeclaredProperties(t).Where(IsSerialized);
+    /// <summary>
+    /// The rule every walk of the declared types takes for the members of an owner: whether
+    /// <paramref name="prop"/>, a member of the declared type <paramref name="owner"/> as
+    /// <see cref="DeclaredProperties"/> lists it, may be stored as a column. For a class or a struct, the
+    /// writer's rule: a property it stores (<see cref="IsSerialized"/>: a getter and a setter, no
+    /// <see cref="IgnoreDataMemberAttribute"/>). For an interface, the declared type tells only what a path
+    /// reaches through it: the implementing class decides what is written, and sees neither the accessors nor
+    /// the attributes of the interface member. So every member of an interface counts, its own or one it
+    /// inherits at any depth, whatever its getter, its setter and attributes such as
+    /// <see cref="IgnoreDataMemberAttribute"/>. An indexer is never a column (the writer cannot read it
+    /// without an index).
+    /// </summary>
+    private static bool IsDeclaredColumn(Type owner, PropertyInfo prop) =>
+        prop.GetIndexParameters().Length == 0 && (owner.IsInterface || IsSerialized(prop));
 
     /// <summary>
     /// The public instance properties of <paramref name="t"/> as a declared type: for a class or a struct
     /// those <see cref="Type.GetProperties(BindingFlags)"/> lists; for an interface also the members of every
     /// interface it inherits, at any depth (<see cref="Type.GetProperties(BindingFlags)"/> lists only the
     /// members an interface declares), so that a member an interface inherits counts in every walk of the
-    /// declared types as one it declares. A member declared again with the same name and type is listed
-    /// once, the nearest declaration first. Reflection alone, remembered per type; an inherited interface
-    /// whose members cannot be read is skipped. Throws what listing the type's own members throws.
+    /// declared types as one it declares. A member declared again with the same name and type (and both, or
+    /// neither, an indexer) is listed once, the nearest declaration first; members of one name with different
+    /// types are each listed. Reflection alone, remembered per type; an inherited interface whose members
+    /// cannot be read is skipped. Throws what listing the type's own members throws.
     /// </summary>
     internal static PropertyInfo[] DeclaredProperties(Type t) =>
         _declaredProperties.GetOrAdd(t, static type =>
@@ -2632,7 +2709,9 @@ internal static class TypeMetadataCache
                     {
                         foreach (var member in inherited.GetProperties(BindingFlags.Public | BindingFlags.Instance))
                         {
-                            if (!all.Exists(p => p.Name == member.Name && p.PropertyType == member.PropertyType))
+                            var indexer = member.GetIndexParameters().Length > 0;
+                            if (!all.Exists(p => p.Name == member.Name && p.PropertyType == member.PropertyType
+                                                 && p.GetIndexParameters().Length > 0 == indexer))
                                 all.Add(member);
                         }
                     }
@@ -2719,7 +2798,9 @@ internal static class TypeMetadataCache
     /// <paramref name="root"/>, or the declared type of a property along the path, is or implements an
     /// interface that declares a member marked <see cref="TableValueSplitAttribute"/> (ruling R11): the update
     /// would write that member as an ordinary cell. A member an interface-typed owner inherits from another
-    /// interface is found as one it declares (<see cref="DeclaredProperties"/>). Declared types and attributes
+    /// interface is found as one it declares (<see cref="DeclaredProperties"/>), and at every segment every
+    /// member of that name is followed (<see cref="DeclaredPath"/>), whatever its accessors and attributes and
+    /// whatever the order in which an interface lists the interfaces it inherits. Declared types and attributes
     /// are read by reflection alone (nothing is constructed, no getter is called, no metadata is built); what
     /// the walk finds is remembered per type and column path (up to <see cref="MaxRememberedReadTargets"/>).
     /// </summary>
@@ -2737,31 +2818,20 @@ internal static class TypeMetadataCache
     }
 
     // The first declared type along the path (root first) that is or implements an interface with a member
-    // marked [TableValueSplit], with that member; null when there is none.
+    // marked [TableValueSplit], with that member; null when there is none. Every member of each segment's name
+    // is followed (DeclaredPath, as the R11 walk), so the outcome does not depend on the order in which an
+    // interface lists the interfaces it inherits; a type the check cannot read ends only its own branch.
     private static (Type Owner, Type Contract, PropertyInfo Marked)? InterfaceMemberSplitOnPath(Type root, string columnPath)
     {
-        var owner = root;
-        foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries).Prepend(null))
+        if (InterfaceMemberSplit(root) is { } atRoot)
+            return (root, atRoot.Contract, atRoot.Marked);
+        foreach (var step in DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: true))
         {
-            if (segment is not null)
+            foreach (var (_, property) in step)
             {
-                PropertyInfo? property;
-#pragma warning disable CA1031 // a type the check cannot read ends the walk: the update goes on as before
-                try
-                {
-                    property = Array.Find(DeclaredProperties(owner), p => p.Name == segment && p.GetIndexParameters().Length == 0);
-                }
-                catch (Exception)
-                {
-                    return null;
-                }
-#pragma warning restore CA1031
-                if (property is null)
-                    return null;
-                owner = property.PropertyType;
+                if (InterfaceMemberSplit(property.PropertyType) is { } found)
+                    return (property.PropertyType, found.Contract, found.Marked);
             }
-            if (InterfaceMemberSplit(owner) is { } found)
-                return (owner, found.Contract, found.Marked);
         }
         return null;
     }
