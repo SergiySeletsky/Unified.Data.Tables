@@ -141,10 +141,11 @@ All overloads register `IMemoryCache`, the configured options, and the open-gene
 > same tables makes `Sliding` caching unbounded-stale in the readers. Use `CachePolicy.Disabled` in
 > secondary processes and `Absolute` with a short TTL in the primary.
 
-Within one process the cache follows the writes made through it: the cache never answers with a version
-older than a write or delete this process has completed. This holds for every entity type, across all
-stores of one entity type that share an `IMemoryCache` (the DI registration shares one), and for the
-cached `QueryAsync(partition)` lists:
+Within one process the cache follows the writes made through it: once a write or delete this process
+made has returned, the cache does not answer with an older version, except for the moment described
+below while an earlier, overlapping write of the same entity is still running. This holds for every
+entity type, across all stores of one entity type that share an `IMemoryCache` (the DI registration
+shares one), and for the cached `QueryAsync(partition)` lists:
 
 - a read that is in flight while a write or delete of the same entity completes may still return the
   version it fetched, but it does not leave that version in the cache;
@@ -166,24 +167,36 @@ cached `QueryAsync(partition)` lists:
   serialized) drops nothing. For a type with large values, a create, update or upsert that fails while its
   values are prepared (a stream that fails while it is read, a value too large to store, a cancelled
   token) also drops the entry, although nothing was written; the next read goes to the table;
-- after `UpdateAsync(id, builder)` over an entity this store has cached, when every path of the builder
-  names a top-level property, the store keeps the entity cached with the update applied, as 0.8.3 did. It
-  applies the update to a private copy, so changing an object you passed to the builder after the call
-  has no effect on what the store returns. The cached entity takes the ETag the update returned only when
-  the update was conditional on exactly the cached entity's version (`WithETag` with the ETag of the
-  entity this store holds). In every other case (no `WithETag`, a `WithETag` naming another version, a
-  response without an ETag) it keeps the ETag it had, as on 0.8.3. That ETag is older than the row's: a
-  `Strict` update or `MutateAsync` with it meets a conflict, which drops the entry, and the retry reads the
-  row. So after an unconditional builder update, `OneAsync` can return the updated entity with its
-  previous ETag; to hold the current ETag, use the string the builder update returns, or make the update
-  conditional on the version you read. A cached entity never carries an ETag newer than its content, so
-  an optimistic write of a cached entity never overwrites a change it has not seen. A builder update with
-  a nested path (or a name that maps to no property) drops the entry;
+- after `UpdateAsync(id, builder)` the store keeps the entity cached with the update applied, as 0.8.3
+  did, only when all of this holds: this store had the entity cached when the update was sent, and no read
+  or other write has put another version of it into the cache since; every path of the builder names a
+  top-level property; and every value is a non-null scalar of the property's own type that the update
+  writes whole in the property's own column: a `string` that the `OversizedCellPolicy` did not trim or
+  compress, a `bool`, `int`, `long`, `double`, `Guid` or enum, a `DateTimeOffset`, or a `DateTime` that is
+  not local (a date after the year 1601). Then the store copies the cached entity once (its constructor
+  and getters run once, as on 0.8.3) and sets the values on the copy. In every other case (a nested path
+  or a name that maps to no property, a null put into `Updates`, an object, a collection or another
+  JSON-stored value, a `byte[]`, a trimmed string, a `decimal`, a value of another type than the
+  property's) the store drops the entry without copying the entity, and the next read fetches the row. If
+  the constructor or a getter throws while the copy is made, or the cache throws while the entry is put,
+  the update has been stored and the entry is dropped before the exception leaves the call, as on 0.8.3 (a
+  `TargetInvocationException` around the constructor's exception, or the cache's own); the next read
+  returns the stored row. The entity kept cached takes the ETag the update returned only when the update
+  was conditional on exactly the cached entity's version (`WithETag` with the ETag of the entity this
+  store holds). In every other case (no `WithETag`, a `WithETag` naming another version, a response
+  without an ETag) it keeps the ETag it had, as on 0.8.3. That ETag is older than the row's: a `Strict`
+  update or `MutateAsync` with it meets a conflict, which drops the entry, and the retry reads the row. So
+  after an unconditional builder update, `OneAsync` can return the updated entity with its previous ETag;
+  to hold the current ETag, use the string the builder update returns, or make the update conditional on
+  the version you read. A cached entity never carries an ETag newer than its content, so an optimistic
+  write of a cached entity never overwrites a change it has not seen;
 - `"a"` and `"a|a"` address the same row and share one entry, and `DeletePartitionAsync` evicts every row
   it listed, also when it fails part-way.
 
-Each of these can cost one more point read; none changes what is stored, what is sent, or what a call
-returns. What the cache does not cover:
+Each of these can cost one more point read. None changes a cell or the request of a write; what a read
+returns changes only from a stale version to the current one, and a failed write whose cache eviction
+itself throws now throws the storage call's exception (on 0.8.3 a `Strict` update that met a 412 over a
+disposed cache threw `ObjectDisposedException`). What the cache does not cover:
 
 - a write made by another process, or through a store over another `IMemoryCache`: it is not seen until
   the cache entry expires, hence the note above. A store built with `CachePolicy.Disabled` over the cache
@@ -549,7 +562,8 @@ Batch writes bypass protected-property enforcement (per-row reads would defeat t
 them as trusted server-side paths.
 
 A protected property counts as changed when its new value does not `Equals` the stored one, and the
-refusal quotes both values. A protected [large value](#large-values-split-and-blob-offload) (a
+refusal quotes both values; a `byte[]` counts as changed only when its bytes differ, on both stores and
+for every type. A protected [large value](#large-values-split-and-blob-offload) (a
 `TableBlobContent`, or a value opted in with `[TableValueSplit]`) is compared by content instead: a file
 is unchanged when it is the same blob (same SHA-256, length and content type), a `byte[]` when it has the
 same bytes, a string as always. So saving an entity as it was read, with only other properties changed,
@@ -600,8 +614,10 @@ losslessly instead. A store plans large values (split cells, continuation rows, 
 entity type that is *large-value aware*, called *split-aware* below; every other type is a *plain* type.
 Whether a type is aware is decided from its declared types alone, by reflection (below). Plain types produce the same
 columns and make the same SDK calls as in 0.8.3, with deliberate differences that apply to every type: a
-projected query no longer names `odata.etag` in its `$select` (the entities still carry their `ETag`), and
-the read cache corrections described under [Register it](#2-register-it).
+projected query no longer names `odata.etag` in its `$select` (the entities still carry their `ETag`),
+the read cache corrections described under [Register it](#2-register-it), the reads of `TableStorage<T>`
+skipping rows that carry a `_SplitOf` cell (see [Limitations](#limitations)), and no `byte[]` shared
+between a caller and the read cache or the rows of the in-memory store.
 
 > **Roll forward only.** Rows written split or offloaded cannot be read correctly by 0.8.x or older.
 > Deploy the 0.9.0 package bump first with no attributes, and add `[TableValueSplit]` or
@@ -632,9 +648,12 @@ type, which may flatten at runtime. The message names the member.
 The attribute on a property declared on an interface is a misuse too (`InvalidOperationException`): .NET
 does not pass the attributes of an interface member to the class that implements it, so the library
 cannot honour it. It makes no type large-value aware and lists no large-value column. It is reported
-whenever the serializer meets a class that implements the interface: a write of an instance of that
-class (at any size, under every `OversizedCellPolicy`; the value is never trimmed) or a read that creates
-or fills one, before anything is stored. The message names the interface member (`INote.Notes`), the
+whenever the serializer flattens a class that implements the interface into columns: a write of such an
+instance as the entity or in a property that flattens into columns (at any size, under every
+`OversizedCellPolicy`; the value is never trimmed), or a read that creates or fills one, before anything
+is stored. An instance held in a JSON-stored property (a collection, or a type stored as one JSON cell)
+is not checked: it is written as JSON like every other value of that cell, and a trimming
+`OversizedCellPolicy` can trim that cell. The message names the interface member (`INote.Notes`), the
 implementing class and the remedy: put `[TableValueSplit]` on the property of the implementing class (or
 on that class) and remove it from the interface; where an entity holds the implementation in a property
 declared as the interface (or as another type), also mark the entity class `[TableValueSplit]` so that
@@ -642,6 +661,17 @@ the entity is large-value aware. On a read below the entity itself, the misuse a
 exception of a `SerializationException` ("Failed to set ..."), as for every misused attribute of a
 nested type. An attribute on an abstract property, or on a base-class property that a derived class
 overrides or hides, is honoured (below).
+
+A builder partial update (`UpdateAsync(id, builder)`, on `TableStorage<T>` and `InMemoryStorage<T>`) never
+writes a member marked on an interface. When the entity type, or the declared type of a property along the
+updated path, is or implements an interface that declares a member marked `[TableValueSplit]`, the update
+is refused with the same `InvalidOperationException` before anything is written, under every
+`OversizedCellPolicy` and at every size, also for a path to another member of that type; the message names
+the interface member and the remedy. This check reads declared types and attributes by reflection only, so
+for a plain entity type it does not see a property declared as a base class or `object` whose value at run
+time is such a class: a path through it (`x => x.Doc.Notes`) writes an ordinary cell, which a trimming
+`OversizedCellPolicy` can trim, and later reads of the row report the misuse. Mark such an entity class
+`[TableValueSplit]`, or declare the property with the class, and fix the attribute as the message says.
 
 On a class the attribute covers every `string`, `byte[]` and JSON-stored property of the class, whether
 the class declares the property or inherits it, except the entity `Id`, which stays an ordinary key
@@ -660,11 +690,13 @@ declared types by reflection, so it is the same in every process and at every mo
 
 The library runs none of a plain type's code (constructor, static constructor, property getters, of the
 entity type or of the types of its properties) except where 0.8.3 runs it: when a read materializes a row,
-and when an entity you passed in is serialized. Constructing a store (also when a DI container resolves
-it), `DeleteAsync`, `ExistsAsync` of a missing row, `CountAsync`, `DeletePartitionAsync` and
-`UpdateAsync(id, builder)` construct nothing, so whatever the entity's constructor does cannot change,
-break or delay the store. For a large-value aware type the store constructs the entity once, with its
-public parameterless constructor, when it first needs the list of its large-value columns, and reads the
+when an entity you passed in is serialized, and when `UpdateAsync(id, builder)` keeps a cached entity warm
+(see [Register it](#2-register-it)), which copies that entity once and so constructs it once, as 0.8.3
+did. Constructing a store (also when a DI container resolves it), `DeleteAsync`, `ExistsAsync` of a
+missing row, `CountAsync` and `DeletePartitionAsync` construct nothing, and neither does a builder update
+that does not keep a cached entity warm, so whatever the entity's constructor does cannot change, break or
+delay those calls. For a large-value aware type the store constructs the entity once, with its public
+parameterless constructor, when it first needs the list of its large-value columns, and reads the
 properties that may hold a nested object, to learn the columns of the objects the constructor puts there.
 If the constructor or a getter throws then, the exception is ignored, the columns of the declared types
 stand for that operation, and a later use tries again; it never makes the store treat the type as plain.
@@ -672,13 +704,16 @@ Once the constructor succeeds, replaces and deletes release the blobs of members
 (a blob that an operation during the failure did not release is left to the orphan sweep). A builder
 partial update of such a type may construct the entity (and the declared type of an empty nested property
 on the updated path) once per column it names for the first time, to learn whether the column is a large
-value as a read would see it. While that constructor or a getter throws, or an object along the path
-cannot be created (an empty property declared as an interface or an abstract type), a builder update that
-names a column the store has not resolved before (a top-level one too) is refused with
-`NotSupportedException` before anything is written, whose inner exception is the failure: the library
-cannot tell whether the column is a large value, which a partial update cannot write. The failure is not
-remembered: send the update again once the constructor succeeds, or replace the entity. A column resolved
-once is remembered and needs no constructor again. Such a constructor should have no side effects.
+value as a read would see it, and copies a cached entity it keeps warm once, as for a plain type. While
+that constructor or a getter throws, or an object along the path cannot be created (an empty property
+declared as an interface or an abstract type), a builder update that names a column the store has not
+resolved before (a top-level one too) is refused with `NotSupportedException` before anything is written.
+Its inner exception is the failure (for a throwing constructor, a `TargetInvocationException` whose inner
+exception is the constructor's): the library cannot tell whether the column is a large value, which a
+partial update cannot write. The failure is not remembered: replace the entity instead, or send the update
+again once the constructor succeeds. A column resolved once is remembered and needs no constructor again.
+A misused `[TableValueSplit]` that this resolution meets is not wrapped: the update throws the exception a
+whole-entity write of the type reports. Such a constructor should have no side effects.
 
 A member of a runtime subtype can be a large value too. When a property is declared as an interface, an
 abstract class or a base class, its `[TableValueSplit]` and `TableBlobContent` members are those of the
@@ -745,7 +780,10 @@ property, before anything is uploaded or stored:
   not change that. The message says to declare the property as `TableBlobContent`, the only type through
   which a content is stored. For a subclass written through a store of its base type it names the
   declaring class: when the base declares the property, declaring it there is enough; when only the
-  subclass declares it, store the subclass through an `IStorage` of its own type as well.
+  subclass declares it, store the subclass through an `IStorage` of its own type as well. When the
+  refusal concerns a `TableBlobContent` below an object held in a property declared as `object` (or
+  another type that is not the holder's), declare that property with the holder's type as well: a read
+  creates an object only for a property whose declared type it can construct.
 - A subclass written through a store of its base type (`IStorage<TBase>`): a read creates a `TBase`, so a
   store never stores a value of a subclass that it could not read back. When `TBase` is plain, a value in
   any large-value member of the subclass is refused whatever its size; a subclass that opts into nothing is
@@ -980,25 +1018,34 @@ of your own) stores the same bytes as the first attempt. A seekable stream that 
 over that stream, fail with `InvalidOperationException` before anything is uploaded.
 
 A forward-only (non-seekable) stream can be read once. The library remembers the stream objects a write
-of a `TableBlobContent` has read, and recognises a stream by its object: the stream given to
-`FromStream`, and the streams below it that the framework wrappers expose, followed recursively:
+of a `TableBlobContent` has read, for as long as the stream object lives (being remembered does not keep
+a stream alive), and recognises a stream by its object: the stream given to `FromStream`, and the
+streams below it that the framework wrappers expose, followed recursively:
 `BufferedStream` (its underlying stream), `GZipStream`, `DeflateStream`, `ZLibStream` and `BrotliStream`
 (their base stream).
 
-- A non-seekable stream that a write read to its end is remembered only until that write commits. After a
-  write that stored its row, a new content over the same stream object is a new payload and is stored
-  whatever it delivers, an empty payload included. So `TableBlobContent.FromStream(Request.Body, ...)`
-  works for every request of a keep-alive connection, although the server hands all of them the same
+- A non-seekable stream that a write read to its end stays remembered whether that write stored its row or
+  failed (a conflict, a duplicate key, any exception), and whatever became of any other write (another
+  transaction of the same batch, another write that shares the content): no commit makes the library
+  forget it. A new content over that stream object is stored whole when the stream delivers at least one
+  byte: the object was given a new payload. So `TableBlobContent.FromStream(Request.Body, ...)` stores
+  every non-empty request of a keep-alive connection, although the server hands all of them the same
   request-body object.
-- After a write that read a non-seekable stream to its end and then failed (a conflict, a duplicate key,
-  any exception), a new content over that stream is stored whole when the stream delivers at least one
-  byte (it was given a new payload), and refused with `InvalidOperationException` before anything is
-  uploaded when it delivers nothing: that is the retry that would otherwise store an empty file and report
-  success. The row keeps its previous file. A recycled stream object whose new payload is genuinely empty
-  is refused in that one situation (after a failed write); create an empty content with
-  `TableBlobContent.FromBytes([], ...)` instead.
+- When the stream delivers nothing, the new content is refused with `InvalidOperationException` before
+  anything is uploaded, after a write that committed and after one that failed alike: that is the retry
+  that would otherwise store an empty file and report success. Every row keeps the file it holds (a row
+  that a batch committed before a later transaction of the batch failed keeps the committed file). A new,
+  empty payload on a reused stream object is therefore refused too; the message says so. Store an empty
+  file with `TableBlobContent.FromBytes([], contentType)` (an empty array), or from a seekable stream.
+- A write that read a non-seekable stream to its end and then failed or was cancelled while it finished
+  its temporary copy counts the stream as read to its end, not as partly read: a new payload on it is
+  stored, an empty one refused. That write's own content has no copy left and is refused for every later
+  write ("its temporary copy was released by a failed write"): create the content again.
+- When the temporary copy of a non-seekable stream cannot be created (no usable temporary directory), the
+  write throws before it reads anything and leaves the stream as it was: the same content, or a new
+  content over the stream, can be written once a temporary copy can be made.
 - Two contents over one non-seekable stream written by one write (two properties of one entity, two
-  entities of one batch) are refused the same way, before anything is written.
+  entities of one batch) are refused with `InvalidOperationException` before anything is written.
 - A stream that a failed or cancelled write read only part of, and a seekable stream that a write could not
   put back where the content started, are refused with `InvalidOperationException` for every later content
   over them, also when they are wrapped in one of the framework wrappers above. A content whose write
@@ -1021,11 +1068,13 @@ stream or `FromBytes`; or open the source again for each attempt, where "open ag
 the bytes (the file opened again, a new request), never a new wrapper over the stream an earlier attempt
 read. The refusal messages say which case applies and give these remedies.
 
-A server author must know one consequence. A web server hands every request of a connection the same
+A server author must know two consequences. A web server hands every request of a connection the same
 request-body object, so after a write that read the body only part-way (the read failed or was
 cancelled), every later content over that object is refused for as long as the server reuses it, also on
 the next requests of that connection. Buffer the body into a seekable stream (a `MemoryStream`, or a file)
-and create the content over that, or close the connection after such a failure.
+and create the content over that, or close the connection after such a failure. And once a write has read
+that object to its end, a later request with an empty body over it is refused (see above): store an
+empty upload with `TableBlobContent.FromBytes([], contentType)`.
 
 A write refused because a read could not map a file's column back to a property (a `TableBlobContent`
 below an object whose runtime type a read does not recreate) may have read the file's source first; a
@@ -1277,15 +1326,17 @@ so a scaled-out app may register it in one instance only.
   is deleted while its main row declares continuation rows, `DeleteAsync` finds no main row at its id, or
   the partition is deleted.
 - A table shared between a split-aware type and a plain type or a polymorphic store: the reads of
-  `TableStorage<T>` skip every row that carries a `_SplitOf` cell, for every type, so the plain type does
-  not return the split-aware type's continuation rows. A plain type and a polymorphic store delete a
-  partition as 0.8.3 does, every listed row by key, in chunks of 100. Such a delete can remove
-  continuation rows of a split entity that is written while it runs, and leave that entity unreadable
-  (`TableValueIntegrityException`): delete such a partition through the split-aware type, or do not write
-  into it while the delete runs. A polymorphic store refuses an item whose type is not large-value aware
-  and holds a value in a large-value member below a runtime subtype with the plain store's
-  `NotSupportedException` (whose remedies are for `IStorage<T>`); polymorphic stores write no split or
-  offloaded value at all, so store such an item through an `IStorage<T>` of a large-value aware type.
+  `TableStorage<T>` (`OneAsync`, `ExistsAsync`, the queries, streams and pages) skip every row that
+  carries a `_SplitOf` cell, for every type, so the plain type does not return the split-aware type's
+  continuation rows; `CountAsync` of the plain type still counts them, as on 0.8.3. A plain type and a
+  polymorphic store delete a partition as 0.8.3 does, every listed row by key, in chunks of 100. Such a
+  delete can remove continuation rows of a split entity that is written while it runs, and leave that
+  entity unreadable (`TableValueIntegrityException`): delete such a partition through the split-aware
+  type, or do not write into it while the delete runs. A polymorphic store refuses an item whose type is
+  not large-value aware and holds a value in a large-value member below a runtime subtype with the plain
+  store's `NotSupportedException` (whose remedies are for `IStorage<T>`); polymorphic stores write no
+  split or offloaded value at all, so store such an item through an `IStorage<T>` of a large-value aware
+  type.
 - Keys of split-aware types must be well-formed UTF-16: a partition or row key with an unpaired surrogate
   (`"a\uD800"`) would name the same blobs as one with U+FFFD in its place, so writes refuse it with
   `ArgumentException`. Plain types are unaffected.
