@@ -295,7 +295,7 @@ public static class TableEntitySerializer
         if (largeValues is not null)
             result = ApplyLargeValues(result, largeValues, ctx);
 
-        result = ApplyColumnAliases(result, entity, meta);
+        result = ApplyColumnAliases(result, entity, meta, largeValues, ctx);
 
         // A polymorphic row's keys encode an aggregate version or a tick count, not an id — so
         // recomputing Id from them would overwrite the object's real id with "partition|row".
@@ -325,61 +325,79 @@ public static class TableEntitySerializer
             if (path.IsEmpty || ReadTarget(result, path, baseColumn) is not { } target)
                 continue;
 
-            object decoded;
-            if (cells.TryGetValue(baseColumn + SplitCodec.BlobSuffix, out var reference))
-            {
-                if (ctx.Resolved.TryGetValue(baseColumn, out var resolved))
-                {
-                    decoded = resolved;
-                }
-                else if (target.PropertyType == typeof(TableBlobContent) && ctx.LazyContent is { } lazy)
-                {
-                    var parsed = Providers.BlobReference.Parse(baseColumn,
-                        reference as string ?? throw new TableValueIntegrityException(baseColumn, "the blob reference is not a string."));
-                    result = SetProperty(result, new TableEntityValue(path, lazy(baseColumn, parsed)));
-                    continue;
-                }
-                else if (ctx.Projection is { } projected && !ValueOffloadCoordinator.Projects(projected, baseColumn))
-                {
-                    continue;
-                }
-                else
-                {
-                    throw new InvalidOperationException(UnresolvedOffloadMessage(baseColumn));
-                }
-            }
-            else
-            {
-                decoded = SplitCodec.Decode(baseColumn, cells);
-            }
-
-            var fmt = target.PropertyType == typeof(string) || target.PropertyType == typeof(byte[])
-                ? TableEntityValueFormat.Raw
-                : TableEntityValueFormat.Json;
-            result = SetProperty(result, new TableEntityValue(path, decoded, fmt) { IsLargeValue = true });
+            result = ApplyLargeValue(result, path, target, baseColumn, cells, ctx, renamedTo: null);
         }
         return result;
     }
 
+    // Sets the large value stored in the cells of baseColumn on target, the property at path. For a
+    // legacy column read through [ColumnAlias], renamedTo is the column of that property: the cells,
+    // the resolved value and every failure are still named after the column the value is stored under.
+    private static object ApplyLargeValue(
+        object result, ImmutableList<string> path, PropertyInfo target, string baseColumn,
+        Dictionary<string, object> cells, ValueReadContext ctx, string? renamedTo)
+    {
+        object decoded;
+        if (cells.TryGetValue(baseColumn + SplitCodec.BlobSuffix, out var reference))
+        {
+            if (ctx.Resolved.TryGetValue(baseColumn, out var resolved))
+            {
+                decoded = resolved;
+            }
+            else if (target.PropertyType == typeof(TableBlobContent) && ctx.LazyContent is { } lazy)
+            {
+                var parsed = Providers.BlobReference.Parse(baseColumn,
+                    reference as string ?? throw new TableValueIntegrityException(baseColumn, "the blob reference is not a string."));
+                return SetProperty(result, new TableEntityValue(path, lazy(baseColumn, parsed)));
+            }
+            else if (ctx.Projection is { } projected && !ValueOffloadCoordinator.Projects(projected, baseColumn)
+                     && (renamedTo is null || !ValueOffloadCoordinator.Projects(projected, renamedTo)))
+            {
+                return result;
+            }
+            else
+            {
+                throw new InvalidOperationException(UnresolvedOffloadMessage(baseColumn));
+            }
+        }
+        else
+        {
+            decoded = SplitCodec.Decode(baseColumn, cells);
+        }
+
+        var fmt = target.PropertyType == typeof(string) || target.PropertyType == typeof(byte[])
+            ? TableEntityValueFormat.Raw
+            : TableEntityValueFormat.Json;
+        return SetProperty(result, new TableEntityValue(path, decoded, fmt) { IsLargeValue = true });
+    }
+
     /// <summary>
-    /// The declared type of the property a read of <paramref name="entityType"/> sets the large-value
-    /// column <paramref name="column"/> on, resolved as the read resolves it (see
-    /// <see cref="TypeMetadataCache.ReadTarget(object, IReadOnlyList{string})"/>). Null when the read
-    /// takes nothing from the column: no property is mapped to it, or the read fails at an owner it
-    /// cannot create and reports that itself.
+    /// The property a read of <paramref name="row"/> as <paramref name="entityType"/> sets the large-value
+    /// column <paramref name="column"/> on: its declared type and its own column. The property is
+    /// resolved as the read resolves it (see
+    /// <see cref="TypeMetadataCache.ReadTarget(object, IReadOnlyList{string})"/>); a legacy column is
+    /// that of the property a <see cref="ColumnAliasAttribute"/> maps it to, unless the row also has the
+    /// property's own column, which wins. Null when the read takes nothing from the column: no property
+    /// is mapped to it, or the read fails at an owner it cannot create and reports that itself.
     /// </summary>
-    internal static Type? LargeValueTargetType(Type entityType, string column)
+    internal static (Type Type, string Column)? LargeValueTarget(Type entityType, TableEntity row, string column)
     {
 #pragma warning disable CA1031 // the read of the row reports what it cannot resolve; nothing is fetched for it
         try
         {
-            return TypeMetadataCache.ReadTarget(entityType, column)?.PropertyType;
+            if (TypeMetadataCache.ReadTarget(entityType, column) is { } target)
+                return (target.PropertyType, column);
         }
         catch (Exception)
         {
             return null;
         }
 #pragma warning restore CA1031
+
+        return TypeMetadataCache.GetMetadata(entityType).AliasMap.TryGetValue(column, out var renamed)
+               && !HasCanonicalColumn(row, renamed.Name)
+            ? (renamed.PropertyType, renamed.Name)
+            : null;
     }
 
     // The property a read sets the large-value column on (null: no property takes it). An owner the
@@ -433,9 +451,14 @@ public static class TableEntitySerializer
     /// <summary>
     /// Second pass for <see cref="ColumnAliasAttribute"/>: a legacy (alias) column deserializes
     /// into its property only when no canonical column for that property exists on the row, so
-    /// canonical data always wins and rewrites converge rows to the canonical schema.
+    /// canonical data always wins and rewrites converge rows to the canonical schema. The legacy column
+    /// is read in every form the canonical one can have: one cell (raw, <c>__Json</c>, <c>__GZip</c>),
+    /// split cells with their manifest (continuation rows are already assembled into the row), or a
+    /// blob reference.
     /// </summary>
-    private static object ApplyColumnAliases(object result, TableEntity entity, TypeMetadata meta)
+    private static object ApplyColumnAliases(
+        object result, TableEntity entity, TypeMetadata meta,
+        Dictionary<string, Dictionary<string, object>>? largeValues, ValueReadContext ctx)
     {
         if (meta.AliasMap.Count == 0)
             return result;
@@ -445,19 +468,17 @@ public static class TableEntitySerializer
             var aliasColumn = kv.Key;
             var property = kv.Value;
 
-            var hasCanonical = false;
-            foreach (var suffix in AliasSuffixes)
-            {
-                if (entity.ContainsKey(property.Name + suffix))
-                {
-                    hasCanonical = true;
-                    break;
-                }
-            }
-            if (hasCanonical
-                || entity.ContainsKey(property.Name + SplitCodec.ChunksSuffix)
-                || entity.ContainsKey(property.Name + SplitCodec.BlobSuffix))
+            if (HasCanonicalColumn(entity, property.Name))
                 continue;
+
+            // A legacy large value. It wins over a plain cell of the same legacy name, as the split cells
+            // of a canonical column win over a plain cell beside them.
+            if (largeValues is not null && largeValues.TryGetValue(aliasColumn, out var cells))
+            {
+                result = ApplyLargeValue(
+                    result, ImmutableList.Create(property.Name), property, aliasColumn, cells, ctx, renamedTo: property.Name);
+                continue;
+            }
 
             foreach (var suffix in AliasSuffixes)
             {
@@ -473,6 +494,18 @@ public static class TableEntitySerializer
         }
 
         return result;
+    }
+
+    // True when the row holds the property's own column in any form: one cell (raw, __Json, __GZip),
+    // split cells (their manifest) or a blob reference. A legacy column is then ignored.
+    private static bool HasCanonicalColumn(TableEntity row, string property)
+    {
+        foreach (var suffix in AliasSuffixes)
+        {
+            if (row.ContainsKey(property + suffix))
+                return true;
+        }
+        return row.ContainsKey(property + SplitCodec.ChunksSuffix) || row.ContainsKey(property + SplitCodec.BlobSuffix);
     }
 
     /// <summary>
@@ -1577,30 +1610,75 @@ internal static class TypeMetadataCache
     private static LargeValueInfo DeclaredLargeValues(Type t) =>
         _declaredLargeValues.GetOrAdd(t, static type => WalkLargeValues(type));
 
-    // Adds the columns only a new instance of an entity type shows: the large-value members of the
-    // objects its constructor puts in its properties. A read keeps such a default instance and maps a
-    // column through its runtime type, which may have members its declared type (an interface, an
-    // abstract class, a base class) lacks; the declared walk cannot see them. Every column the declared
-    // walk listed stays where it is; the others follow.
+    // Adds the columns a read takes a large value from that the declared walk cannot see. Every column
+    // the declared walk listed stays where it is; the others follow.
+    //  - The columns only a new instance of an entity type shows: the large-value members of the objects
+    //    its constructor puts in its properties. A read keeps such a default instance and maps a column
+    //    through its runtime type, which may have members its declared type (an interface, an abstract
+    //    class, a base class) lacks.
+    //  - The legacy columns of the type's own large-value properties ([ColumnAlias]): a row written
+    //    before the rename holds the value, its split cells or its blob reference under the old name.
     private static LargeValueInfo WithDefaultInstances(Type root, LargeValueInfo declared)
     {
-#pragma warning disable CA1031 // deciding whether a type is large-value aware must not throw, whatever its constructor or its getters do
+        var known = new HashSet<string>(declared.Columns, StringComparer.Ordinal);
+        var found = new List<string>();
+        var aware = declared.Aware;
+#pragma warning disable CA1031 // deciding whether a type is large-value aware must not throw, whatever its constructor, getters or attributes do
         try
         {
-            if (DefaultInstanceOf(root) is not { } instance)
-                return declared;
-
-            var known = new HashSet<string>(declared.Columns, StringComparer.Ordinal);
-            var found = new List<string>();
-            var steps = 0;
-            ListDefaultInstanceColumns(instance, string.Empty, [instance], isRoot: true, known, found, ref steps);
-            return found.Count == 0 ? declared : new LargeValueInfo(true, [.. declared.Columns, .. found]);
+            if (DefaultInstanceOf(root) is { } instance)
+            {
+                var steps = 0;
+                ListDefaultInstanceColumns(instance, string.Empty, [instance], isRoot: true, known, found, ref steps);
+                aware |= found.Count > 0;
+            }
         }
         catch (Exception)
         {
-            return declared;
+            // The declared types decide.
+        }
+
+        try
+        {
+            AddLegacyColumns(root, known, found);
+        }
+        catch (Exception)
+        {
+            // An alias that cannot be read is reported by the serializer on first use of the type.
         }
 #pragma warning restore CA1031
+        return found.Count == 0 ? declared : new LargeValueInfo(aware, [.. declared.Columns, .. found]);
+    }
+
+    // The legacy column names of root's own large-value properties: [ColumnAlias("Old")] on the property,
+    // or [ColumnAlias("Property", "Old")] on the class (aliases apply to top-level columns only). Read by
+    // reflection; a declaration the serializer would refuse is simply not listed here.
+    private static void AddLegacyColumns(Type root, HashSet<string> known, List<string> found)
+    {
+        var large = LargeValueMembers(root).FindAll(m => m.Flattened is null);
+        if (large.Count == 0)
+            return;
+
+        void Add(string? legacy)
+        {
+            if (!string.IsNullOrWhiteSpace(legacy) && legacy.Length <= MaxColumnNameLength && known.Add(legacy))
+                found.Add(legacy);
+        }
+
+        foreach (var member in large)
+        {
+            foreach (var alias in member.Property.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+            {
+                if (alias.PropertyName is null)
+                    Add(alias.LegacyColumnName);
+            }
+        }
+
+        foreach (var alias in root.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+        {
+            if (alias.PropertyName is { } name && large.Exists(m => m.Name == name))
+                Add(alias.LegacyColumnName);
+        }
     }
 
     // A new instance of root, as a read starts from, when its default instances can matter. Only an

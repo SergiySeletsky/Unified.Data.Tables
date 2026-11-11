@@ -280,7 +280,8 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// projection names): a <see cref="TableBlobContent"/> target becomes lazy content; any other target
     /// is downloaded and verified into <see cref="ValueReadContext.Resolved"/>. A reference's target is
     /// the property the read of the row sets its column on, which follows the runtime type of the
-    /// entity's default instances, not only the declared property types.
+    /// entity's default instances, not only the declared property types, and the
+    /// <see cref="ColumnAliasAttribute"/> of a renamed property (a reference under the legacy column).
     /// </summary>
     /// <param name="row">The (assembled) row.</param>
     /// <param name="entityType">The type the row is read as, which decides each reference's target.</param>
@@ -299,11 +300,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         {
             if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
                 continue;
-            if (projectedColumns is not null && !Projects(projectedColumns, column))
+            if (TableEntitySerializer.LargeValueTarget(entityType, row, column) is not { } target)
                 continue;
-            if (TableEntitySerializer.LargeValueTargetType(entityType, column) is not { } target)
+            // A projection names properties: a legacy column is in scope when its (renamed) property is.
+            if (projectedColumns is not null && !Projects(projectedColumns, column) && !Projects(projectedColumns, target.Column))
                 continue;
-            if (target == typeof(TableBlobContent))
+            if (target.Type == typeof(TableBlobContent))
             {
                 anyLazy = true;
                 continue;
