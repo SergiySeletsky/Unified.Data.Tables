@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Security.Cryptography;
 using Azure.Data.Tables;
 
 namespace Unified.Data.Tables.Providers;
@@ -29,6 +30,52 @@ public sealed class LargeValueTable
 
     /// <summary>The client clock, used only when the service time is unknown (replaced by tests).</summary>
     internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. How many times in all a write, a delete or a batch
+    /// transaction of a large-value type is attempted when it keeps losing its condition to concurrent
+    /// writers, before it throws <see cref="ConcurrencyConflictException"/>. Every provider uses this
+    /// number.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public const int MaxWriteAttempts = 5;
+
+    /// <summary>The pause before the first retry; it doubles with every further one.</summary>
+    internal static readonly TimeSpan RetryBaseDelay = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>The longest pause before a retry.</summary>
+    internal static readonly TimeSpan RetryMaxDelay = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>Waits between two attempts (replaced by tests).</summary>
+    internal Func<TimeSpan, CancellationToken, Task> RetryDelay { get; set; } = Task.Delay;
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Waits before attempt <paramref name="attempt"/> of
+    /// a write, delete or batch transaction that lost a race to a concurrent writer: about
+    /// 10&#160;ms before the first retry, doubling with each further one and never more than
+    /// 250&#160;ms, each pause a random length between half of that and all of it, so that writers that
+    /// collided do not collide again in step.
+    /// </summary>
+    /// <param name="attempt">The attempt about to be made: 2 for the first retry.</param>
+    /// <param name="ct">Cancels the wait.</param>
+    /// <returns>A task that completes when the attempt may be made.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="attempt"/> is less than 2.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled during the wait.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task WaitBeforeRetryAsync(int attempt, CancellationToken ct) => RetryDelay(RetryBackoff(attempt), ct);
+
+    /// <summary>
+    /// The pause before attempt <paramref name="attempt"/> (2 = the first retry): a random length between
+    /// half of and the whole of <see cref="RetryBaseDelay"/> doubled once per earlier retry, the whole
+    /// capped at <see cref="RetryMaxDelay"/>.
+    /// </summary>
+    internal static TimeSpan RetryBackoff(int attempt)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(attempt, 2);
+        var ceiling = (int)Math.Min(RetryMaxDelay.TotalMilliseconds, RetryBaseDelay.TotalMilliseconds * Math.Pow(2, Math.Min(attempt - 2, 30)));
+        // Not a secret: the generator is only the one at hand that needs no instance and no lock.
+        return TimeSpan.FromMilliseconds(RandomNumberGenerator.GetInt32(ceiling / 2, ceiling + 1));
+    }
 
     /// <summary>
     /// How much longer the blob cleanup that follows a committed change keeps going once the caller's token

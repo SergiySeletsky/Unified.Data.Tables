@@ -29,7 +29,7 @@ public enum ConcurrencyMode
     /// on the update path (nulling <see cref="Entity.ETag"/> under <see cref="Auto"/> throws).
     /// For a type with a <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property
     /// the write must read the row to find stale parts, so it retries on interleaved writes and throws
-    /// <see cref="ConcurrencyConflictException"/> after three lost races.
+    /// <see cref="ConcurrencyConflictException"/> after five lost races.
     /// </summary>
     LastWriterWins = 2,
 }

@@ -39,8 +39,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     // large-value branch below is reached only for such a T; any other T behaves exactly as before.
     private static readonly bool LargeValueAware = LargeValueTable.IsLargeValueAware(typeof(T));
 
-    /// <summary>How many times a write that lost its condition to a concurrent writer re-reads and retries (as TableStorage).</summary>
-    private const int MaxLargeWriteAttempts = 3;
+    /// <summary>How many times in all a write that keeps losing its condition to concurrent writers is attempted (the number TableStorage uses).</summary>
+    private const int MaxLargeWriteAttempts = LargeValueTable.MaxWriteAttempts;
 
     private readonly Dictionary<(string PartitionKey, string RowKey), StoredRow> rows = [];
     private readonly object gate = new();

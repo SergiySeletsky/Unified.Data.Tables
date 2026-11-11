@@ -84,6 +84,9 @@ public abstract class LargeBatchContract : IAsyncLifetime
     /// <summary>The blob counts <see cref="RecordBlobsAtEachCommit{T}"/> recorded, one per committed transaction.</summary>
     protected abstract IReadOnlyList<int> BlobsAtCommits { get; }
 
+    /// <summary>How many times the concurrent-writer tests repeat their race.</summary>
+    protected virtual int ConcurrentRounds => 25;
+
     private string Id(string rk) => Pk + "|" + rk;
 
     private SplitTextEntity Text(string rk, string body) => new() { Id = Id(rk), Body = body, Title = "t-" + rk };
@@ -661,6 +664,85 @@ public abstract class LargeBatchContract : IAsyncLifetime
         }
     }
 
+    // ── concurrent writers of one row ─────────────────────────────────────
+    //
+    // An upsert of a large-value type reads the row and writes on condition of the version it read. One
+    // attempt of a caller is lost only when another caller commits between that read and that write, and
+    // in these tests each of the other three callers commits exactly once: no caller can lose more than
+    // three attempts, whatever the timing, so with five attempts every call must succeed in every round.
+
+    [Fact]
+    public async Task FourConcurrentUpserts_OfOneRow_AllSucceed_InEveryRound()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+
+        for (var round = 0; round < ConcurrentRounds; round++)
+        {
+            var rk = $"r{round:D3}";
+            var bodies = Enumerable.Range(0, 4).Select(writer => $"round {round}, writer {writer}").ToList();
+
+            await Task.WhenAll(bodies.Select(body => Task.Run(() => store.UpsertAsync(Text(rk, body), Ct), Ct)));
+
+            Assert.Contains((await store.OneAsync(Id(rk), Ct))!.Body, bodies);
+        }
+        Assert.Equal(ConcurrentRounds, await store.CountAsync(Pk, Ct));
+    }
+
+    [Fact]
+    public async Task FourConcurrentUpserts_OfOneRowThatGrowsAndShrinks_AllSucceed_AndLeaveOneWholeValue()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        // No continuation row, one, two, and one again: the writers race over the primary and over the
+        // continuation rows the others add and delete.
+        string[] bodies = ["small", SplitText, TwoPartText, new string('z', 600_000)];
+        var rounds = Math.Max(3, ConcurrentRounds / 5);
+
+        for (var round = 0; round < rounds; round++)
+        {
+            await Task.WhenAll(bodies.Select(body => Task.Run(() => store.UpsertAsync(Text("r1", body), Ct), Ct)));
+
+            // Whichever write was last, the row holds exactly its value (the read verifies its hash), with
+            // exactly the continuation rows that value needs.
+            var body = (await store.OneAsync(Id("r1"), Ct))!.Body!;
+            Assert.Contains(body, bodies);
+            var parts = body.Length <= 32_000 ? 0 : body.Length <= 960_000 ? 1 : 2;
+            Assert.Equal(new[] { "r1" }.Concat(Enumerable.Range(1, parts).Select(i => $"r1~{i:D4}")), await PhysicalRowKeysAsync<SplitTextEntity>());
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentUpsertsAndDeletes_OfOneRow_AllSucceed_AndLeaveNoStrayRow()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        var rounds = Math.Max(3, ConcurrentRounds / 5);
+
+        for (var round = 0; round < rounds; round++)
+        {
+            // Two writers and two deleters: every caller loses at most three attempts here too.
+            await Task.WhenAll(
+                Task.Run(() => store.UpsertAsync(Text("r1", SplitText), Ct), Ct),
+                Task.Run(() => store.DeleteAsync(Id("r1"), Ct), Ct),
+                Task.Run(() => store.UpsertAsync(Text("r1", "small"), Ct), Ct),
+                Task.Run(() => store.DeleteAsync(Id("r1"), Ct), Ct));
+
+            // Deleted, or one whole value: never a continuation row without its primary.
+            var read = await store.OneAsync(Id("r1"), Ct);
+            var keys = await PhysicalRowKeysAsync<SplitTextEntity>();
+            if (read is null)
+                Assert.Empty(keys);
+            else if (read.Body == "small")
+                Assert.Equal(["r1"], keys);
+            else
+            {
+                Assert.Equal(SplitText, read.Body, StringComparer.Ordinal);
+                Assert.Equal(["r1", "r1~0001"], keys);
+            }
+        }
+    }
+
     // ── post-commit robustness ────────────────────────────────────────────
 
     [Fact]
@@ -773,6 +855,9 @@ public sealed class InMemoryLargeBatchContractTests : LargeBatchContract
     protected override void SkipUnlessAvailable()
     {
     }
+
+    // Cheap here: enough rounds for the threads to interleave in many ways.
+    protected override int ConcurrentRounds => 100;
 
     private InMemoryStorage<T> Typed<T>() where T : class, IEntity, new() =>
         stores.OfType<InMemoryStorage<T>>().Single();

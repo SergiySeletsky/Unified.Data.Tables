@@ -239,7 +239,7 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task Upsert_LosesRaceThreeTimes_ThrowsConcurrencyConflict()
+    public async Task Upsert_LosesRaceFiveTimes_ThrowsConcurrencyConflict()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r", PriorPrimary("p", "r", 0, "W/\"prior\""));
@@ -249,8 +249,9 @@ public class TableStorageSplitTests
         await Assert.ThrowsAsync<ConcurrencyConflictException>(
             () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = "small" }, Ct));
 
-        await h.Table.Received(3).UpdateEntityAsync(Arg.Any<TableEntity>(), new ETag("W/\"prior\""), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
-        await h.Table.Received(3).GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+        // Five attempts in all (it was three), each a point read and a conditional replace.
+        await h.Table.Received(5).UpdateEntityAsync(Arg.Any<TableEntity>(), new ETag("W/\"prior\""), TableUpdateMode.Replace, Arg.Any<CancellationToken>());
+        await h.Table.Received(5).GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -561,7 +562,7 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task UpsertBatch_LosesThreeRaces_ThrowsConcurrencyConflictForThatEntity()
+    public async Task UpsertBatch_LosesFiveRaces_ThrowsConcurrencyConflictForThatEntity()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet(PriorPrimary("p", "r1", 0, "W/\"v1\""));
@@ -576,7 +577,8 @@ public class TableStorageSplitTests
         ], Ct));
 
         Assert.Equal("p|r2", ex.Id);
-        await h.Table.ReceivedWithAnyArgs(3).SubmitTransactionAsync(default!, default);
+        // Five attempts in all (it was three).
+        await h.Table.ReceivedWithAnyArgs(5).SubmitTransactionAsync(default!, default);
     }
 
     [Fact]

@@ -316,6 +316,9 @@ public class LeftoverContinuationRowTests
         var query = Assert.Single(script.RangeQueries);
         Assert.Contains("_SplitOf eq 'r'", query, StringComparison.Ordinal);
         await h.Table.DidNotReceiveWithAnyArgs().DeleteEntityAsync(default!, default!, default, default);
+        // The point read, the listing, and a second point read: the rows listed are leftovers only if
+        // there is still no primary after they were listed.
+        await h.Table.Received(2).GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -366,18 +369,43 @@ public class LeftoverContinuationRowTests
     }
 
     [Fact]
-    public async Task Delete_NoPrimaryRow_ALeftoverWasTakenBackMeanwhile_ReadsAgain_AndDeletesTheEntityThatIsThereNow()
+    public async Task Delete_NoPrimaryRow_TheEntityIsCreatedBeforeItsRowsAreListed_ItsContinuationRowIsNotDeletedOnItsOwn()
     {
         using var h = new StorageHarness<SplitTextEntity>();
-        // First no primary; by the retry a writer has created the entity over its leftover.
+        // No row at the first read. Then a writer creates the entity, with one continuation row, and only
+        // then does the delete list the continuation rows: what it lists is the new entity's own row.
         var missing = Mocks.NotFound();
-        var createdMeanwhile = Mocks.Found(PriorPrimary("r", 1, "W/\"v1\""));
+        var created = Mocks.Found(PriorPrimary("r", 1, "W/\"v1\""));
         h.Table.GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
-            .Returns(missing, createdMeanwhile);
+            .Returns(missing, created);
+        var script = new Script(h)
+            .ThenList(OwnPart("r", 1, "W/\"fresh\""))
+            .ThenList(OwnPart("r", 1, "W/\"fresh\""));
+
+        await h.Store.DeleteAsync("p|r", Ct);
+
+        // The rows listed are deleted as leftovers only if a second read still finds no primary. Here it
+        // finds one, so the continuation row goes with its primary, on condition of the primary's
+        // version, and never alone (which would leave a primary whose value cannot be read).
+        Assert.Equal(["Delete r If-Match W/\"v1\"", "Delete r~0001 If-Match *"], Describe(Assert.Single(script.Transactions)));
+        await h.Table.Received(2).GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Delete_NoPrimaryRow_ALeftoverIsTakenBackWhileItIsDeleted_TheDeleteReadsAgain_AndDeletesTheEntityThatIsThereNow()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        // No primary at the first read nor at the second; a writer takes the leftover back for a new
+        // value just before the delete's transaction, which therefore fails its condition.
+        var missing = Mocks.NotFound();
+        var created = Mocks.Found(PriorPrimary("r", 1, "W/\"v1\""));
+        h.Table.GetEntityIfExistsAsync<TableEntity>("p", "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+            .Returns(missing, missing, created);
         var script = new Script(h)
             .ThenList(OwnPart("r", 1, "W/\"e1\""))
             .ThenFail(412, index: 0)
             .ThenList(OwnPart("r", 1, "W/\"e1b\""));
+        h.Store.LargeValueRetryDelay = (_, _) => Task.CompletedTask;
 
         await h.Store.DeleteAsync("p|r", Ct);
 
@@ -718,9 +746,56 @@ public sealed class AzuriteLeftoverContinuationRowTests : AzuriteCleanupTestBase
         Assert.Equal(["POST $batch", "GET query", "POST $batch"], Snapshot(requests));
     }
 
+    [Fact]
+    public async Task DeleteThatReadNoRow_ThenTheEntityIsCreated_NeverLeavesAPrimaryWithoutItsContinuationRow()
+    {
+        SkipUnlessAvailable();
+        var writer = SplitOnlyStore<SplitTextEntity>();
+        // The delete has read "no row at this id"; before it lists the continuation rows, another
+        // writer creates the entity, with a continuation row.
+        var interleaved = new BeforeFirstQuery(() => writer.CreateAsync(new SplitTextEntity { Id = Id("r"), Body = TwoRows }, CancellationToken.None));
+        var deleter = SplitOnlyStore<SplitTextEntity>(TableServiceWith(interleaved));
+        await deleter.EnsureCreatedAsync(Ct);
+
+        await deleter.DeleteAsync(Id("r"), Ct);
+
+        Assert.Equal(1, interleaved.Fired);
+        // The delete came after the create and took the entity as a whole. What must never be left is
+        // the primary alone: its value could not be read again.
+        Assert.Empty(await RowKeysAsync());
+        Assert.Null(await writer.OneAsync(Id("r"), Ct));
+    }
+
     private static List<string> Snapshot(List<string> requests)
     {
         lock (requests) return [.. requests];
+    }
+
+    /// <summary>Runs <paramref name="action"/> once, just before the first query (not a point read) is sent.</summary>
+    private sealed class BeforeFirstQuery(Func<Task> action) : HttpPipelinePolicy
+    {
+        private int fired;
+
+        public int Fired => Volatile.Read(ref fired);
+
+        public override async ValueTask ProcessAsync(HttpMessage message, ReadOnlyMemory<HttpPipelinePolicy> pipeline)
+        {
+            if (IsQuery(message) && Interlocked.Exchange(ref fired, 1) == 0)
+                await action();
+            await ProcessNextAsync(message, pipeline);
+        }
+
+        public override void Process(HttpMessage message, ReadOnlyMemory<HttpPipelinePolicy> pipeline)
+        {
+            if (IsQuery(message) && Interlocked.Exchange(ref fired, 1) == 0)
+                action().GetAwaiter().GetResult();
+            ProcessNext(message, pipeline);
+        }
+
+        private static bool IsQuery(HttpMessage message) =>
+            message.Request.Method == RequestMethod.Get
+            && !message.Request.Uri.Path.Contains("(PartitionKey=", StringComparison.Ordinal)
+            && !message.Request.Uri.Path.EndsWith("/Tables", StringComparison.Ordinal);
     }
 
     /// <summary>Records each table request as its method and kind (<c>$batch</c>, <c>entity</c>, <c>query</c>).</summary>

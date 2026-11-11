@@ -38,6 +38,9 @@ public sealed partial class InMemoryStorage<T>
     /// </summary>
     internal Action? BeforeLargeCommit { get; set; }
 
+    /// <summary>The large-value rules this store shares with TableStorage (for tests that replace their retry wait).</summary>
+    internal LargeValueTable LargeValueRules => large;
+
     // ── Writes ──────────────────────────────────────────────────────────────
 
     private async Task<T> UpsertLargeAsync(T entity, CancellationToken ct)
@@ -102,9 +105,15 @@ public sealed partial class InMemoryStorage<T>
         // Set once the key of a new continuation row turned out to be held by a leftover continuation row
         // of this very entity: from then on every attempt is planned over the entity's own rows.
         var takeBack = false;
+        var lostRace = false;
 
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
+            // After a lost race: the same short, growing, jittered pause as TableStorage. (Taking an own
+            // leftover back is no race, and does not wait.)
+            if (lostRace)
+                await large.WaitBeforeRetryAsync(attempt, ct);
+            lostRace = false;
             PriorRow? prior;
             Dictionary<string, long>? own;
             lock (gate)
@@ -154,6 +163,7 @@ public sealed partial class InMemoryStorage<T>
                             : Conflict(entity.Id);
                     }
                     lost = new RequestFailedException(current is null ? 404 : 412, "The entity was modified by another writer.");
+                    lostRace = true;
                     continue;
                 }
 
@@ -163,6 +173,7 @@ public sealed partial class InMemoryStorage<T>
                 if (own is not null && !SameParts(own, OwnParts(keys)))
                 {
                     lost = PartsChanged();
+                    lostRace = true;
                     continue;
                 }
 
@@ -262,7 +273,8 @@ public sealed partial class InMemoryStorage<T>
     /// each applied atomically under the gate. A transaction's blobs are uploaded just before it, and
     /// released ones deleted after each commit. A repeated key in a create batch was
     /// refused before this point; in an upsert batch its last occurrence is written. An existing key fails
-    /// its create transaction; an upsert transaction that lost a race is planned again and retried. A
+    /// its create transaction; an upsert transaction that lost a race is planned again and retried (five
+    /// attempts in all, with a short pause before each retry, as TableStorage). A
     /// transaction that finds the key of a new continuation row held by a leftover continuation row of the
     /// same entity is planned again over that entity's own rows; a foreign row there fails it.
     /// </summary>
@@ -345,6 +357,7 @@ public sealed partial class InMemoryStorage<T>
             ct.ThrowIfCancellationRequested();
             BeforeLargeCommit?.Invoke();
             BatchUnit? lost = null;
+            var lostRace = true;
             var taking = takeBack;
             lock (gate)
             {
@@ -376,6 +389,7 @@ public sealed partial class InMemoryStorage<T>
                         if (!IsOwnPart(unit.Keys, taken))
                             throw LargeValueTable.ContinuationKeyTaken(unit.Keys.PartitionKey, unit.Keys.RowKey, taken, Taken(taken));
                         lost = unit;
+                        lostRace = false;
                         taking = new HashSet<string>(takeBack ?? [], StringComparer.Ordinal) { unit.Keys.RowKey };
                         break;
                     }
@@ -392,6 +406,9 @@ public sealed partial class InMemoryStorage<T>
                 if (attempt >= MaxLargeWriteAttempts)
                     throw new ConcurrencyConflictException(typeof(T).Name, lost.Entity.Id,
                         new RequestFailedException(412, "The entity was modified by another writer."));
+                // After a lost race: the same pause as TableStorage (none when an own leftover is taken back).
+                if (lostRace)
+                    await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
                 await CommitBatchUnitsAsync(replanned, kind, attempt + 1, taking, ct);
                 continue;

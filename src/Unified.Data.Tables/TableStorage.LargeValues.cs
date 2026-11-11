@@ -21,8 +21,18 @@ public partial class TableStorage<T>
     /// <summary>True when <typeparamref name="T"/> has a member that may be stored as split cells.</summary>
     private static readonly bool LargeValueAware = TypeMetadataCache.IsLargeValueAware(typeof(T));
 
-    /// <summary>How many times a write that lost its condition to a concurrent writer re-reads and retries.</summary>
-    private const int MaxLargeWriteAttempts = 3;
+    /// <summary>
+    /// How many times in all a write, a delete or a batch transaction that keeps losing its condition to
+    /// concurrent writers is attempted (the number every provider uses).
+    /// </summary>
+    private const int MaxLargeWriteAttempts = LargeValueTable.MaxWriteAttempts;
+
+    /// <summary>Waits between two attempts of a write that lost a race (for tests).</summary>
+    internal Func<TimeSpan, CancellationToken, Task> LargeValueRetryDelay
+    {
+        get => large.RetryDelay;
+        set => large.RetryDelay = value;
+    }
 
     // _SplitParts says how many continuation rows the stored row owns, _SplitOf marks the row itself as
     // one; the __blob reference columns are selected now so the offload tier can read them from the same
@@ -154,9 +164,15 @@ public partial class TableStorage<T>
         // then (ownParts: the rows just read for the next attempt, read again for any later one).
         var takeBack = false;
         Dictionary<string, ETag>? ownParts = null;
+        var lostRace = false;
 
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
+            // After a lost race: a short, growing, jittered pause, so that writers that collided do not
+            // collide again in step. (Taking an own leftover back is no race, and does not wait.)
+            if (lostRace)
+                await large.WaitBeforeRetryAsync(attempt, ct);
+            lostRace = false;
             var prior = kind == LargeWriteKind.Create ? null : await ReadPriorAsync(pk, rk, ct);
             if (kind == LargeWriteKind.Replace)
             {
@@ -207,6 +223,7 @@ public partial class TableStorage<T>
                 }
                 // Any write plans again when a continuation row it counted on is gone or has changed.
                 lost = ex;
+                lostRace = true;
                 continue;
             }
 
@@ -587,7 +604,24 @@ public partial class TableStorage<T>
         RequestFailedException? lost = null;
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
+            // Every retry here follows a lost race: a short, growing, jittered pause first.
+            if (attempt > 1)
+                await large.WaitBeforeRetryAsync(attempt, ct);
             var stored = await ReadStoredAsync(pk, rk, ct);
+            List<TableEntity> leftovers = [];
+            if (stored is null)
+            {
+                // No primary row: all that can be left of the entity are continuation rows nothing
+                // declares (one range query, in this case only). When there are none, nothing to do.
+                leftovers = await LeftoverPartsAsync(pk, rk, ct);
+                if (leftovers.Count == 0)
+                    return;
+                // They are leftovers only if there is still no primary now that they are listed: a
+                // writer may have created the entity after the first read, and the rows listed are then
+                // that entity's own. With no primary after the listing, a writer that creates the entity
+                // later rewrites every row it declares, so the versions just listed no longer match.
+                stored = await ReadStoredAsync(pk, rk, ct);
+            }
             // A continuation row addressed by its own id is not an entity: nothing is deleted.
             if (stored is { } found && SplitRowLayout.IsPartRow(found.Row))
                 return;
@@ -598,9 +632,7 @@ public partial class TableStorage<T>
             {
                 if (stored is not { } row)
                 {
-                    // No primary row: all that can be left of the entity are continuation rows nothing
-                    // declares. They go too (one range query, in this case only), so the key is clean.
-                    await DeleteLeftoverPartsAsync(pk, rk, ct);
+                    await DeleteLeftoverPartsAsync(pk, leftovers, ct);
                     return;
                 }
 
@@ -636,26 +668,31 @@ public partial class TableStorage<T>
     }
 
     /// <summary>
-    /// Deletes the continuation rows of an entity that has no primary row (what a writer that does not
-    /// know continuation rows, an interrupted partition delete or a delete that raced a write left of
-    /// it), in transactions of at most 100. Each row is deleted on condition of the version it was listed
-    /// at: a writer that is taking the same rows back for a new value at that moment commits as a whole or
-    /// not at all, and so does this delete (the caller reads again and retries when it loses). A table
-    /// that is not there has nothing to delete, as for any other type.
+    /// The continuation rows of an entity that has no primary row: what a writer that does not know
+    /// continuation rows, an interrupted partition delete or a delete that raced a write left of it. A
+    /// table that is not there has none (the point read of a missing table reads as "no row"; only the
+    /// query says the table is gone), so deleting from it is a no-op, as for any other type.
     /// </summary>
-    private async Task DeleteLeftoverPartsAsync(string pk, string rk, CancellationToken ct)
+    private async Task<List<TableEntity>> LeftoverPartsAsync(string pk, string rk, CancellationToken ct)
     {
-        List<TableEntity> leftovers;
         try
         {
-            leftovers = await QueryPartsAsync(pk, rk, PartKeys, ct);
+            return await QueryPartsAsync(pk, rk, PartKeys, ct);
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
         {
-            // The point read of a missing table reads as "no row"; only the query says the table is gone.
-            return;
+            return [];
         }
+    }
 
+    /// <summary>
+    /// Deletes leftover continuation rows in transactions of at most 100, each row on condition of the
+    /// version it was listed at. A writer that takes the same rows back for a new value at that moment
+    /// commits as a whole or not at all, and so does this delete: the one that loses fails its condition
+    /// (the caller reads again and retries).
+    /// </summary>
+    private async Task DeleteLeftoverPartsAsync(string pk, List<TableEntity> leftovers, CancellationToken ct)
+    {
         foreach (var chunk in leftovers.Chunk(BatchPlanner.DefaultMaxCount))
         {
             var actions = chunk.Select(part => new TableTransactionAction(
@@ -703,8 +740,8 @@ public partial class TableStorage<T>
     /// key repeated in a create batch throws <see cref="DuplicateKeyException"/> before anything is
     /// written; in an upsert batch its last occurrence is written. An existing key fails its create
     /// transaction (<see cref="DuplicateKeyException"/>); earlier transactions stay committed. An upsert
-    /// transaction that lost a race to another writer is planned again from the re-read rows and retried;
-    /// after three lost races it throws <see cref="ConcurrencyConflictException"/>. A transaction that
+    /// transaction that lost a race to another writer is planned again from the re-read rows and retried
+    /// after a short pause; after five lost races it throws <see cref="ConcurrencyConflictException"/>. A transaction that
     /// finds the key of a new continuation row held by a leftover continuation row of the same entity is
     /// planned again over that entity's own rows (they are replaced or deleted in the retried
     /// transaction); a foreign row at such a key fails the transaction, and is left as it is.
@@ -831,9 +868,11 @@ public partial class TableStorage<T>
             catch (RequestFailedException ex) when (BatchLostRace(ex, kind, owners))
             {
                 // The whole transaction failed: nothing of it committed, so it is planned again from the
-                // rows as they are now. A continuation row removed meanwhile (404) is not required again.
+                // rows as they are now, after a short pause. A continuation row removed meanwhile (404)
+                // is not required again.
                 if (attempt >= MaxLargeWriteAttempts)
                     throw new ConcurrencyConflictException(typeName, FailedId(ex, owners, chunk), ex);
+                await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
                 await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, ct);
                 continue;
