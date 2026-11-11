@@ -351,10 +351,14 @@ public sealed partial class InMemoryStorage<T>
     /// </summary>
     private async Task<int> DeletePartitionLargeAsync(string partition, CancellationToken ct)
     {
+        // The partition's rows in row-key order, as the service lists them.
         List<TableEntity> listed;
         lock (gate)
         {
-            listed = OrderedRows().Where(kv => kv.Key.PartitionKey == partition).Select(kv => kv.Value.Data).ToList();
+            listed = rows.Where(kv => kv.Key.PartitionKey == partition)
+                .OrderBy(kv => kv.Key.RowKey, StringComparer.Ordinal)
+                .Select(kv => kv.Value.Data)
+                .ToList();
         }
         // Every row goes, continuation rows included; only logical entities are counted.
         var logical = listed.Count(row => !LargeValueTable.IsPartRow(row));
