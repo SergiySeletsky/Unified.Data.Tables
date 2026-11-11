@@ -982,13 +982,19 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
 
+        // The entry cached when the merge is sent: the only one the update may keep warm (see below).
+        var cached = CachedBeforeTheMerge(id);
         var partial = new TableEntity(partitionKey, rowKey);
         foreach (var (name, value) in builder.Updates)
         {
             // The typed overload refuses a [TableValueSplit] member: its cells must be replaced together.
-            foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(typeof(T), name, value))
+            var cells = TableEntitySerializer.FlattenProperty(typeof(T), name, value);
+            if (cached is not null && !IsWholeScalarInItsOwnCell(name, value, cells))
+                cached = null;
+            foreach (var (col, cell) in cells)
             {
-                partial[col] = cell;
+                // A byte[] is sent as a copy: the request never holds an array the caller may change.
+                partial[col] = cell is byte[] bytes ? bytes.Clone() : cell;
             }
         }
         // Always bump UpdatedAt — set last so it wins over any caller-supplied value.
@@ -1015,28 +1021,48 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             throw;
         }
 
-        // Keep the cache warm, as 0.8.3 did: if the entity is cached and every declared path maps onto a
-        // top-level property, a copy of it is patched, copied again (so that no value object the caller
-        // passed to the builder is reachable from the cache) and put (a write's put: it gives way to
-        // another write or delete of the entity noted since the mark). The merge was applied to the row
-        // the table holds, the patch to the row the cache holds; they are known to be the same row only
-        // when the merge was conditional on exactly the cached entity's version. Only then does the copy
-        // carry the merge's new ETag. Otherwise (an unconditional merge, a condition on another version, a
-        // response without a version) it keeps the ETag the cached entity had: never newer than its
-        // content, so an optimistic write with it meets 412, evicts and reads the row. Nested-path updates
-        // (or unknown names) evict instead — the next OneAsync re-reads fresh.
+        // Keep the cache warm, as 0.8.3 did, only where the patch is known to give the row's content: the
+        // entry the merge was sent over is still the entry in the cache (no read and no other write has
+        // put another since: one put during the flight may hold a later change of another writer), and
+        // every value is a non-null scalar the merge wrote whole in its own top-level column. Then one copy
+        // of that entry (one construction, as on 0.8.3) gets the values and is put (a write's put: it
+        // gives way to another write or delete of the entity noted since the mark). The copy carries the
+        // merge's new ETag only when the merge was conditional on exactly the cached entity's version, the
+        // one case in which the row it was applied to is the row the entry holds; otherwise (an
+        // unconditional merge, a condition on another version, a response without a version) it keeps the
+        // cached entity's own ETag, never newer than its content, so an optimistic write with it meets
+        // 412, evicts and reads the row. In every other case the entry is evicted and the next read asks
+        // the table. Whatever throws while the copy is made or put (the entity's constructor, a getter or
+        // setter, the cache) evicts the entry before the exception leaves: the version from before the
+        // merge is never left cached.
         var newETag = ReadETagHeader(resp);
-        if (cachePolicy.Enabled
-            && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null
-            && PatchesTopLevelOnly(builder.Updates) && Snapshot(id, cached.Entity) is { } copy
-            && TryApplyUpdates(copy, builder.Updates) && Snapshot(id, copy) is { } patched)
+        if (cached is not null
+            && cache.TryGetValue<CachedEntity>(EntityKey(id), out var current) && ReferenceEquals(current, cached))
         {
-            patched.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
-            patched.Timestamp = null; // the row changed server-side; stale until re-read
-            var onCachedVersion = newETag is not null && builder.ETag is not null
-                && string.Equals(builder.ETag, cached.Entity.ETag, StringComparison.Ordinal);
-            patched.ETag = onCachedVersion ? newETag!.Value.ToString() : cached.Entity.ETag;
-            PutWrite(id, new CachedEntity(patched, onCachedVersion ? newETag!.Value : cached.ETag), mark);
+            try
+            {
+                if (Snapshot(id, cached.Entity) is { } copy)
+                {
+                    var properties = TypeMetadataCache.GetMetadata(typeof(T)).PropertyMap;
+                    foreach (var (name, value) in builder.Updates)
+                        properties[name].SetValue(copy, value);
+                    copy.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
+                    copy.Timestamp = null; // the row changed server-side; stale until re-read
+                    var onCachedVersion = newETag is not null && builder.ETag is not null
+                        && string.Equals(builder.ETag, cached.Entity.ETag, StringComparison.Ordinal);
+                    copy.ETag = onCachedVersion ? newETag!.Value.ToString() : cached.Entity.ETag;
+                    PutWrite(id, new CachedEntity(copy, onCachedVersion ? newETag!.Value : cached.ETag), mark);
+                }
+                else
+                {
+                    cache.Remove(EntityCacheKey(id));
+                }
+            }
+            catch (Exception)
+            {
+                EvictAfterFailedWrite(id, partitionKey);
+                throw;
+            }
         }
         else
         {
@@ -1045,6 +1071,23 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         InvalidateQueryCache(partitionKey);
         return newETag?.ToString() ?? string.Empty;
+    }
+
+    // The entity's entry in the cache when a builder update is about to send its merge; null when there
+    // is none or caching is off. A cache that can no longer be asked (disposed) answers none here, so the
+    // merge is sent as on 0.8.3 and the cache's exception comes from the eviction after it.
+    private CachedEntity? CachedBeforeTheMerge(string id)
+    {
+        if (!cachePolicy.Enabled)
+            return null;
+        try
+        {
+            return cache.TryGetValue<CachedEntity>(EntityKey(id), out var entry) ? entry : null;
+        }
+        catch (ObjectDisposedException)
+        {
+            return null;
+        }
     }
 
     private static ETag? ReadETagHeader(Response response)
@@ -1062,32 +1105,28 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
     }
 
-    // True when every path of the builder names a top-level property: only then is the cached entity
-    // copied to be patched (a nested path evicts, and copies nothing).
-    private static bool PatchesTopLevelOnly(Dictionary<string, object> updates)
+    // Whether a builder value may be applied to the cached entity (ruling R10, points 2 and 3), decided
+    // from the cells the merge sends: the path names a top-level property, the value is a non-null scalar
+    // of the property's own type, and it is the one cell the merge writes for it, under the property's
+    // own column and as it is (a string no policy trimmed or compressed), so that a read maps the cell back
+    // to the same value. A null (the merge writes no cell and the row keeps its value), an object the
+    // serializer flattens, a collection or other JSON-stored value, a byte[] (mutable) and a large value
+    // do not qualify; nor does a local date (stored as its UTC instant) or one at or before the year of the
+    // 1601-01-01 sentinel (a read may return it as the default value).
+    private static bool IsWholeScalarInItsOwnCell(string name, object? value, Dictionary<string, object> cells)
     {
-        var map = TypeMetadataCache.GetMetadata(typeof(T)).PropertyMap;
-        return updates.Keys.All(map.ContainsKey);
-    }
-
-    private static bool TryApplyUpdates(T entity, Dictionary<string, object> updates)
-    {
-        // Validate every path BEFORE mutating: the cached instance is shared with prior readers,
-        // so a partial patch followed by eviction would leave them a half-updated object.
-        var meta = TypeMetadataCache.GetMetadata(typeof(T));
-        foreach (var name in updates.Keys)
+        if (value is null || cells.Count != 1 || !cells.TryGetValue(name, out var cell)
+            || !TypeMetadataCache.GetMetadata(typeof(T)).PropertyMap.TryGetValue(name, out var property)
+            || value.GetType() != (Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType))
+            return false;
+        return value switch
         {
-            if (!meta.PropertyMap.ContainsKey(name))
-            {
-                return false; // nested/unknown path — caller evicts the cache entry instead
-            }
-        }
-
-        foreach (var (name, value) in updates)
-        {
-            meta.PropertyMap[name].SetValue(entity, value);
-        }
-        return true;
+            string s => cell is string written && string.Equals(s, written, StringComparison.Ordinal),
+            bool or int or long or double or Guid or Enum => true,
+            DateTimeOffset d => d.UtcDateTime.Year > 1601,
+            DateTime d => d.Kind != DateTimeKind.Local && d.Year > 1601,
+            _ => false,
+        };
     }
 
     /// <inheritdoc />
@@ -1467,10 +1506,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     //
     // An entry's ETag is never newer than its content: it is the version of the row whose content the
     // entry holds, or an older one. The one put of an older one is a builder update's patched copy (see
-    // UpdateAsync(id, builder)): its merge was applied to the row the table holds, its patch to the row
-    // the cache holds, so the copy takes the merge's ETag only when the merge was conditional on exactly
-    // the cached version. An optimistic write of an entry with an older ETag meets 412 and evicts; it never
-    // overwrites a change the entry has not seen.
+    // UpdateAsync(id, builder)). It is made only from the entry that was cached when the merge was sent
+    // and is still the entry once the merge returned (an entry a read put during the flight may hold a
+    // later change of another writer, and is evicted instead), and only when every value is a non-null
+    // scalar the merge wrote whole in its own column, so the patch changes exactly what the merge changed.
+    // Its merge was applied to the row the table holds, its patch to the row the entry holds, so the copy
+    // takes the merge's ETag only when the merge was conditional on exactly the cached version; otherwise
+    // it keeps the cached entity's own, older ETag. An optimistic write of an entry with an older ETag
+    // meets 412 and evicts; it never overwrites a change the entry has not seen.
     // Writes by other processes are not seen, as before (see CachePolicy).
 
     private static readonly ConditionalWeakTable<IMemoryCache, WriteGenerations> GenerationsByCache = new();
