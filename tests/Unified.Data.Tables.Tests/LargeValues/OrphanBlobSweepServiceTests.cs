@@ -15,6 +15,10 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// entity type on an interval. Time is stepped through the service's delay seam, so every round is
 /// deterministic.
 /// </summary>
+// The rig registers through AddUnifiedInMemoryStorage, which applies its options to the process-wide
+// TableEntitySerializer.OversizedCellPolicy: outside this collection it reset the policy underneath
+// the policy tests while they ran.
+[Collection("OversizedCellPolicy")]
 public class OrphanBlobSweepServiceTests
 {
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(30);

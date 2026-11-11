@@ -17,6 +17,10 @@ namespace Unified.Data.Tables.Tests;
 /// <c>UNIFIED_TABLES_REQUIRE_AZURITE=1</c> so an absent emulator fails them too.
 /// To run locally: start Azurite (e.g. <c>azurite --silent</c> or the VS Code Azurite extension),
 /// then <c>dotnet test</c>. They never touch any cloud Azure resource.
+///
+/// Every test works in partitions of its own (see <see cref="Partition"/>), so two test runs that
+/// share one emulator do not see, count or delete each other's rows; each test deletes its rows when
+/// it ends.
 /// </summary>
 public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
 {
@@ -25,6 +29,14 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     private TableServiceClient _service = default!;
     private bool _available;
     private readonly List<(string Table, string PartitionKey, string RowKey)> _cleanup = new();
+
+    // New for every test (xUnit creates the class once per test). With fixed partition names, a second
+    // test process on the same Azurite found the first one's rows: creates failed as duplicates, counts
+    // were off and one run's partition delete removed the other's rows.
+    private readonly string _run = Guid.NewGuid().ToString("N");
+
+    /// <summary>This test's own partition <paramref name="name"/>: the name plus a GUID no other run has.</summary>
+    private string Partition(string name) => $"{name}-{_run}";
 
     // Once per test run: skips only when the emulator is not there at all (see AzuriteProbe); any other
     // probe failure, or an absent emulator with UNIFIED_TABLES_REQUIRE_AZURITE=1, fails the tests.
@@ -64,7 +76,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
 
         var store = Store<TestEntity>();
-        var entity = new TestEntity { Id = "integration|alice", Name = "Alice", Value = 42 };
+        var entity = new TestEntity { Id = $"{Partition("integration")}|alice", Name = "Alice", Value = 42 };
         Track<TestEntity>(entity.Id);
 
         await store.CreateAsync(entity);
@@ -84,7 +96,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         // Bypass the write serializer and insert a row whose date is a plain DateTime — exactly the
         // representation older rows surface as through the SDK. Reading it back into a DateTimeOffset
         // property must not throw (DateTimeOffset is not IConvertible).
-        const string pk = "legacy-pk";
+        var pk = Partition("legacy-pk");
         const string rk = "legacy-rk";
         var table = _service.GetTableClient(nameof(EntityWithDateTime));
         await table.CreateIfNotExistsAsync();
@@ -108,7 +120,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
 
         var store = Store<TestEntity>();
-        var entity = new TestEntity { Id = "integration|patch", Name = "before", Value = 5 };
+        var entity = new TestEntity { Id = $"{Partition("integration")}|patch", Name = "before", Value = 5 };
         Track<TestEntity>(entity.Id);
         await store.CreateAsync(entity);
 
@@ -127,15 +139,16 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
 
         var store = Store<TestEntity>();
-        Track<TestEntity>("delpart|a");
-        Track<TestEntity>("delpart|b");
-        await store.CreateAsync(new TestEntity { Id = "delpart|a", Name = "A" });
-        await store.CreateAsync(new TestEntity { Id = "delpart|b", Name = "B" });
+        var p = Partition("delpart");
+        Track<TestEntity>($"{p}|a");
+        Track<TestEntity>($"{p}|b");
+        await store.CreateAsync(new TestEntity { Id = $"{p}|a", Name = "A" });
+        await store.CreateAsync(new TestEntity { Id = $"{p}|b", Name = "B" });
 
-        var deleted = await store.DeletePartitionAsync("delpart");
+        var deleted = await store.DeletePartitionAsync(p);
 
         Assert.Equal(2, deleted);
-        Assert.Empty(await Store<TestEntity>().QueryAsync("delpart"));
+        Assert.Empty(await Store<TestEntity>().QueryAsync(p));
     }
 
     [Fact]
@@ -144,7 +157,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
 
         var store = Store<TestEntity>();
-        const string p = "linqfilter";
+        var p = Partition("linqfilter");
         for (var i = 0; i < 6; i++)
         {
             var id = $"{p}|{i:D2}";
@@ -164,7 +177,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
 
         var store = Store<TestEntity>();
-        const string p = "paging";
+        var p = Partition("paging");
         const int total = 25;
         for (var i = 0; i < total; i++)
         {
@@ -205,9 +218,10 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         // comfortably one "legal" 100-entity chunk under the old planner and comfortably over the
         // transaction limit.
         var store = Store<TestEntity>();
+        var p = Partition("batch413");
         var blob = new string('x', 60_000);
         var entities = Enumerable.Range(0, 60)
-            .Select(i => new TestEntity { Id = $"batch413|row{i:D3}", Name = blob, Value = i })
+            .Select(i => new TestEntity { Id = $"{p}|row{i:D3}", Name = blob, Value = i })
             .ToArray();
 
         foreach (var e in entities) Track<TestEntity>(e.Id);
@@ -217,7 +231,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         Assert.Equal(entities.Length, written);
 
         // Round-trip: every row is readable and intact, so the split did not lose or truncate one.
-        var readBack = await store.QueryAsync(new QueryOptions { Partition = "batch413" });
+        var readBack = await store.QueryAsync(new QueryOptions { Partition = p });
         Assert.Equal(entities.Length, readBack.Count);
         Assert.All(readBack, e => Assert.Equal(60_000, e.Name.Length));
     }
@@ -230,16 +244,17 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
         // Projection is the difference between reading a scalar and dragging every large payload
         // in the partition across the wire with it.
         var store = Store<TestEntity>();
-        var entity = new TestEntity { Id = "projection|row1", Name = new string('y', 40_000), Value = 42 };
+        var p = Partition("projection");
+        var entity = new TestEntity { Id = $"{p}|row1", Name = new string('y', 40_000), Value = 42 };
         Track<TestEntity>(entity.Id);
         await store.UpsertAsync(entity);
 
         var projected = await store.QueryAsync(
-            new QueryOptions { Partition = "projection", Select = ["Value"] });
+            new QueryOptions { Partition = p, Select = ["Value"] });
 
         var row = Assert.Single(projected);
         Assert.Equal(42, row.Value);
-        Assert.Equal("projection|row1", row.Id);        // keys survive — they are added back
+        Assert.Equal($"{p}|row1", row.Id);              // keys survive — they are added back
         Assert.True(string.IsNullOrEmpty(row.Name), "an unselected column must not come back populated");
     }
 }
