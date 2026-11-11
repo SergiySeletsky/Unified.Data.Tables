@@ -205,7 +205,15 @@ public partial class TableStorage<T>
                 // other row is foreign: the write is refused and that row is left as it is.
                 ownParts = await OwnPartsAsync(pk, rk, ct);
                 if (!ownParts.ContainsKey(taken))
-                    throw LargeValueTable.ContinuationKeyTaken(pk, rk, taken, ex);
+                {
+                    if (await HeldByForeignRowAsync(pk, rk, taken, ct))
+                        throw LargeValueTable.ContinuationKeyTaken(pk, rk, taken, ex);
+                    // The row in the way is gone (or the entity's own again): a lost race, planned again.
+                    ownParts = null;
+                    lost = ex;
+                    lostRace = true;
+                    continue;
+                }
                 takeBack = true;
                 lost = ex;
                 continue;
@@ -329,6 +337,18 @@ public partial class TableStorage<T>
             actions.Add(new TableTransactionAction(
                 TableTransactionActionType.Delete, new TableEntity(pk, partKey), ReadVersion(own, partKey) ?? ETag.All));
         }
+    }
+
+    // After a new continuation row failed on a taken key that is not among the entity's own rows: true
+    // when a row that is not the entity's continuation row holds that key now (one point read, on this
+    // refusal path only), so the foreign-row error names a row that is there. No row there, or the
+    // entity's own continuation row again, is a lost race.
+    private async Task<bool> HeldByForeignRowAsync(string pk, string rk, string partKey, CancellationToken ct)
+    {
+        var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, partKey, PartKeys, ct);
+        if (!response.HasValue || response.Value is not { } row)
+            return false;
+        return !(row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is string owner && string.Equals(owner, rk, StringComparison.Ordinal));
     }
 
     // The version one of the entity's own continuation rows was read at, when the plan was made over them.
@@ -811,7 +831,9 @@ public partial class TableStorage<T>
     /// after a short pause; after five lost races it throws <see cref="ConcurrencyConflictException"/>. A transaction that
     /// finds the key of a new continuation row held by a leftover continuation row of the same entity is
     /// planned again over that entity's own rows (they are replaced or deleted in the retried
-    /// transaction); a foreign row at such a key fails the transaction, and is left as it is.
+    /// transaction); a foreign row at such a key fails the transaction, and is left as it is. A key no
+    /// row holds any more by the time the write looks (another caller removed the leftover) is a lost
+    /// race: planned again after the pause, within the five attempts.
     /// </summary>
     private async Task WriteBatchLargeAsync(IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
@@ -919,7 +941,18 @@ public partial class TableStorage<T>
                 var unit = chunk[owners[((TableTransactionFailedException)ex).FailedTransactionActionIndex!.Value]];
                 var own = await OwnPartsAsync(unit.Pk, unit.Rk, ct);
                 if (!own.ContainsKey(taken))
-                    throw LargeValueTable.ContinuationKeyTaken(unit.Pk, unit.Rk, taken, ex);
+                {
+                    if (await HeldByForeignRowAsync(unit.Pk, unit.Rk, taken, ct))
+                        throw LargeValueTable.ContinuationKeyTaken(unit.Pk, unit.Rk, taken, ex);
+                    // The row in the way is gone (or the entity's own again): a lost race, planned again
+                    // from the rows as they are now, after a short pause.
+                    if (attempt >= MaxLargeWriteAttempts)
+                        throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
+                    await large.WaitBeforeRetryAsync(attempt + 1, ct);
+                    var again = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
+                    await SubmitBatchUnitsAsync(again, kind, attempt + 1, takeBack, ct);
+                    continue;
+                }
                 if (attempt >= MaxLargeWriteAttempts)
                     throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
                 var taking = takeBack is null

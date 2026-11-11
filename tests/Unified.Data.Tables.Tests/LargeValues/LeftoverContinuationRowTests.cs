@@ -167,6 +167,8 @@ public class LeftoverContinuationRowTests
         var script = new Script(h)
             .ThenFail(409, index: 1)
             .ThenList(new TableEntity("p", "r~0001") { ETag = new ETag("W/\"x\""), [SystemColumnNames.SplitOf] = "another" });
+        // The row at the key, read once on this refusal path: it is there, and it is not the entity's.
+        h.SetupGet("p", "r~0001", new TableEntity("p", "r~0001") { ETag = new ETag("W/\"x\""), [SystemColumnNames.SplitOf] = "another" });
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => h.Store.CreateAsync(new SplitTextEntity { Id = "p|r", Body = OnePartText }, Ct));
@@ -175,6 +177,7 @@ public class LeftoverContinuationRowTests
         Assert.IsType<TableTransactionFailedException>(ex.InnerException);
         Assert.Single(script.Transactions);
         Assert.Single(script.RangeQueries);
+        await h.Table.Received(1).GetEntityIfExistsAsync<TableEntity>("p", "r~0001", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -210,6 +213,8 @@ public class LeftoverContinuationRowTests
             .ThenList()
             .ThenFail(409, index: 1)
             .ThenList();
+        // The other writer's row at the key, read once the entity's own rows no longer hold it.
+        h.SetupGet("p", "r~0001", new TableEntity("p", "r~0001") { ETag = new ETag("W/\"theirs\"") });
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => h.Store.CreateAsync(new SplitTextEntity { Id = "p|r", Body = OnePartText }, Ct));
