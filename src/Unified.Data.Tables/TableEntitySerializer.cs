@@ -1863,11 +1863,20 @@ internal static class TypeMetadataCache
     /// getter that fails leaves the columns of the declared types, and a later call tries again. Never
     /// throws; empty, and nothing constructed, for a type that is not large-value aware.
     /// </summary>
-    internal static IReadOnlyList<string> LargeValueColumns(Type t) => LargeValues(t).Columns;
+    internal static IReadOnlyList<string> LargeValueColumns(Type t) => LargeValues(t, out _).Columns;
 
-    private static LargeValueInfo LargeValues(Type t)
+    /// <summary>
+    /// <see cref="LargeValueColumns(Type)"/>, with <paramref name="remembered"/> true when the list is the one
+    /// remembered for the type (the probe completed, or the type is not large-value aware) and false when a
+    /// constructor or getter of the default instance failed: a caller that keeps something built from the
+    /// list keeps it only when it is true.
+    /// </summary>
+    internal static IReadOnlyList<string> LargeValueColumns(Type t, out bool remembered) => LargeValues(t, out remembered).Columns;
+
+    private static LargeValueInfo LargeValues(Type t, out bool remembered)
     {
         ArgumentNullException.ThrowIfNull(t);
+        remembered = true;
         // A type that opts into nothing by its declared types is never constructed to answer this.
         if (!IsLargeValueAware(t))
             return DeclaredLargeValues(t);
@@ -1875,6 +1884,7 @@ internal static class TypeMetadataCache
             return known;
 
         var info = WithDefaultInstances(t, DeclaredLargeValues(t), out var complete);
+        remembered = complete;
         return complete ? _largeValues.GetOrAdd(t, info) : info;
     }
 
