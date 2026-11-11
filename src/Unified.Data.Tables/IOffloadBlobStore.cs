@@ -42,7 +42,14 @@ public interface IOffloadBlobStore
     /// <exception cref="TableValueIntegrityException">The blob does not exist.</exception>
     Task TouchAsync(string name, CancellationToken ct);
 
-    /// <summary>Storage-provider SPI, not for application code. Opens the blob's stored bytes for reading.</summary>
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Opens the blob's stored bytes for reading. The
+    /// bytes under a name never change, so a read is not disturbed by <see cref="TouchAsync"/> running
+    /// while it is under way: the stream keeps delivering the blob. A blob deleted meanwhile either does
+    /// not affect a stream that already holds its bytes, or fails the next read with
+    /// <see cref="TableValueIntegrityException"/> (never with the store's own error type), which is what
+    /// lets a reader retry from the row's current version.
+    /// </summary>
     /// <param name="column">The column the blob belongs to, named by an integrity failure.</param>
     /// <param name="name">The blob name.</param>
     /// <param name="ct">Cancels the call.</param>

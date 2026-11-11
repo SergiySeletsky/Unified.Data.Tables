@@ -80,6 +80,10 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// The stream is over the stored bytes as they were when it was opened: a touch, and a delete, of
+    /// the blob while it is read do not affect it.
+    /// </remarks>
     public async Task<Stream> OpenReadAsync(string column, string name, CancellationToken ct)
     {
         OffloadBlobNames.ThrowIfNotAddressable(name);
