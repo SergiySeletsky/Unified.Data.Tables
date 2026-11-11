@@ -14,11 +14,16 @@ namespace Unified.Data.Tables;
 /// <para>
 /// On a property declared on an interface the attribute is a misuse: .NET does not pass the attributes of
 /// an interface member to the class that implements it, so it cannot be honoured. It makes no type
-/// large-value aware and lists no large-value column. Every write or read that meets a class implementing
-/// the interface throws <see cref="System.InvalidOperationException"/> before anything is stored (a value of
-/// such a class is never trimmed), naming the interface member and the remedy: put the attribute on the
-/// property of the implementing class, or on that class (and, where an entity holds the implementation in
-/// a property declared as the interface, on the entity class too).
+/// large-value aware and lists no large-value column. Every write or read that flattens a class
+/// implementing the interface into columns (the entity, or a property that flattens into columns) throws
+/// <see cref="System.InvalidOperationException"/> before anything is stored (a value of such a class is
+/// never trimmed), naming the interface member and the remedy: put the attribute on the property of the
+/// implementing class, or on that class (and, where an entity holds the implementation in a property
+/// declared as the interface, on the entity class too). A builder partial update is refused with the same
+/// exception before anything is written when the entity type, or the declared type of a property along
+/// the updated path, is or implements such an interface. An instance held in a JSON-stored property (a
+/// collection, or a type stored as one JSON cell) is not checked: it is written as JSON like every other
+/// value of that cell, and a trimming <c>OversizedCellPolicy</c> can trim that cell.
 /// </para>
 /// <para>
 /// A store treats its entity type as large-value aware (it plans split cells, continuation rows and blobs)

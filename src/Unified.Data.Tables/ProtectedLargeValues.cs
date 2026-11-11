@@ -98,7 +98,7 @@ public static class ProtectedLargeValues
 
     /// <summary>
     /// Storage-provider SPI, not for application code. True when the value <paramref name="written"/> to a
-    /// large-value property leaves the <paramref name="stored"/> one as it is: the same instance; two
+    /// large-value property, or to a <c>byte[]</c> property, leaves the <paramref name="stored"/> one as it is: the same instance; two
     /// <see cref="TableBlobContent"/> of the same blob (the same SHA-256, length and content type, both known);
     /// two <c>byte[]</c> with the same bytes; otherwise <see cref="object.Equals(object, object)"/>. A content
     /// whose hash is not known yet (a stream that was never prepared) counts as changed: nothing is downloaded
