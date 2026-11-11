@@ -372,8 +372,9 @@ public sealed class LargeValueTable
     /// <returns>A task that completes when every content is sealed.</returns>
     /// <exception cref="InvalidOperationException">A content of the entity can no longer be written: its
     /// source stream was partly read by a failed write and cannot be read again from where the content
-    /// starts, its temporary copy was released by a failed write, or its source stream was already read by
-    /// another write and cannot deliver its bytes again.</exception>
+    /// starts, its temporary copy was released by a failed write, its source stream (or a stream below it)
+    /// was read part-way or could not be put back by another write, or a write that has not committed read
+    /// it to its end and it delivers nothing now.</exception>
     /// <exception cref="NotSupportedException">The entity is a subclass of the store's entity type and holds
     /// a <see cref="TableBlobContent"/> in a column the store's type does not read back (refused before the
     /// content's stream is read).</exception>
@@ -387,6 +388,15 @@ public sealed class LargeValueTable
     /// <param name="entity">The entity that was being written.</param>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public static void ReleasePrepared(object entity) => ValueOffloadCoordinator.ReleasePrepared(entity);
+
+    /// <summary>
+    /// Storage-provider SPI, not for application code. Tells the large-value layer that the row (or the
+    /// transaction) writing <paramref name="entity"/> committed: the callers' streams its contents read to
+    /// their end are forgotten, so a later content over the same stream object is a new payload.
+    /// </summary>
+    /// <param name="entity">The entity that was written.</param>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static void Committed(object entity) => ValueOffloadCoordinator.Committed(entity);
 
     /// <summary>
     /// Storage-provider SPI, not for application code. Serializes <paramref name="entity"/> onto a

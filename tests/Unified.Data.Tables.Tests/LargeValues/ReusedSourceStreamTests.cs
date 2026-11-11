@@ -290,24 +290,23 @@ public class ReusedSourceStreamTests(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// A forward-only stream that a successful write has read: a new content over it would store
-    /// nothing, and is refused before anything is uploaded.
+    /// A forward-only stream that a successful write has read: that write committed, so the stream is
+    /// forgotten and a new content over the same object is a new payload, whatever it delivers, an empty
+    /// one included (ruling R9 point 1 of fix wave 4, CONTENT-1: a server reuses one request-body object
+    /// for every request of a connection). Before R9 this content was refused for the life of the stream.
+    /// The refusal after a write that did NOT commit is <see cref="MutateAsync_SettingAFileFromAForwardOnlyStream_RetriedAfterAConflict_IsRefusedAndKeepsThePreviousFile"/>.
     /// </summary>
     [Fact]
-    public async Task ANewContentOverAForwardOnlyStreamThatAWriteHasRead_IsRefusedBeforeAnythingIsUploaded()
+    public async Task ANewContentOverAForwardOnlyStreamThatACommittedWriteHasRead_IsANewPayload_AnEmptyOneIncluded()
     {
         var data = RandomBytes(Size, seed: 213);
         var store = Store();
         var stream = new FaultyContentStream(data, seekable: false);
         await store.CreateAsync(new FileEntity { Id = "p|a", File = File(stream) }, Ct);
-        var blobs = store.OffloadedBlobNames();
 
-        var refused = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => store.CreateAsync(new FileEntity { Id = "p|b", File = File(stream) }, Ct));
+        await store.CreateAsync(new FileEntity { Id = "p|b", File = File(stream) }, Ct);
 
-        AssertAlreadyReadForwardOnly(refused);
-        Assert.Null(await store.OneAsync("p|b", Ct));
-        Assert.Equal(blobs, store.OffloadedBlobNames());
+        Assert.Equal(0, (await store.OneAsync("p|b", Ct))!.File!.Length);
         Assert.Equal(data, await ReadFileAsync((await store.OneAsync("p|a", Ct))!.File!));
     }
 

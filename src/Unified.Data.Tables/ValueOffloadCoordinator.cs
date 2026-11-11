@@ -67,8 +67,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// be put back, and a forward-only one that was partly consumed, make the content unusable: this and
     /// every later write of it throws before anything is read or uploaded. So does a content whose
     /// temporary copy an earlier failed write released (<see cref="ReleasePrepared"/>), and a new content
-    /// over a stream that a write has already read (a forward-only stream, or a seekable one that could
-    /// not be put back where its content started).
+    /// whose stream, or a stream below it that a framework wrapper exposes, a write read part-way or could
+    /// not put back where its content started. A new content over a stream that a write which has not
+    /// committed (<see cref="Committed"/>) read to its end is read, and refused when it delivers nothing.
     /// <para>
     /// A content held by several writes at once is prepared by one of them; the others wait for it and
     /// find it prepared. Each content is waited for on its own, never two at a time.
@@ -76,8 +77,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// </remarks>
     /// <exception cref="InvalidOperationException">
     /// A content can no longer be written: its source was partly read by a failed write and cannot be
-    /// read again from where the content starts, its temporary copy was released by a failed write, or
-    /// its source stream was already read by another write and cannot deliver its bytes again.
+    /// read again from where the content starts, its temporary copy was released by a failed write, its
+    /// source stream (or a stream below it) was read part-way or could not be put back by another write,
+    /// or a write that has not committed read it to its end and it delivers nothing now.
     /// </exception>
     internal async Task PrepareAsync(object entity, CancellationToken ct)
     {
@@ -132,16 +134,16 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                     ?? throw new InvalidOperationException($"The TableBlobContent of '{column}' has no content to read.");
                 // Before the first read: a write cancelled by now has not touched the source.
                 ct.ThrowIfCancellationRequested();
-                // A stream a write has already read (a forward-only one, or one it could not put back) is
-                // refused before this content reads any of it.
-                if (!content.HasSourceOrigin)
-                    content.ClaimSource(column);
+                // A stream a write has read part-way, or could not put back, is refused before this content
+                // reads any of it. One that a write which has not committed read to its end is read: a new
+                // payload is stored, nothing at all is refused (the retry that would store an empty file).
+                var consumed = !content.HasSourceOrigin && content.ClaimSource(column);
                 // A source that was seekable when it was first prepared stays on this path: it is read from
                 // the recorded origin or not at all, never from wherever it stands now.
                 if (content.HasSourceOrigin || source.CanSeek)
-                    await HashSeekableAsync(column, content, source, ct);
+                    await HashSeekableAsync(column, content, source, consumed, ct);
                 else
-                    await SpoolAsync(content, source, ct);
+                    await SpoolAsync(column, content, source, consumed, ct);
             }
             finally
             {
@@ -152,7 +154,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     // Hashes a seekable source in one pass from where its content starts and puts it back there: for
     // the upload when the pass succeeded, for a retry when it failed or was cancelled.
-    private static async Task HashSeekableAsync(string column, TableBlobContent content, Stream source, CancellationToken ct)
+    private static async Task HashSeekableAsync(string column, TableBlobContent content, Stream source, bool consumed, CancellationToken ct)
     {
         var origin = content.RewindSource(column);
         long length;
@@ -167,23 +169,27 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             content.RestoreSource();
             throw;
         }
+        if (consumed && length == 0)
+            throw content.RefuseEmptyAfterConsumed(column);
         content.Seal(length, sha);
     }
 
     // Copies a forward-only source, while hashing it, to a delete-on-close temporary file that becomes
-    // the upload source. A copy that fails or is cancelled has consumed part of the source for good.
-    private static async Task SpoolAsync(TableBlobContent content, Stream source, CancellationToken ct)
+    // the upload source. A copy that fails or is cancelled has consumed part of the source for good. A
+    // source whose chain an uncommitted write read to its end (consumed) and that delivers nothing is refused.
+    private static async Task SpoolAsync(string column, TableBlobContent content, Stream source, bool consumed, CancellationToken ct)
     {
         var spool = new FileStream(
             Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()),
             FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, CopyBufferBytes,
             FileOptions.DeleteOnClose | FileOptions.Asynchronous);
+        long length;
+        string sha;
         try
         {
-            var (length, sha) = await CopyHashingAsync(source, spool, ct);
+            (length, sha) = await CopyHashingAsync(source, spool, ct);
             await spool.FlushAsync(ct);
             spool.Position = 0;
-            content.Seal(length, sha, spool);
         }
         catch
         {
@@ -191,6 +197,13 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             content.LoseSource();
             throw;
         }
+        if (consumed && length == 0)
+        {
+            await spool.DisposeAsync();
+            throw content.RefuseEmptyAfterConsumed(column);
+        }
+        content.EndSourceRead(complete: true);
+        content.Seal(length, sha, spool);
     }
 
     /// <summary>
@@ -373,8 +386,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             // does each cached copy of that entity), so it stays bound where it is, and the entity being
             // written gets a content of its own, bound to the blob its own row references. A property that
             // cannot be assigned keeps the instance as it is.
+            // It also forgets, when its write commits, the streams the shared instance read (R9).
             blob.Assign?.Invoke(TableBlobContent.Bound(
-                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column, store));
+                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column, store).KeepingStreamsOf(content));
         }
     }
 
@@ -389,6 +403,18 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         ArgumentNullException.ThrowIfNull(entity);
         foreach (var (_, content) in TableEntitySerializer.FindBlobContents(entity))
             content.ReleasePrepared();
+    }
+
+    /// <summary>
+    /// The row (or the transaction) that writes <paramref name="entity"/> committed: the callers' streams
+    /// its contents read to their end are forgotten, so a later content over the same stream object is a
+    /// new payload (ruling R9 point 1). A write that fails leaves them listed (see <see cref="PrepareAsync"/>).
+    /// </summary>
+    internal static void Committed(object entity)
+    {
+        ArgumentNullException.ThrowIfNull(entity);
+        foreach (var (_, content) in TableEntitySerializer.FindBlobContents(entity))
+            content.Committed();
     }
 
     /// <summary>How many times a create-only upload that lost its blob to a concurrent delete is retried in all.</summary>
