@@ -871,7 +871,8 @@ its message ends with what to do. `OffloadForbiddenByProperty` is `true` when bl
 and the property forbids it (set its `Offload` to `BlobOffload.AboveThreshold`). When it is `false`,
 follow the message: configure `UnifiedTableStorageOptions.BlobOffload` when a value needs a blob and no
 offload is configured; mark the large properties (or the class) `[TableValueSplit]`, or store less in
-one entity, when the bytes of the cells that must stay on the main row are what does not fit. When their
+one entity, when the bytes of the cells that must stay on the main row are what does not fit (for a value
+that a read would not return into a large-value member, see [Tiers](#tiers)). When their
 bytes fit but the main row has no property left for the cells of its split values (see
 [Tiers](#tiers)), `ColumnName` is the largest split value, `EncodedBytes` its own encoded size, and the
 message says how many properties its cells need and how many of the 252 the other properties leave. The
@@ -903,7 +904,15 @@ A moved value keeps four cells on the main row where it had one, so the limit of
 what stops it; the `OversizedValueException` then says so. A value that a read would not return into a
 large-value member (see [above](#large-values-split-and-blob-offload)) is never moved: it stays in its
 cell, the other values are moved instead, and when moving them is not enough the write throws
-`OversizedValueException` before anything is stored.
+`OversizedValueException` before anything is stored. When the bytes of the cells that must stay on the
+main row are what does not fit, the exception names the largest of those cells, and its message advises
+marking the large properties (or the class) `[TableValueSplit]`, or storing less in one entity. When that
+cell is such a value, the value is opted in already, and marking the entity class does not reach a value
+below a nested object: to let that value move, use a remedy that the refusal of such a value names
+(above; below a nested object, an instance of the runtime type in the property that holds it, put there
+by the constructor, that property declared with the runtime type, or `[TableValueSplit]` on the member of
+the declared type). Marking the other large properties, or the class, still lets the other values move,
+which can be enough.
 
 One entity holds 252 properties besides `PartitionKey`, `RowKey` and `Timestamp`. A split value keeps its
 four manifest cells on the main row besides its chunks, a row with split values keeps its part count

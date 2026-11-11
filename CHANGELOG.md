@@ -563,7 +563,10 @@ Lossless storage of large values, opt-in per property.
   limits; when their number does (no property left for the cells of the split values), it names the
   largest split value with its own encoded size. It no longer names the row key or the size of a hash
   cell, and it does not advise configuring `BlobOffload` when ordinary cells are what does not fit, nor
-  marking `[TableValueSplit]` a property that already is.
+  marking `[TableValueSplit]` a property that already is, except for a value that a read would not return
+  into a large-value member, which stays on the main row: when it is the largest cell there, the message
+  names it and advises marking the large properties (or the class), although that value is opted in
+  already (a remedy that its refusal names lets it move, see Added).
 - A large value that cannot be set on its property (the property's type changed since the row was written)
   is reported with at most 200 characters of the value and its total length, not with the whole value in
   the `SerializationException` message.
