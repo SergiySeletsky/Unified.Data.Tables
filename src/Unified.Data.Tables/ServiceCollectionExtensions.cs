@@ -32,14 +32,24 @@ public static partial class ServiceCollectionExtensions
     /// </summary>
     /// <remarks>
     /// The first call's options are the registered ones; the options of a later call (of any overload) are
-    /// not used. A later call still does one thing: when the registered options set
-    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> and no call has supplied the offload blob client
-    /// yet (for example because the first call was this overload, which derives none), it supplies that
-    /// client if it can, by the same rule as a first call: its own
+    /// not used. The blob client every store uses follows from the registered (unkeyed) options, whoever
+    /// registered them (a call of the library, or the host as an instance, a factory or a type): their
+    /// <see cref="BlobOffloadOptions.ServiceClient"/>; else, when they set
+    /// <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/>, the host's registered client and no other
+    /// one; only when they choose neither, the client a call supplied. A later call therefore still does one
+    /// thing: when the registered options set <see cref="UnifiedTableStorageOptions.BlobOffload"/>, choose no
+    /// client, and no call has supplied one yet (for example because the first call was this overload,
+    /// which derives none), it supplies that client if it can, by the same rule as a first call: its own
     /// <see cref="BlobOffloadOptions.ServiceClient"/>, else the host's registered client when it sets
     /// <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/>, else the client its connection string or
     /// endpoint derives. A client an earlier call supplied is never replaced, and the registered options
-    /// object is not changed.
+    /// object is not changed. Options registered through a factory or a type are read when the container
+    /// builds them; beside such options a later call offers its client only when it has one to offer, so
+    /// options of that kind that set <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/> get the
+    /// host's client only after a call that offers a client of its own (a connection-string or credential
+    /// overload, or a call that sets <see cref="UnifiedTableStorageOptions.BlobOffload"/> with a
+    /// <see cref="BlobOffloadOptions.ServiceClient"/> or <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/>);
+    /// otherwise a large-value store fails to resolve with <see cref="InvalidOperationException"/>.
     /// </remarks>
     public static IServiceCollection AddUnifiedTableStorage(
         this IServiceCollection services, Action<UnifiedTableStorageOptions>? configure = null) =>
@@ -54,14 +64,16 @@ public static partial class ServiceCollectionExtensions
     /// <see cref="BlobServiceClient"/> built from the same string if it has a blob endpoint (a
     /// <c>BlobEndpoint</c>, <c>UseDevelopmentStorage=true</c>, or an <c>AccountName</c> without a table
     /// endpoint or on an Azure Storage table host). That client is private to the library: nothing is
-    /// registered as the <see cref="BlobServiceClient"/> service. When an earlier call already registered
-    /// options that set <see cref="UnifiedTableStorageOptions.BlobOffload"/> without supplying the blob
-    /// client, this call supplies it the same way (see the remarks on
+    /// registered as the <see cref="BlobServiceClient"/> service. When options already registered (by an
+    /// earlier call or by the host) set <see cref="UnifiedTableStorageOptions.BlobOffload"/>, choose no blob
+    /// client and no call has supplied one, this call supplies it the same way; a client the registered
+    /// options choose is never replaced (see the remarks on
     /// <see cref="AddUnifiedTableStorage(IServiceCollection, Action{UnifiedTableStorageOptions}?)"/>).
     /// </summary>
     /// <exception cref="ArgumentException">
-    /// Blob offload is configured, this call is the one to supply its client, and the string names a blob
-    /// endpoint the Blobs SDK rejects.
+    /// Blob offload is configured, this call is the one to supply its client (the registered options, this
+    /// call's own or an instance registered before it, ask for blob offload, choose no client, and no call
+    /// has supplied one), and the string names a blob endpoint the Blobs SDK rejects.
     /// </exception>
     public static IServiceCollection AddUnifiedTableStorage(
         this IServiceCollection services, string connectionString,
@@ -85,9 +97,10 @@ public static partial class ServiceCollectionExtensions
     /// Storage table host (<c>{account}.table.core.{suffix}</c>, in any cloud), blob offload uses a
     /// <see cref="BlobServiceClient"/> for the same account (<c>.blob.core.</c>) and credential, private to
     /// the library. For any other host (Cosmos DB Table API, an emulator, a custom domain) supply the blob
-    /// client through <see cref="BlobOffloadOptions.ServiceClient"/>. When an earlier call already registered
-    /// options that set <see cref="UnifiedTableStorageOptions.BlobOffload"/> without supplying the blob
-    /// client, this call supplies it the same way (see the remarks on
+    /// client through <see cref="BlobOffloadOptions.ServiceClient"/>. When options already registered (by an
+    /// earlier call or by the host) set <see cref="UnifiedTableStorageOptions.BlobOffload"/>, choose no blob
+    /// client and no call has supplied one, this call supplies it the same way; a client the registered
+    /// options choose is never replaced (see the remarks on
     /// <see cref="AddUnifiedTableStorage(IServiceCollection, Action{UnifiedTableStorageOptions}?)"/>).
     /// </summary>
     /// <param name="services">The service collection.</param>
@@ -127,15 +140,32 @@ public static partial class ServiceCollectionExtensions
             // The offload client follows the options that register: only when blob offload is
             // configured, and only under the library's own key.
             if (options.BlobOffload is { } offload)
-                RegisterOffloadClient(services, offload, derivedBlobClient);
+                RegisterOffloadClient(services, SuppliedClient(offload, derivedBlobClient));
         }
-        else if (RegisteredOptions(services)?.BlobOffload is not null && !OffloadClientRegistered(services))
+        else if (!OffloadClientRegistered(services))
         {
-            // The registered options stay as they are and still decide everything else. They ask for
-            // blob offload, though, and no call has supplied its client yet (typically the first call
-            // was the overload without a connection string): this call supplies it if it can, by the
-            // same rule as a first call. Dropping it left every large-value store unresolvable.
-            RegisterOffloadClient(services, options.BlobOffload, derivedBlobClient);
+            // The registered options stay as they are and still decide everything else, the blob client
+            // first: the order of choice applies to THEM, whoever registered them. Only when they ask for
+            // blob offload and choose no client does this call supply one, by its own rule (dropping it
+            // left every large-value store unresolvable).
+            var registered = RegisteredOptions(services);
+            if (registered?.ImplementationInstance is UnifiedTableStorageOptions known)
+            {
+                // Options registered as an instance can be read now. Their ServiceClient needs no
+                // registration (TableStorage<T> takes it from them); UseRegisteredServiceClient means the
+                // host's client and no other one, so this call derives nothing.
+                if (known.BlobOffload is { ServiceClient: null } offload)
+                    RegisterOffloadClient(services, offload.UseRegisteredServiceClient
+                        ? HostsClient
+                        : SuppliedClient(options.BlobOffload, derivedBlobClient));
+            }
+            else if (registered is not null)
+            {
+                // A factory or a type: the options cannot be read before the container builds them, so
+                // the choice is made then (ChooseOffloadClient). This call only offers its own client;
+                // one that cannot be built is not offered, as those options may never need it.
+                RegisterOffloadClient(services, SuppliedClientIfItCanBeBuilt(options.BlobOffload, derivedBlobClient));
+            }
         }
 
         services.AddMemoryCache();
@@ -144,12 +174,11 @@ public static partial class ServiceCollectionExtensions
         return services;
     }
 
-    // The options TableStorage<T> will be given: the last unkeyed registration, as the container
-    // resolves it. Null when there is none, or when the host registered them as a type or a factory,
+    // The registration of the options TableStorage<T> will be given: the last unkeyed one, as the
+    // container resolves it. Its instance is null when the host registered them as a type or a factory,
     // which cannot be read before the container is built.
-    private static UnifiedTableStorageOptions? RegisteredOptions(IServiceCollection services) =>
-        services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions))
-            ?.ImplementationInstance as UnifiedTableStorageOptions;
+    private static ServiceDescriptor? RegisteredOptions(IServiceCollection services) =>
+        services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions));
 
     // Whether a call has already registered the offload client (an instance, or the factory that
     // resolves the host's client): that choice is kept, so a later call never replaces it.
@@ -157,28 +186,60 @@ public static partial class ServiceCollectionExtensions
         services.Any(d => d.IsKeyedService && d.ServiceType == typeof(BlobServiceClient)
             && OffloadBlobServiceClientKey.Equals(d.ServiceKey));
 
-    // The rule, in order: BlobOffloadOptions.ServiceClient; the host's registered BlobServiceClient when
-    // UseRegisteredServiceClient is set (resolved lazily, so the host may register it after this call);
-    // the client the overload derives from its connection string or endpoint. None of them is ever
-    // registered as the unkeyed BlobServiceClient. A factory that finds no client yields null, which
-    // leaves TableStorage<T> without one; only a large-value-aware T refuses that. A later call whose
-    // own options set no BlobOffload (offload is null) can only contribute the derived client.
-    private static void RegisterOffloadClient(
-        IServiceCollection services, BlobOffloadOptions? offload, Func<BlobServiceClient?>? derivedBlobClient)
+    // What one call supplies, by the rule, in order: its BlobOffloadOptions.ServiceClient; the host's
+    // registered BlobServiceClient when it sets UseRegisteredServiceClient (resolved lazily, so the host
+    // may register it after this call); the client its overload derives from its connection string or
+    // endpoint (built now, so a malformed blob endpoint fails this call). Null when it supplies none. A
+    // call whose own options set no BlobOffload (offload is null) can only supply the derived client.
+    private static Func<IServiceProvider, BlobServiceClient?>? SuppliedClient(
+        BlobOffloadOptions? offload, Func<BlobServiceClient?>? derivedBlobClient)
     {
         if (offload?.ServiceClient is { } explicitClient)
-        {
-            services.TryAddKeyedSingleton(OffloadBlobServiceClientKey, explicitClient);
-            return;
-        }
+            return _ => explicitClient;
         if (offload is { UseRegisteredServiceClient: true })
+            return HostsClient;
+        return derivedBlobClient?.Invoke() is { } derived ? _ => derived : null;
+    }
+
+    // The same, for a call beside options that cannot be read yet: a client its string cannot build is
+    // not offered (and fails nothing), since those options may name their own client or none at all.
+    private static Func<IServiceProvider, BlobServiceClient?>? SuppliedClientIfItCanBeBuilt(
+        BlobOffloadOptions? offload, Func<BlobServiceClient?>? derivedBlobClient)
+    {
+        try
         {
-            services.TryAddKeyedSingleton<BlobServiceClient>(OffloadBlobServiceClientKey,
-                (sp, _) => sp.GetService<BlobServiceClient>()!);
-            return;
+            return SuppliedClient(offload, derivedBlobClient);
         }
-        if (derivedBlobClient?.Invoke() is { } derived)
-            services.TryAddKeyedSingleton(OffloadBlobServiceClientKey, derived);
+        catch (ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private static BlobServiceClient? HostsClient(IServiceProvider provider) => provider.GetService<BlobServiceClient>();
+
+    // Registers the offload client under the library's key, once: the first client a call supplies is
+    // kept. Nothing is ever registered as the unkeyed BlobServiceClient. The order of choice is applied
+    // when the container builds the client, to the options every store receives (whoever registered
+    // them, as an instance, a factory or a type): their ServiceClient; the host's client when they set
+    // UseRegisteredServiceClient, and then no other one; else the client a call supplied. A null result
+    // leaves TableStorage<T> without one; only a large-value-aware T refuses that.
+    private static void RegisterOffloadClient(IServiceCollection services, Func<IServiceProvider, BlobServiceClient?>? supplied)
+    {
+        if (supplied is null)
+            return;
+        services.TryAddKeyedSingleton<BlobServiceClient>(OffloadBlobServiceClientKey,
+            (sp, _) => ChooseOffloadClient(sp, supplied)!);
+    }
+
+    private static BlobServiceClient? ChooseOffloadClient(IServiceProvider provider, Func<IServiceProvider, BlobServiceClient?> supplied)
+    {
+        var offload = provider.GetService<UnifiedTableStorageOptions>()?.BlobOffload;
+        if (offload?.ServiceClient is { } named)
+            return named;
+        if (offload is { UseRegisteredServiceClient: true })
+            return HostsClient(provider);
+        return supplied(provider);
     }
 
     // True for an Azure Storage connection string that names or implies a blob endpoint: an explicit
