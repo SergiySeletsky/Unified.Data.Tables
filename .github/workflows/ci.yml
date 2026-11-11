@@ -1,0 +1,51 @@
+name: CI
+
+# The check that gates a change on the build and the tests. It needs no secret, so it runs the same
+# for a pull request from a fork, and its result does not depend on the SonarQube analysis
+# (sonarqube.yml), which needs a token and can fail for reasons that have nothing to do with the code.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # The Azurite integration tests must run, not skip: start the emulator (pinned, same image, flags
+      # and ports as publish.yml) and make an unreachable one a test failure.
+      - name: Start Azurite
+        shell: bash
+        run: |
+          docker run -d --name azurite -p 10000:10000 -p 10002:10002 \
+            mcr.microsoft.com/azure-storage/azurite:3.35.0 \
+            azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --loose --skipApiVersionCheck
+          for port in 10000 10002; do
+            for attempt in $(seq 1 60); do
+              if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then break; fi
+              if [ "$attempt" = 60 ]; then echo "Azurite did not open port $port"; docker logs azurite; exit 1; fi
+              sleep 1
+            done
+          done
+
+      # One command per step: the step fails exactly when its command does.
+      - name: Build
+        run: dotnet build Unified.Data.Tables.slnx -c Release
+
+      - name: Test
+        env:
+          UNIFIED_TABLES_REQUIRE_AZURITE: "1"
+        run: dotnet test Unified.Data.Tables.slnx -c Release --no-build
