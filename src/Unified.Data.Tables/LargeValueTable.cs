@@ -467,6 +467,19 @@ public sealed class LargeValueTable
         }
     }
 
+    /// <summary>
+    /// Storage-provider SPI, not for application code. The time of a commit that released blobs, on the
+    /// clock cleanup measures their age with, for a cleanup that runs later
+    /// (<see cref="DeleteReleasedBlobsAsync"/>, <c>serviceNow</c>): a batch deletes the blobs its
+    /// transactions released only after its last transaction has committed, and the grace of each is
+    /// counted from the commit that released it. Null when this table never deletes a released blob.
+    /// </summary>
+    /// <param name="ct">Cancels the read of the blob store's clock.</param>
+    /// <returns>The blob store's time now (the client clock less <see cref="ClientClockMargin"/> when it cannot tell), or null.</returns>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<DateTimeOffset?> CommitTimeAsync(CancellationToken ct) =>
+        blobs is null || NeverCleansUp ? null : await ServiceNowAsync(ct);
+
     // The paths that are blobs of the row itself: offload-shaped names under {table}/{pk}/{rk}/. Every
     // blob a write of the row uploads has such a name, so anything else was not written for this row: a
     // row copied raw from another table, or to another row key, still references the source row's

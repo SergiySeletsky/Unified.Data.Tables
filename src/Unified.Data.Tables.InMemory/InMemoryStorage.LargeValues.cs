@@ -267,11 +267,16 @@ public sealed partial class InMemoryStorage<T>
     private sealed record BatchUnit(
         T Entity, (string PartitionKey, string RowKey) Keys, PriorRow? Prior, LargeValueWritePlan Plan, Dictionary<string, long>? OwnParts);
 
+    /// <summary>The blobs one committed batch transaction released from one row, and the time of that commit.</summary>
+    private sealed record ReleasedBlobs((string PartitionKey, string RowKey) Keys, List<string> Paths, DateTimeOffset? CommittedAt);
+
     /// <summary>
     /// The batch contract of TableStorage&lt;T&gt;: per partition, each entity's rows are one indivisible
     /// unit, packed in order into the same transactions (<see cref="LargeValueTable.PlanTransactions"/>),
-    /// each applied atomically under the gate. A transaction's blobs are uploaded just before it, and
-    /// released ones deleted after each commit. A repeated key in a create batch was
+    /// each applied atomically under the gate. A transaction's blobs are uploaded just before it; the
+    /// released ones are deleted once, after the last transaction committed, each on condition of the grace
+    /// counted from the commit that released it (a later entity may hold a content read from one of them).
+    /// A batch that fails part way deletes none of them; the orphan sweep does. A repeated key in a create batch was
     /// refused before this point; in an upsert batch its last occurrence is written. An existing key fails
     /// its create transaction; an upsert transaction that lost a race is planned again and retried (five
     /// attempts in all, with a short pause before each retry, as TableStorage). A
@@ -295,11 +300,18 @@ public sealed partial class InMemoryStorage<T>
         {
             foreach (var (_, entity) in writes)
                 await large.PrepareAsync(entity, ct);
+            var released = new List<ReleasedBlobs>();
             foreach (var group in writes.GroupBy(w => w.Keys.Item1, StringComparer.Ordinal))
             {
                 var units = await PlanBatchUnitsAsync(group.Select(g => g.Entity).ToList(), kind, takeBack: null, ct);
-                await CommitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, ct);
+                await CommitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, released, ct);
             }
+
+            // Every transaction committed, so no content of the batch is still to be read from a released
+            // blob (a cancelled token only bounds how long cleanup may take).
+            foreach (var row in released)
+                await large.DeleteReleasedBlobsAsync(row.Keys.PartitionKey, row.Keys.RowKey, row.Paths, row.CommittedAt,
+                    onForeign: null, onFailure: null, ct);
         }
         finally
         {
@@ -345,7 +357,8 @@ public sealed partial class InMemoryStorage<T>
         return units;
     }
 
-    private async Task CommitBatchUnitsAsync(List<BatchUnit> units, LargeWriteKind kind, int attempt, HashSet<string>? takeBack, CancellationToken ct)
+    private async Task CommitBatchUnitsAsync(
+        List<BatchUnit> units, LargeWriteKind kind, int attempt, HashSet<string>? takeBack, List<ReleasedBlobs> released, CancellationToken ct)
     {
         foreach (var range in LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList()))
         {
@@ -417,17 +430,21 @@ public sealed partial class InMemoryStorage<T>
                 if (lostRace)
                     await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
-                await CommitBatchUnitsAsync(replanned, kind, attempt + 1, taking, ct);
+                await CommitBatchUnitsAsync(replanned, kind, attempt + 1, taking, released, ct);
                 continue;
             }
 
-            // Committed: the blobs only the replaced rows referenced go (a cancelled token only bounds it).
+            // Committed: the blobs only the replaced rows referenced go once the whole batch has committed,
+            // their grace counted from now (the committed transaction is not failed by a cancelled token).
             AfterLargeCommit?.Invoke();
+            DateTimeOffset? committedAt = null;
             foreach (var unit in chunk)
             {
                 if (unit.Prior is { Blobs.Count: > 0 })
-                    await large.DeleteReleasedBlobsAsync(unit.Keys.PartitionKey, unit.Keys.RowKey,
-                        unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), serviceNow: null, onForeign: null, onFailure: null, ct);
+                {
+                    committedAt ??= await large.CommitTimeAsync(CancellationToken.None);
+                    released.Add(new ReleasedBlobs(unit.Keys, [.. unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal)], committedAt));
+                }
             }
         }
     }

@@ -817,13 +817,20 @@ public partial class TableStorage<T>
     /// </summary>
     private sealed record BatchUnit(T Entity, string Pk, string Rk, PriorRow? Prior, LargeValueWritePlan Plan, Dictionary<string, ETag>? OwnParts);
 
+    /// <summary>The blobs one committed batch transaction released from one row, and the service time of that commit.</summary>
+    private sealed record ReleasedBlobs(string Pk, string Rk, List<string> Paths, DateTimeOffset? CommittedAt);
+
     /// <summary>
     /// A split-aware batch, with the plain batch's contract: per partition, each entity's rows (primary,
     /// continuation rows, stale-part deletes) are one indivisible unit, and the units are packed in order
     /// into entity-group transactions (<see cref="LargeValueTable.PlanTransactions"/>), each atomic. The
     /// blobs a transaction's rows reference are uploaded (create-only) just before that transaction, so a
-    /// blob waits for its row no longer than in a single write; after each transaction commits, the blobs
-    /// only the replaced rows referenced are deleted (best effort). A
+    /// blob waits for its row no longer than in a single write. The blobs only the replaced rows referenced
+    /// are deleted (best effort) once, after the last transaction of the call has committed, each on
+    /// condition of the cleanup grace counted from the commit that released it: an entity of a later
+    /// transaction may hold a content read from such a blob, and it is read when that entity's upload runs.
+    /// A batch that fails part way deletes none of them (the orphan sweep does), so every entity it did not
+    /// write keeps a readable content and the same batch can be sent again. A
     /// key repeated in a create batch throws <see cref="DuplicateKeyException"/> before anything is
     /// written; in an upsert batch its last occurrence is written. An existing key fails its create
     /// transaction (<see cref="DuplicateKeyException"/>); earlier transactions stay committed. An upsert
@@ -851,11 +858,18 @@ public partial class TableStorage<T>
             // Hash every TableBlobContent once (a non-seekable one is copied to a temporary file).
             foreach (var entity in writes)
                 await large.PrepareAsync(entity, ct);
+            var released = new List<ReleasedBlobs>();
             foreach (var group in writes.GroupBy(e => GetEntityKeys(e.Id).PartitionKey, StringComparer.Ordinal))
             {
                 var units = await PlanBatchUnitsAsync([.. group], kind, takeBack: null, ct);
-                await SubmitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, ct);
+                await SubmitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, released, ct);
             }
+
+            // Every transaction committed: nothing of the batch is left to upload, so no blob a content of
+            // it is read from can be needed any more. A committed write is never reported as failed: a
+            // cancelled token only bounds how long cleanup may take.
+            foreach (var row in released)
+                await DeleteBlobsAsync(row.Pk, row.Rk, row.Paths, row.CommittedAt, ct);
         }
         finally
         {
@@ -917,7 +931,8 @@ public partial class TableStorage<T>
     }
 
     private async Task SubmitBatchUnitsAsync(
-        List<BatchUnit> units, LargeWriteKind kind, int attempt, Dictionary<string, Dictionary<string, ETag>?>? takeBack, CancellationToken ct)
+        List<BatchUnit> units, LargeWriteKind kind, int attempt, Dictionary<string, Dictionary<string, ETag>?>? takeBack,
+        List<ReleasedBlobs> released, CancellationToken ct)
     {
         foreach (var range in LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList()))
         {
@@ -950,7 +965,7 @@ public partial class TableStorage<T>
                         throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
                     await large.WaitBeforeRetryAsync(attempt + 1, ct);
                     var again = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
-                    await SubmitBatchUnitsAsync(again, kind, attempt + 1, takeBack, ct);
+                    await SubmitBatchUnitsAsync(again, kind, attempt + 1, takeBack, released, ct);
                     continue;
                 }
                 if (attempt >= MaxLargeWriteAttempts)
@@ -968,7 +983,7 @@ public partial class TableStorage<T>
                         taking.TryAdd(other.Rk, null);
                 }
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
-                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, released, ct);
                 continue;
             }
             catch (RequestFailedException ex) when (kind == LargeWriteKind.Create && ex.Status == 409 && IsBatchPrimaryFailure(ex, owners))
@@ -984,16 +999,16 @@ public partial class TableStorage<T>
                     throw new ConcurrencyConflictException(typeName, FailedId(ex, owners, chunk), ex);
                 await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
-                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, released, ct);
                 continue;
             }
 
-            // The transaction committed: the blobs only the replaced rows referenced can go. A committed
-            // write is never reported as failed: a cancelled token only bounds how long cleanup may take.
+            // The transaction committed: the blobs only the replaced rows referenced can go, once the whole
+            // batch has committed (a later transaction may still read one of them as a content's source).
             foreach (var unit in chunk)
             {
                 if (unit.Prior is { Blobs.Count: > 0 })
-                    await DeleteBlobsAsync(unit.Pk, unit.Rk, unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), committedAt, ct);
+                    released.Add(new ReleasedBlobs(unit.Pk, unit.Rk, [.. unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal)], committedAt));
             }
         }
     }
