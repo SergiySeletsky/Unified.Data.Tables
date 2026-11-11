@@ -187,7 +187,8 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// Makes every pending blob exist: one with the same name and hash is touched (refreshing its
     /// <c>Last-Modified</c>) and its bytes are not sent again; an absent one is uploaded create-only
     /// through a read that verifies the bytes still match what was prepared. Each
-    /// <see cref="TableBlobContent"/> is then bound to its blob.
+    /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob
+    /// stays bound there, and the property it was written from gets a content bound to this one.
     /// </summary>
     /// <exception cref="BlobOffloadNotConfiguredException">Blob offload is not configured.</exception>
     /// <exception cref="InvalidOperationException">A source changed after it was prepared.</exception>
@@ -227,9 +228,21 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         // from the same prepared source, and binding releases that source.
         foreach (var blob in pending)
         {
+            if (blob.Content is not { } content)
+                continue;
             var name = blob.Reference.Path;
             var column = blob.Column;
-            blob.Content?.Bind(name, c => OpenLazyAsync(store, column, name, c), column);
+            Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, c);
+            if (content.Bind(name, open, column))
+                continue;
+
+            // The content already streams another blob: it was read from another row, or it is on another
+            // property or entity as well. That instance is shared (the entity it came from holds it, and so
+            // does each cached copy of that entity), so it stays bound where it is, and the entity being
+            // written gets a content of its own, bound to the blob its own row references. A property that
+            // cannot be assigned keeps the instance as it is.
+            blob.Assign?.Invoke(TableBlobContent.Bound(
+                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column));
         }
     }
 

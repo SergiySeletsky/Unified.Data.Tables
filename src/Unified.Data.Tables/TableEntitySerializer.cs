@@ -592,6 +592,9 @@ public static class TableEntitySerializer
                     PartialUpdateRefusal(string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name))));
 
             var childNode = new TableEntityValue(value.Path.Add(prop.Name), childVal!);
+            // A write may have to put another content instance on this property (PendingBlob.Assign).
+            if (childVal is TableBlobContent && !value.Type.IsValueType)
+                childNode.BlobContentOwner = (value.Value, prop);
             if (!Flatten(dict, seen, childNode, state, childSplit))
                 return false;
         }
@@ -843,6 +846,12 @@ internal sealed class TableEntityValue
 
     /// <summary>The marker column recording a truncation, e.g. <c>Tags__Truncated</c>.</summary>
     public string TruncationMarkerColumn => string.Join(Delim, Path) + TruncatedSuffix;
+
+    /// <summary>
+    /// For a <see cref="TableBlobContent"/> value: the object and the property it was read from, so that a
+    /// write can put another content instance there. Null when that object is held by value.
+    /// </summary>
+    public (object Owner, PropertyInfo Property)? BlobContentOwner { get; set; }
 
     /// <summary>Whether a column is a truncation marker — metadata that must be skipped on read.</summary>
     internal static bool IsTruncationMarker(string column) =>
@@ -1136,7 +1145,11 @@ internal sealed class TableEntityValue
         var reference = new Providers.BlobReference(
             BlobName(ctx, st, columnName, blob.Sha256), blob.Sha256, blob.Length, blob.ContentType, "binary");
         // The content says what to upload from when the upload runs (its prepared source, or the blob it is bound to by then).
-        st.AddPending(new PendingBlob(columnName, reference, null, c => blob.OpenUploadSourceAsync(columnName, c)) { Content = blob });
+        st.AddPending(new PendingBlob(columnName, reference, null, c => blob.OpenUploadSourceAsync(columnName, c))
+        {
+            Content = blob,
+            Assign = BlobContentOwner is { } owner ? content => owner.Property.SetValue(owner.Owner, content) : null,
+        });
         largeCells = [new(columnName + SplitCodec.BlobSuffix, reference.ToJson())];
         return true;
     }

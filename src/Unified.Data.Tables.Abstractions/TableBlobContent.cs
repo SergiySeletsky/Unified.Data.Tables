@@ -287,20 +287,36 @@ public sealed class TableBlobContent
         return await OpenReadAsync(ct).ConfigureAwait(false);
     }
 
-    /// <summary>Points the content at the blob it was written to; reads now stream that blob.</summary>
+    /// <summary>
+    /// Points the content at the blob it was written to; reads now stream that blob. A content that
+    /// already streams another blob (it was read from another row, or written to another property or
+    /// entity before) is left as it is: the entity it came from holds this instance, and so does every
+    /// cached copy of that entity, and all of them would otherwise read the new blob from now on and
+    /// fail once that blob is deleted.
+    /// </summary>
     /// <param name="path">The blob name.</param>
     /// <param name="open">Opens the blob.</param>
     /// <param name="columnName">The column named by an integrity failure; defaults to <paramref name="path"/>.</param>
-    internal void Bind(string path, Func<CancellationToken, Task<Stream>> open, string? columnName = null)
+    /// <returns>
+    /// True when the content serves reads of <paramref name="path"/>: it is bound to that blob now, or was
+    /// already, or it keeps its bytes in memory and never reads a blob. False when it streams another
+    /// blob and was not changed; the caller then gives the written entity a content of its own.
+    /// </returns>
+    internal bool Bind(string path, Func<CancellationToken, Task<Stream>> open, string? columnName = null)
     {
         Guard.NotNull(path, nameof(path));
         Guard.NotNull(open, nameof(open));
-        BoundPath = path;
-        this.open = open;
-        Abandoned = false;
+        if (BoundPath is { } bound)
+            return bytes is not null || string.Equals(bound, path, StringComparison.Ordinal);
+
+        // The opener last: a concurrent OpenReadAsync that sees it also sees the names it reports.
         column = columnName;
+        BoundPath = path;
+        Abandoned = false;
         ReleaseSpool();
         Source = null;
+        this.open = open;
+        return true;
     }
 
     /// <summary>Content read from a row: known length, hash and type, streamed lazily from its blob.</summary>

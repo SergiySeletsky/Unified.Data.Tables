@@ -74,4 +74,12 @@ internal sealed record PendingBlob(
 {
     /// <summary>The <see cref="TableBlobContent"/> to bind to the blob once uploaded; null for a split value.</summary>
     public TableBlobContent? Content { get; init; }
+
+    /// <summary>
+    /// Puts another content on the property <see cref="Content"/> was serialized from. Used when
+    /// <see cref="Content"/> already streams another blob and so stays bound there: the written entity
+    /// then gets a content of its own, bound to this blob. Null for a split value, and when the property
+    /// cannot be assigned (its owner is held by value).
+    /// </summary>
+    public Action<TableBlobContent>? Assign { get; init; }
 }
