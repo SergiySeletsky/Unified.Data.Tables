@@ -210,7 +210,9 @@ public class SplitRowLayoutTests
         var bag = new TableEntity("pk", "rk");
         for (var i = 0; i < 40; i++) bag[$"O{i}"] = new string('o', 32_000); // 2.5 MB ordinary
         var ex = Assert.Throws<OversizedValueException>(() => SplitRowLayout.Plan(bag));
-        Assert.Equal("rk", ex.ColumnName);
+        // The largest cell that cannot move (the first of the equal ones), not the row key.
+        Assert.Equal("O0", ex.ColumnName);
+        Assert.Equal(64_000, ex.EncodedBytes);
     }
 
     // ── packing a batch into transactions ──────────────────────────────────

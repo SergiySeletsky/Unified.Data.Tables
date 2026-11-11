@@ -4,7 +4,8 @@ namespace Unified.Data.Tables;
 
 /// <summary>
 /// A value marked <see cref="TableValueSplitAttribute"/> is too large to store in table rows and
-/// cannot be offloaded to blob storage.
+/// cannot be offloaded to blob storage, or the cells of an entity that cannot leave its main row
+/// (its ordinary cells among them) exceed one entity. The message ends with what can be done.
 /// </summary>
 /// <remarks>
 /// Derives from <see cref="SerializationException"/> so existing <c>catch (SerializationException)</c>
@@ -30,6 +31,19 @@ public sealed class OversizedValueException : SerializationException
         EncodedBytes = encodedBytes;
         Reason = reason;
         OffloadForbiddenByProperty = offloadForbiddenByProperty;
+    }
+
+    /// <summary>Creates the exception for a value that blob offload cannot help with.</summary>
+    /// <param name="columnName">The column whose value is too large.</param>
+    /// <param name="encodedBytes">Size of the stored (encoded) value in bytes.</param>
+    /// <param name="reason">Why the value cannot be stored.</param>
+    /// <param name="remedy">What to do about it, as a sentence; the message ends with it instead of the advice about blob offload.</param>
+    public OversizedValueException(string columnName, long encodedBytes, string reason, string remedy)
+        : base($"Property '{columnName}' encodes to {encodedBytes:N0} B and cannot be stored: {reason}. {remedy}")
+    {
+        ColumnName = columnName;
+        EncodedBytes = encodedBytes;
+        Reason = reason;
     }
 
     /// <summary>True when the property's <see cref="TableValueSplitAttribute.Offload"/> forbids blob offload.</summary>

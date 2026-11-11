@@ -18,12 +18,30 @@ internal sealed record ValueWriteContext(
 {
     private static readonly IReadOnlySet<string> NoColumns = new HashSet<string>(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Flattened base columns written in split form although the value fits one cell: the planner moved
+    /// them off a primary row that was too full, so their chunks can go to continuation rows.
+    /// </summary>
+    public IReadOnlySet<string> ForceSplit { get; init; } = NoColumns;
+
+    /// <summary>
+    /// Receives every opted-in value the serializer wrote as one ordinary cell: the values the planner
+    /// may move to split form. Null when no rows are planned (the public serializer, a clone).
+    /// </summary>
+    public ICollection<InlineValue>? Inline { get; init; }
+
     /// <summary>The public serializer API: no offload, not a clone; split values form an unbounded bag.</summary>
     public static ValueWriteContext Public { get; } = new(null, null, NoColumns, false);
 
     /// <summary>An in-process copy of an entity: split values stay a bag, <see cref="TableBlobContent"/> is kept by reference.</summary>
     public static ValueWriteContext ForClone { get; } = new(null, null, NoColumns, true);
 }
+
+/// <summary>An opted-in value the serializer wrote as one ordinary cell.</summary>
+/// <param name="Column">The flattened base column (<c>Inner_Items</c>).</param>
+/// <param name="Cell">The cell that holds the value: the column itself, or <c>Inner_Items__Json</c> for a JSON-stored value.</param>
+/// <param name="Encoding">The property's encoding, which the value takes when it is split.</param>
+internal readonly record struct InlineValue(string Column, string Cell, SplitEncoding Encoding);
 
 /// <summary>
 /// What a read has already resolved outside the row: decoded values of offloaded columns, and how to

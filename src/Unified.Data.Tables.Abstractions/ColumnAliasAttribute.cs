@@ -4,7 +4,10 @@ namespace Unified.Data.Tables;
 /// Declares a legacy column name that deserializes into a property when the canonical column
 /// (the property's own name) is absent from the row. Reads only — writes always use the property
 /// name, so rows converge to the canonical schema as they are rewritten. Aliases apply to
-/// top-level columns (including their <c>__Json</c>/<c>__GZip</c> variants).
+/// top-level columns (including their <c>__Json</c>/<c>__GZip</c> variants). For a property marked
+/// <see cref="TableValueSplitAttribute"/> and for a <see cref="TableBlobContent"/> property the legacy
+/// column is also read as split cells, continuation rows and a blob reference; the blob stays under
+/// the legacy name until the entity is saved again.
 /// </summary>
 /// <remarks>
 /// Use the property-level form for properties you own. Use the class-level form (property name +

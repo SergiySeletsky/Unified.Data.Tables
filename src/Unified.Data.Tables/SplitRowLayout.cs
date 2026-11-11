@@ -9,6 +9,16 @@ namespace Unified.Data.Tables;
 internal sealed record SplitRowPlan(TableEntity Primary, IReadOnlyList<TableEntity> Parts);
 
 /// <summary>
+/// Why a logical row cannot be planned: the cells that must stay on its primary row (every cell but the
+/// chunks of split values, and the part count) exceed one entity.
+/// </summary>
+/// <param name="Properties">How many properties those cells are.</param>
+/// <param name="Bytes">Their estimated size, as <see cref="TableRowSize.Estimate"/> measures the row.</param>
+/// <param name="LargestColumn">The column of the largest of them.</param>
+/// <param name="LargestBytes">The stored size of that cell's value.</param>
+internal sealed record PrimaryOverflow(int Properties, long Bytes, string LargestColumn, long LargestBytes);
+
+/// <summary>
 /// Pure layout of a logical entity bag onto a primary row plus continuation rows
 /// (<c>{RowKey}~0001</c>...), and the inverse assembly. No I/O.
 /// </summary>
@@ -22,7 +32,10 @@ internal static class SplitRowLayout
     /// placed on it. The service limits an entity by its stored size, which <see cref="MaxEntityBytes"/>
     /// bounds; the storage emulator limits it by its request body instead, where escaped text is up to
     /// six bytes per character and binary is base64. Split cells are placed within both, so a split row
-    /// is accepted by either. Cells that cannot be split are still held only to <see cref="MaxEntityBytes"/>.
+    /// is accepted by either. Cells that cannot be split are still held only to <see cref="MaxEntityBytes"/>,
+    /// and so is a row that fits one entity as it is: only a row whose opted-in values had to be moved
+    /// to split form to fit (see <see cref="ChoosePromotions(PrimaryOverflow, IEnumerable{ValueTuple{string, long}})"/>)
+    /// is brought within this budget as well, as far as moving such values can.
     /// </summary>
     internal const long MaxEntityWireBytes = 1_000_000;
     internal const int MaxRowKeyLength = 480;
@@ -40,13 +53,169 @@ internal static class SplitRowLayout
         SplitCodec.TryParseLargeValueColumn(column, out _, out var kind, out _) && kind == LargeValueCellKind.Chunk;
 
     private static long CellCost(string key, object? value) =>
-        8L + (key.Length * 2L) + value switch
+        8L + (key.Length * 2L) + ValueBytes(value);
+
+    private static long ValueBytes(object? value) => value switch
+    {
+        byte[] binary => binary.Length,
+        BinaryData binary => binary.ToMemory().Length,
+        string text => text.Length * 2L,
+        _ => 8L,
+    };
+
+    /// <summary>The cells a split value keeps on the primary row: <c>__chunks</c>, <c>__sha256</c>, <c>__enc</c>, <c>__len</c>.</summary>
+    internal const int ManifestCells = 4;
+
+    // The estimated size of those four cells for a column: their names (the column and the suffixes,
+    // 26 characters in all), an int, a 64-character hash, the encoding tag and a long.
+    private static long ManifestCost(string column, string enc) =>
+        (ManifestCells * 8L) + (2L * ((ManifestCells * column.Length) + 26)) + 8 + 128 + (2L * enc.Length) + 8;
+
+    private static readonly string Sha256Sample = new('0', 64);
+
+    // The same four cells as the request sends them.
+    private static long ManifestWire(string column, string enc) =>
+        TableRowSize.PropertyWireSize(column + SplitCodec.ChunksSuffix, 0)
+        + TableRowSize.PropertyWireSize(column + "__sha256", Sha256Sample)
+        + TableRowSize.PropertyWireSize(column + "__enc", enc)
+        + TableRowSize.PropertyWireSize(column + "__len", 0L);
+
+    /// <summary>
+    /// What moving <paramref name="value"/> to split form frees on the primary row: its one cell goes
+    /// (its chunk can then sit on a continuation row) and four manifest cells come. In estimated bytes
+    /// (<see cref="TableRowSize.Estimate"/>) and in bytes of the request (<see cref="TableRowSize.WireSize"/>);
+    /// not positive for a value smaller than its manifest.
+    /// </summary>
+    internal static (long Bytes, long Wire) PromotionGain(TableEntity row, InlineValue value)
+    {
+        if (!row.TryGetValue(value.Cell, out var cell))
+            return (0, 0);
+        // The tag SplitCodec gives the value once it is split (a value that fits one cell is well-formed text).
+        var enc = cell is byte[] or BinaryData ? "binary" : value.Encoding == SplitEncoding.Gzip ? "gzip" : "text";
+        return (CellCost(value.Cell, cell) - ManifestCost(value.Column, enc),
+            TableRowSize.PropertyWireSize(value.Cell, cell) - ManifestWire(value.Column, enc));
+    }
+
+    /// <summary>
+    /// The opted-in values to move from one cell each to split form so that the cells left on the first
+    /// row fit one entity (<see cref="MaxEntityBytes"/>), chosen as the other overload chooses them.
+    /// Empty when the property count is what does not fit: moving a value adds properties.
+    /// </summary>
+    internal static List<string> ChoosePromotions(PrimaryOverflow overflow, IEnumerable<(string Column, long Gain)> candidates) =>
+        overflow.Properties > MaxPropertiesPerRow ? [] : ChoosePromotions(overflow.Properties, overflow.Bytes - MaxEntityBytes, candidates);
+
+    /// <summary>
+    /// The opted-in values to move from one cell each to split form to free <paramref name="excess"/>
+    /// bytes on a primary row of <paramref name="properties"/> properties: the largest gain first (the
+    /// first of equal ones), as many as it takes and as the row has properties for, since a moved value
+    /// leaves <see cref="ManifestCells"/> cells where its one cell was. Empty when nothing frees bytes
+    /// or the row has no property left.
+    /// </summary>
+    internal static List<string> ChoosePromotions(int properties, long excess, IEnumerable<(string Column, long Gain)> candidates)
+    {
+        var moved = new List<string>();
+        foreach (var (column, gain) in candidates.Where(c => c.Gain > 0).OrderByDescending(c => c.Gain))
         {
-            byte[] binary => binary.Length,
-            BinaryData binary => binary.ToMemory().Length,
-            string text => text.Length * 2L,
-            _ => 8L,
-        };
+            if (excess <= 0 || properties + ManifestCells - 1 > MaxPropertiesPerRow)
+                break;
+            moved.Add(column);
+            excess -= gain;
+            properties += ManifestCells - 1;
+        }
+        return moved;
+    }
+
+    /// <summary>
+    /// How far the cells that stay on the primary row of <paramref name="plan"/> (every cell but the
+    /// chunks, which are only placed there within the budget) exceed <see cref="MaxEntityWireBytes"/>,
+    /// and how many properties they are. Not positive when they are within it.
+    /// </summary>
+    internal static (int Properties, long Excess) FirstRowWireExcess(SplitRowPlan plan)
+    {
+        var properties = 0;
+        long wire = 2;
+        foreach (var (key, value) in plan.Primary)
+        {
+            if (IsChunk(key))
+                continue;
+            wire += TableRowSize.PropertyWireSize(key, value);
+            if (!IsSystemKey(key))
+                properties++;
+        }
+        return (properties, wire - MaxEntityWireBytes);
+    }
+
+    /// <summary>
+    /// The error of a row whose first-row cells exceed one entity after everything that can leave the
+    /// row has left it. It names the largest cell that is left, which is a real column, and both limits.
+    /// </summary>
+    /// <param name="overflow">What is in the way.</param>
+    /// <param name="movable">
+    /// How many opted-in values of one cell each are still on the row because it has no property left
+    /// for their manifests.
+    /// </param>
+    internal static OversizedValueException PrimaryOverflowError(PrimaryOverflow overflow, int movable)
+    {
+        var reason = string.Create(CultureInfo.InvariantCulture,
+            $"the cells that must stay on the entity's main row ({overflow.Properties} properties, {overflow.Bytes:N0} estimated bytes) "
+            + $"exceed what one entity holds ({MaxPropertiesPerRow} properties, {MaxEntityBytes:N0} estimated bytes), "
+            + $"and '{overflow.LargestColumn}' is the largest of them");
+        if (movable > 0)
+            reason += string.Create(CultureInfo.InvariantCulture,
+                $"; {movable} more [TableValueSplit] value(s) on that row fit one cell each, but a value moved to continuation rows "
+                + $"leaves {ManifestCells} cells behind and the row has no property left for them");
+        return new OversizedValueException(overflow.LargestColumn, overflow.LargestBytes, reason,
+            "Only the chunks of [TableValueSplit] values can go to continuation rows: mark the large properties (or the class) "
+            + "[TableValueSplit], or store less in one entity.");
+    }
+
+    /// <summary>
+    /// The error of a row that has no split value left to move to a blob and still does not fit one
+    /// entity-group transaction: the deletes of the continuation rows stored under its key are what is
+    /// in the way. It names the largest cell of the row, which is a real column.
+    /// </summary>
+    internal static OversizedValueException TransactionOverflowError(SplitRowPlan plan, int extraActions)
+    {
+        var (column, bytes) = LargestCell(plan.Primary);
+        return new OversizedValueException(column, bytes,
+            string.Create(CultureInfo.InvariantCulture,
+                $"the row and the deletes of the {extraActions} continuation rows stored under its key do not fit one entity-group "
+                + $"transaction ({BatchPlanner.DefaultMaxCount} actions, {BatchPlanner.DefaultMaxBytes:N0} estimated bytes)"),
+            "Remove the leftover continuation rows of this key, then write the entity again.");
+    }
+
+    // The column and the stored size of the cell with the largest value on the row (the first of equal
+    // ones), other than the keys and the part count.
+    private static (string Column, long Bytes) LargestCell(TableEntity row)
+    {
+        string? largest = null;
+        long bytes = -1;
+        foreach (var (key, value) in row)
+        {
+            if (IsSystemKey(key) || key == SystemColumnNames.SplitParts)
+                continue;
+            var valueBytes = ValueBytes(value);
+            if (valueBytes > bytes)
+                (largest, bytes) = (key, valueBytes);
+        }
+        return largest is null ? ("(none)", 0) : (ColumnOf(largest), bytes);
+    }
+
+    // The column a cell belongs to: the base column of a large-value cell, or the name without the
+    // suffix of a JSON, GZip or truncation-marker cell.
+    private static string ColumnOf(string cell)
+    {
+        if (SplitCodec.TryParseLargeValueColumn(cell, out var column, out _, out _))
+            return column;
+        foreach (var suffix in CellSuffixes)
+        {
+            if (cell.Length > suffix.Length && cell.EndsWith(suffix, StringComparison.Ordinal))
+                return cell[..^suffix.Length];
+        }
+        return cell;
+    }
+
+    private static readonly string[] CellSuffixes = ["__Json", "__GZip", "__Truncated"];
 
     private static int CustomCount(TableEntity row)
     {
@@ -57,8 +226,19 @@ internal static class SplitRowLayout
     }
 
     /// <summary>Plans <paramref name="logical"/>; returns it unchanged (no parts) when it fits one row.</summary>
-    internal static SplitRowPlan Plan(TableEntity logical)
+    /// <exception cref="OversizedValueException">
+    /// The cells that cannot go to continuation rows exceed one entity (<see cref="PrimaryOverflowError"/>).
+    /// </exception>
+    internal static SplitRowPlan Plan(TableEntity logical) =>
+        TryPlan(logical, out var overflow) ?? throw PrimaryOverflowError(overflow!, movable: 0);
+
+    /// <summary>
+    /// <see cref="Plan"/> without the exception: null, with what is in the way, when the cells that
+    /// cannot go to continuation rows (every cell but the chunks of split values) exceed one entity.
+    /// </summary>
+    internal static SplitRowPlan? TryPlan(TableEntity logical, out PrimaryOverflow? overflow)
     {
+        overflow = null;
         if (CustomCount(logical) <= MaxPropertiesPerRow && TableRowSize.Estimate(logical) <= MaxEntityBytes
             && (TableRowSize.WireSize(logical) <= MaxEntityWireBytes || !logical.Keys.Any(IsChunk)))
             return new SplitRowPlan(logical, []);
@@ -87,11 +267,11 @@ internal static class SplitRowLayout
         var placedInRow = 0;
 
         if (props > MaxPropertiesPerRow || bytes > MaxEntityBytes)
-            throw new OversizedValueException(
-                logical.RowKey ?? "(row)",
-                bytes,
-                "the cells that cannot be split onto continuation rows exceed the entity limit of "
-                + $"{MaxPropertiesPerRow} properties and {MaxEntityBytes:N0} estimated bytes");
+        {
+            var (column, largest) = LargestCell(primary);
+            overflow = new PrimaryOverflow(props, bytes, column, largest);
+            return null;
+        }
 
         foreach (var (key, value) in chunks)
         {

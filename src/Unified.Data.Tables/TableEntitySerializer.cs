@@ -73,7 +73,7 @@ public static class TableEntitySerializer
         var entity = new TableEntity(partitionKey, rowKey);
         if (root == null) return entity;
 
-        var flat = Flatten(root, persistType, new FlattenState(ctx, pending, Partial: false, partitionKey, rowKey));
+        var flat = Flatten(root, persistType, new FlattenState(ctx, pending, Partial: false, partitionKey, rowKey, root.GetType()));
         foreach (var kv in flat)
             entity[kv.Key] = kv.Value;
 
@@ -124,6 +124,13 @@ public static class TableEntitySerializer
     /// <summary>The message for a large value reached by a partial (Merge) update.</summary>
     internal static string PartialUpdateRefusal(string name) =>
         $"'{name}' is a large value; partial updates cannot write it — replace the entity instead.";
+
+    /// <summary>The message for a large value whose column a read of <paramref name="root"/> maps to no property.</summary>
+    internal static string UnreadableLargeValue(Type root, string column) =>
+        $"'{column}' of {root.Name} needs split cells or a blob, and a read of {root.Name} would not map the column " +
+        $"'{column}' back to a property: the object that owns it has a runtime type a read does not recreate. A read " +
+        "keeps the instance the constructor puts in a property and creates the declared type where there is none. " +
+        "Initialise the owning property with an instance of that runtime type, or declare the property with that type.";
 
     /// <summary>Late-bound deserialize; requires the row to have been written with <c>persistType: true</c>.</summary>
     /// <remarks>
@@ -286,24 +293,27 @@ public static class TableEntitySerializer
         }
 
         if (largeValues is not null)
-            result = ApplyLargeValues(result, type, largeValues, ctx);
+            result = ApplyLargeValues(result, largeValues, ctx);
 
-        result = ApplyColumnAliases(result, entity, meta);
+        result = ApplyColumnAliases(result, entity, meta, largeValues, ctx);
 
         // A polymorphic row's keys encode an aggregate version or a tick count, not an id — so
         // recomputing Id from them would overwrite the object's real id with "partition|row".
         return restoreId ? RestoreIdFromKeys(result, entity) : result;
     }
 
-    // Reassembles every split value (verifying its SHA-256) and sets it on its property. A value whose
-    // property no longer exists on the type is skipped unread, like any other unknown column. A group
+    // Reassembles every split value (verifying its SHA-256) and sets it on its property. The property
+    // is the one an ordinary cell of the same column would be set on: each owner along the column path
+    // is the instance that is already there (a default instance keeps its runtime type, which may have
+    // members its declared type lacks) or a new instance of the declared type. A value whose property
+    // no longer exists is skipped unread, like any other unknown column. A group
     // holding a blob reference takes its value from what the read resolved outside the row: a
     // downloaded value, or a lazy TableBlobContent. A reference the read's projection excludes keeps
     // the property's default; any other unresolved one (a plain FromTableEntity, or a store whose type
     // is not large-value-aware) throws, because an entity with the property silently empty would drop
     // the reference on its next write and the orphan sweep would then delete the value.
     private static object ApplyLargeValues(
-        object result, Type type, Dictionary<string, Dictionary<string, object>> largeValues, ValueReadContext ctx)
+        object result, Dictionary<string, Dictionary<string, object>> largeValues, ValueReadContext ctx)
     {
         foreach (var (baseColumn, cells) in largeValues)
         {
@@ -312,43 +322,97 @@ public static class TableEntitySerializer
                 continue;
 
             var path = TableEntityValue.Create(baseColumn, string.Empty).Path;
-            if (TypeMetadataCache.ResolvePath(type, path) is not { } target)
+            if (path.IsEmpty || ReadTarget(result, path, baseColumn) is not { } target)
                 continue;
 
-            object decoded;
-            if (cells.TryGetValue(baseColumn + SplitCodec.BlobSuffix, out var reference))
+            result = ApplyLargeValue(result, path, target, baseColumn, cells, ctx, renamedTo: null);
+        }
+        return result;
+    }
+
+    // Sets the large value stored in the cells of baseColumn on target, the property at path. For a
+    // legacy column read through [ColumnAlias], renamedTo is the column of that property: the cells,
+    // the resolved value and every failure are still named after the column the value is stored under.
+    private static object ApplyLargeValue(
+        object result, ImmutableList<string> path, PropertyInfo target, string baseColumn,
+        Dictionary<string, object> cells, ValueReadContext ctx, string? renamedTo)
+    {
+        object decoded;
+        if (cells.TryGetValue(baseColumn + SplitCodec.BlobSuffix, out var reference))
+        {
+            if (ctx.Resolved.TryGetValue(baseColumn, out var resolved))
             {
-                if (ctx.Resolved.TryGetValue(baseColumn, out var resolved))
-                {
-                    decoded = resolved;
-                }
-                else if (target.PropertyType == typeof(TableBlobContent) && ctx.LazyContent is { } lazy)
-                {
-                    var parsed = Providers.BlobReference.Parse(baseColumn,
-                        reference as string ?? throw new TableValueIntegrityException(baseColumn, "the blob reference is not a string."));
-                    result = SetProperty(result, new TableEntityValue(path, lazy(baseColumn, parsed)));
-                    continue;
-                }
-                else if (ctx.Projection is { } projected && !ValueOffloadCoordinator.Projects(projected, baseColumn))
-                {
-                    continue;
-                }
-                else
-                {
-                    throw new InvalidOperationException(UnresolvedOffloadMessage(baseColumn));
-                }
+                decoded = resolved;
+            }
+            else if (target.PropertyType == typeof(TableBlobContent) && ctx.LazyContent is { } lazy)
+            {
+                var parsed = Providers.BlobReference.Parse(baseColumn,
+                    reference as string ?? throw new TableValueIntegrityException(baseColumn, "the blob reference is not a string."));
+                return SetProperty(result, new TableEntityValue(path, lazy(baseColumn, parsed)));
+            }
+            else if (ctx.Projection is { } projected && !ValueOffloadCoordinator.Projects(projected, baseColumn)
+                     && (renamedTo is null || !ValueOffloadCoordinator.Projects(projected, renamedTo)))
+            {
+                return result;
             }
             else
             {
-                decoded = SplitCodec.Decode(baseColumn, cells);
+                throw new InvalidOperationException(UnresolvedOffloadMessage(baseColumn));
             }
-
-            var fmt = target.PropertyType == typeof(string) || target.PropertyType == typeof(byte[])
-                ? TableEntityValueFormat.Raw
-                : TableEntityValueFormat.Json;
-            result = SetProperty(result, new TableEntityValue(path, decoded, fmt));
         }
-        return result;
+        else
+        {
+            decoded = SplitCodec.Decode(baseColumn, cells);
+        }
+
+        var fmt = target.PropertyType == typeof(string) || target.PropertyType == typeof(byte[])
+            ? TableEntityValueFormat.Raw
+            : TableEntityValueFormat.Json;
+        return SetProperty(result, new TableEntityValue(path, decoded, fmt) { IsLargeValue = true });
+    }
+
+    /// <summary>
+    /// The property a read of <paramref name="row"/> as <paramref name="entityType"/> sets the large-value
+    /// column <paramref name="column"/> on: its declared type and its own column. The property is
+    /// resolved as the read resolves it (see
+    /// <see cref="TypeMetadataCache.ReadTarget(object, IReadOnlyList{string})"/>); a legacy column is
+    /// that of the property a <see cref="ColumnAliasAttribute"/> maps it to, unless the row also has the
+    /// property's own column, which wins. Null when the read takes nothing from the column: no property
+    /// is mapped to it, or the read fails at an owner it cannot create and reports that itself.
+    /// </summary>
+    internal static (Type Type, string Column)? LargeValueTarget(Type entityType, TableEntity row, string column)
+    {
+#pragma warning disable CA1031 // the read of the row reports what it cannot resolve; nothing is fetched for it
+        try
+        {
+            if (TypeMetadataCache.ReadTarget(entityType, column) is { } target)
+                return (target.PropertyType, column);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+#pragma warning restore CA1031
+
+        return TypeMetadataCache.GetMetadata(entityType).AliasMap.TryGetValue(column, out var renamed)
+               && !HasCanonicalColumn(row, renamed.Name)
+            ? (renamed.PropertyType, renamed.Name)
+            : null;
+    }
+
+    // The property a read sets the large-value column on (null: no property takes it). An owner the
+    // read cannot create (an interface or abstract type with no default instance) fails as it fails
+    // for the ordinary cells beside the value, never by leaving the value out.
+    private static PropertyInfo? ReadTarget(object result, ImmutableList<string> path, string baseColumn)
+    {
+        try
+        {
+            return TypeMetadataCache.ReadTarget(result, path);
+        }
+        catch (Exception ex)
+        {
+            throw new SerializationException($"Failed to set '{baseColumn}'.", ex);
+        }
     }
 
     // The row's PartitionKey/RowKey are the authoritative identity. A legacy row written by another
@@ -387,9 +451,14 @@ public static class TableEntitySerializer
     /// <summary>
     /// Second pass for <see cref="ColumnAliasAttribute"/>: a legacy (alias) column deserializes
     /// into its property only when no canonical column for that property exists on the row, so
-    /// canonical data always wins and rewrites converge rows to the canonical schema.
+    /// canonical data always wins and rewrites converge rows to the canonical schema. The legacy column
+    /// is read in every form the canonical one can have: one cell (raw, <c>__Json</c>, <c>__GZip</c>),
+    /// split cells with their manifest (continuation rows are already assembled into the row), or a
+    /// blob reference.
     /// </summary>
-    private static object ApplyColumnAliases(object result, TableEntity entity, TypeMetadata meta)
+    private static object ApplyColumnAliases(
+        object result, TableEntity entity, TypeMetadata meta,
+        Dictionary<string, Dictionary<string, object>>? largeValues, ValueReadContext ctx)
     {
         if (meta.AliasMap.Count == 0)
             return result;
@@ -399,19 +468,17 @@ public static class TableEntitySerializer
             var aliasColumn = kv.Key;
             var property = kv.Value;
 
-            var hasCanonical = false;
-            foreach (var suffix in AliasSuffixes)
-            {
-                if (entity.ContainsKey(property.Name + suffix))
-                {
-                    hasCanonical = true;
-                    break;
-                }
-            }
-            if (hasCanonical
-                || entity.ContainsKey(property.Name + SplitCodec.ChunksSuffix)
-                || entity.ContainsKey(property.Name + SplitCodec.BlobSuffix))
+            if (HasCanonicalColumn(entity, property.Name))
                 continue;
+
+            // A legacy large value. It wins over a plain cell of the same legacy name, as the split cells
+            // of a canonical column win over a plain cell beside them.
+            if (largeValues is not null && largeValues.TryGetValue(aliasColumn, out var cells))
+            {
+                result = ApplyLargeValue(
+                    result, ImmutableList.Create(property.Name), property, aliasColumn, cells, ctx, renamedTo: property.Name);
+                continue;
+            }
 
             foreach (var suffix in AliasSuffixes)
             {
@@ -427,6 +494,18 @@ public static class TableEntitySerializer
         }
 
         return result;
+    }
+
+    // True when the row holds the property's own column in any form: one cell (raw, __Json, __GZip),
+    // split cells (their manifest) or a blob reference. A legacy column is then ignored.
+    private static bool HasCanonicalColumn(TableEntity row, string property)
+    {
+        foreach (var suffix in AliasSuffixes)
+        {
+            if (row.ContainsKey(property + suffix))
+                return true;
+        }
+        return row.ContainsKey(property + SplitCodec.ChunksSuffix) || row.ContainsKey(property + SplitCodec.BlobSuffix);
     }
 
     /// <summary>
@@ -464,18 +543,37 @@ public static class TableEntitySerializer
     internal static Dictionary<string, object> FlattenProperty(Type ownerType, string columnPath, object value)
     {
         ArgumentNullException.ThrowIfNull(ownerType);
+        // A type that opts into nothing has no member to refuse. It takes the path of 0.8.3, which builds
+        // no metadata for the declared types along the column path (one may be a type the serializer
+        // cannot build metadata for, such as an interface that declares two indexers). The one member
+        // such a type can still have is a large value of an object that only a read creates (below a
+        // property that is empty on a new entity): the read's own resolution finds it, and never throws.
+        if (!TypeMetadataCache.IsLargeValueAware(ownerType))
+        {
+            if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath))
+                throw new NotSupportedException(PartialUpdateRefusal(columnPath));
+            return FlattenProperty(columnPath, value);
+        }
+
+        // The entity type is one the serializer flattens: its metadata is built here as on any first
+        // use, so a misused attribute is reported. The types further along the path are declared types,
+        // which the serializer may never flatten, so they are read by reflection alone.
+        _ = TypeMetadataCache.GetMetadata(ownerType);
         var owner = ownerType;
         foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries))
         {
-            var meta = TypeMetadataCache.GetMetadata(owner);
-            if (meta.SplitOptions.ContainsKey(segment))
-                throw new NotSupportedException(PartialUpdateRefusal(columnPath));
-            if (!meta.PropertyMap.TryGetValue(segment, out var prop))
+            if (!TypeMetadataCache.TryGetMember(owner, segment, out var memberType, out var largeValue))
                 break;
-            if (prop.PropertyType == typeof(TableBlobContent))
+            if (largeValue)
                 throw new NotSupportedException(PartialUpdateRefusal(columnPath));
-            owner = prop.PropertyType;
+            owner = memberType;
         }
+
+        // The same question for the object a read finds along the path: a default instance may be of a
+        // runtime type that opts the member in although the declared type's member is ordinary. A plain
+        // cell merged beside its split cells would read back the old value.
+        if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath))
+            throw new NotSupportedException(PartialUpdateRefusal(columnPath));
         return FlattenProperty(columnPath, value);
     }
 
@@ -621,7 +719,8 @@ public static class TableEntitySerializer
     /// <summary>True when <paramref name="item"/> holds a <see cref="TableBlobContent"/> in a flattened column.</summary>
     /// <remarks>
     /// The cached type check keeps every plain type off the reflection walk. A content reachable only
-    /// through a runtime subtype is missed here, but the write still refuses it (OversizedValueException).
+    /// through a runtime subtype the type's default instances do not show is missed here, but the write
+    /// still refuses it (OversizedValueException, or NotSupportedException when no read would map it back).
     /// </remarks>
     internal static bool CarriesBlobContent(object item)
     {
@@ -651,19 +750,24 @@ public static class TableEntitySerializer
             seen.Remove(owner);
     }
 
-    /// <summary>The <see cref="TableValueSplitAttribute"/> of a flattened base column of <paramref name="type"/>, or null.</summary>
-    internal static TableValueSplitAttribute? SplitOptionFor(Type type, string baseColumn)
+    /// <summary>
+    /// The <see cref="TableValueSplitAttribute"/> the flattened base column of <paramref name="root"/> was
+    /// written under, or null: the attribute of the member of the object that holds the value, whose
+    /// runtime type may differ from the declared type of the property it sits in.
+    /// </summary>
+    internal static TableValueSplitAttribute? SplitOptionFor(object root, string baseColumn)
     {
         var path = TableEntityValue.Create(baseColumn, string.Empty).Path;
         if (path.Count == 0) return null;
-        var owner = type;
+        var owner = root;
         for (var i = 0; i < path.Count - 1; i++)
         {
-            if (!TypeMetadataCache.GetMetadata(owner).PropertyMap.TryGetValue(path[i], out var prop))
+            if (!TypeMetadataCache.GetMetadata(owner.GetType()).PropertyMap.TryGetValue(path[i], out var prop)
+                || prop.GetValue(owner) is not { } child)
                 return null;
-            owner = prop.PropertyType;
+            owner = child;
         }
-        return TypeMetadataCache.GetMetadata(owner).SplitOptions.TryGetValue(path[^1], out var split) ? split : null;
+        return TypeMetadataCache.GetMetadata(owner.GetType()).SplitOptions.TryGetValue(path[^1], out var split) ? split : null;
     }
 
     private static object SetProperty(object root, TableEntityValue val)
@@ -731,10 +835,11 @@ public static class TableEntitySerializer
 
 /// <summary>
 /// One flatten pass: the write context, the blobs it collects, whether it serves a partial (Merge)
-/// update (which must refuse large values), and the row keys blob names are built from.
+/// update (which must refuse large values), the row keys blob names are built from, and the type of
+/// the object being flattened (the type a read of the row materializes; null for a partial update).
 /// </summary>
 internal readonly record struct FlattenState(
-    ValueWriteContext Ctx, List<PendingBlob>? Pending, bool Partial, string PartitionKey, string RowKey)
+    ValueWriteContext Ctx, List<PendingBlob>? Pending, bool Partial, string PartitionKey, string RowKey, Type? RootType = null)
 {
     /// <summary>
     /// Records a blob to upload before the entity write. Only a context with blob offload produces one,
@@ -836,6 +941,16 @@ internal sealed class TableEntityValue
     public object? Value { get; }
     public Type? Type { get; }
     public TableEntityValueFormat Format { get; private set; }
+
+    /// <summary>
+    /// True for a value reassembled from split cells or downloaded from a blob. It can be of any size, so
+    /// a failure message quotes at most <see cref="MaxDescribedChars"/> characters of it and states its
+    /// length; a value that came from one cell is named whole, as on 0.8.3.
+    /// </summary>
+    public bool IsLargeValue { get; init; }
+
+    /// <summary>How many characters of a large value a failure message quotes.</summary>
+    internal const int MaxDescribedChars = 200;
 
     /// <summary>
     /// Set by <see cref="TrySerialize"/> when the oversized-cell policy trimmed (or dropped) this
@@ -1031,7 +1146,8 @@ internal sealed class TableEntityValue
     }
 
     // An opted-in value: one ordinary cell when it fits (a string or byte[] raw, never __GZip; JSON
-    // text as __Json), otherwise split cells. Never trims and never consults OversizedCellPolicy.
+    // text as __Json), otherwise split cells; a column the planner moved (ValueWriteContext.ForceSplit)
+    // is split whatever its size. Never trims and never consults OversizedCellPolicy.
     // False for a value that is not string, byte[] or JSON-stored (a scalar, or an object that
     // flattens into columns) — it takes the ordinary path.
     private bool TrySerializeLarge(
@@ -1061,16 +1177,23 @@ internal sealed class TableEntityValue
                 break;
         }
 
-        if (SplitCodec.FitsOneCell(payload, split.Encoding))
+        // A value that fits one cell stays in its cell, unless the planner moved the column off a primary
+        // row that was too full: then it takes the split form below, like a value too large for one cell.
+        var moved = state is { Ctx: { } planned } && (planned.ForceSplit.Contains(columnName) || planned.ForceOffload.Contains(columnName));
+        if (!moved && SplitCodec.FitsOneCell(payload, split.Encoding))
         {
+            var column = columnName;
             if (isJson)
             {
                 columnName += JsonSuffix;
                 Format = TableEntityValueFormat.Json;
             }
+            state?.Ctx.Inline?.Add(new InlineValue(column, columnName, split.Encoding));
             value = payload;
             return true;
         }
+
+        RefuseUnreadable(state, columnName);
 
         // Tier 3 (blob offload): only for a storage write, never for a clone or the public serializer.
         if (state is { Ctx: { IsClone: false } ctx } st && (ctx.Offload is not null || ctx.ForceOffload.Count > 0))
@@ -1108,6 +1231,18 @@ internal sealed class TableEntityValue
         return true;
     }
 
+    // A large value is stored outside the cell of its property (split cells, continuation rows, a blob),
+    // so a read must map its column back to that property: a value below an object whose runtime type a
+    // read does not recreate would be stored and then left out of every read. A top-level column always
+    // maps (the entity type has the property), and a clone is read back from the same object.
+    private void RefuseUnreadable(FlattenState? state, string columnName)
+    {
+        if (Path.Count < 2 || state is not { RootType: { } root, Ctx.IsClone: false })
+            return;
+        if (!TypeMetadataCache.ReadsBack(root, columnName))
+            throw new NotSupportedException(TableEntitySerializer.UnreadableLargeValue(root, columnName));
+    }
+
     private static string BlobName(ValueWriteContext ctx, FlattenState state, string columnName, string sha256) =>
         ValueOffloadCoordinator.BlobName(
             ctx.TableName ?? throw new InvalidOperationException("A blob offload write needs the table name."),
@@ -1134,6 +1269,7 @@ internal sealed class TableEntityValue
             value = blob;
             return true;
         }
+        RefuseUnreadable(state, columnName);
         if (ctx.Offload is null)
             throw new OversizedValueException(columnName, blob.IsSealed ? blob.Length : 0,
                 "a TableBlobContent is always stored in blob storage and blob offload is not configured");
@@ -1386,71 +1522,555 @@ internal sealed class TableEntityValue
         return Encoding.UTF8.GetString(outMs.ToArray());
     }
 
-    public override string ToString() => $"{string.Join(Delim, Path)}={Value}";
+    public override string ToString()
+    {
+        var name = string.Join(Delim, Path);
+        if (IsLargeValue)
+        {
+            if (Value is string { Length: > MaxDescribedChars } text)
+            {
+                // Never end the excerpt on half a surrogate pair.
+                var cut = char.IsHighSurrogate(text[MaxDescribedChars - 1]) ? MaxDescribedChars - 1 : MaxDescribedChars;
+                return string.Create(CultureInfo.InvariantCulture, $"{name}={text.AsSpan(0, cut)}… ({text.Length:N0} characters)");
+            }
+            if (Value is byte[] bytes)
+                return string.Create(CultureInfo.InvariantCulture, $"{name}={Value} ({bytes.Length:N0} bytes)");
+        }
+        return $"{name}={Value}";
+    }
 }
 
 internal static class TypeMetadataCache
 {
     private static readonly ConcurrentDictionary<Type, TypeMetadata> _cache = new();
-    private static readonly ConcurrentDictionary<Type, IReadOnlyList<string>> _largeValueColumns = new();
+    private static readonly ConcurrentDictionary<Type, LargeValueInfo> _largeValues = new();
+    private static readonly ConcurrentDictionary<Type, LargeValueInfo> _declaredLargeValues = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Column), PropertyInfo?> _readTargets = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Column), bool> _largeOnRead = new();
 
     public static TypeMetadata GetMetadata(Type t)
         => _cache.GetOrAdd(t, CreateMetadata);
 
+    /// <summary>True when flattening metadata was built for <paramref name="t"/> (for tests).</summary>
+    internal static bool HasMetadata(Type t) => _cache.ContainsKey(t);
+
+    /// <summary>
+    /// The bound of the large-value walk: how many types it inspects below one entity type, and how many
+    /// steps the listing of the columns may take. No real entity comes near it; it keeps a type graph
+    /// with factorially many paths, or with no end (a generic type whose property is a deeper
+    /// instantiation of itself), from hanging or overflowing the stack in a store's static initializer.
+    /// </summary>
+    internal const int MaxLargeValueWalkSteps = 10_000;
+
+    /// <summary>The longest property name Azure Table Storage accepts: a longer path names no column.</summary>
+    private const int MaxColumnNameLength = 255;
+
+    /// <summary>
+    /// How deep a column of at most <see cref="MaxColumnNameLength"/> characters can lie: every level
+    /// adds a name of at least one character and the path delimiter.
+    /// </summary>
+    private const int MaxFlattenDepth = MaxColumnNameLength / 2 + 1;
+
     /// <summary>
     /// True when <paramref name="t"/>, or any nested type it flattens into columns, has a
-    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property. Such a type may
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property; for an entity
+    /// type also when an object its constructor puts in a property has one (the default instance of an
+    /// interface-, abstract- or base-typed property, whose runtime type a read keeps). Such a type may
     /// produce split cells or blob references; any other type takes none of the large-value branches.
+    /// Never throws, whatever the type: a store asks this in its static initializer, where an exception
+    /// would break the store type for the rest of the process.
     /// </summary>
-    internal static bool IsLargeValueAware(Type t) => LargeValueColumns(t).Count > 0;
+    internal static bool IsLargeValueAware(Type t) => LargeValues(t).Aware;
 
     /// <summary>
-    /// Every flattened base column of <paramref name="t"/> that can carry split cells or a blob
-    /// reference (<c>"Body"</c>, <c>"Inner_Body"</c>, <c>"Content"</c>).
+    /// The flattened base columns of <paramref name="t"/> that can carry split cells or a blob reference
+    /// (<c>"Body"</c>, <c>"Inner_Body"</c>, <c>"Content"</c>): one for every path of declared types that
+    /// does not meet a type twice (a type that reaches itself ends the path) and whose name a column can
+    /// hold, in declaration order. A type graph too dense to list every such path within
+    /// <see cref="MaxLargeValueWalkSteps"/> lists the paths nearest the entity instead. For an entity
+    /// type the columns of the runtime types of its default instances follow (see
+    /// <see cref="IsLargeValueAware"/>). Never throws; empty for a type that opts into nothing.
     /// </summary>
-    internal static IReadOnlyList<string> LargeValueColumns(Type t)
+    internal static IReadOnlyList<string> LargeValueColumns(Type t) => LargeValues(t).Columns;
+
+    private static LargeValueInfo LargeValues(Type t)
     {
         ArgumentNullException.ThrowIfNull(t);
-        return _largeValueColumns.GetOrAdd(t, static type =>
-        {
-            var columns = new List<string>();
-            CollectLargeValueColumns(type, string.Empty, new HashSet<Type>(), columns);
-            return columns.AsReadOnly();
-        });
+        return _largeValues.GetOrAdd(t, static type => WithDefaultInstances(type, DeclaredLargeValues(type)));
     }
 
-    // Walks the same property graph Flatten does: a property in SplitOptions is a large-value column;
-    // a property whose type flattens into Owner_Child columns is walked (once per path, so a type that
-    // reaches itself does not recurse forever).
-    private static void CollectLargeValueColumns(Type type, string prefix, HashSet<Type> visiting, List<string> columns)
+    // What the declared types alone say (reflection only, nothing is constructed).
+    private static LargeValueInfo DeclaredLargeValues(Type t) =>
+        _declaredLargeValues.GetOrAdd(t, static type => WalkLargeValues(type));
+
+    // Adds the columns a read takes a large value from that the declared walk cannot see. Every column
+    // the declared walk listed stays where it is; the others follow.
+    //  - The columns only a new instance of an entity type shows: the large-value members of the objects
+    //    its constructor puts in its properties. A read keeps such a default instance and maps a column
+    //    through its runtime type, which may have members its declared type (an interface, an abstract
+    //    class, a base class) lacks.
+    //  - The legacy columns of the type's own large-value properties ([ColumnAlias]): a row written
+    //    before the rename holds the value, its split cells or its blob reference under the old name.
+    private static LargeValueInfo WithDefaultInstances(Type root, LargeValueInfo declared)
     {
-        if (!visiting.Add(type))
+        var known = new HashSet<string>(declared.Columns, StringComparer.Ordinal);
+        var found = new List<string>();
+        var aware = declared.Aware;
+#pragma warning disable CA1031 // deciding whether a type is large-value aware must not throw, whatever its constructor, getters or attributes do
+        try
+        {
+            if (DefaultInstanceOf(root) is { } instance)
+            {
+                var steps = 0;
+                ListDefaultInstanceColumns(instance, string.Empty, [instance], isRoot: true, known, found, ref steps);
+                aware |= found.Count > 0;
+            }
+        }
+        catch (Exception)
+        {
+            // The declared types decide.
+        }
+
+        try
+        {
+            AddLegacyColumns(root, known, found);
+        }
+        catch (Exception)
+        {
+            // An alias that cannot be read is reported by the serializer on first use of the type.
+        }
+#pragma warning restore CA1031
+        return found.Count == 0 ? declared : new LargeValueInfo(aware, [.. declared.Columns, .. found]);
+    }
+
+    // The legacy column names of root's own large-value properties: [ColumnAlias("Old")] on the property,
+    // or [ColumnAlias("Property", "Old")] on the class (aliases apply to top-level columns only). Read by
+    // reflection; a declaration the serializer would refuse is simply not listed here.
+    private static void AddLegacyColumns(Type root, HashSet<string> known, List<string> found)
+    {
+        var large = LargeValueMembers(root).FindAll(m => m.Flattened is null);
+        if (large.Count == 0)
             return;
 
-        var meta = GetMetadata(type);
-        foreach (var prop in meta.Properties)
+        void Add(string? legacy)
         {
-            if (meta.SplitOptions.ContainsKey(prop.Name) || prop.PropertyType == typeof(TableBlobContent))
-                columns.Add(prefix + prop.Name);
-            else if (FlattensIntoColumns(prop.PropertyType))
-                CollectLargeValueColumns(prop.PropertyType, prefix + prop.Name + TableEntityValue.PathDelimiter, visiting, columns);
+            if (!string.IsNullOrWhiteSpace(legacy) && legacy.Length <= MaxColumnNameLength && known.Add(legacy))
+                found.Add(legacy);
         }
 
-        visiting.Remove(type);
+        foreach (var member in large)
+        {
+            foreach (var alias in member.Property.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+            {
+                if (alias.PropertyName is null)
+                    Add(alias.LegacyColumnName);
+            }
+        }
+
+        foreach (var alias in root.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+        {
+            if (alias.PropertyName is { } name && large.Exists(m => m.Name == name))
+                Add(alias.LegacyColumnName);
+        }
     }
 
-    /// <summary>Resolves a flattened column path (<c>["Inner", "Body"]</c>) to its leaf property, or null.</summary>
-    internal static PropertyInfo? ResolvePath(Type type, IReadOnlyList<string> path)
+    // A new instance of root, as a read starts from, when its default instances can matter. Only an
+    // entity type is constructed (a store's T: a class with a public parameterless constructor that
+    // implements IEntity), and only when it has a property whose declared type flattens into columns;
+    // no other type is ever constructed to answer this.
+    private static object? DefaultInstanceOf(Type root)
     {
-        PropertyInfo? prop = null;
-        var owner = type;
-        foreach (var segment in path)
+        if (!root.IsClass || root.IsAbstract || root.ContainsGenericParameters
+            || !typeof(IEntity).IsAssignableFrom(root)
+            || root.GetConstructor(Type.EmptyTypes) is null
+            || !LargeValueMembers(root).Exists(m => m.Flattened is not null))
+            return null;
+
+        return Activator.CreateInstance(root);
+    }
+
+    // The large-value columns below one object of a new entity's graph: its own large-value members,
+    // those of the objects in its properties and, where a property is empty, those the declared walk
+    // lists for the property's declared type (a read creates that type there). The entity's own empty
+    // properties add nothing: the declared walk of the entity has listed them. Bounded like that walk.
+    private static void ListDefaultInstanceColumns(
+        object instance, string prefix, List<object> owners, bool isRoot, HashSet<string> known, List<string> found, ref int steps)
+    {
+        if (++steps > MaxLargeValueWalkSteps)
+            return;
+
+        void Add(string column)
         {
-            if (!GetMetadata(owner).PropertyMap.TryGetValue(segment, out prop))
-                return null;
-            owner = prop.PropertyType;
+            if (column.Length <= MaxColumnNameLength && known.Count < MaxLargeValueWalkSteps && known.Add(column))
+                found.Add(column);
         }
-        return prop;
+
+        foreach (var member in LargeValueMembers(instance.GetType()))
+        {
+            var column = prefix + member.Name;
+            if (member.Flattened is not { } declared)
+            {
+                Add(column);
+                continue;
+            }
+
+            if (column.Length >= MaxColumnNameLength)
+                continue;
+
+            object? value;
+#pragma warning disable CA1031 // a getter that fails shows no default instance
+            try
+            {
+                value = member.Property.GetValue(instance);
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+#pragma warning restore CA1031
+
+            if (value is null)
+            {
+                if (!isRoot)
+                {
+                    foreach (var below in DeclaredLargeValues(declared).Columns)
+                        Add(column + TableEntityValue.PathDelimiter + below);
+                }
+            }
+            else if (FlattensAtRuntime(value) && owners.Count < MaxFlattenDepth && !owners.Exists(o => ReferenceEquals(o, value)))
+            {
+                owners.Add(value);
+                ListDefaultInstanceColumns(value, column + TableEntityValue.PathDelimiter, owners, isRoot: false, known, found, ref steps);
+                owners.RemoveAt(owners.Count - 1);
+            }
+        }
+    }
+
+    // True for an object the writer flattens into Owner_Child columns (and a read then drills into).
+    private static bool FlattensAtRuntime(object value) =>
+        value is not (string or TableBlobContent)
+        && !TableEntityValue.IsPrimitive(value.GetType()) && !value.GetType().IsEnum
+        && TableEntityValue.CanSerializeWithoutJson(value);
+
+    /// <summary>What the large-value walk found below one type.</summary>
+    private sealed class LargeValueInfo(bool aware, IReadOnlyList<string> columns)
+    {
+        public static readonly LargeValueInfo None = new(false, []);
+
+        public bool Aware { get; } = aware;
+
+        public IReadOnlyList<string> Columns { get; } = columns;
+    }
+
+    // Walks the property graph Flatten walks, by reflection alone: a large-value member is a column; a
+    // property whose declared type flattens into Owner_Child columns is walked. It never builds
+    // flattening metadata (GetMetadata): 0.8.3 built that only when a value of a type was first
+    // serialized, and it throws for types the writer never flattens (JsonNode declares two indexers
+    // named Item). Every type is inspected once, and a branch that leads to no large-value member is
+    // never listed, so a type that opts into nothing costs one pass over its types however many paths
+    // run through them.
+    private static LargeValueInfo WalkLargeValues(Type root)
+    {
+        // 1. The types below the root, each inspected once, nearest first.
+        var members = new Dictionary<Type, List<LargeValueMember>>();
+        var found = new Queue<(Type Type, int Depth)>();
+        found.Enqueue((root, 0));
+        while (members.Count < MaxLargeValueWalkSteps && found.TryDequeue(out var next))
+        {
+            if (members.ContainsKey(next.Type))
+                continue;
+
+            var own = LargeValueMembers(next.Type);
+            members.Add(next.Type, own);
+            if (next.Depth >= MaxFlattenDepth)
+                continue;
+
+            foreach (var member in own)
+            {
+                if (member.Flattened is { } nested && !members.ContainsKey(nested))
+                    found.Enqueue((nested, next.Depth + 1));
+            }
+        }
+
+        // 2. The types that lead to a large-value member: those that have one, and every type above them.
+        var owners = new Dictionary<Type, List<Type>>();
+        var leads = new HashSet<Type>();
+        var reached = new Queue<Type>();
+        foreach (var (type, own) in members)
+        {
+            foreach (var member in own)
+            {
+                if (member.Flattened is not { } nested)
+                {
+                    if (leads.Add(type))
+                        reached.Enqueue(type);
+                    continue;
+                }
+
+                if (!owners.TryGetValue(nested, out var above))
+                    owners[nested] = above = [];
+                above.Add(type);
+            }
+        }
+        while (reached.TryDequeue(out var type))
+        {
+            if (!owners.TryGetValue(type, out var above))
+                continue;
+
+            foreach (var owner in above)
+            {
+                if (leads.Add(owner))
+                    reached.Enqueue(owner);
+            }
+        }
+        if (!leads.Contains(root))
+            return LargeValueInfo.None;
+
+        // 3. The columns: every path, or the nearest ones when there are too many paths to list.
+        var columns = new List<string>();
+        var steps = 0;
+        if (!TryListEveryPath(new WalkStep(root, string.Empty, null), members, leads, columns, ref steps))
+        {
+            columns.Clear();
+            ListNearestPaths(root, members, leads, columns);
+        }
+        return new LargeValueInfo(true, columns.AsReadOnly());
+    }
+
+    // Every path through the types that lead to a large-value member, depth first in declaration
+    // order. False when that takes more than MaxLargeValueWalkSteps. The column-name limit bounds the
+    // depth, so an endless chain of types ends too.
+    private static bool TryListEveryPath(
+        WalkStep step, Dictionary<Type, List<LargeValueMember>> members, HashSet<Type> leads, List<string> columns, ref int steps)
+    {
+        if (++steps > MaxLargeValueWalkSteps)
+            return false;
+
+        foreach (var member in members[step.Type])
+        {
+            var column = step.Prefix + member.Name;
+            if (column.Length > MaxColumnNameLength)
+                continue;
+
+            if (member.Flattened is not { } nested)
+                columns.Add(column);
+            else if (leads.Contains(nested) && !step.Meets(nested)
+                     && !TryListEveryPath(new WalkStep(nested, column + TableEntityValue.PathDelimiter, step), members, leads, columns, ref steps))
+                return false;
+        }
+
+        return true;
+    }
+
+    // The same paths breadth first, for a type graph with too many to list: the columns nearest the
+    // root come first, and the listing stops after MaxLargeValueWalkSteps.
+    private static void ListNearestPaths(
+        Type root, Dictionary<Type, List<LargeValueMember>> members, HashSet<Type> leads, List<string> columns)
+    {
+        var queue = new Queue<WalkStep>();
+        queue.Enqueue(new WalkStep(root, string.Empty, null));
+        for (var steps = 1; queue.TryDequeue(out var step); steps++)
+        {
+            foreach (var member in members[step.Type])
+            {
+                var column = step.Prefix + member.Name;
+                if (column.Length > MaxColumnNameLength)
+                    continue;
+
+                if (member.Flattened is not { } nested)
+                    columns.Add(column);
+                else if (leads.Contains(nested) && !step.Meets(nested) && steps + queue.Count < MaxLargeValueWalkSteps)
+                    queue.Enqueue(new WalkStep(nested, column + TableEntityValue.PathDelimiter, step));
+            }
+        }
+    }
+
+    /// <summary>One type on a path from the root, with the column prefix that leads to it.</summary>
+    private sealed class WalkStep(Type type, string prefix, WalkStep? owner)
+    {
+        public Type Type { get; } = type;
+
+        public string Prefix { get; } = prefix;
+
+        /// <summary>True when the path already passes through <paramref name="other"/>.</summary>
+        public bool Meets(Type other)
+        {
+            for (var step = this; step is not null; step = step.Owner)
+            {
+                if (step.Type == other)
+                    return true;
+            }
+            return false;
+        }
+
+        private WalkStep? Owner { get; } = owner;
+    }
+
+    /// <summary>
+    /// One property of a type as the large-value walk sees it: a large-value column of its own
+    /// (<see cref="Flattened"/> is null), or a property whose declared type flattens into columns.
+    /// </summary>
+    private readonly record struct LargeValueMember(string Name, Type? Flattened, PropertyInfo Property);
+
+    // The properties of one type that are, or may lead to, large-value columns, in declaration order.
+    // Reflection over an arbitrary type can fail (a member type that does not load, a dynamic type).
+    // A property that cannot be read contributes nothing and the others still count; a type whose
+    // properties cannot be listed contributes nothing. Neither costs data: the serializer reflects over
+    // the same members before it writes a value of the type, and fails there.
+    private static List<LargeValueMember> LargeValueMembers(Type type)
+    {
+        var members = new List<LargeValueMember>();
+#pragma warning disable CA1031 // deciding whether a type is large-value aware must not throw, whatever reflection does
+        try
+        {
+            var classLevel = ClassLevelSplit(type);
+            foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                try
+                {
+                    if (LargeValueMemberOf(type, prop, classLevel) is { } member)
+                        members.Add(member);
+                }
+                catch (Exception)
+                {
+                    // This property is not a column the walk can describe.
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // The properties of this type cannot be listed.
+        }
+#pragma warning restore CA1031
+        return members;
+    }
+
+    private static LargeValueMember? LargeValueMemberOf(Type type, PropertyInfo prop, TableValueSplitAttribute? classLevel)
+    {
+        // An indexer is never a column: the writer cannot read it without an index.
+        if (!IsSerialized(prop) || prop.GetIndexParameters().Length > 0)
+            return null;
+
+        var propertyType = prop.PropertyType;
+        if (propertyType == typeof(TableBlobContent) || SplitFor(type, prop, classLevel, validate: false) is not null)
+            return new LargeValueMember(prop.Name, Flattened: null, prop);
+        return FlattensIntoColumns(propertyType) ? new LargeValueMember(prop.Name, propertyType, prop) : null;
+    }
+
+    /// <summary>
+    /// The stored property of <paramref name="owner"/> named <paramref name="name"/>, read by reflection
+    /// alone (no flattening metadata is built for <paramref name="owner"/>, which may be a declared type
+    /// the serializer never flattens): its declared type, and whether it is a large-value member. False
+    /// when the type stores no such property.
+    /// </summary>
+    internal static bool TryGetMember(Type owner, string name, out Type memberType, out bool largeValue)
+    {
+        foreach (var prop in SerializedProperties(owner))
+        {
+            if (prop.Name != name || prop.GetIndexParameters().Length > 0)
+                continue;
+
+            memberType = prop.PropertyType;
+            largeValue = memberType == typeof(TableBlobContent)
+                         || SplitFor(owner, prop, ClassLevelSplit(owner), validate: false) is not null;
+            return true;
+        }
+
+        memberType = typeof(object);
+        largeValue = false;
+        return false;
+    }
+
+    /// <summary>
+    /// The property a read of <paramref name="root"/> sets the flattened column path
+    /// (<c>["Inner", "Body"]</c>) on, resolved as an ordinary cell is set: every owner along the path is
+    /// the instance that is already there, so a default instance keeps its runtime type (which may have
+    /// members its declared type lacks), or a new instance of the declared type where there is none.
+    /// Null when no property takes the column. Nothing is changed on <paramref name="root"/>.
+    /// </summary>
+    /// <exception cref="Exception">
+    /// Whatever creating a missing owner throws: an interface or abstract type has no instance to create,
+    /// and an ordinary cell below it fails the same way.
+    /// </exception>
+    internal static PropertyInfo? ReadTarget(object root, IReadOnlyList<string> path)
+    {
+        var owner = root;
+        for (var i = 0; i < path.Count - 1; i++)
+        {
+            if (!GetMetadata(owner.GetType()).PropertyMap.TryGetValue(path[i], out var property))
+                return null;
+            if (property.GetValue(owner) is not { } child)
+                return ReadTarget(property.PropertyType, string.Join(TableEntityValue.PathDelimiter, path.Skip(i + 1)));
+            owner = child;
+        }
+        return GetMetadata(owner.GetType()).PropertyMap.TryGetValue(path[^1], out var leaf) ? leaf : null;
+    }
+
+    /// <summary>The most resolved columns <see cref="ReadTarget(Type, string)"/> remembers; beyond it they are resolved again.</summary>
+    private const int MaxRememberedReadTargets = 10_000;
+
+    /// <summary>
+    /// <see cref="ReadTarget(object, IReadOnlyList{string})"/> on a new instance of <paramref name="type"/>:
+    /// the property a read of that type sets the flattened <paramref name="column"/> on, or null. The
+    /// answer is remembered per type and column; a failure is not, and is thrown again.
+    /// </summary>
+    internal static PropertyInfo? ReadTarget(Type type, string column)
+    {
+        if (_readTargets.TryGetValue((type, column), out var known))
+            return known;
+
+        var path = TableEntityValue.Create(column, string.Empty).Path;
+        var target = path.IsEmpty ? null : ReadTarget(GetMetadata(type).Creator(), path);
+        if (_readTargets.Count < MaxRememberedReadTargets)
+            _readTargets.TryAdd((type, column), target);
+        return target;
+    }
+
+    /// <summary>
+    /// True when the property a read of <paramref name="type"/> sets <paramref name="column"/> on is a
+    /// large-value member: a <see cref="TableBlobContent"/>, or one its owner's runtime type opts in.
+    /// Never throws, and the answer is remembered: a column a read cannot resolve is not one.
+    /// </summary>
+    internal static bool IsLargeValueOnRead(Type type, string column)
+    {
+        if (_largeOnRead.TryGetValue((type, column), out var known))
+            return known;
+
+        bool large;
+#pragma warning disable CA1031 // a path a read cannot resolve names no member to refuse
+        try
+        {
+            large = ReadTarget(type, column) is { ReflectedType: { } owner } leaf
+                && (leaf.PropertyType == typeof(TableBlobContent) || GetMetadata(owner).SplitOptions.ContainsKey(leaf.Name));
+        }
+        catch (Exception)
+        {
+            large = false;
+        }
+#pragma warning restore CA1031
+        if (_largeOnRead.Count < MaxRememberedReadTargets)
+            _largeOnRead.TryAdd((type, column), large);
+        return large;
+    }
+
+    /// <summary>
+    /// False when a read of <paramref name="root"/> maps <paramref name="column"/> to no property, so a
+    /// value stored under it would never be read. True when it maps, and also when the read fails at an
+    /// owner it cannot create: that read reports the failure, as it does for the ordinary cells beside
+    /// the value (the behaviour of 0.8.3 for that shape).
+    /// </summary>
+    internal static bool ReadsBack(Type root, string column)
+    {
+#pragma warning disable CA1031 // a read that fails is not a read that silently skips the value
+        try
+        {
+            return ReadTarget(root, column) is not null;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+#pragma warning restore CA1031
     }
 
     // A property type the serializer stores natively (no columns of its own to walk).
@@ -1463,14 +2083,19 @@ internal static class TypeMetadataCache
     private static bool FlattensIntoColumns(Type type) =>
         !IsScalar(type) && TableEntitySerializer.FlattensToColumns(type);
 
+    // The public instance properties the serializer stores as columns (the rule of 0.8.3, unchanged).
+    private static IEnumerable<PropertyInfo> SerializedProperties(Type t) =>
+        t.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(IsSerialized);
+
+    private static bool IsSerialized(PropertyInfo p) =>
+        p.CanRead && p.CanWrite
+        && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
+        && p.Name != nameof(TableEntity.ETag)
+        && p.Name != nameof(TableEntity.Timestamp);
+
     private static TypeMetadata CreateMetadata(Type t)
     {
-        var props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                     .Where(p => p.CanRead && p.CanWrite
-                              && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
-                              && p.Name != nameof(TableEntity.ETag)
-                              && p.Name != nameof(TableEntity.Timestamp))
-                     .ToImmutableList();
+        var props = SerializedProperties(t).ToImmutableList();
 
         var map = props.ToDictionary(p => p.Name, p => p);
         // Prefer the real ctor (runs field initializers). For types WITHOUT a public parameterless
@@ -1484,62 +2109,101 @@ internal static class TypeMetadataCache
         return new TypeMetadata(props, map, BuildAliasMap(t, map), BuildSplitOptions(t, props), creator);
     }
 
-    // [TableValueSplit] per property. A property-level attribute wins. A class-level attribute covers
-    // every string, byte[] and JSON-stored property declared by the annotated class or a class
-    // derived from it - not members inherited from its bases (Entity.Id stays an ordinary, filterable
-    // key column). A property-level attribute on a scalar or on a concrete type that flattens into
-    // columns has nothing to split and fails on first use of the type; one on an interface or abstract
-    // type that may flatten at runtime cannot be honoured and fails (NotSupportedException) too.
+    // [TableValueSplit] per property; see SplitFor. A misused attribute fails here, on first use of the type.
     private static Dictionary<string, TableValueSplitAttribute> BuildSplitOptions(Type t, ImmutableList<PropertyInfo> props)
     {
         var options = new Dictionary<string, TableValueSplitAttribute>(StringComparer.Ordinal);
-
-        Type? annotated = null;
-        for (var cur = t; cur is not null; cur = cur.BaseType)
-        {
-            if (cur.IsDefined(typeof(TableValueSplitAttribute), inherit: false))
-            {
-                annotated = cur;
-                break;
-            }
-        }
-        var classLevel = annotated?.GetCustomAttribute<TableValueSplitAttribute>(inherit: false);
-
+        var classLevel = ClassLevelSplit(t);
         foreach (var prop in props)
         {
-            var type = prop.PropertyType;
-            if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
-            {
-                if (type == typeof(TableBlobContent))
-                    throw new InvalidOperationException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: a TableBlobContent is always stored in blob storage. Remove the attribute.");
-                if (IsScalar(type) && type != typeof(string) && type != typeof(byte[]))
-                    throw new InvalidOperationException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: a {type.Name} is a native cell and cannot be split. " +
-                        "Only string, byte[] and JSON-stored properties can.");
-                if (FlattensIntoColumns(type) && !type.IsInterface && !type.IsAbstract)
-                    throw new InvalidOperationException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is flattened into columns. " +
-                        "Put [TableValueSplit] on its members instead.");
-                // An interface or abstract type flattens or not depending on the runtime value; a
-                // flattened value would silently ignore the attribute (and could then be trimmed).
-                if (!IsSplittable(type))
-                    throw new NotSupportedException(
-                        $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is an interface or abstract type, which may be " +
-                        "flattened into columns at runtime, so the attribute cannot be honoured. Declare the property as " +
-                        "string, byte[] or a concrete type stored as JSON, or put [TableValueSplit] on the members of its implementations.");
-                options[prop.Name] = own;
-            }
-            else if (classLevel is not null
-                     && prop.DeclaringType is { } declaring && annotated!.IsAssignableFrom(declaring)
-                     && IsSplittable(type))
-            {
-                options[prop.Name] = classLevel;
-            }
+            if (SplitFor(t, prop, classLevel, validate: true) is { } split)
+                options[prop.Name] = split;
         }
 
         return options;
     }
+
+    // The class-level [TableValueSplit] that applies to t: the nearest one, on t itself or on a base
+    // class (a derived class inherits it, and may declare its own).
+    private static TableValueSplitAttribute? ClassLevelSplit(Type t)
+    {
+        for (var cur = t; cur is not null; cur = cur.BaseType)
+        {
+            if (cur.GetCustomAttribute<TableValueSplitAttribute>(inherit: false) is { } attribute)
+                return attribute;
+        }
+        return null;
+    }
+
+    // The [TableValueSplit] that applies to one property of t, or null.
+    //  - A property-level attribute wins: the property's own, or the one of the base property it
+    //    re-declares (override or new), so a re-declaration keeps the opt-in.
+    //  - Otherwise the class-level attribute of t covers every string, byte[] and JSON-stored property
+    //    of t, declared or inherited - but never the entity id (it stays an ordinary, filterable key
+    //    column) nor a member that is not stored as an ordinary column (an indexer; ETag, Timestamp and
+    //    [IgnoreDataMember] members are not serialized properties at all).
+    // A property-level attribute on a scalar or on a concrete type that flattens into columns has
+    // nothing to split; one on an interface or abstract type that may flatten at runtime cannot be
+    // honoured. With validate such a misuse throws (the serializer, on first use of the type); without,
+    // the property is simply not opted in (the large-value walk, which must not throw).
+    private static TableValueSplitAttribute? SplitFor(Type t, PropertyInfo prop, TableValueSplitAttribute? classLevel, bool validate)
+    {
+        // The property's type is resolved only for a property an attribute may cover: the metadata of
+        // a type that opts into nothing is built from property names and attributes alone, as on 0.8.3.
+        if (PropertyLevelSplit(prop) is not { } own)
+            return classLevel is not null && IsOrdinaryColumn(t, prop) && IsSplittable(prop.PropertyType) ? classLevel : null;
+
+        var type = prop.PropertyType;
+        if (type == typeof(TableBlobContent))
+            return !validate ? null : throw new InvalidOperationException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: a TableBlobContent is always stored in blob storage. Remove the attribute.");
+        if (IsScalar(type) && type != typeof(string) && type != typeof(byte[]))
+            return !validate ? null : throw new InvalidOperationException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: a {type.Name} is a native cell and cannot be split. " +
+                "Only string, byte[] and JSON-stored properties can.");
+        if (FlattensIntoColumns(type) && !type.IsInterface && !type.IsAbstract)
+            return !validate ? null : throw new InvalidOperationException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is flattened into columns. " +
+                "Put [TableValueSplit] on its members instead.");
+        // An interface or abstract type flattens or not depending on the runtime value; a
+        // flattened value would silently ignore the attribute (and could then be trimmed).
+        if (!IsSplittable(type))
+            return !validate ? null : throw new NotSupportedException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is an interface or abstract type, which may be " +
+                "flattened into columns at runtime, so the attribute cannot be honoured. Declare the property as " +
+                "string, byte[] or a concrete type stored as JSON, or put [TableValueSplit] on the members of its implementations.");
+        return own;
+    }
+
+    // The property's own [TableValueSplit], or that of the base property it re-declares: an override
+    // inherits it through reflection; a property that hides (new) a base property of the same name and
+    // type does not, so the hidden declarations are looked up (by name first: a property that
+    // re-declares nothing resolves no type).
+    private static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
+    {
+        if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
+            return own;
+
+        for (var cur = prop.DeclaringType?.BaseType; cur is not null; cur = cur.BaseType)
+        {
+            foreach (var hidden in cur.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+            {
+                if (hidden.Name == prop.Name
+                    && hidden.GetIndexParameters().Length == 0 && prop.GetIndexParameters().Length == 0
+                    && hidden.PropertyType == prop.PropertyType
+                    && hidden.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } inherited)
+                    return inherited;
+            }
+        }
+        return null;
+    }
+
+    // A property a class-level attribute may opt in: one the writer stores as an ordinary column (not
+    // an indexer, nor a name with the path delimiter, which the writer refuses), and not the entity id.
+    private static bool IsOrdinaryColumn(Type t, PropertyInfo prop) =>
+        prop.GetIndexParameters().Length == 0
+        && !TableEntityValue.ContainsPathDelimiter(prop.Name)
+        && !(prop.Name == nameof(IEntity.Id) && typeof(IEntity).IsAssignableFrom(t));
 
     // string, byte[], or a type the serializer stores as one JSON cell.
     private static bool IsSplittable(Type type) =>

@@ -132,22 +132,67 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     }
 
     /// <summary>
-    /// Serializes <paramref name="entity"/> and plans its rows. While the plan does not fit one
-    /// entity-group transaction (with <paramref name="extraActions"/> more actions), the largest split
-    /// value whose property allows offload is moved to a blob and the entity re-serialized.
+    /// Serializes <paramref name="entity"/> and plans its rows.
+    /// <para>
+    /// An opted-in value that fits one cell stays in its cell. When the cells that must stay on the
+    /// primary row then exceed one entity, the largest of those values are moved to split form (their
+    /// property's encoding, the normal split cells), so their chunks can go to continuation rows, until
+    /// the primary row fits; a row that needed this is also brought within the request budget of one
+    /// entity (<see cref="SplitRowLayout.MaxEntityWireBytes"/>) as far as moving such values can, like
+    /// every row split cells are placed on. A row that fits one entity is left as it is.
+    /// </para>
+    /// <para>
+    /// While the plan does not fit one entity-group transaction (with <paramref name="extraActions"/>
+    /// more actions), the largest split value whose property allows offload is moved to a blob and the
+    /// entity re-serialized.
+    /// </para>
     /// </summary>
-    /// <exception cref="OversizedValueException">No value is left that may be offloaded.</exception>
+    /// <exception cref="OversizedValueException">
+    /// Nothing more can be moved: the cells that are left on the primary row exceed one entity, or no
+    /// value is left that may be offloaded. The exception names a column of the entity.
+    /// </exception>
     internal (TableEntity Row, SplitRowPlan Plan, IReadOnlyList<PendingBlob> Blobs) Serialize(object entity, string pk, string rk, int extraActions)
     {
         ArgumentNullException.ThrowIfNull(entity);
-        var type = entity.GetType();
         var force = new HashSet<string>(StringComparer.Ordinal);
+        var split = new HashSet<string>(StringComparer.Ordinal);
         while (true)
         {
             var pending = new List<PendingBlob>();
-            var ctx = new ValueWriteContext(options, tableName, force, IsClone: false);
+            var inline = new List<InlineValue>();
+            var ctx = new ValueWriteContext(options, tableName, force, IsClone: false) { ForceSplit = split, Inline = inline };
             var row = TableEntitySerializer.ToTableEntity(entity, pk, rk, ctx, pending);
-            var plan = SplitRowLayout.Plan(row);
+            if (SplitRowLayout.TryPlan(row, out var overflow) is not { } plan)
+            {
+                // The cells that must stay on the primary row exceed one entity, and opted-in values of
+                // one cell each are among them: move the largest, so their chunks can leave the row.
+                var gains = inline.ConvertAll(value => (value.Column, Gain: SplitRowLayout.PromotionGain(row, value).Bytes));
+                var moved = SplitRowLayout.ChoosePromotions(overflow!, gains);
+                if (moved.Count == 0)
+                    throw SplitRowLayout.PrimaryOverflowError(overflow!, gains.Count(g => g.Gain > 0));
+                split.UnionWith(moved);
+                continue;
+            }
+
+            // A row values were moved off is a split row: its primary row is kept within the request
+            // budget of one entity too, as far as moving more of them can. (Cells that cannot be moved
+            // are held to the stored size alone, as on every row.)
+            if (split.Count > 0 && inline.Count > 0)
+            {
+                var first = SplitRowLayout.FirstRowWireExcess(plan);
+                if (first.Excess > 0)
+                {
+                    var gains = inline.ConvertAll(value => (value.Column, Gain: SplitRowLayout.PromotionGain(row, value)));
+                    var moved = SplitRowLayout.ChoosePromotions(
+                        first.Properties, first.Excess, gains.Where(g => g.Gain.Bytes > 0).Select(g => (g.Column, g.Gain.Wire)));
+                    if (moved.Count > 0)
+                    {
+                        split.UnionWith(moved);
+                        continue;
+                    }
+                }
+            }
+
             if (SplitRowLayout.FitsOneTransaction(plan, extraActions))
                 return (row, plan, pending);
 
@@ -161,7 +206,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                     continue;
                 if (force.Contains(column)) continue;
                 var length = value switch { long l => l, int i => i, _ => 0L };
-                if (TableEntitySerializer.SplitOptionFor(type, column)?.Offload == BlobOffload.Never)
+                if (TableEntitySerializer.SplitOptionFor(entity, column)?.Offload == BlobOffload.Never)
                 {
                     if (length > neverLength) (never, neverLength) = (column, length);
                 }
@@ -182,10 +227,11 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
                 throw new OversizedValueException(never, neverLength,
                     reason + " and the property does not allow blob offload (BlobOffload.Never)",
                     offloadForbiddenByProperty: options is not null);
-            throw new OversizedValueException(
-                best ?? never ?? rk,
-                best is not null ? bestLength : TableRowSize.Estimate(plan.Primary) + plan.Parts.Sum(TableRowSize.Estimate),
-                options is null ? reason + " and blob offload is not configured" : reason);
+            // A split value that may be offloaded is left, and there is nowhere to offload it to.
+            if (best is not null)
+                throw new OversizedValueException(best, bestLength, reason + " and blob offload is not configured");
+            // No split value is left at all: the deletes of the stored row's continuation rows do not fit.
+            throw SplitRowLayout.TransactionOverflowError(plan, extraActions);
         }
     }
 
@@ -341,7 +387,10 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// <summary>
     /// Resolves the blob references of <paramref name="row"/> that are in scope (every one, or those a
     /// projection names): a <see cref="TableBlobContent"/> target becomes lazy content; any other target
-    /// is downloaded and verified into <see cref="ValueReadContext.Resolved"/>.
+    /// is downloaded and verified into <see cref="ValueReadContext.Resolved"/>. A reference's target is
+    /// the property the read of the row sets its column on, which follows the runtime type of the
+    /// entity's default instances, not only the declared property types, and the
+    /// <see cref="ColumnAliasAttribute"/> of a renamed property (a reference under the legacy column).
     /// </summary>
     /// <param name="row">The (assembled) row.</param>
     /// <param name="entityType">The type the row is read as, which decides each reference's target.</param>
@@ -360,12 +409,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         {
             if (!SplitCodec.TryParseLargeValueColumn(key, out var column, out var kind, out _) || kind != LargeValueCellKind.BlobReference)
                 continue;
-            if (projectedColumns is not null && !Projects(projectedColumns, column))
+            if (TableEntitySerializer.LargeValueTarget(entityType, row, column) is not { } target)
                 continue;
-            var path = TableEntityValue.Create(column, string.Empty).Path;
-            if (TypeMetadataCache.ResolvePath(entityType, path) is not { } target)
+            // A projection names properties: a legacy column is in scope when its (renamed) property is.
+            if (projectedColumns is not null && !Projects(projectedColumns, column) && !Projects(projectedColumns, target.Column))
                 continue;
-            if (target.PropertyType == typeof(TableBlobContent))
+            if (target.Type == typeof(TableBlobContent))
             {
                 anyLazy = true;
                 continue;
