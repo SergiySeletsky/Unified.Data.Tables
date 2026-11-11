@@ -470,17 +470,18 @@ public static class TableEntitySerializer
         if (!TypeMetadataCache.IsLargeValueAware(ownerType))
             return FlattenProperty(columnPath, value);
 
+        // The entity type is one the serializer flattens: its metadata is built here as on any first
+        // use, so a misused attribute is reported. The types further along the path are declared types,
+        // which the serializer may never flatten, so they are read by reflection alone.
+        _ = TypeMetadataCache.GetMetadata(ownerType);
         var owner = ownerType;
         foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries))
         {
-            var meta = TypeMetadataCache.GetMetadata(owner);
-            if (meta.SplitOptions.ContainsKey(segment))
-                throw new NotSupportedException(PartialUpdateRefusal(columnPath));
-            if (!meta.PropertyMap.TryGetValue(segment, out var prop))
+            if (!TypeMetadataCache.TryGetMember(owner, segment, out var memberType, out var largeValue))
                 break;
-            if (prop.PropertyType == typeof(TableBlobContent))
+            if (largeValue)
                 throw new NotSupportedException(PartialUpdateRefusal(columnPath));
-            owner = prop.PropertyType;
+            owner = memberType;
         }
         return FlattenProperty(columnPath, value);
     }
@@ -1613,35 +1614,72 @@ internal static class TypeMetadataCache
     private readonly record struct LargeValueMember(string Name, Type? Flattened);
 
     // The properties of one type that are, or may lead to, large-value columns, in declaration order.
-    // Reflection over an arbitrary type can fail (a member type that does not load, a dynamic type);
-    // such a type contributes nothing, which costs no data: the serializer reflects over the same
-    // members before it writes a value of the type, and fails there.
+    // Reflection over an arbitrary type can fail (a member type that does not load, a dynamic type).
+    // A property that cannot be read contributes nothing and the others still count; a type whose
+    // properties cannot be listed contributes nothing. Neither costs data: the serializer reflects over
+    // the same members before it writes a value of the type, and fails there.
     private static List<LargeValueMember> LargeValueMembers(Type type)
     {
         var members = new List<LargeValueMember>();
+#pragma warning disable CA1031 // deciding whether a type is large-value aware must not throw, whatever reflection does
         try
         {
             var classLevel = ClassLevelSplit(type);
-            foreach (var prop in SerializedProperties(type))
+            foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
             {
-                // An indexer is never a column: the writer cannot read it without an index.
-                if (prop.GetIndexParameters().Length > 0)
-                    continue;
-
-                var propertyType = prop.PropertyType;
-                if (propertyType == typeof(TableBlobContent) || SplitFor(type, prop, classLevel, validate: false) is not null)
-                    members.Add(new LargeValueMember(prop.Name, Flattened: null));
-                else if (FlattensIntoColumns(propertyType))
-                    members.Add(new LargeValueMember(prop.Name, propertyType));
+                try
+                {
+                    if (LargeValueMemberOf(type, prop, classLevel) is { } member)
+                        members.Add(member);
+                }
+                catch (Exception)
+                {
+                    // This property is not a column the walk can describe.
+                }
             }
         }
-#pragma warning disable CA1031 // deciding whether a type is large-value aware must not throw, whatever reflection does
         catch (Exception)
-#pragma warning restore CA1031
         {
-            members.Clear();
+            // The properties of this type cannot be listed.
         }
+#pragma warning restore CA1031
         return members;
+    }
+
+    private static LargeValueMember? LargeValueMemberOf(Type type, PropertyInfo prop, TableValueSplitAttribute? classLevel)
+    {
+        // An indexer is never a column: the writer cannot read it without an index.
+        if (!IsSerialized(prop) || prop.GetIndexParameters().Length > 0)
+            return null;
+
+        var propertyType = prop.PropertyType;
+        if (propertyType == typeof(TableBlobContent) || SplitFor(type, prop, classLevel, validate: false) is not null)
+            return new LargeValueMember(prop.Name, Flattened: null);
+        return FlattensIntoColumns(propertyType) ? new LargeValueMember(prop.Name, propertyType) : null;
+    }
+
+    /// <summary>
+    /// The stored property of <paramref name="owner"/> named <paramref name="name"/>, read by reflection
+    /// alone (no flattening metadata is built for <paramref name="owner"/>, which may be a declared type
+    /// the serializer never flattens): its declared type, and whether it is a large-value member. False
+    /// when the type stores no such property.
+    /// </summary>
+    internal static bool TryGetMember(Type owner, string name, out Type memberType, out bool largeValue)
+    {
+        foreach (var prop in SerializedProperties(owner))
+        {
+            if (prop.Name != name || prop.GetIndexParameters().Length > 0)
+                continue;
+
+            memberType = prop.PropertyType;
+            largeValue = memberType == typeof(TableBlobContent)
+                         || SplitFor(owner, prop, ClassLevelSplit(owner), validate: false) is not null;
+            return true;
+        }
+
+        memberType = typeof(object);
+        largeValue = false;
+        return false;
     }
 
     /// <summary>Resolves a flattened column path (<c>["Inner", "Body"]</c>) to its leaf property, or null.</summary>
@@ -1670,11 +1708,13 @@ internal static class TypeMetadataCache
 
     // The public instance properties the serializer stores as columns (the rule of 0.8.3, unchanged).
     private static IEnumerable<PropertyInfo> SerializedProperties(Type t) =>
-        t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-         .Where(p => p.CanRead && p.CanWrite
-                  && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
-                  && p.Name != nameof(TableEntity.ETag)
-                  && p.Name != nameof(TableEntity.Timestamp));
+        t.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(IsSerialized);
+
+    private static bool IsSerialized(PropertyInfo p) =>
+        p.CanRead && p.CanWrite
+        && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
+        && p.Name != nameof(TableEntity.ETag)
+        && p.Name != nameof(TableEntity.Timestamp);
 
     private static TypeMetadata CreateMetadata(Type t)
     {

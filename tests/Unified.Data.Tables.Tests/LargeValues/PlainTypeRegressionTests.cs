@@ -1036,6 +1036,151 @@ public class PlainTypeRegressionTests
         Assert.False(LargeValueTable.IsLargeValueAware(type));
     }
 
+    /// <summary>An opted-in entity that also has the members that broke plain types.</summary>
+    public class SplitWithJsonMembersDoc : Entity
+    {
+        [TableValueSplit(SplitEncoding.Text)]
+        public string? Body { get; set; }
+
+        public JsonNode? Payload { get; set; }
+
+        public PlainJsonHolder? Inner { get; set; }
+
+        public IPlainLookup? Lookup { get; set; } = new PlainLookup();
+    }
+
+    [Fact]
+    public async Task OptedInType_WithJsonMembers_IsAware_AndRoundTripsOnBothStores()
+    {
+        // The same walk decides awareness for an opted-in type: JsonNode and the indexed interface
+        // must not break it either.
+        Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(SplitWithJsonMembersDoc)));
+        Assert.Equal(["Body"], TypeMetadataCache.LargeValueColumns(typeof(SplitWithJsonMembersDoc)));
+
+        var body = OffloadTestSupport.Ascii(40_000);
+        SplitWithJsonMembersDoc Make() => new()
+        {
+            Id = Id,
+            Body = body,
+            Payload = Sample(),
+            Inner = new PlainJsonHolder { Name = "n", Data = JsonNode.Parse("[1]") },
+            Lookup = new PlainLookup { Label = "abc" },
+        };
+
+        static void AssertStored(TableEntity row, SplitWithJsonMembersDoc read, string expectedBody)
+        {
+            Assert.Equal(2, row["Body__chunks"]);
+            Assert.Equal(SampleJson, row["Payload__Json"]);
+            Assert.Equal("[1]", row["Inner_Data__Json"]);
+            Assert.Equal("n", row["Inner_Name"]);
+            Assert.Equal("abc", row["Lookup_Label"]);
+            Assert.Equal(expectedBody, read.Body);
+            AssertJson(SampleJson, read.Payload);
+            AssertJson("[1]", read.Inner!.Data);
+            Assert.Equal("abc", read.Lookup!.Label);
+        }
+
+        TableEntity? written = null;
+        using (var writer = new StorageHarness<SplitWithJsonMembersDoc>())
+        {
+            writer.Table.AddEntityAsync(Arg.Do<TableEntity>(e => written = e), Arg.Any<CancellationToken>()).Returns(Mocks.EtagResponse());
+            await writer.Store.CreateAsync(Make());
+        }
+        Assert.NotNull(written);
+        written.ETag = new ETag("W/\"etag1\"");
+        using (var reader = new StorageHarness<SplitWithJsonMembersDoc>())
+        {
+            reader.SetupGet(written);
+            AssertStored(written, (await reader.Store.OneAsync(Id))!, body);
+        }
+
+        var memory = new InMemoryStorage<SplitWithJsonMembersDoc>();
+        await memory.CreateAsync(Make());
+        AssertStored(memory.PhysicalRow(Pk, Rk)!, (await memory.OneAsync(Id))!, body);
+
+        // A builder update of an ordinary member through the declared types still merges (the path
+        // check builds no metadata for the indexed interface either); one of the large member is refused.
+        await memory.UpdateAsync(Id, b => b.SetProperty(x => x.Inner!.Name, "n2"));
+        await memory.UpdateAsync(Id, b => b.SetProperty(x => x.Lookup!.Label, "v2"));
+        var merged = (await memory.OneAsync(Id))!;
+        Assert.Equal("n2", merged.Inner!.Name);
+        Assert.Equal("v2", merged.Lookup!.Label);
+        await Assert.ThrowsAsync<NotSupportedException>(() => memory.UpdateAsync(Id, b => b.SetProperty(x => x.Body, "new")));
+        Assert.Equal(body, (await memory.OneAsync(Id))!.Body);
+
+        using var harness = new StorageHarness<SplitWithJsonMembersDoc>();
+        TableEntity? patch = null;
+        harness.Table.UpdateEntityAsync(Arg.Do<TableEntity>(e => patch = e), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns(Mocks.EtagResponse());
+        await harness.Store.UpdateAsync(Id, b => b.SetProperty(x => x.Lookup!.Label, "v2"));
+        Assert.Equal("v2", patch!["Lookup_Label"]);
+        await Assert.ThrowsAsync<NotSupportedException>(() => harness.Store.UpdateAsync(Id, b => b.SetProperty(x => x.Body, "new")));
+    }
+
+    private sealed class PartlyUnreflectableMarker
+    {
+        [TableValueSplit(SplitEncoding.Text)]
+        public string? Body { get; set; }
+
+        public string? Broken { get; set; }
+
+        public TableBlobContent? File { get; set; }
+    }
+
+    // The marker's properties, one of which cannot say what its type is.
+    private sealed class PartlyUnreflectableType() : TypeDelegator(typeof(PartlyUnreflectableMarker))
+    {
+        public override PropertyInfo[] GetProperties(BindingFlags bindingAttr) =>
+            base.GetProperties(bindingAttr).Select(p => p.Name == "Broken" ? new UnreflectableProperty(p) : p).ToArray();
+    }
+
+    private sealed class UnreflectableProperty(PropertyInfo inner) : PropertyInfo
+    {
+        public override Type PropertyType => throw new TypeLoadException("Could not load the property type.");
+
+        public override PropertyAttributes Attributes => inner.Attributes;
+
+        public override bool CanRead => inner.CanRead;
+
+        public override bool CanWrite => inner.CanWrite;
+
+        public override string Name => inner.Name;
+
+        public override Type? DeclaringType => inner.DeclaringType;
+
+        public override Type? ReflectedType => inner.ReflectedType;
+
+        public override MethodInfo[] GetAccessors(bool nonPublic) => inner.GetAccessors(nonPublic);
+
+        public override MethodInfo? GetGetMethod(bool nonPublic) => inner.GetGetMethod(nonPublic);
+
+        public override MethodInfo? GetSetMethod(bool nonPublic) => inner.GetSetMethod(nonPublic);
+
+        public override ParameterInfo[] GetIndexParameters() => inner.GetIndexParameters();
+
+        public override object? GetValue(object? obj, BindingFlags invokeAttr, Binder? binder, object?[]? index, System.Globalization.CultureInfo? culture) =>
+            inner.GetValue(obj, invokeAttr, binder, index, culture);
+
+        public override void SetValue(object? obj, object? value, BindingFlags invokeAttr, Binder? binder, object?[]? index, System.Globalization.CultureInfo? culture) =>
+            inner.SetValue(obj, value, invokeAttr, binder, index, culture);
+
+        public override object[] GetCustomAttributes(bool inherit) => inner.GetCustomAttributes(inherit);
+
+        public override object[] GetCustomAttributes(Type attributeType, bool inherit) => inner.GetCustomAttributes(attributeType, inherit);
+
+        public override bool IsDefined(Type attributeType, bool inherit) => inner.IsDefined(attributeType, inherit);
+    }
+
+    [Fact]
+    public void PropertyWhoseReflectionFails_DoesNotHideTheLargeValueMembersBesideIt()
+    {
+        var type = new PartlyUnreflectableType();
+
+        // One unreadable property must not turn an opted-in type into a plain one.
+        Assert.True(TypeMetadataCache.IsLargeValueAware(type));
+        Assert.Equal(["Body", "File"], TypeMetadataCache.LargeValueColumns(type));
+    }
+
     [Fact]
     public async Task MisusedAttribute_NoLongerBreaksStoreConstruction_AndStillFailsOnFirstUse()
     {
