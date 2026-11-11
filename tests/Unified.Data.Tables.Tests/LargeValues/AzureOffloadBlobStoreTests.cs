@@ -200,13 +200,26 @@ public class AzureOffloadBlobStoreTests
     }
 
     [Fact]
-    public async Task OpenRead_ReturnsTheBlobStream()
+    public async Task OpenRead_StreamsTheBlob()
     {
         var rig = new Rig();
         var content = new MemoryStream([1, 2, 3]);
-        rig.Blob.OpenReadAsync(Arg.Any<BlobOpenReadOptions>(), Arg.Any<CancellationToken>()).Returns(Task.FromResult<Stream>(content));
+        BlobOpenReadOptions? options = null;
+        rig.Blob.OpenReadAsync(Arg.Do<BlobOpenReadOptions>(o => options = o), Arg.Any<CancellationToken>()).Returns(Task.FromResult<Stream>(content));
 
-        Assert.Same(content, await rig.Store.OpenReadAsync("File", Name, Ct));
+        // The SDK's stream is not handed out as is: the store reads it through a stream that survives the
+        // blob's metadata being re-set and reports a deleted blob as an integrity failure
+        // (OpenReadDuringWriteTests). What it delivers is the blob, from its start.
+        await using (var stream = await rig.Store.OpenReadAsync("File", Name, Ct))
+        {
+            var bytes = new byte[8];
+            Assert.Equal(3, await stream.ReadAsync(bytes, Ct));
+            Assert.Equal(new byte[] { 1, 2, 3 }, bytes[..3]);
+            Assert.Equal(0, await stream.ReadAsync(bytes, Ct));
+        }
+
+        Assert.Equal(0, options!.Position);
+        Assert.False(content.CanRead, "the SDK stream is disposed with the stream that was handed out");
     }
 
     [Fact]

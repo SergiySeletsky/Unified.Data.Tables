@@ -47,40 +47,87 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// source is hashed in one pass and rewound; a non-seekable one is copied while hashing to a
     /// delete-on-close temporary file that becomes the upload source. Content is never buffered in memory.
     /// </summary>
+    /// <remarks>
+    /// An attempt that fails or is cancelled never leaves a later one the unread tail of a source. A
+    /// seekable source is put back where its content starts, so a retry reads all of it; one that cannot
+    /// be put back, and a forward-only one that was partly consumed, make the content unusable: this and
+    /// every later write of it throws before anything is read or uploaded. So does a content whose
+    /// temporary copy an earlier failed write released (<see cref="ReleasePrepared"/>).
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// A content can no longer be written: its source was partly read by a failed write and cannot be
+    /// read again from where the content starts, or its temporary copy was released by a failed write.
+    /// </exception>
     internal async Task PrepareAsync(object entity, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entity);
-        foreach (var (column, content) in TableEntitySerializer.FindBlobContents(entity))
+        var contents = TableEntitySerializer.FindBlobContents(entity);
+        // Refused before any source is read and any blob uploaded.
+        foreach (var (column, content) in contents)
+        {
+            content.ThrowIfNotWritable(column);
+            // A source prepared by an earlier write that failed must still be there to upload from: one the
+            // caller has closed since is found now, not after other blobs of this write were uploaded.
+            if (content.IsSealed && content.Source is not null)
+                content.RewindSource(column);
+        }
+
+        foreach (var (column, content) in contents)
         {
             if (content.IsSealed) continue;
             var source = content.Source
                 ?? throw new InvalidOperationException($"The TableBlobContent of '{column}' has no content to read.");
-            if (source.CanSeek)
-            {
-                var origin = source.Position;
-                var (length, sha) = await CopyHashingAsync(source, null, ct);
-                source.Position = origin;
-                content.Seal(length, sha, origin);
-            }
+            // Before the first read: a write cancelled by now has not touched the source.
+            ct.ThrowIfCancellationRequested();
+            // A source that was seekable when it was first prepared stays on this path: it is read from
+            // the recorded origin or not at all, never from wherever it stands now.
+            if (content.HasSourceOrigin || source.CanSeek)
+                await HashSeekableAsync(column, content, source, ct);
             else
-            {
-                var spool = new FileStream(
-                    Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()),
-                    FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, CopyBufferBytes,
-                    FileOptions.DeleteOnClose | FileOptions.Asynchronous);
-                try
-                {
-                    var (length, sha) = await CopyHashingAsync(source, spool, ct);
-                    await spool.FlushAsync(ct);
-                    spool.Position = 0;
-                    content.Seal(length, sha, 0, spool);
-                }
-                catch
-                {
-                    await spool.DisposeAsync();
-                    throw;
-                }
-            }
+                await SpoolAsync(content, source, ct);
+        }
+    }
+
+    // Hashes a seekable source in one pass from where its content starts and puts it back there: for
+    // the upload when the pass succeeded, for a retry when it failed or was cancelled.
+    private static async Task HashSeekableAsync(string column, TableBlobContent content, Stream source, CancellationToken ct)
+    {
+        var origin = content.RewindSource(column);
+        long length;
+        string sha;
+        try
+        {
+            (length, sha) = await CopyHashingAsync(source, null, ct);
+            source.Position = origin;
+        }
+        catch
+        {
+            content.RestoreSource();
+            throw;
+        }
+        content.Seal(length, sha);
+    }
+
+    // Copies a forward-only source, while hashing it, to a delete-on-close temporary file that becomes
+    // the upload source. A copy that fails or is cancelled has consumed part of the source for good.
+    private static async Task SpoolAsync(TableBlobContent content, Stream source, CancellationToken ct)
+    {
+        var spool = new FileStream(
+            Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()),
+            FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, CopyBufferBytes,
+            FileOptions.DeleteOnClose | FileOptions.Asynchronous);
+        try
+        {
+            var (length, sha) = await CopyHashingAsync(source, spool, ct);
+            await spool.FlushAsync(ct);
+            spool.Position = 0;
+            content.Seal(length, sha, spool);
+        }
+        catch
+        {
+            await spool.DisposeAsync();
+            content.LoseSource();
+            throw;
         }
     }
 
@@ -146,7 +193,8 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// Makes every pending blob exist: one with the same name and hash is touched (refreshing its
     /// <c>Last-Modified</c>) and its bytes are not sent again; an absent one is uploaded create-only
     /// through a read that verifies the bytes still match what was prepared. Each
-    /// <see cref="TableBlobContent"/> is then bound to its blob.
+    /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob
+    /// stays bound there, and the property it was written from gets a content bound to this one.
     /// </summary>
     /// <exception cref="BlobOffloadNotConfiguredException">Blob offload is not configured.</exception>
     /// <exception cref="InvalidOperationException">A source changed after it was prepared.</exception>
@@ -186,15 +234,29 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         // from the same prepared source, and binding releases that source.
         foreach (var blob in pending)
         {
+            if (blob.Content is not { } content)
+                continue;
             var name = blob.Reference.Path;
             var column = blob.Column;
-            blob.Content?.Bind(name, c => OpenLazyAsync(store, column, name, c), column);
+            Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, c);
+            if (content.Bind(name, open, column))
+                continue;
+
+            // The content already streams another blob: it was read from another row, or it is on another
+            // property or entity as well. That instance is shared (the entity it came from holds it, and so
+            // does each cached copy of that entity), so it stays bound where it is, and the entity being
+            // written gets a content of its own, bound to the blob its own row references. A property that
+            // cannot be assigned keeps the instance as it is.
+            blob.Assign?.Invoke(TableBlobContent.Bound(
+                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column));
         }
     }
 
     /// <summary>
     /// Releases the temporary copies <see cref="PrepareAsync"/> made for the contents of
     /// <paramref name="entity"/> that were not bound to a blob (the write failed before uploading them).
+    /// Such a content has nothing left to be uploaded from: <see cref="PrepareAsync"/> refuses it in every
+    /// later write. A content from a seekable stream or from bytes is not affected and can be written again.
     /// </summary>
     internal static void ReleasePrepared(object entity)
     {
