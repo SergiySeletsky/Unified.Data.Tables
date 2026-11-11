@@ -7,6 +7,13 @@ namespace Unified.Data.Tables;
 /// updates with a caller-supplied ETag, and ETag-conditional partial updates
 /// (<see cref="UpdateBuilder{T}.WithETag"/>). Provider-agnostic — the storage backend's own
 /// exception (e.g. an Azure 412) is preserved as <see cref="Exception.InnerException"/>.
+/// For a type with large values (a <see cref="TableValueSplitAttribute"/> or
+/// <see cref="TableBlobContent"/> property) it is also thrown by a write, delete or batch that lost
+/// its condition to concurrent writers five times, and by a read (a point read, a query, a stream or a
+/// page) whose row another writer replaced during each of its five attempts, so that its continuation
+/// rows or blobs belonged to another version every time. Nothing stored is damaged then and the read
+/// can be repeated; its <see cref="Exception.InnerException"/> is the
+/// <see cref="TableValueIntegrityException"/> of the last attempt.
 /// </summary>
 /// <remarks>
 /// The canonical recovery is re-read → re-apply → retry, which

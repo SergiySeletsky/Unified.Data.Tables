@@ -627,6 +627,9 @@ public sealed partial class InMemoryStorage<T>
     private async Task<IReadOnlyList<T>> BoundedLargeAsync(QueryOptions options, CancellationToken ct) =>
         await MaterializeAllAsync(LogicalSnapshot(() => Bounded(options)), ct);
 
+    // Pages over the stored rows, as the service does for TableStorage: a continuation row (declared or
+    // leftover) takes a place in the page and is then skipped, so a page can hold fewer entities than its
+    // size, or none, and still carry a cursor; the cursor resumes after the last row of the page.
     private async Task<EntityPage<T>> PageLargeAsync(
         string? partition, string? rowKeyPrefix, int pageSize, string fingerprint,
         (string PartitionKey, string RowKey)? after, CancellationToken ct)
@@ -635,7 +638,7 @@ public sealed partial class InMemoryStorage<T>
         string? next = null;
         lock (gate)
         {
-            IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = LogicalRows()
+            IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = OrderedRows()
                 .Where(kv => partition is null || kv.Key.PartitionKey == partition)
                 .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal));
             if (after is { } a)
@@ -649,7 +652,7 @@ public sealed partial class InMemoryStorage<T>
                 var last = page[page.Count - 1].Key;
                 next = PageCursor.Encode(fingerprint, last.PartitionKey + "\0" + last.RowKey);
             }
-            pageRows = page.Select(kv => Assembled(kv.Value)).ToList();
+            pageRows = page.Where(kv => !LargeValueTable.IsPartRow(kv.Value.Data)).Select(kv => Assembled(kv.Value)).ToList();
         }
 
         return new EntityPage<T>(await MaterializeAllAsync(pageRows, ct), next);
@@ -716,9 +719,11 @@ public sealed partial class InMemoryStorage<T>
     /// <summary>
     /// The entity an assembled row holds, its offloaded values downloaded outside the gate. A writer that
     /// replaces or deletes the row meanwhile can delete a blob the snapshot references: as in
-    /// TableStorage, the row is then read again and, when its version changed, the read retries from the
-    /// new version (at most <see cref="MaxLargeReadAttempts"/> attempts); an unchanged version is a genuine
-    /// integrity failure; a row deleted meanwhile is null.
+    /// TableStorage, the row is then read again after every failed attempt, the last included: an
+    /// unchanged version is a genuine integrity failure; a row deleted meanwhile is null; a changed
+    /// version retries the read from the new version after the writers' pause, and when the version
+    /// changed during each of the <see cref="MaxLargeReadAttempts"/> attempts the read throws
+    /// <see cref="ConcurrencyConflictException"/> with the last integrity failure as its inner exception.
     /// </summary>
     private async Task<T?> MaterializeAsync(StoredRow row, CancellationToken ct)
     {
@@ -732,7 +737,7 @@ public sealed partial class InMemoryStorage<T>
                 entity.Timestamp = row.Timestamp;
                 return entity;
             }
-            catch (TableValueIntegrityException) when (attempt < MaxLargeReadAttempts)
+            catch (TableValueIntegrityException failure)
             {
                 StoredRow? current;
                 lock (gate)
@@ -745,13 +750,17 @@ public sealed partial class InMemoryStorage<T>
                     return null;
                 if (current.Version == row.Version)
                     throw;
+                if (attempt >= MaxLargeReadAttempts)
+                    throw new ConcurrencyConflictException(
+                        ConcurrencyMessages.ReadKeptChanging(typeof(T).Name, keys.PartitionKey, keys.RowKey, MaxLargeReadAttempts), failure);
+                await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 row = current;
             }
         }
     }
 
     /// <summary>How many times a read whose blobs belonged to another version of the row is attempted in all (as TableStorage).</summary>
-    private const int MaxLargeReadAttempts = 3;
+    private const int MaxLargeReadAttempts = LargeValueTable.MaxWriteAttempts;
 
     private async Task<List<T>> MaterializeAllAsync(List<StoredRow> source, CancellationToken ct)
     {
