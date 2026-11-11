@@ -355,8 +355,9 @@ await storage.UpdateAsync(id, b => b
 
 `OneAsync`/`QueryAsync` populate `Entity.ETag`. Pass it back on `UpdateAsync(entity)` for a strict
 check — a concurrent modification throws `ConcurrencyConflictException` (the provider's 412 rides
-along as `InnerException`), and the conflicting row's cache entry is evicted so the next read is
-fresh.
+along as `InnerException`; a type with large values reads the row first and, when that read already
+shows another version, has no provider exception to attach), and the conflicting row's cache entry is
+evicted so the next read is fresh.
 
 ```csharp
 var c = await storage.OneAsync(id);
@@ -743,11 +744,11 @@ the entity again and open the new content.
 A write that fails can be retried with the same content when it was created from bytes or from a
 seekable stream: every attempt reads the stream from the position it had at the first one, and a failed
 or cancelled attempt puts it back there. A content from a non-seekable stream may not survive a failed
-write: when the write fails before its blobs are uploaded, the stream has been partly read or its
-temporary copy has been deleted, and every later write of that content throws
-`InvalidOperationException` before anything is read or uploaded (as it does for a seekable stream that
-can no longer be put back where the content starts, one disposed in the meantime, say). Create the
-content again from its source. So use `FromBytes` or a seekable stream wherever a write may be retried,
+write: when the write fails after it has begun to read the stream and before its blobs are uploaded, the
+stream has been partly read or its temporary copy has been deleted, and every later write of that
+content throws `InvalidOperationException` before anything is read or uploaded (as it does for a
+seekable stream that can no longer be put back where the content starts, one disposed in the meantime,
+say). Create the content again from its source. So use `FromBytes` or a seekable stream wherever a write may be retried,
 in particular inside `MutateAsync` and `MutateOrCreateAsync`, which apply the mutation again with the
 same content instance after a conflict; with a non-seekable source, create the content inside the
 mutation from something that can be opened again.

@@ -70,9 +70,9 @@ Lossless storage of large values, opt-in per property.
     again while it is read, and a blob deleted under it fails the read with
     `TableValueIntegrityException`, not with the blob service's own error.
   - A write that fails can be retried with the same content when it came from a seekable stream or from
-    bytes. A content from a non-seekable stream whose write failed before its blobs were uploaded must
-    be created again: every later write of it throws `InvalidOperationException` before anything is read
-    or uploaded.
+    bytes. A content from a non-seekable stream whose write failed after the stream was read and before
+    its blobs were uploaded must be created again: every later write of it throws
+    `InvalidOperationException` before anything is read or uploaded.
   - One content can be assigned to several properties or entities, and a content read from one row can
     be written into another: each row gets its own blob, and the written property is given its own
     `TableBlobContent`, so the entity it came from is not affected.
