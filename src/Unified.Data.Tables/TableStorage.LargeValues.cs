@@ -736,22 +736,68 @@ public partial class TableStorage<T>
     }
 
     /// <summary>
-    /// True when a projection names a large-value column, or an object that owns one: such a value
-    /// spans cells and continuation rows, so the whole row is fetched and assembled instead.
+    /// True when a projection of a split-aware <typeparamref name="T"/> must fetch the whole row: when
+    /// one of the requested names is not known to be an ordinary column. A large value spans cells and
+    /// continuation rows (or a blob), so a projection that names it, an object that owns it, or one of
+    /// its storage cells (<c>{Prop}__c0</c>, <c>__chunks</c>, <c>__sha256</c>, <c>__enc</c>, <c>__len</c>,
+    /// or the <c>{Prop}__Json</c> / <c>{Prop}__GZip</c> cell of an opted-in property) fetches and
+    /// assembles the whole row and returns the whole value; so does a name that cannot be resolved,
+    /// because it may be a large value the type's column list does not hold (below a repeated type, or a
+    /// runtime subtype). Only a projection whose every name is a system column or resolves, through the
+    /// declared types and the read-side resolution of runtime owners, to an ordinary member is narrowed.
+    /// The blob reference cell <c>{Prop}__blob</c> named alone is narrowed as before and leaves the
+    /// property at its default.
     /// </summary>
     private static bool SelectsLargeValue(IReadOnlyCollection<string> requested)
     {
-        var columns = TypeMetadataCache.LargeValueColumns(typeof(T));
         foreach (var name in requested)
         {
-            foreach (var column in columns)
-            {
-                if (string.Equals(name, column, StringComparison.Ordinal)
-                    || column.StartsWith(name + TableEntityValue.PathDelimiter, StringComparison.Ordinal))
-                    return true;
-            }
+            if (!IsKnownOrdinaryColumn(name))
+                return true;
         }
         return false;
+    }
+
+    /// <summary>See <see cref="SelectsLargeValue"/>: true only for a name known to be an ordinary column.</summary>
+    private static bool IsKnownOrdinaryColumn(string name)
+    {
+        if (Array.IndexOf(SystemColumns, name) >= 0 || Array.IndexOf(SplitSystemColumns, name) >= 0
+            || string.Equals(name, ETagToken, StringComparison.Ordinal))
+            return true;
+        // A storage cell names its value; the reference cell alone is the one exception, kept as it was.
+        if (SplitCodec.TryParseLargeValueColumn(name, out _, out var kind, out _))
+            return kind == LargeValueCellKind.BlobReference;
+        foreach (var column in TypeMetadataCache.LargeValueColumns(typeof(T)))
+        {
+            if (string.Equals(name, column, StringComparison.Ordinal)
+                || column.StartsWith(name + TableEntityValue.PathDelimiter, StringComparison.Ordinal))
+                return false;
+        }
+
+        // Not on the list: resolved as a read resolves it (the type is split-aware, so a default instance
+        // may be constructed, ruling R3). A name that resolves to no member, to a large-value member, to an
+        // object that may own one, or whose resolution fails, is not known to be ordinary.
+#pragma warning disable CA1031 // a name that cannot be resolved is simply not known to be ordinary
+        try
+        {
+            if (TypeMetadataCache.IsLargeValueOnRead(typeof(T), name))
+                return false;
+            return TypeMetadataCache.ReadTarget(typeof(T), name) is { } leaf && !MayOwnColumns(leaf.PropertyType);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+#pragma warning restore CA1031
+    }
+
+    /// <summary>True when a member of <paramref name="type"/> may be stored as columns of its own (an object the serializer flattens).</summary>
+    private static bool MayOwnColumns(Type type)
+    {
+        var underlying = Nullable.GetUnderlyingType(type) ?? type;
+        if (type == typeof(string) || type == typeof(byte[]) || TableEntityValue.IsPrimitive(type) || underlying.IsEnum)
+            return false;
+        return TableEntitySerializer.FlattensToColumns(type);
     }
 
     /// <summary>Columns a split-aware projection adds so continuation rows can be recognised and skipped.</summary>
