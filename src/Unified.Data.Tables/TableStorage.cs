@@ -428,10 +428,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         // is simply not cached. Nor is a row whose part count cannot be read (a damaged row): it exists,
         // and DeleteAsync can delete it, but its value cannot be read.
         // A plain type over a row another type wrote with large-value cells is not cached either: its
-        // read would throw for an offloaded value, and existence needs no value.
+        // read would throw for an offloaded value, and existence needs no value. A column that only has
+        // the name of such a cell is read as 0.8.3 read it, and the row is cached as 0.8.3 cached it.
         if (response.HasValue && (LargeValueAware
             ? DeclaresNoParts(response.Value!) && !HasBlobReference(response.Value!)
-            : !TableEntitySerializer.HasLargeValueCells(response.Value!)))
+            : !TableEntitySerializer.HasGenuineLargeValueCells(response.Value!)))
         {
             var entity = response.Value!.FromTableEntity<T>();
             entity.ETag = response.Value!.ETag.ToString();

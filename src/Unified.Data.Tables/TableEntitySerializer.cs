@@ -143,6 +143,17 @@ public static class TableEntitySerializer
         return false;
     }
 
+    /// <summary>
+    /// True when <paramref name="row"/> holds a large value the library wrote: a well-formed split manifest or
+    /// a cell that parses as a blob reference. A column that only has the name of such a cell (another
+    /// program's <c>Body__len</c>) is not one; a type that is not large-value aware reads it as 0.8.3 did.
+    /// </summary>
+    internal static bool HasGenuineLargeValueCells(TableEntity row)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        return GenuineLargeValueColumns(row) is not null;
+    }
+
     /// <summary>The message for a read of an offloaded value that nothing resolved.</summary>
     internal static string UnresolvedOffloadMessage(string column) =>
         $"Column '{column}' holds a value offloaded to blob storage ('{column}{SplitCodec.BlobSuffix}'), and this read " +
