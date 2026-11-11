@@ -89,6 +89,22 @@ public class PlainPathLargeValueRefusalTests
         public string? Title { get; set; }
     }
 
+    /// <summary>A plain type whose <c>object</c>-typed property can hold a <see cref="TableBlobContent"/>.</summary>
+    public sealed class Attachment : Entity
+    {
+        public object? File { get; set; }
+    }
+
+    [Fact]
+    public void PlainSerializer_RefusesAFileInAnObjectTypedProperty_OfAPlainType()
+    {
+        var ex = Assert.Throws<NotSupportedException>(() =>
+            new Attachment { Id = "p|r", File = TableBlobContent.FromBytes([1], "application/octet-stream") }.ToTableEntity("p", "r"));
+
+        Assert.Contains("Attachment.File (column 'File')", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("declare Attachment.File as TableBlobContent", ex.Message, StringComparison.Ordinal);
+    }
+
     public sealed class Payment
     {
         public IShape Method { get; set; } = new Circle();
