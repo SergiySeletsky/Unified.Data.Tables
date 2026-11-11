@@ -284,6 +284,40 @@ public class LeftoverContinuationRowTests
     }
 
     [Fact]
+    public async Task UpsertBatch_SeveralEntitiesOfOneTransactionHaveLeftovers_OneRetryTakesThemAllBack()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet(null);
+        // The service reports the first action that fails: r1's continuation row. r2 has a leftover too.
+        var script = new Script(h)
+            .ThenFail(409, index: 1)
+            .ThenList(OwnPart("r1", 1, "W/\"e1\""))
+            .ThenList(OwnPart("r2", 1, "W/\"e2\""), OwnPart("r2", 2, "W/\"e3\""));
+
+        await h.Store.UpsertBatchAsync(
+        [
+            new SplitTextEntity { Id = "p|r1", Body = OnePartText },
+            new SplitTextEntity { Id = "p|r2", Body = OnePartText },
+            new SplitTextEntity { Id = "p|r3", Body = "small" },
+        ], Ct);
+
+        // Leftovers come in numbers: once one entity meets its own, every entity of the transaction that
+        // inserts a continuation row is looked up, and the one retry takes them all back.
+        Assert.Equal(2, script.Transactions.Count);
+        Assert.Equal(
+            [
+                "Add r1", "UpdateReplace r1~0001 If-Match W/\"e1\"",
+                "Add r2", "UpdateReplace r2~0001 If-Match W/\"e2\"", "Delete r2~0002 If-Match W/\"e3\"",
+                "Add r3",
+            ],
+            Describe(script.Transactions[1]));
+        // One look per entity that inserts a continuation row; none for r3, which has none.
+        Assert.Equal(2, script.RangeQueries.Count);
+        Assert.Contains("_SplitOf eq 'r1'", script.RangeQueries[0], StringComparison.Ordinal);
+        Assert.Contains("_SplitOf eq 'r2'", script.RangeQueries[1], StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CreateBatch_OwnLeftover_IsTakenBack_AndAConditionThatFailsOnItIsRetried()
     {
         using var h = new StorageHarness<SplitTextEntity>();

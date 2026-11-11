@@ -14,8 +14,9 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property) the call reads
     /// the row first, to find its continuation rows and blobs, and deletes it on condition of the version
     /// it read: a delete that loses a race to another writer reads again and retries after a short
-    /// pause, and can throw <see cref="ConcurrencyConflictException"/> after five lost races. When no
-    /// row has the id, continuation rows left behind for it (if any) are removed.
+    /// pause, and can throw <see cref="ConcurrencyConflictException"/> after five lost races. For such a
+    /// type, when no row has the id, the call also looks for continuation rows left behind for it and
+    /// removes them.
     /// </summary>
     /// <param name="id">Composite document identifier (<c>"{PartitionKey}|{RowKey}"</c>).</param>
     /// <param name="ct">Cancellation token.</param>

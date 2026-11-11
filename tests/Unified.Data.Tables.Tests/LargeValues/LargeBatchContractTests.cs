@@ -591,6 +591,26 @@ public abstract class LargeBatchContract : IAsyncLifetime
     }
 
     [Fact]
+    public async Task UpsertBatch_TwoEntitiesOfOneTransactionHaveLeftovers_BothAreTakenBackInOneRetry()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        await SeedLeftoversAsync("r1", TwoPartText);
+        await SeedLeftoversAsync("r2", SplitText);
+        ResetTransactions();
+
+        await store.UpsertBatchAsync([Text("r1", SplitText), Text("r2", SplitText)], Ct);
+
+        // The failed transaction and one retry: not one retry per entity.
+        Assert.Equal(2, Transactions);
+        Assert.Equal(["r1", "r1~0001", "r2", "r2~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r1~0001"));
+        Assert.Null(await PhysicalTitleAsync<SplitTextEntity>("r2~0001"));
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r2"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
+    [Fact]
     public async Task CreateBatch_HittingAnOwnLeftover_Succeeds_AndLeavesNoStrayRow()
     {
         SkipUnlessAvailable();

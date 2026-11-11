@@ -390,7 +390,14 @@ public sealed partial class InMemoryStorage<T>
                             throw LargeValueTable.ContinuationKeyTaken(unit.Keys.PartitionKey, unit.Keys.RowKey, taken, Taken(taken));
                         lost = unit;
                         lostRace = false;
-                        taking = new HashSet<string>(takeBack ?? [], StringComparer.Ordinal) { unit.Keys.RowKey };
+                        // As TableStorage: every entity of the transaction that inserts a continuation
+                        // row is planned over its own rows, so one retry takes all their leftovers back.
+                        taking = new HashSet<string>(takeBack ?? [], StringComparer.Ordinal);
+                        foreach (var other in chunk)
+                        {
+                            if (Enumerable.Range(0, other.Plan.Parts.Count).Any(other.Plan.IsNewPart))
+                                taking.Add(other.Keys.RowKey);
+                        }
                         break;
                     }
                 }

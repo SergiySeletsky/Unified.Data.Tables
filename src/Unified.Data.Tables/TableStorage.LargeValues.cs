@@ -881,6 +881,14 @@ public partial class TableStorage<T>
                     ? new Dictionary<string, Dictionary<string, ETag>?>(StringComparer.Ordinal)
                     : new Dictionary<string, Dictionary<string, ETag>?>(takeBack, StringComparer.Ordinal);
                 taking[unit.Rk] = own;
+                // Leftovers come in numbers (a partition delete that stopped, a writer that does not know
+                // continuation rows): every other entity of the transaction that inserts a continuation
+                // row is planned over its own rows too, so one retry takes them all back.
+                foreach (var other in chunk)
+                {
+                    if (InsertsAPart(other.Plan))
+                        taking.TryAdd(other.Rk, null);
+                }
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
                 await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, ct);
                 continue;
@@ -931,6 +939,17 @@ public partial class TableStorage<T>
                 owners.Add(i);
         }
         return (actions, owners);
+    }
+
+    // True when the plan inserts a continuation row: one beyond what the stored row declares.
+    private static bool InsertsAPart(LargeValueWritePlan plan)
+    {
+        for (var i = 0; i < plan.Parts.Count; i++)
+        {
+            if (plan.IsNewPart(i))
+                return true;
+        }
+        return false;
     }
 
     // A failure the service attributes to no action, or to a primary (an insert or conditional replace).
