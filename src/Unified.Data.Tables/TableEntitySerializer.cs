@@ -813,9 +813,12 @@ public static class TableEntitySerializer
     /// <summary>
     /// <see cref="FlattenProperty(string, object)"/> for a column path of <paramref name="ownerType"/>
     /// (<c>"Inner_Body"</c>): refuses a path that reaches a large-value member, which the untyped
-    /// overload cannot see.
+    /// overload cannot see. For a large-value aware type whose read-side resolution of the path throws (its
+    /// constructor or a getter fails), the path may name one, so it is refused too.
     /// </summary>
-    /// <exception cref="NotSupportedException">The path names a large-value member.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The path names a large-value member, or (aware type) resolving it failed, so whether it does is not known.
+    /// </exception>
     internal static Dictionary<string, object> FlattenProperty(Type ownerType, string columnPath, object value)
     {
         ArgumentNullException.ThrowIfNull(ownerType);
