@@ -269,6 +269,36 @@ public class DenseTypeGraphTests
         Assert.Equal(["Body"], Columns(typeof(WalkNode)));
     }
 
+    [Fact]
+    public async Task ValueBelowARepeatedType_IsNotListed_AndStillRoundTripsOnBothStores()
+    {
+        // The list of columns is what the stores read ahead and project by, not what may be stored: a
+        // large value deeper than the list reaches is still written split and read back whole.
+        var deep = OffloadTestSupport.Ascii(40_000);
+        WalkList Make() => new() { Id = "p|r", Head = new WalkNode { Body = "head", Next = new WalkNode { Body = deep } } };
+        Assert.DoesNotContain("Head_Next_Body", TypeMetadataCache.LargeValueColumns(typeof(WalkList)));
+
+        var memory = new InMemoryStorage<WalkList>();
+        await memory.CreateAsync(Make());
+        Assert.Equal(2, memory.PhysicalRow("p", "r")!["Head_Next_Body__chunks"]);
+        var read = (await memory.OneAsync("p|r"))!;
+        Assert.Equal("head", read.Head!.Body);
+        Assert.Equal(deep, read.Head.Next!.Body);
+
+        Azure.Data.Tables.TableEntity? written = null;
+        using (var writer = new StorageHarness<WalkList>())
+        {
+            writer.Table.AddEntityAsync(Arg.Do<Azure.Data.Tables.TableEntity>(e => written = e), Arg.Any<CancellationToken>()).Returns(Mocks.EtagResponse());
+            await writer.Store.CreateAsync(Make());
+        }
+        Assert.NotNull(written);
+        Assert.Equal(2, written["Head_Next_Body__chunks"]);
+        written.ETag = new Azure.ETag("W/\"etag1\"");
+        using var reader = new StorageHarness<WalkList>();
+        reader.SetupGet(written);
+        Assert.Equal(deep, (await reader.Store.OneAsync("p|r"))!.Head!.Next!.Body);
+    }
+
     private sealed class WalkLeft
     {
         [TableValueSplit(SplitEncoding.Text)]
