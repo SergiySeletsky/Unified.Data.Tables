@@ -1081,20 +1081,23 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     }
 
     // The entity's entry in the cache when a builder update is about to send its merge; null when there
-    // is none or caching is off. A cache that can no longer be asked (disposed) answers none here, so the
-    // merge is sent as on 0.8.3 and the cache's exception comes from the eviction after it.
+    // is none or caching is off. A cache whose lookup throws (disposed, or failing in any other way)
+    // answers none here: the merge is sent as on 0.8.3, which asked the cache only after it, and the
+    // entry is then evicted, so the cache's exception, if it fails again, comes from that eviction.
     private CachedEntity? CachedBeforeTheMerge(string id)
     {
         if (!cachePolicy.Enabled)
             return null;
+#pragma warning disable CA1031 // a failing lookup means "no entry": the update evicts after the merge
         try
         {
             return cache.TryGetValue<CachedEntity>(EntityKey(id), out var entry) ? entry : null;
         }
-        catch (ObjectDisposedException)
+        catch (Exception)
         {
             return null;
         }
+#pragma warning restore CA1031
     }
 
     private static ETag? ReadETagHeader(Response response)
@@ -1115,11 +1118,16 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // Whether a builder value may be applied to the cached entity (ruling R10, points 2 and 3), decided
     // from the cells the merge sends: the path names a top-level property, the value is a non-null scalar
     // of the property's own type, and it is the one cell the merge writes for it, under the property's
-    // own column and as it is (a string no policy trimmed or compressed), so that a read maps the cell back
-    // to the same value. A null (the merge writes no cell and the row keeps its value), an object the
-    // serializer flattens, a collection or other JSON-stored value, a byte[] (mutable) and a large value
-    // do not qualify; nor does a local date (stored as its UTC instant) or one at or before the year of the
-    // 1601-01-01 sentinel (a read may return it as the default value).
+    // own column, that a read converts back to a value equal to the one set. These are the scalars the
+    // serializer stores in a cell of their own (as 0.8.3 kept warm): a string no policy trimmed or
+    // compressed, a bool, int, uint, long, ulong (stored as a long, read back unchanged over its whole
+    // range), byte (a one-byte binary cell), double, Guid, TimeSpan (its invariant text), an enum (its
+    // name), a decimal whose double cell converts back to an equal decimal, and a date other than the
+    // 1601-01-01 sentinel instant (which a read returns as the default value; the default value itself is
+    // written as the sentinel and reads back equal) and not local (stored as its UTC instant). A null (the
+    // merge writes no cell and the row keeps its value), an object the serializer flattens, a collection
+    // or other JSON-stored value (a float, short, char, sbyte, ushort among them), a byte[] (mutable) and
+    // a large value do not qualify.
     private static bool IsWholeScalarInItsOwnCell(string name, object? value, Dictionary<string, object> cells)
     {
         if (value is null || cells.Count != 1 || !cells.TryGetValue(name, out var cell)
@@ -1129,11 +1137,29 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         return value switch
         {
             string s => cell is string written && string.Equals(s, written, StringComparison.Ordinal),
-            bool or int or long or double or Guid or Enum => true,
-            DateTimeOffset d => d.UtcDateTime.Year > 1601,
-            DateTime d => d.Kind != DateTimeKind.Local && d.Year > 1601,
+            bool or int or uint or long or ulong or byte or double or Guid or TimeSpan or Enum => true,
+            decimal m => cell is double written && DecimalReadBack(written) == m,
+            DateTimeOffset d => d != DateSentinel,
+            DateTime d => d.Kind != DateTimeKind.Local && d != DateSentinel.UtcDateTime,
             _ => false,
         };
+    }
+
+    // The date a cell cannot hold as a genuine value: the serializer writes an unset date as this instant
+    // and a read returns it as the default value.
+    private static readonly DateTimeOffset DateSentinel = new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    // What a read makes of a decimal's double cell (the invariant conversion), or null where it fails.
+    private static decimal? DecimalReadBack(double cell)
+    {
+        try
+        {
+            return Convert.ToDecimal(cell, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch (OverflowException)
+        {
+            return null;
+        }
     }
 
     /// <inheritdoc />
