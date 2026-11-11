@@ -29,7 +29,9 @@ public static class StorageExtensions
     /// (<see cref="ConcurrencyConflictException"/>), a brief jittered backoff is awaited, then the
     /// entity is re-read and <paramref name="mutate"/> is re-applied to the FRESH copy — which is
     /// what makes derived values (counters, unions, merges) correct under concurrency, unlike a
-    /// plain update that would persist a value computed from a stale read.
+    /// plain update that would persist a value computed from a stale read. A read that throws
+    /// <see cref="ConcurrencyConflictException"/> (a read of a large value whose row kept changing) is a
+    /// lost race too: it counts as an attempt and is retried the same way.
     /// </summary>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
@@ -54,8 +56,19 @@ public static class StorageExtensions
 
         for (var attempt = 1; ; attempt++)
         {
-            var entity = await storage.OneAsync(id, ct).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Cannot mutate '{id}': the entity does not exist.");
+            T? read;
+            try
+            {
+                read = await storage.OneAsync(id, ct).ConfigureAwait(false);
+            }
+            catch (ConcurrencyConflictException) when (attempt < maxAttempts)
+            {
+                // A read of a large value whose row kept changing lost its races: an attempt like a
+                // write's conflict, retried after the same backoff.
+                await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
+                continue;
+            }
+            var entity = read ?? throw new InvalidOperationException($"Cannot mutate '{id}': the entity does not exist.");
 
             mutate(entity);
 
@@ -128,8 +141,9 @@ public static class StorageExtensions
     /// <returns>The persisted entity, including its refreshed <see cref="Entity.ETag"/>.</returns>
     /// <exception cref="ConcurrencyConflictException">
     /// Still racing after <paramref name="maxAttempts"/> attempts — whether the last race lost was
-    /// an update conflict or a create race (a last-attempt <see cref="DuplicateKeyException"/> is
-    /// wrapped, never leaked).
+    /// an update conflict, a create race (a last-attempt <see cref="DuplicateKeyException"/> is
+    /// wrapped, never leaked) or a read whose row kept changing (a read's conflict is retried as an
+    /// attempt, like the write's).
     /// </exception>
     public static async Task<T> MutateOrCreateAsync<T>(
         this IStorage<T> storage, string id, Func<T> create, Action<T> mutate,
@@ -143,7 +157,17 @@ public static class StorageExtensions
 
         for (var attempt = 1; ; attempt++)
         {
-            var entity = await storage.OneAsync(id, ct).ConfigureAwait(false);
+            T? entity;
+            try
+            {
+                entity = await storage.OneAsync(id, ct).ConfigureAwait(false);
+            }
+            catch (ConcurrencyConflictException) when (attempt < maxAttempts)
+            {
+                // A read whose row kept changing lost its races: an attempt like a write's conflict.
+                await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
+                continue;
+            }
             try
             {
                 if (entity is null)
@@ -176,7 +200,8 @@ public static class StorageExtensions
     /// <summary>
     /// Outcome-returning variant of <see cref="MutateAsync{T}"/> for flows where a missing row or
     /// a lost race is an EXPECTED branch, not an error: nothing is thrown for either — the caller
-    /// switches on <see cref="MutationResult{T}.Status"/> instead of catching.
+    /// switches on <see cref="MutationResult{T}.Status"/> instead of catching. A lost race is a write's
+    /// conflict or a read's (a read of a large value whose row kept changing); both are retried.
     /// </summary>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
@@ -195,7 +220,19 @@ public static class StorageExtensions
 
         for (var attempt = 1; ; attempt++)
         {
-            var entity = await storage.OneAsync(id, ct).ConfigureAwait(false);
+            T? entity;
+            try
+            {
+                entity = await storage.OneAsync(id, ct).ConfigureAwait(false);
+            }
+            catch (ConcurrencyConflictException)
+            {
+                // A read whose row kept changing lost its races: an attempt like a write's conflict.
+                if (attempt >= maxAttempts)
+                    return new MutationResult<T>(MutationStatus.Conflicted, null);
+                await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
+                continue;
+            }
             if (entity is null)
                 return new MutationResult<T>(MutationStatus.NotFound, null);
 
@@ -218,7 +255,8 @@ public static class StorageExtensions
     /// <summary>
     /// Exactly-once state transition as a RESULT, not an exception: applies
     /// <paramref name="apply"/> only while <paramref name="when"/> holds on the FRESH row,
-    /// re-checking after every lost race. The three outcomes of contended transitions —
+    /// re-checking after every lost race (a write's conflict, or a read's conflict for a large value whose
+    /// row kept changing). The three outcomes of contended transitions —
     /// applied, someone else got there first, row gone — are all expected branches:
     /// <list type="bullet">
     ///   <item><description><see cref="MutationStatus.Updated"/> — this caller performed the transition;</description></item>
@@ -254,7 +292,19 @@ public static class StorageExtensions
 
         for (var attempt = 1; ; attempt++)
         {
-            var entity = await storage.OneAsync(id, ct).ConfigureAwait(false);
+            T? entity;
+            try
+            {
+                entity = await storage.OneAsync(id, ct).ConfigureAwait(false);
+            }
+            catch (ConcurrencyConflictException)
+            {
+                // A read whose row kept changing lost its races: an attempt like a write's conflict.
+                if (attempt >= maxAttempts)
+                    return new MutationResult<T>(MutationStatus.Conflicted, null);
+                await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
+                continue;
+            }
             if (entity is null)
                 return new MutationResult<T>(MutationStatus.NotFound, null);
 

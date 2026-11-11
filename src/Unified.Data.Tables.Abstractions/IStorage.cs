@@ -136,8 +136,9 @@ public interface IStorage<T> where T : class, IEntity, new()
 
     /// <summary>
     /// Check whether a document with the given composite id exists. A large value is never assembled or
-    /// downloaded to answer: a row with continuation rows or an offloaded value, or one whose part count is
-    /// damaged (it exists and can be deleted, but not read), answers <c>true</c> and is not cached.
+    /// downloaded to answer: a row with continuation rows or an offloaded value, or one whose part count or
+    /// in-row value is damaged (it exists and can be deleted, but not read), answers <c>true</c> and is not
+    /// cached.
     /// </summary>
     /// <param name="id">Composite document identifier.</param>
     /// <param name="ct">Cancellation token.</param>
