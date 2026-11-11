@@ -1984,6 +1984,8 @@ internal static class TypeMetadataCache
     /// any other type takes none of the large-value branches. Decided by reflection alone: nothing is
     /// constructed and no getter is called, so a store may ask this in its static initializer. Never
     /// throws, whatever the type, and the answer is the same in every process and at every moment.
+    /// The properties of each type are those <see cref="IsDeclaredColumn"/> counts: of an interface, every
+    /// member, whatever its accessors and attributes.
     /// </summary>
     internal static bool IsLargeValueAware(Type t)
     {
