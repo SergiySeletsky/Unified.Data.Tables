@@ -711,14 +711,16 @@ public partial class TableStorage<T>
     /// Deletes leftover continuation rows in transactions of at most 100, each row on condition of the
     /// version it was listed at. A writer that takes the same rows back for a new value at that moment
     /// commits as a whole or not at all, and so does this delete: the one that loses fails its condition
-    /// (the caller reads again and retries).
+    /// (the caller reads again and retries). These transactions hold no primary row to put a condition
+    /// on, so a row whose version is unknown is never deleted here (the service always sends one): it
+    /// stays, invisible, for the next write or delete of the entity.
     /// </summary>
     private async Task DeleteLeftoverPartsAsync(string pk, List<TableEntity> leftovers, CancellationToken ct)
     {
-        foreach (var chunk in leftovers.Chunk(BatchPlanner.DefaultMaxCount))
+        foreach (var chunk in leftovers.Where(part => IsVersion(part.ETag)).Chunk(BatchPlanner.DefaultMaxCount))
         {
             var actions = chunk.Select(part => new TableTransactionAction(
-                TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), IsVersion(part.ETag) ? part.ETag : ETag.All));
+                TableTransactionActionType.Delete, new TableEntity(pk, part.RowKey), part.ETag));
             await client.SubmitTransactionAsync(actions, ct);
         }
     }

@@ -449,6 +449,23 @@ public class LeftoverContinuationRowTests
     }
 
     [Fact]
+    public async Task Delete_NoPrimaryRow_ALeftoverWhoseVersionIsUnknown_IsNotDeletedUnconditionally()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", null);
+        // The listing carries no version for r~0002 (the service always sends one; a double may not).
+        var unversioned = new TableEntity("p", "r~0002") { [SystemColumnNames.SplitOf] = "r" };
+        var script = new Script(h).ThenList(OwnPart("r", 1, "W/\"e1\""), unversioned);
+
+        await h.Store.DeleteAsync("p|r", Ct);
+
+        // This delete has no primary row to put a condition on: the rows' own versions are all that
+        // tells a leftover from the continuation row of an entity created a moment ago. Without one
+        // the row stays (it is invisible, and the next write or delete of the entity takes it).
+        Assert.Equal(["Delete r~0001 If-Match W/\"e1\""], Describe(Assert.Single(script.Transactions)));
+    }
+
+    [Fact]
     public async Task Delete_NoPrimaryRow_MoreLeftoversThanOneTransactionHolds_GoInSeveral()
     {
         using var h = new StorageHarness<SplitTextEntity>();
