@@ -192,7 +192,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var mark = BeginWrite(entity.Id);
         if (LargeValueAware)
         {
-            CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Create, ETag.All, ct), mark);
+            CommitLargeWrite(entity, partitionKey, await WriteLargeOrEvictAsync(entity, LargeWriteKind.Create, ETag.All, partitionKey, ct), mark);
             return entity;
         }
 
@@ -206,7 +206,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         {
             // An existing key is an EXPECTED outcome of concurrent creates — surface it
             // provider-agnostically (GetOrCreateAsync/MutateOrCreateAsync absorb it entirely).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
             throw new DuplicateKeyException(typeName, entity.Id, ex);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
         }
 
         // Read ETag from the response headers. Relying on dataEntity.ETag being mutated by the SDK
@@ -243,10 +250,19 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         await EnsureTableAsync(ct);
 
         var (partitionKey, rowKey) = GetEntityKeys(id);
-        if (LargeValueAware)
-            await DeleteLargeAsync(partitionKey, rowKey, ct);
-        else
-            await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
+        try
+        {
+            if (LargeValueAware)
+                await DeleteLargeAsync(partitionKey, rowKey, ct);
+            else
+                await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(id, partitionKey);
+            throw;
+        }
 
         cache.Remove(EntityCacheKey(id));
         InvalidateQueryCache(partitionKey);
@@ -939,9 +955,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         {
             // Conditional merge lost the race. The 412 proves a foreign writer touched the row,
             // so the cached entity AND any cached query results for its partition are stale.
-            cache.Remove(EntityCacheKey(id));
-            InvalidateQueryCache(partitionKey);
+            EvictAfterFailedWrite(id, partitionKey);
             throw new ConcurrencyConflictException(typeName, id, ex);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(id, partitionKey);
+            throw;
         }
 
         // Keep the cache coherent: if the entity is cached and every declared path maps onto a
@@ -1063,16 +1084,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var mark = BeginWrite(entity.Id); // before the first storage call (see WriteGenerations)
         if (LargeValueAware)
         {
-            try
-            {
-                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Replace, etag, ct), mark);
-            }
-            catch (ConcurrencyConflictException)
-            {
-                cache.Remove(EntityCacheKey(entity.Id));
-                InvalidateQueryCache(partitionKey);
-                throw;
-            }
+            CommitLargeWrite(entity, partitionKey, await WriteLargeOrEvictAsync(entity, LargeWriteKind.Replace, etag, partitionKey, ct), mark);
             return entity;
         }
 
@@ -1093,9 +1105,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // read. Surface the provider-agnostic conflict; the 412 also proves the cached entity
             // and the partition's cached query results are stale, so drop both — a follow-up read
             // (e.g. MutateAsync's retry) must see the fresh row.
-            cache.Remove(EntityCacheKey(entity.Id));
-            InvalidateQueryCache(partitionKey);
+            EvictAfterFailedWrite(entity.Id, partitionKey);
             throw new ConcurrencyConflictException(typeName, entity.Id, ex);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
         }
 
         return entity;
@@ -1125,21 +1142,22 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var mark = BeginWrite(entity.Id); // before the first storage call (see WriteGenerations)
         if (LargeValueAware)
         {
-            try
-            {
-                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Upsert, ETag.All, ct), mark);
-            }
-            catch (ConcurrencyConflictException)
-            {
-                cache.Remove(EntityCacheKey(entity.Id));
-                InvalidateQueryCache(partitionKey);
-                throw;
-            }
+            CommitLargeWrite(entity, partitionKey, await WriteLargeOrEvictAsync(entity, LargeWriteKind.Upsert, ETag.All, partitionKey, ct), mark);
             return entity;
         }
 
         var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
-        var upsertResponse = await client.UpsertEntityAsync(dataEntity, TableUpdateMode.Replace, ct);
+        Response upsertResponse;
+        try
+        {
+            upsertResponse = await client.UpsertEntityAsync(dataEntity, TableUpdateMode.Replace, ct);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
+        }
 
         // Same header-first ETag read as CreateAsync — the SDK does not mutate dataEntity.ETag.
         ETag? responseETag = null;
@@ -1252,6 +1270,22 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     {
         cache.Remove(EntityCacheKey(id));
         InvalidateQueryCache(partitionKey);
+    }
+
+    // The large-value write of a create, update or upsert; when it throws, the entry and the partition's
+    // lists go before the exception leaves (EvictAfterFailedWrite). A key the row layout refuses
+    // (ArgumentException) is refused before any storage call: nothing was written, nothing is evicted.
+    private async Task<LargeWriteResult> WriteLargeOrEvictAsync(T entity, LargeWriteKind kind, ETag ifMatch, string partitionKey, CancellationToken ct)
+    {
+        try
+        {
+            return await WriteLargeAsync(entity, kind, ifMatch, ct);
+        }
+        catch (Exception ex) when (ex is not ArgumentException)
+        {
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
+        }
     }
 
     // A READ's put: the entity a point read, a query, a page or a stream found. It is cached only while
