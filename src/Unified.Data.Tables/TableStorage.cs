@@ -425,8 +425,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             return false;
 
         // A split or offloaded value is not assembled or downloaded just to answer "does it exist" - it
-        // is simply not cached. Nor is a row whose part count cannot be read (a damaged row): it exists,
-        // and DeleteAsync can delete it, but its value cannot be read.
+        // is simply not cached. Nor is a row whose part count cannot be read, or whose value stored in the
+        // row's own cells fails its integrity check (a damaged row): it exists, and DeleteAsync can delete
+        // it, but its value cannot be read.
         // A plain type over a row another type wrote with large-value cells is not cached either: its
         // read would throw for an offloaded value, and existence needs no value. A column that only has
         // the name of such a cell is read as 0.8.3 read it, and the row is cached as 0.8.3 cached it.
@@ -434,7 +435,15 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             ? DeclaresNoParts(response.Value!) && !HasBlobReference(response.Value!)
             : !TableEntitySerializer.HasGenuineLargeValueCells(response.Value!)))
         {
-            var entity = response.Value!.FromTableEntity<T>();
+            T entity;
+            try
+            {
+                entity = response.Value!.FromTableEntity<T>();
+            }
+            catch (TableValueIntegrityException) when (LargeValueAware)
+            {
+                return true;
+            }
             entity.ETag = response.Value!.ETag.ToString();
             entity.Timestamp = response.Value!.Timestamp;
             CacheRead(id, entity, response.Value!.ETag, mark);
