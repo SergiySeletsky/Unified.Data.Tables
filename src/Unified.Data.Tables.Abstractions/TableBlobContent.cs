@@ -13,7 +13,9 @@ namespace Unified.Data.Tables;
 /// <para>
 /// Requires blob offload to be configured on the storage (<c>UnifiedTableStorageOptions.BlobOffload</c>).
 /// A <see cref="TableBlobContent"/> property cannot be filtered on, written by a partial update, or
-/// placed inside a collection or a JSON-stored object.
+/// placed inside a collection or a JSON-stored object. It is stored only through a property declared as
+/// <see cref="TableBlobContent"/>: in a property declared as <see cref="object"/> the write throws
+/// <see cref="NotSupportedException"/> naming the property, before anything is uploaded.
 /// </para>
 /// <para>
 /// One content may be assigned to several properties or entities, and a content read from one row may
@@ -136,10 +138,12 @@ public sealed class TableBlobContent
     /// created again (over the same seekable stream, which stands where the content started).
     /// </para>
     /// <para>
-    /// A non-seekable stream is copied to a temporary file once. A write that fails releases that copy,
-    /// so its content cannot be written again; and a stream that a write has read cannot be read
-    /// again, so a new content over it is refused with <see cref="InvalidOperationException"/> before
-    /// anything is uploaded. For content whose write may be retried, create the content once and assign
+    /// A non-seekable stream is copied to a temporary file once. A write that fails after it began to read
+    /// the stream and before the content was uploaded releases that copy (or has partly read the stream),
+    /// and the content cannot be written again; a write that fails later, for example on its row write,
+    /// leaves the content bound to its blob (above). A stream that a write has read cannot be read again,
+    /// so a new content over it is refused with <see cref="InvalidOperationException"/> before anything
+    /// is uploaded, and so are two contents over one such stream written by one write. For content whose write may be retried, create the content once and assign
     /// that instance on every attempt, use a seekable stream or <see cref="FromBytes"/>, or open the
     /// source again for each attempt. A content that can no longer be written (its temporary copy was
     /// released, or its stream was partly read by a failed write and cannot be put back) makes every

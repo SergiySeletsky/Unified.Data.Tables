@@ -19,8 +19,10 @@ namespace Unified.Data.Tables;
 /// Reflection-based (de)serializer that flattens an arbitrary object graph into a flat
 /// <see cref="TableEntity"/> and reconstructs it on read. Scalars map to native cells; nested
 /// complex types fan out to <c>Parent_Child</c> columns; collections and other shapes that cannot
-/// be represented natively fall back to JSON, and oversized JSON is GZip-compressed (and, as a last
-/// resort, trimmed) to fit the Azure Tables 64&#160;KB per-cell limit.
+/// be represented natively fall back to JSON, and oversized JSON is GZip-compressed to fit the Azure
+/// Tables 64&#160;KB per-cell limit; a payload that still does not fit throws by default
+/// (<see cref="OversizedCellPolicy.Throw"/>) and is trimmed only under a trim policy. A property marked
+/// <see cref="TableValueSplitAttribute"/> is stored whole instead.
 /// </summary>
 public static class TableEntitySerializer
 {

@@ -2,8 +2,8 @@ namespace Unified.Data.Tables;
 
 /// <summary>
 /// Opts a property (or the properties of a class) into lossless storage of values of
-/// any size: the value is kept inline when it fits one cell, otherwise split across cells and rows,
-/// and finally offloaded to blob storage. Nothing is ever trimmed.
+/// any size: the value is kept inline when it fits one cell and the entity fits one row, otherwise split
+/// across cells and rows, and finally offloaded to blob storage. Nothing is ever trimmed.
 /// </summary>
 /// <remarks>
 /// On a class the attribute covers every <c>string</c>, <c>byte[]</c> and JSON-stored property of the

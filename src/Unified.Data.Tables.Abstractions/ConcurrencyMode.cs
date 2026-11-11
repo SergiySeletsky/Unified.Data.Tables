@@ -19,7 +19,8 @@ public enum ConcurrencyMode
 
     /// <summary>
     /// Require <see cref="Entity.ETag"/> (throws <see cref="System.InvalidOperationException"/>
-    /// when absent); a concurrent modification surfaces as a 412 with no retry.
+    /// when absent); a concurrent modification surfaces as <see cref="ConcurrencyConflictException"/>
+    /// with no retry.
     /// </summary>
     Strict = 1,
 

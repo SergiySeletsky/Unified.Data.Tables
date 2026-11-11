@@ -7,6 +7,17 @@ namespace Unified.Data.Tables;
 /// <typeparamref name="T"/>). Implemented by <c>TableStorage&lt;T&gt;</c> in the Unified.Data.Tables package.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
+/// <remarks>
+/// A type with large values is one whose declared types have a <see cref="TableValueSplitAttribute"/>
+/// or <see cref="TableBlobContent"/> member, or that carries the attribute on its class. For such a type
+/// every read that returns entities (<see cref="OneAsync"/>, the <c>QueryAsync</c> and
+/// <c>QueryStreamAsync</c> overloads, <see cref="QueryPageAsync"/>, <see cref="AnyAsync"/>) reads a row's
+/// continuation rows and blobs after its main row. When a writer replaced the row in between, the read is
+/// retried from the new version, five times in all; when the row changed during each attempt it throws
+/// <see cref="ConcurrencyConflictException"/> (nothing is damaged; repeat the read), and only a row whose
+/// version did not change is reported as <see cref="TableValueIntegrityException"/>. In a query, a stream
+/// or a page that exception ends the whole call.
+/// </remarks>
 public interface IStorage<T> where T : class, IEntity, new()
 {
     /// <summary>
@@ -23,16 +34,30 @@ public interface IStorage<T> where T : class, IEntity, new()
     Task DeleteAsync(string id, CancellationToken ct = default);
 
     /// <summary>
-    /// Delete every document in a partition using batched transactions (up to 100 entities per batch).
+    /// Delete every document in a partition in batched transactions of up to 100 rows. Atomic per
+    /// transaction only: when one fails or the token is cancelled, the call throws and the earlier
+    /// transactions stay committed; calling it again finishes the delete. For a type with large values a
+    /// row and its continuation rows are always deleted in the same transaction, and an entity written
+    /// while the delete runs is, after it, either whole or gone: continuation rows listed without their
+    /// main row are deleted last, only when no main row exists for them and each is still the version
+    /// that was listed (a row that changed is left alone, and the call does not fail because of it). A
+    /// type without large values deletes every listed row by key, as before; on a table that a type with
+    /// large values also writes, such a delete can remove continuation rows of an entity written while it
+    /// runs.
     /// </summary>
     /// <param name="partition">The partition key whose entities should be removed.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>The number of entities deleted.</returns>
+    /// <returns>The number of entities deleted (continuation rows are not counted).</returns>
     Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default);
 
     /// <summary>
     /// Insert a new document; throws <see cref="DuplicateKeyException"/> when the id already
     /// exists (use <c>StorageExtensions.GetOrCreateAsync</c> when that is an expected outcome).
+    /// For a type with large values the call reads nothing first; it takes back continuation rows the
+    /// entity left behind earlier when the new value needs their keys, and ends in
+    /// <see cref="ConcurrencyConflictException"/> only if those rows keep changing or vanishing during its
+    /// five attempts. A row of another writer at such a key is never overwritten: the call throws
+    /// <see cref="InvalidOperationException"/> naming the key and stores nothing.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -50,7 +75,11 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// first, to find the continuation rows and blobs the new value replaces, and writes on condition of
     /// the version it read. The caller's ETag is still ignored and the last writer still wins, but an
     /// upsert that loses a race to another writer reads again and retries after a short pause, and can
-    /// throw <see cref="ConcurrencyConflictException"/> after five lost races.
+    /// throw <see cref="ConcurrencyConflictException"/> after five lost races. A continuation row the
+    /// entity left behind earlier is taken back when the new value needs its key; one that another caller
+    /// removes meanwhile counts as a lost race. A row of another writer at the key of a new continuation
+    /// row is never overwritten: the call throws <see cref="InvalidOperationException"/> naming the key and
+    /// stores nothing.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -105,7 +134,11 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <param name="ct">Cancellation token.</param>
     Task<T?> OneAsync(string id, CancellationToken ct = default);
 
-    /// <summary>Check whether a document with the given composite id exists.</summary>
+    /// <summary>
+    /// Check whether a document with the given composite id exists. A large value is never assembled or
+    /// downloaded to answer: a row with continuation rows or an offloaded value, or one whose part count is
+    /// damaged (it exists and can be deleted, but not read), answers <c>true</c> and is not cached.
+    /// </summary>
     /// <param name="id">Composite document identifier.</param>
     /// <param name="ct">Cancellation token.</param>
     Task<bool> ExistsAsync(string id, CancellationToken ct = default);
@@ -160,7 +193,9 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// Fetch one server page plus an opaque cursor for the next page — the resumable paging primitive
     /// for grids and infinite scroll. <paramref name="options"/>'s <see cref="QueryOptions.Take"/> is
     /// the page size (default 100, clamped to 1..1000); pass a prior page's
-    /// <see cref="QueryOptions.ContinuationToken"/> to resume. Never cached.
+    /// <see cref="QueryOptions.ContinuationToken"/> to resume. Never cached. For a type with large values a
+    /// continuation row takes a place in a page, so a page can hold fewer entities than the page size, or
+    /// none, and still carry a cursor: keep paging until it is null.
     /// </summary>
     /// <param name="options">Query bounds; <see cref="QueryOptions.Take"/> is the page size and
     /// <see cref="QueryOptions.ContinuationToken"/> the resume cursor.</param>
@@ -199,11 +234,15 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// key repeated within the batch is written once, with its last occurrence. Such a type reads each row
     /// first and replaces it conditionally: a chunk that loses a race to another writer is re-read and
     /// retried after a short pause, and after five lost races the call throws
-    /// <see cref="ConcurrencyConflictException"/> (chunks already written stay written).
+    /// <see cref="ConcurrencyConflictException"/> (chunks already written stay written). The blobs the
+    /// replaced rows no longer reference are deleted once, after the last transaction; a batch that fails
+    /// part way deletes none of them (the orphan sweep does), so the same batch can be sent again.
     /// </summary>
     /// <param name="entities">The entities to upsert.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>The number of entities written.</returns>
+    /// <returns>
+    /// The number of entities passed: a row named more than once counts each time and is written once.
+    /// </returns>
     Task<int> UpsertBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default);
 
     /// <summary>

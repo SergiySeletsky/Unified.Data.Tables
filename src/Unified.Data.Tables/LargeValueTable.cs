@@ -370,6 +370,13 @@ public sealed class LargeValueTable
     /// <param name="entity">The entity about to be written.</param>
     /// <param name="ct">Cancels reading the content.</param>
     /// <returns>A task that completes when every content is sealed.</returns>
+    /// <exception cref="InvalidOperationException">A content of the entity can no longer be written: its
+    /// source stream was partly read by a failed write and cannot be read again from where the content
+    /// starts, its temporary copy was released by a failed write, or its source stream was already read by
+    /// another write and cannot deliver its bytes again.</exception>
+    /// <exception cref="NotSupportedException">The entity is a subclass of the store's entity type and holds
+    /// a <see cref="TableBlobContent"/> in a column the store's type does not read back (refused before the
+    /// content's stream is read).</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public Task PrepareAsync(object entity, CancellationToken ct) => coordinator.PrepareAsync(entity, ct);
 

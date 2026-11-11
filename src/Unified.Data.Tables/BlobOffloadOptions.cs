@@ -72,8 +72,9 @@ public sealed class BlobOffloadOptions
     /// <para>
     /// A grace of zero, or below one second, protects nothing: a blob that another writer touched in the
     /// same second as the commit, and is about to reference, can be deleted under it. Such values are for
-    /// tests only. <see cref="TimeSpan.MaxValue"/> switches the cleanup after writes and deletes off:
-    /// every replaced or released blob is left to <c>SweepOrphanBlobsAsync</c>.
+    /// tests only. <see cref="TimeSpan.MaxValue"/> (a grace longer than the calendar) switches the cleanup
+    /// off: nothing is deleted after a write, a delete or a partition delete, and every replaced or
+    /// released blob is left to <c>SweepOrphanBlobsAsync</c>.
     /// </para>
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
