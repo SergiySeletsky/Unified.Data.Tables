@@ -502,24 +502,41 @@ public sealed class AzuritePartitionDeleteSurvivorTests : AzuriteCleanupTestBase
         Assert.Equal([BlobName("survivor", SurvivorText)], await BlobNamesAsync());
     }
 
+    // The two halves of "existing behaviour kept" are separate tests here: the emulator stamps
+    // Last-Modified itself, so one delete that must find one blob older and another younger than a short
+    // grace would depend on how busy the emulator is. (The in-memory and mocked-table tests cover both
+    // in a single delete.)
+
     [Fact]
-    public async Task NoSurvivor_BlobsOlderThanTheGraceGo_YoungerOnesStayForTheSweep()
+    public async Task NoSurvivor_BlobsOlderThanTheGrace_AreDeleted()
     {
         SkipUnlessAvailable();
-        // Long enough that the delete below, which follows the young row's create at once, still finds
-        // that row's blob younger than the grace even on a busy emulator.
-        var grace = TimeSpan.FromSeconds(6);
+        var grace = TimeSpan.FromSeconds(1);
         var store = Store<SplitTextEntity>(grace);
-        await store.CreateAsync(Row("old", Text), Ct);
+        await store.CreateAsync(Row("r1", Text), Ct);
+        await store.CreateAsync(Row("r2", OtherText), Ct);
+        Assert.Equal(2, (await BlobNamesAsync()).Count);
         await BlobsOlderThanAsync(grace);
-        await store.CreateAsync(Row("young", OtherText), Ct);
 
         Assert.Equal(2, await store.DeletePartitionAsync(Pk, Ct));
 
         Assert.Empty(await RawRowsAsync(TableName));
+        Assert.Empty(await BlobNamesAsync());
+    }
+
+    [Fact]
+    public async Task NoSurvivor_BlobsYoungerThanTheGrace_StayForTheSweep()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>(); // the default grace of five minutes
+        await store.CreateAsync(Row("young", OtherText), Ct);
+
+        Assert.Equal(1, await store.DeletePartitionAsync(Pk, Ct));
+
+        Assert.Empty(await RawRowsAsync(TableName));
         Assert.Equal([BlobName("young", OtherText)], await BlobNamesAsync());
 
-        // The orphan sweep collects the young one once it is old enough.
+        // The orphan sweep collects it once it is old enough.
         await BlobsOlderThanAsync(TimeSpan.Zero);
         Assert.Equal(1, await store.SweepOrphanBlobsAsync(Pk, TimeSpan.Zero, Ct));
         Assert.Empty(await BlobNamesAsync());
