@@ -21,9 +21,11 @@ namespace Unified.Data.Tables;
 /// implementing class, or on that class (and, where an entity holds the implementation in a property
 /// declared as the interface, on the entity class too). A builder partial update is refused with the same
 /// exception before anything is written when the entity type, or the declared type of a property along
-/// the updated path, is or implements such an interface. An instance held in a JSON-stored property (a
-/// collection, or a type stored as one JSON cell) is not checked: it is written as JSON like every other
-/// value of that cell, and a trimming <c>OversizedCellPolicy</c> can trim that cell.
+/// the updated path, is or implements such an interface (<c>InMemoryStorage&lt;T&gt;</c> looks at the row
+/// first: for a missing row, or a <c>WithETag</c> that names another version, it throws the 404 or the
+/// conflict, as for every builder update). An instance held in a JSON-stored property (a collection, or a
+/// type stored as one JSON cell) is not checked: it is written as JSON like every other value of that
+/// cell, and a trimming <c>OversizedCellPolicy</c> can trim that cell.
 /// </para>
 /// <para>
 /// A store treats its entity type as large-value aware (it plans split cells, continuation rows and blobs)
@@ -32,21 +34,28 @@ namespace Unified.Data.Tables;
 /// attribute on the entity class itself. The last also applies when it covers none of the entity's own
 /// properties: it is how an entity opts in whose large values are members of an object whose type is known
 /// only at run time (an interface-, abstract- or base-class-typed property that holds a subtype with
-/// <c>[TableValueSplit]</c> or <see cref="TableBlobContent"/> members); it still covers the entity's own
-/// string, <c>byte[]</c> and JSON-stored properties as above. The store of such an entity
-/// constructs it once, when it first needs the columns of the objects its constructor puts in those
-/// properties; it never constructs a type that is not large-value aware. A type that is not large-value
-/// aware refuses to store a value in such a member below a runtime subtype, whatever its size, with
-/// <see cref="System.NotSupportedException"/>.
+/// <c>[TableValueSplit]</c> or <see cref="TableBlobContent"/> members). The entity's constructor must then
+/// put an instance of that subtype in the property: a read keeps that instance and creates the declared
+/// type where there is none, and below an object of the declared type such a value that needs split cells
+/// or a blob is refused (below). The attribute still covers the entity's own string, <c>byte[]</c> and
+/// JSON-stored properties as above. The store of such an entity constructs it when it first needs the
+/// columns of the objects its constructor puts in those properties, and once for each column of such a
+/// member that a write or a builder update meets before it was resolved; it never constructs a type that
+/// is not large-value aware. A type that is not large-value aware refuses to store a value in such a
+/// member below a runtime subtype, whatever its size, with <see cref="System.NotSupportedException"/>.
 /// </para>
 /// <para>
-/// A value too large for one cell is stored only where a read returns it. Below an object a read cannot
-/// create (a struct held in a nullable property, an interface- or abstract-typed property with no instance)
-/// the write is refused with <see cref="System.NotSupportedException"/> naming the column, before anything
-/// is stored; a value that fits one cell there stays an ordinary cell. A split value keeps four cells on
-/// the entity's main row besides its chunks, and a row with split values its part count, within the 252
-/// properties one entity holds besides its keys and timestamp: an entity with no other properties than
-/// those of <see cref="Entity"/> holds 62 split values, a wider one fewer. Beyond that the write throws
+/// A value too large for one cell is stored only where a read returns it into a large-value member of the
+/// object the read creates or keeps there. Below an object a read cannot create (a struct held in a
+/// nullable property, an interface- or abstract-typed property with no instance), and below one whose type
+/// has no member of the value's name, or has one that is not a large-value member (a property declared as
+/// a base class and empty on a new entity, written holding a subclass that marks the member while the base
+/// class does not), the write is refused with <see cref="System.NotSupportedException"/> naming the column,
+/// before anything is stored or uploaded; a value that fits one cell there stays an ordinary cell, and is
+/// never moved to split form to make a crowded row fit. A split value keeps four cells on the entity's main
+/// row besides its chunks, and a row with split values its part count, within the 252 properties one entity
+/// holds besides its keys and timestamp: an entity with no other properties than those of
+/// <see cref="Entity"/> holds 62 split values, a wider one fewer. Beyond that the write throws
 /// <see cref="OversizedValueException"/>, which names the value and the properties its cells need.
 /// </para>
 /// </remarks>

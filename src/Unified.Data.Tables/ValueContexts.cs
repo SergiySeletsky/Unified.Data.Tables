@@ -25,8 +25,10 @@ internal sealed record ValueWriteContext(
     public IReadOnlySet<string> ForceSplit { get; init; } = NoColumns;
 
     /// <summary>
-    /// Receives every opted-in value the serializer wrote as one ordinary cell: the values the planner
-    /// may move to split form. Null when no rows are planned (the public serializer, a clone).
+    /// Receives every opted-in value the serializer wrote as one ordinary cell and a read of
+    /// <see cref="ReadType"/> returns into a large-value member: the values the planner may move to split
+    /// form (a value a read would set on an ordinary member stays in its cell). Null when no rows are
+    /// planned (the public serializer, a clone).
     /// </summary>
     public ICollection<InlineValue>? Inline { get; init; }
 

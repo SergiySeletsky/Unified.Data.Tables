@@ -211,13 +211,16 @@ public sealed class TableBlobContent
     /// stream. Two contents over one non-seekable stream written by one write are refused the same way. A
     /// stream a failed write read only part of, and a seekable stream a write could not put back, are
     /// refused for every later content (so a server that reuses a request-body object which a failed write
-    /// read part-way refuses every later content over it: buffer the body into a seekable
-    /// stream, or close the connection after such a failure). What is remembered about a stream holds for the streams
-    /// below it that the framework wrappers expose (<c>BufferedStream</c>, <c>GZipStream</c>,
-    /// <c>DeflateStream</c>, <c>ZLibStream</c>, <c>BrotliStream</c>, followed recursively), so a new such
-    /// wrapper over a stream an earlier attempt consumed is recognised. Only the content's own stream and
-    /// those wrappers are: a new wrapper of another kind (a user-written stream, a decryption stream) over
-    /// a consumed stream is not, and stores whatever that stream still delivers, possibly nothing.
+    /// read part-way refuses every later content over it: buffer the body into a seekable stream, or close
+    /// the connection after such a failure). A write cancelled once it has begun to read a non-seekable
+    /// stream counts the stream as read part-way, also when the stream had delivered no byte yet: the library
+    /// cannot tell whether the stream took bytes from its own source that it did not deliver. What is
+    /// remembered about a stream holds for the streams below it that the framework wrappers expose
+    /// (<c>BufferedStream</c>, <c>GZipStream</c>, <c>DeflateStream</c>, <c>ZLibStream</c>,
+    /// <c>BrotliStream</c>, followed recursively), so a new such wrapper over a stream an earlier attempt
+    /// consumed is recognised. Only the content's own stream and those wrappers are: a new wrapper of another
+    /// kind (a user-written stream, a decryption stream) over a consumed stream is not, and stores whatever
+    /// that stream still delivers, possibly nothing.
     /// </para>
     /// <para>
     /// For content whose write may be retried, create the content once, outside a delegate that may run
@@ -245,7 +248,12 @@ public sealed class TableBlobContent
     }
 
     /// <summary>Content held in memory; its length and SHA-256 are known at once.</summary>
-    /// <param name="content">The bytes. The array is used as is, not copied; do not change it afterwards.</param>
+    /// <param name="content">
+    /// The bytes. The array is used as is, not copied; do not change it afterwards: a content keeps reading
+    /// this array after it is written, so a change would reach every entity that holds the content, including
+    /// the read cache's copy of the written entity (a fresh read, and <c>InMemoryStorage</c>, return the
+    /// stored bytes).
+    /// </param>
     /// <param name="contentType">The MIME type to store the blob with.</param>
     /// <returns>The content.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="content"/> or <paramref name="contentType"/> is null.</exception>

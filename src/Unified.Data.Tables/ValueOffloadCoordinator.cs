@@ -231,9 +231,10 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// Serializes <paramref name="entity"/> and plans its rows.
     /// <para>
     /// An opted-in value that fits one cell stays in its cell. When the cells that must stay on the
-    /// primary row then exceed one entity, the largest of those values are moved to split form (their
-    /// property's encoding, the normal split cells), so their chunks can go to continuation rows, until
-    /// the primary row fits; a row that needed this is also brought within the request budget of one
+    /// primary row then exceed one entity, the largest of those values that a read of the entity type
+    /// returns into a large-value member are moved to split form (their property's encoding, the normal
+    /// split cells), so their chunks can go to continuation rows, until the primary row fits (any other
+    /// value stays in its cell); a row that needed this is also brought within the request budget of one
     /// entity (<see cref="SplitRowLayout.MaxEntityWireBytes"/>) as far as moving such values can, like
     /// every row split cells are placed on. A row that fits one entity is left as it is.
     /// </para>

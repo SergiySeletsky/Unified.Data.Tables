@@ -55,7 +55,10 @@ public static class TableEntitySerializer
     /// <exception cref="NotSupportedException">
     /// The runtime type of <paramref name="root"/> is not large-value aware and its graph holds a value in a
     /// large-value member. Mark the type with <see cref="TableValueSplitAttribute"/>, or declare the
-    /// property that holds the member with the type that carries it.
+    /// property that holds the member with the type that carries it. Or the runtime type is large-value
+    /// aware and a value that needs split cells is where a read of that type would not return it into a
+    /// large-value member (see <see cref="TableValueSplitAttribute"/>): below an object a read cannot
+    /// create, or one whose type has no member of that name or does not mark it.
     /// </exception>
     public static TableEntity ToTableEntity(
         this object root,
