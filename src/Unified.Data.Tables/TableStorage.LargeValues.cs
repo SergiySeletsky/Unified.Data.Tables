@@ -914,11 +914,18 @@ public partial class TableStorage<T>
         }
         var writes = DistinctBatchKeys(entities, kind);
 
+        // Exactly the entities whose PrepareAsync ran are released: one whose prepare never started (an
+        // earlier one threw) holds no count on its contents, and releasing it could count out another
+        // write of a content it shares.
+        var enlisted = new List<T>(writes.Count);
         try
         {
             // Hash every TableBlobContent once (a non-seekable one is copied to a temporary file).
             foreach (var entity in writes)
+            {
+                enlisted.Add(entity);
                 await large.PrepareAsync(entity, ct);
+            }
             var released = new List<ReleasedBlobs>();
             foreach (var group in writes.GroupBy(e => GetEntityKeys(e.Id).PartitionKey, StringComparer.Ordinal))
             {
@@ -934,7 +941,7 @@ public partial class TableStorage<T>
         }
         finally
         {
-            foreach (var entity in writes)
+            foreach (var entity in enlisted)
                 LargeValueTable.ReleasePrepared(entity);
         }
     }

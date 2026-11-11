@@ -296,10 +296,17 @@ public sealed partial class InMemoryStorage<T>
             writes = prepared.Where((p, i) => last[p.Keys] == i).ToList();
         }
 
+        // Exactly the entities whose PrepareAsync ran are released: one whose prepare never started (an
+        // earlier one threw) holds no count on its contents, and releasing it could count out another
+        // write of a content it shares.
+        var enlisted = new List<T>(writes.Count);
         try
         {
             foreach (var (_, entity) in writes)
+            {
+                enlisted.Add(entity);
                 await large.PrepareAsync(entity, ct);
+            }
             var released = new List<ReleasedBlobs>();
             foreach (var group in writes.GroupBy(w => w.Keys.Item1, StringComparer.Ordinal))
             {
@@ -315,7 +322,7 @@ public sealed partial class InMemoryStorage<T>
         }
         finally
         {
-            foreach (var (_, entity) in writes)
+            foreach (var entity in enlisted)
                 LargeValueTable.ReleasePrepared(entity);
         }
 
