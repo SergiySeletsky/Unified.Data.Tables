@@ -521,9 +521,13 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// work without, and returns <c>null</c> (meaning every column) when no projection was asked for.
     ///
     /// The trap this closes: a projection of <c>["Content"]</c> is a perfectly valid Tables query
-    /// that comes back with no PartitionKey, no RowKey, no ETag and no type discriminator, and
+    /// that comes back with no PartitionKey, no RowKey, no Timestamp and no type discriminator, and
     /// deserializes into a silently wrong entity. Projection is a transfer optimisation, never a
     /// change to what an entity IS, so the system columns are not the caller's to omit.
+    ///
+    /// The row's version is not one of them: <c>odata.etag</c> is not a column. The service returns it
+    /// with every entity, selected or not, and a <c>$select</c> that names it may be refused (other Azure
+    /// SDKs strip the token), so it is never sent, and one a caller named is dropped.
     /// </summary>
     internal static IEnumerable<string>? BuildSelect(QueryOptions? options)
     {
@@ -535,13 +539,19 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         columns.AddRange(SystemColumns);
         if (LargeValueAware) columns.AddRange(SplitSystemColumns);
         foreach (var column in requested)
-            if (!columns.Contains(column, StringComparer.Ordinal)) columns.Add(column);
+        {
+            if (!string.Equals(column, ETagToken, StringComparison.Ordinal) && !columns.Contains(column, StringComparer.Ordinal))
+                columns.Add(column);
+        }
 
         return columns;
     }
 
     /// <summary>Columns every projection carries whether the caller asked for them or not.</summary>
-    private static readonly string[] SystemColumns = ["PartitionKey", "RowKey", "Timestamp", "odata.etag", "_TypeName"];
+    private static readonly string[] SystemColumns = ["PartitionKey", "RowKey", "Timestamp", "_TypeName"];
+
+    /// <summary>The name under which the service returns a row's version; never part of a <c>$select</c>.</summary>
+    private const string ETagToken = "odata.etag";
 
     // Shared server-side streaming iterator. Validation lives in the public methods so it throws
     // eagerly rather than being deferred to the first MoveNext of the returned sequence.
