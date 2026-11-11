@@ -187,9 +187,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         entity.Id = NormalizeId(entity.Id);
 
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        // Taken before the first storage call: the entity is cached only if no other write or delete of
+        // it was noted in between (see WriteGenerations).
+        var mark = BeginWrite(entity.Id);
         if (LargeValueAware)
         {
-            CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Create, ETag.All, ct));
+            CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Create, ETag.All, ct), mark);
             return entity;
         }
 
@@ -221,7 +224,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
         var insertedETag = responseETag ?? dataEntity.ETag;
         entity.ETag = insertedETag.ToString();
-        CacheEntity(entity.Id, entity, insertedETag);
+        CacheEntity(entity.Id, entity, insertedETag, mark);
         InvalidateQueryCache(partitionKey);
 
         return entity;
@@ -926,6 +929,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         partial[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
 
         var condition = builder.ETag is null ? ETag.All : new ETag(builder.ETag);
+        var mark = BeginWrite(id); // before the storage call (see WriteGenerations)
         Response resp;
         try
         {
@@ -941,15 +945,17 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
 
         // Keep the cache coherent: if the entity is cached and every declared path maps onto a
-        // top-level property, patch it in place with the new ETag so reads stay warm. Nested-path
-        // updates (or unknown names) evict instead — the next OneAsync re-reads fresh.
+        // top-level property, a copy of it is patched and put with the new ETag so reads stay warm (a
+        // write's put: it gives way to another write or delete of the entity noted since the mark).
+        // Nested-path updates (or unknown names) evict instead — the next OneAsync re-reads fresh.
         var newETag = ReadETagHeader(resp);
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null
-            && TryApplyUpdates(cached.Entity, builder.Updates))
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null
+            && PatchesTopLevelOnly(builder.Updates) && Snapshot(id, cached.Entity) is { } patched
+            && TryApplyUpdates(patched, builder.Updates))
         {
-            cached.Entity.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
-            cached.Entity.Timestamp = null; // the row changed server-side; stale until re-read
-            CacheEntity(id, cached.Entity, newETag ?? cached.ETag);
+            patched.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
+            patched.Timestamp = null; // the row changed server-side; stale until re-read
+            PutWrite(id, new CachedEntity(patched, newETag ?? cached.ETag), mark);
         }
         else
         {
@@ -973,6 +979,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // not be masked as "no ETag".
             return null;
         }
+    }
+
+    // True when every path of the builder names a top-level property: only then is the cached entity
+    // copied to be patched (a nested path evicts, and copies nothing).
+    private static bool PatchesTopLevelOnly(Dictionary<string, object> updates)
+    {
+        var map = TypeMetadataCache.GetMetadata(typeof(T)).PropertyMap;
+        return updates.Keys.All(map.ContainsKey);
     }
 
     private static bool TryApplyUpdates(T entity, Dictionary<string, object> updates)
@@ -1046,11 +1060,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        var mark = BeginWrite(entity.Id); // before the first storage call (see WriteGenerations)
         if (LargeValueAware)
         {
             try
             {
-                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Replace, etag, ct));
+                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Replace, etag, ct), mark);
             }
             catch (ConcurrencyConflictException)
             {
@@ -1069,7 +1084,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             var newETag = updateResponse.Headers.ETag ?? etag;
             entity.ETag = newETag.ToString();
 
-            CacheEntity(entity.Id, entity, newETag);
+            CacheEntity(entity.Id, entity, newETag, mark);
             InvalidateQueryCache(partitionKey);
         }
         catch (RequestFailedException ex) when (ex.Status == 412)
@@ -1107,11 +1122,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
+        var mark = BeginWrite(entity.Id); // before the first storage call (see WriteGenerations)
         if (LargeValueAware)
         {
             try
             {
-                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Upsert, ETag.All, ct));
+                CommitLargeWrite(entity, partitionKey, await WriteLargeAsync(entity, LargeWriteKind.Upsert, ETag.All, ct), mark);
             }
             catch (ConcurrencyConflictException)
             {
@@ -1137,7 +1153,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
         var newETag = responseETag ?? dataEntity.ETag;
         entity.ETag = newETag.ToString();
-        CacheEntity(entity.Id, entity, newETag);
+        CacheEntity(entity.Id, entity, newETag, mark);
         InvalidateQueryCache(partitionKey);
 
         return entity;
@@ -1199,15 +1215,43 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     private string QueryCacheKey(string? partition) => $"{cacheKeyPrefix}:query:{partition ?? "*"}";
 
     // A WRITE's put: the entity a create, update or upsert has just committed, under the version the
-    // service returned for it. The write is noted before the entry is overwritten (see WriteGenerations).
+    // service returned for it. The write notes itself and puts only if no other write or delete of the
+    // entity was noted since its mark (BeginWrite); otherwise it evicts the entry (see WriteGenerations).
     // (An entity that cannot be copied for the cache is not put, and the entry of the version it replaced
     // is left as it always was: evicting it would turn the next read into a failed one, because a row
     // that cannot be copied cannot be read back either.)
-    private void CacheEntity(string id, T entity, ETag etag)
+    private void CacheEntity(string id, T entity, ETag etag, ReadMark mark)
     {
-        Generations.NoteWrite(id);
         if (cachePolicy.Enabled && Snapshot(id, entity) is { } snapshot)
-            cache.Set(EntityKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
+            PutWrite(id, new CachedEntity(snapshot, etag), mark);
+        else
+            Generations.NoteWrite(id);
+    }
+
+    // A write's put of an entry it has already copied. Noting the write and comparing with the write's
+    // mark are one critical section; the put follows, and is undone when another write or delete of the
+    // entity was noted meanwhile. (The cache itself is called outside the gate, as every write called it
+    // before: an IMemoryCache whose Set runs code that reads through this store must not wait for a gate
+    // its caller holds.) A write that was not alone evicts instead of putting.
+    private void PutWrite(string id, CachedEntity value, ReadMark mark)
+    {
+        var key = EntityKey(id);
+        if (Generations.NoteWriteAlone(mark, id, out var noted))
+        {
+            cache.Set(key, value, CacheEntryOptions());
+            if (Generations.IsLatest(id, noted))
+                return;
+        }
+        cache.Remove(key);
+    }
+
+    // A write or delete whose storage call threw may or may not have committed (a timeout, a cancellation,
+    // a connection dropped after the commit). The entity's entry and its partition's cached lists go
+    // (noted first), so the next read asks the table.
+    private void EvictAfterFailedWrite(string id, string partitionKey)
+    {
+        cache.Remove(EntityCacheKey(id));
+        InvalidateQueryCache(partitionKey);
     }
 
     // A READ's put: the entity a point read, a query, a page or a stream found. It is cached only while
@@ -1268,23 +1312,41 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // ── Read-cache coherence ────────────────────────────────────────────────
     //
     // A read puts what it read into the cache some time after it read it: the response is in flight, and
-    // a split-aware read still queries the continuation rows and downloads the blobs. A write or delete
-    // that commits in between must not be followed by the read caching the older version: later reads
-    // would be served it from memory, and a deleted entity would stay readable. So:
+    // a split-aware read still queries the continuation rows and downloads the blobs. A write puts what it
+    // wrote some time after its row committed: its response is in flight, and a split-aware write first
+    // deletes the blobs of the version it replaced. A write or delete of the same entity that commits in
+    // between must not be followed by that put of the older version: later reads would be served it from
+    // memory, a read-then-upsert caller would write it back, and a deleted entity would stay readable. So:
     //
-    //   - a mutation, once it has committed, NOTES itself (advances a write generation) before it evicts
-    //     or overwrites a cache entry: the entity's generation in EntityCacheKey and CacheEntity, before
-    //     the entity's entry goes or is replaced; the partition's in InvalidateQueryCache, before the
-    //     cached lists go. Every mutating path goes through those helpers;
+    //   - a mutation, once it has committed (or once its storage call threw: it may have committed),
+    //     NOTES itself (advances a write generation) before it evicts or overwrites a cache entry: the
+    //     entity's generation in EntityCacheKey and PutWrite, before the entity's entry goes or is
+    //     replaced; the partition's in InvalidateQueryCache, before the cached lists go. Every mutating
+    //     path goes through those helpers;
     //   - a read takes a ReadMark (the generations it depends on) before its first storage call and puts
     //     its result only while they are unchanged. Comparing and putting are one critical section with
-    //     the advance.
+    //     the advance;
+    //   - a write's put gives way: a write takes a mark of the entity's generation (BeginWrite) before its
+    //     first storage call. When it has committed it notes itself and, in the same critical section,
+    //     asks whether any other write or delete of the entity was noted since its mark. If one was, it
+    //     evicts the entry instead of putting. If none was, it puts, and then evicts again if another
+    //     write or delete was noted after its own note. (The order in which the service applied two
+    //     overlapping unconditional writes cannot be known from the order of their responses, so neither
+    //     of two overlapping writes keeps its entity cached.)
     //
-    // Why that is enough: take a read that fetched an older version than a write committed. It took its
-    // mark before that commit, hence before the write's advance. Either the advance came before the
-    // read's compare-and-put, and the read puts nothing; or it came after, and then the write evicts or
-    // overwrites what the read put, because it touches the entry only after advancing. So once the write
-    // has returned, nothing older than it is in the cache, or was ever visible there after that moment.
+    // Why the read rule is enough: take a read that fetched an older version than a write committed. It
+    // took its mark before that commit, hence before the write's advance. Either the advance came before
+    // the read's compare-and-put, and the read puts nothing; or it came after, and then the write evicts
+    // or overwrites what the read put, because it touches the entry only after advancing. So once the
+    // write has returned, nothing older than it is in the cache, or was ever visible there after that
+    // moment.
+    //
+    // Why the write rule is enough: take a write A whose entity is still cached once A and every other
+    // mutation of the entity have returned. No mutation was noted between A's mark and A's check after its
+    // put (A would have evicted), and none after that check (it would have evicted or overwritten A's
+    // entry, since each touches the entry only after noting). So every other mutation was noted before
+    // A's mark: it committed before A began, and A's version is the one the table holds. Two entities that
+    // share a counter only make a write evict where it could have cached.
     // Writes by other processes are not seen, as before (see CachePolicy).
 
     private static readonly ConditionalWeakTable<IMemoryCache, WriteGenerations> GenerationsByCache = new();
@@ -1302,6 +1364,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     /// <summary>The mark of a read of many entities; taken before the read's first storage call.</summary>
     private ReadMark BeginScan() => cachePolicy.Enabled ? Generations.MarkAll() : default;
+
+    /// <summary>
+    /// The mark of a write of one entity; taken before the write's first storage call. A write puts its
+    /// entity only while no other write or delete of the entity was noted since (see CacheEntity).
+    /// </summary>
+    private ReadMark BeginWrite(string id) => cachePolicy.Enabled ? Generations.MarkEntity(id) : default;
 
     /// <summary>
     /// What a read noted before its first storage call: the write generation of the one entity it reads
@@ -1396,6 +1464,32 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                     return false;
                 cache.Set(key, value, options);
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// Notes a committed write of the entity <paramref name="id"/>, like <see cref="NoteWrite"/>, and
+        /// tells, in the same critical section, whether no other write or delete of it was noted since the
+        /// write's own <paramref name="mark"/>. <paramref name="noted"/> is the generation this note gave.
+        /// </summary>
+        public bool NoteWriteAlone(ReadMark mark, ReadOnlySpan<char> id, out long noted)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                var alone = mark.Taken && mark.All is null && mark.Stripe == stripe && counters[stripe] == mark.Generation;
+                noted = ++counters[stripe];
+                return alone;
+            }
+        }
+
+        /// <summary>True while no write or delete of the entity <paramref name="id"/> was noted after the note that gave <paramref name="noted"/>.</summary>
+        public bool IsLatest(ReadOnlySpan<char> id, long noted)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                return counters[stripe] == noted;
             }
         }
 
