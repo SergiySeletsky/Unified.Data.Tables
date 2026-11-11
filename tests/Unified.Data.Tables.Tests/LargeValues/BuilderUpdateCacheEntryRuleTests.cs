@@ -223,14 +223,18 @@ public class BuilderUpdateCacheEntryRuleTests
             $"served Name='{served.Name}' ETag={served.ETag}, row ETag={rowETag}, race read ETag={readETag}; after MutateAsync the row's Name is '{stored["Name"]}' (B's committed change must survive)");
     }
 
-    // CACHE-L1: CACHE-R4-1 with the race read being a partition query or a predicate query. A stream
-    // (QueryStreamAsync) does not warm the entity cache: the control.
+    // CACHE-L1: CACHE-R4-1 with the race read being a partition query, a predicate query, ExistsAsync or a
+    // page. A stream (QueryStreamAsync) does not warm the entity cache: the control.
     [Theory]
     [InlineData(false, "query")]
     [InlineData(true, "query")]
     [InlineData(false, "predicate")]
     [InlineData(true, "predicate")]
     [InlineData(false, "stream")]
+    [InlineData(false, "exists")]
+    [InlineData(true, "exists")]
+    [InlineData(false, "page")]
+    [InlineData(true, "page")]
     public async Task ABuilderUpdate_WhoseEntryAQueryPutDuringItsFlight_NeverLetsAnOptimisticWriteUndoALaterChange(bool largeValues, string read)
     {
         if (largeValues)
@@ -262,6 +266,12 @@ public class BuilderUpdateCacheEntryRuleTests
                     break;
                 case "predicate":
                     _ = a.QueryAsync(x => x.Version == 1, "p", ct: Ct).GetAwaiter().GetResult();
+                    break;
+                case "exists":
+                    Assert.True(a.ExistsAsync(Id, Ct).GetAwaiter().GetResult());
+                    break;
+                case "page":
+                    _ = a.QueryPageAsync(new QueryOptions { Partition = "p" }, Ct).GetAwaiter().GetResult();
                     break;
                 default:
                     var e = a.QueryStreamAsync(new QueryOptions { Partition = "p" }, Ct).GetAsyncEnumerator(Ct);
