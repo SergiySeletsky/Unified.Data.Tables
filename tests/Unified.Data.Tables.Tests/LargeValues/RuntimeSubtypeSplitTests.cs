@@ -1031,25 +1031,33 @@ public class RuntimeSubtypeSplitTests
     [Theory]
     [InlineData(LargeValueStores.Memory)]
     [InlineData(LargeValueStores.Azurite)]
-    public async Task InterfaceTypedPropertyWithNoDefaultInstance_FailsOnRead_AsItsOrdinaryCellsDo_NeverNull(string store)
+    public async Task InterfaceTypedPropertyWithNoDefaultInstance_RefusesALargeValueAtWrite_AndFailsOnReadAsItsOrdinaryCellsDo(string store)
     {
         await using var stores = await LargeValueStores.OpenAsync(store);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
 
-        // Ordinary cells beside the large value: the read fails where 0.8.3 fails.
+        // Ordinary cells only (the value fits one cell): the read fails where 0.8.3 fails.
         var mixed = stores!.Id("mixed");
         await stores.Store<NoDefaultInterfaceHolder>().CreateAsync(
-            new NoDefaultInterfaceHolder { Id = mixed, Shape = new RuntimeCircle { Radius = 2, Notes = Ascii(40_000) } }, Ct);
+            new NoDefaultInterfaceHolder { Id = mixed, Shape = new RuntimeCircle { Radius = 2, Notes = Ascii(1_000) } }, Ct);
         var ex = await Assert.ThrowsAsync<SerializationException>(() => stores.Store<NoDefaultInterfaceHolder>().OneAsync(mixed, Ct));
         Assert.Contains("interface", ex.InnerException!.Message, StringComparison.OrdinalIgnoreCase);
 
-        // Only the large value: the same failure, not an entity whose Shape is silently null.
-        var only = stores.Id("only");
-        await stores.Store<NoDefaultInterfaceHolder>().CreateAsync(
-            new NoDefaultInterfaceHolder { Id = only, Shape = new RuntimeNotesOnly { Notes = Ascii(40_000) } }, Ct);
-        ex = await Assert.ThrowsAsync<SerializationException>(() => stores.Store<NoDefaultInterfaceHolder>().OneAsync(only, Ct));
-        Assert.Contains("Shape_Notes", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("interface", ex.InnerException!.Message, StringComparison.OrdinalIgnoreCase);
+        // A value that needs split cells: no read could return it (the owner cannot be created), so the
+        // write is refused before anything is stored (SERIALIZER-7 of fix wave 2: a check that cannot
+        // decide refuses), never a row that every read of it and of its partition fails on.
+        foreach (var (key, shape) in new (string, IRuntimeShape)[]
+                 {
+                     ("large-mixed", new RuntimeCircle { Radius = 2, Notes = Ascii(40_000) }),
+                     ("large-only", new RuntimeNotesOnly { Notes = Ascii(40_000) }),
+                 })
+        {
+            var refused = await Assert.ThrowsAsync<NotSupportedException>(() => stores.Store<NoDefaultInterfaceHolder>().CreateAsync(
+                new NoDefaultInterfaceHolder { Id = stores.Id(key), Shape = shape }, Ct));
+            Assert.Contains("'Shape_Notes'", refused.Message, StringComparison.Ordinal);
+            Assert.Contains("cannot create the object that owns the value", refused.Message, StringComparison.Ordinal);
+        }
+        Assert.Equal(["mixed"], (await stores.RawRowsAsync<NoDefaultInterfaceHolder>()).Select(r => r.RowKey));
     }
 
     // ── the cache copy ─────────────────────────────────────────────────────

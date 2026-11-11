@@ -171,6 +171,18 @@ public static class TableEntitySerializer
         "keeps the instance the constructor puts in a property and creates the declared type where there is none. " +
         "Initialise the owning property with an instance of that runtime type, or declare the property with that type.";
 
+    /// <summary>
+    /// The message for a large value whose column a read of <paramref name="root"/> cannot resolve: the read
+    /// fails at an owner it cannot create (a struct held in a nullable property, an interface or an abstract
+    /// type with no instance), so every read of a row holding the value would fail.
+    /// </summary>
+    internal static string UnresolvableLargeValue(Type root, string column) =>
+        $"'{column}' of {root.Name} needs split cells or a blob, and a read of {root.Name} cannot map the column " +
+        $"'{column}' back to a property: it cannot create the object that owns the value (a struct held in a nullable " +
+        "property, or an interface or abstract type with no instance in the property), so no read of the row could " +
+        "return it. Declare the owning property with a type a read can create (the struct itself rather than its " +
+        "nullable form, or a class), or initialise the property with an instance in the constructor. Nothing was stored.";
+
     /// <summary>Late-bound deserialize; requires the row to have been written with <c>persistType: true</c>.</summary>
     /// <remarks>
     /// This overload performs <b>no base-type check</b>: it resolves whatever assembly-qualified name
@@ -1343,8 +1355,10 @@ internal sealed class TableEntityValue
     {
         if (Path.Count < 2 || state is not { RootType: { } root, Ctx.IsClone: false })
             return;
-        if (!TypeMetadataCache.ReadsBack(root, columnName))
-            throw new NotSupportedException(TableEntitySerializer.UnreadableLargeValue(root, columnName));
+        if (!TypeMetadataCache.ReadsBack(root, columnName, out var unresolved))
+            throw new NotSupportedException(unresolved
+                ? TableEntitySerializer.UnresolvableLargeValue(root, columnName)
+                : TableEntitySerializer.UnreadableLargeValue(root, columnName));
     }
 
     private static string BlobName(ValueWriteContext ctx, FlattenState state, string columnName, string sha256) =>
@@ -2233,26 +2247,32 @@ internal static class TypeMetadataCache
     }
 
     /// <summary>
-    /// False when a read of <paramref name="root"/> maps <paramref name="column"/> to no property, so a
-    /// value stored under it would never be read. True when it maps, and also when the read fails at an
-    /// owner it cannot create: that read reports the failure, as it does for the ordinary cells beside
-    /// the value (the behaviour of 0.8.3 for that shape). Resolved as
-    /// <see cref="ReadTarget(Type, string)"/> resolves it: nothing is constructed for a type that is not
-    /// large-value aware.
+    /// True only when a read of <paramref name="root"/> maps <paramref name="column"/> to a property. False
+    /// when it maps the column to no property (a value stored under it would never be read), and false, with
+    /// <paramref name="unresolved"/> set, when resolving the column throws: the read fails at an owner it
+    /// cannot create (a struct held in a nullable property, whose creator yields nothing; an interface or an
+    /// abstract type with no instance), so every read of a row holding the value would fail. A check that
+    /// cannot decide refuses. Resolved as <see cref="ReadTarget(Type, string)"/> resolves it: nothing is
+    /// constructed for a type that is not large-value aware.
     /// </summary>
-    internal static bool ReadsBack(Type root, string column)
+    internal static bool ReadsBack(Type root, string column, out bool unresolved)
     {
-#pragma warning disable CA1031 // a read that fails is not a read that silently skips the value
+        unresolved = false;
+#pragma warning disable CA1031 // a column the check cannot resolve is a column no read returns
         try
         {
             return ReadTarget(root, column) is not null;
         }
         catch (Exception)
         {
-            return true;
+            unresolved = true;
+            return false;
         }
 #pragma warning restore CA1031
     }
+
+    /// <summary><see cref="ReadsBack(Type, string, out bool)"/> without the reason.</summary>
+    internal static bool ReadsBack(Type root, string column) => ReadsBack(root, column, out _);
 
     // A property type the serializer stores natively (no columns of its own to walk).
     private static bool IsScalar(Type type)
