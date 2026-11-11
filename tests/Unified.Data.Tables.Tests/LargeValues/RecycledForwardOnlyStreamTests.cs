@@ -5,12 +5,12 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 
 /// <summary>
 /// A forward-only stream object that is given a new payload after a write read it (CONTENT-1 of the
-/// fix-wave-3 review; ruling R9 points 1 to 3). A server hands every request of one connection the same
-/// request-body object, so the library remembers a stream that a write read to its end only while that
-/// write has not committed. After a committed write the next content over the object is a new payload,
-/// whatever it delivers. After a failed write a new content over it is stored when the stream delivers
-/// bytes again and refused, before anything is uploaded, when it delivers nothing (BLOBS-2: the retry
-/// never stores an empty file). A stream a write read only part of stays refused.
+/// fix-wave-3 review; ruling R9 as revised in fix wave 5). A server hands every request of one connection
+/// the same request-body object. The library remembers a stream that a write read to its end for as long
+/// as the stream object lives, whether that write committed or failed: a new content over it is stored when
+/// the stream delivers bytes again and refused, before anything is uploaded, when it delivers nothing
+/// (BLOBS-2: the retry never stores an empty file; a new, empty payload on the reused object is refused too).
+/// A stream a write read only part of stays refused.
 /// </summary>
 public class RecycledForwardOnlyStreamTests(ITestOutputHelper output)
 {
@@ -58,21 +58,33 @@ public class RecycledForwardOnlyStreamTests(ITestOutputHelper output)
         Assert.Equal(second, await ReadFileAsync((await store.OneAsync("p|two", Ct))!.File!));
     }
 
-    /// <summary>R9 point 1: a committed write forgets the stream, so an empty next payload is stored as an empty file.</summary>
+    /// <summary>
+    /// R9 as revised (fix wave 5): a committed write does not forget the stream, so an empty next payload is
+    /// refused before anything is uploaded, and the message names the remedy for an empty file. (Wave 4 stored
+    /// it as an empty file; that forgetting let a retry store empty files, STREAMS-1.)
+    /// </summary>
     [Fact]
-    public async Task AfterACommittedWrite_ANewContentOverTheSameStreamThatDeliversNothing_StoresAnEmptyFile()
+    public async Task AfterACommittedWrite_ANewContentOverTheSameStreamThatDeliversNothing_IsRefusedBeforeAnythingIsUploaded()
     {
         var store = Store();
         var body = new RecycledForwardOnlyBodyStream();
         body.Load(RandomBytes(Size, seed: 33));
         await store.UpsertAsync(new FileEntity { Id = "p|one", File = File(body) }, Ct);
+        var blobs = store.OffloadedBlobNames();
 
         body.Load([]);
-        await store.UpsertAsync(new FileEntity { Id = "p|two", File = File(body) }, Ct);
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => store.UpsertAsync(new FileEntity { Id = "p|two", File = File(body) }, Ct));
 
-        var read = await store.OneAsync("p|two", Ct);
-        Assert.Equal(0, read!.File!.Length);
-        Assert.Empty(await ReadFileAsync(read.File));
+        output.WriteLine(refused.Message);
+        AssertConsumedAndEmpty(refused);
+        Assert.Contains("new, empty payload", refused.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("failed", refused.Message, StringComparison.Ordinal);
+        Assert.Null(await store.OneAsync("p|two", Ct));
+        Assert.Equal(blobs, store.OffloadedBlobNames());
+
+        // The remedy the message names: an empty file from an empty array.
+        await store.UpsertAsync(new FileEntity { Id = "p|two", File = TableBlobContent.FromBytes([], "application/octet-stream") }, Ct);
+        Assert.Equal(0, (await store.OneAsync("p|two", Ct))!.File!.Length);
     }
 
     /// <summary>R9 point 2: after a failed write that read the stream to its end, an empty payload is the retry BLOBS-2 is about, and is refused.</summary>
@@ -115,9 +127,12 @@ public class RecycledForwardOnlyStreamTests(ITestOutputHelper output)
         Assert.Equal(next, await ReadFileAsync((await store.OneAsync("p|r", Ct))!.File!));
     }
 
-    /// <summary>A failed write, then the same content instance written again: that commit forgets the stream too.</summary>
+    /// <summary>
+    /// A failed write, then the same content instance written again: the retry stores it, and the stream stays
+    /// remembered after that commit (R9 as revised): an empty next payload is refused, a new one stored.
+    /// </summary>
     [Fact]
-    public async Task AFailedWriteRetriedWithTheSameContent_ForgetsTheStreamWhenTheRetryCommits()
+    public async Task AFailedWriteRetriedWithTheSameContent_IsStored_AndTheStreamStaysRememberedAfterTheRetryCommits()
     {
         var store = Store();
         await store.CreateAsync(new FileEntity { Id = "p|taken", Title = "someone else's" }, Ct);
@@ -130,9 +145,14 @@ public class RecycledForwardOnlyStreamTests(ITestOutputHelper output)
         Assert.Equal(data, await ReadFileAsync((await store.OneAsync("p|free", Ct))!.File!));
 
         body.Load([]);
-        await store.UpsertAsync(new FileEntity { Id = "p|next", File = File(body) }, Ct);
+        AssertConsumedAndEmpty(await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.UpsertAsync(new FileEntity { Id = "p|next", File = File(body) }, Ct)));
+        Assert.Null(await store.OneAsync("p|next", Ct));
 
-        Assert.Equal(0, (await store.OneAsync("p|next", Ct))!.File!.Length);
+        var next = RandomBytes(Size, seed: 47);
+        body.Load(next);
+        await store.UpsertAsync(new FileEntity { Id = "p|next", File = File(body) }, Ct);
+        Assert.Equal(next, await ReadFileAsync((await store.OneAsync("p|next", Ct))!.File!));
     }
 
     /// <summary>R9 point 3: a stream a failed write read only part of stays refused, whatever it would deliver now.</summary>
@@ -174,8 +194,8 @@ public class RecycledForwardOnlyStreamTests(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// Every kind of write tells the large-value layer when it committed: afterwards the stream it read is
-    /// forgotten, and an empty next payload over the same object is stored (it would be refused otherwise).
+    /// After every kind of write commits, the stream it read stays remembered (R9 as revised; wave 4 forgot
+    /// it): a new payload of at least one byte over the same object is stored whole, an empty one is refused.
     /// </summary>
     [Theory]
     [InlineData("Create")]
@@ -185,7 +205,7 @@ public class RecycledForwardOnlyStreamTests(ITestOutputHelper output)
     [InlineData("CreateBatch")]
     [InlineData("UpsertBatch")]
     [InlineData("MutateAsync")]
-    public async Task EveryKindOfWrite_ForgetsTheStreamItReadWhenItCommits(string kind)
+    public async Task EveryKindOfWrite_RemembersTheStreamItReadAfterItCommits(string kind)
     {
         var store = Store();
         var existing = await store.CreateAsync(new FileEntity { Id = "p|existing", Title = "v1" }, Ct);
@@ -198,8 +218,14 @@ public class RecycledForwardOnlyStreamTests(ITestOutputHelper output)
         Assert.Equal(data, await ReadFileAsync((await store.OneAsync(id, Ct))!.File!));
 
         body.Load([]);
+        AssertConsumedAndEmpty(await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.UpsertAsync(new FileEntity { Id = "p|next", File = File(body) }, Ct)));
+        Assert.Null(await store.OneAsync("p|next", Ct));
+
+        var next = RandomBytes(Size, seed: 48);
+        body.Load(next);
         await store.UpsertAsync(new FileEntity { Id = "p|next", File = File(body) }, Ct);
-        Assert.Equal(0, (await store.OneAsync("p|next", Ct))!.File!.Length);
+        Assert.Equal(next, await ReadFileAsync((await store.OneAsync("p|next", Ct))!.File!));
     }
 
     internal static async Task WriteAsync(IStorage<FileEntity> store, string kind, string id, string? etag, TableBlobContent content)
@@ -315,7 +341,7 @@ public sealed class AzuriteRecycledForwardOnlyStreamTests(ITestOutputHelper outp
     [InlineData("CreateBatch")]
     [InlineData("UpsertBatch")]
     [InlineData("MutateAsync")]
-    public async Task EveryKindOfWrite_ForgetsTheStreamItReadWhenItCommits(string kind)
+    public async Task EveryKindOfWrite_RemembersTheStreamItReadAfterItCommits(string kind)
     {
         Assert.SkipUnless(Available, SkipReason);
         var store = Store<FileEntity>(Offload(TimeSpan.Zero));
@@ -327,10 +353,18 @@ public sealed class AzuriteRecycledForwardOnlyStreamTests(ITestOutputHelper outp
 
         await RecycledForwardOnlyStreamTests.WriteAsync(store, kind, id, existing.ETag, File(body));
         Assert.Equal(data, await ReadFileAsync((await Store<FileEntity>().OneAsync(id, Ct))!.File!));
+        var blobs = (await BlobsAsync<FileEntity>()).ConvertAll(b => b.Name);
 
         body.Load([]);
+        RecycledForwardOnlyStreamTests.AssertConsumedAndEmpty(await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.UpsertAsync(new FileEntity { Id = Id("next"), File = File(body) }, Ct)));
+        Assert.Null(await Store<FileEntity>().OneAsync(Id("next"), Ct));
+        Assert.Equal(blobs, (await BlobsAsync<FileEntity>()).ConvertAll(b => b.Name));
+
+        var next = RandomBytes(Size, seed: 49);
+        body.Load(next);
         await store.UpsertAsync(new FileEntity { Id = Id("next"), File = File(body) }, Ct);
-        Assert.Equal(0, (await Store<FileEntity>().OneAsync(Id("next"), Ct))!.File!.Length);
+        Assert.Equal(next, await ReadFileAsync((await Store<FileEntity>().OneAsync(Id("next"), Ct))!.File!));
     }
 }
 
