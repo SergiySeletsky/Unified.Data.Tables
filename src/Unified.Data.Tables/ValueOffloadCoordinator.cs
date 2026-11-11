@@ -64,7 +64,13 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         var contents = TableEntitySerializer.FindBlobContents(entity);
         // Refused before any source is read and any blob uploaded.
         foreach (var (column, content) in contents)
+        {
             content.ThrowIfNotWritable(column);
+            // A source prepared by an earlier write that failed must still be there to upload from: one the
+            // caller has closed since is found now, not after other blobs of this write were uploaded.
+            if (content.IsSealed && content.Source is not null)
+                content.RewindSource(column);
+        }
 
         foreach (var (column, content) in contents)
         {

@@ -415,6 +415,40 @@ public class BlobContentRetryTests
     }
 
     [Fact]
+    public async Task SourceDisposedBeforeTheRetryOfAWriteThatFailedInItsUpload_IsRefusedBeforeAnythingIsUploaded()
+    {
+        var data = RandomBytes(Size, seed: 55);
+        var source = new FaultyContentStream(data, seekable: true);
+        var store = new InMemoryStorage<TwoBlobEntity>(null, new UnifiedTableStorageOptions { BlobOffload = new BlobOffloadOptions() });
+        // A content that can always be uploaded stands before the one read from the stream.
+        var entity = new TwoBlobEntity
+        {
+            Id = "p|r",
+            First = TableBlobContent.FromBytes(RandomBytes(1_000, seed: 56), "image/png"),
+            Second = TableBlobContent.FromStream(source, "application/octet-stream"),
+        };
+        store.Blobs.BeforeUpload = (_, _) => throw new IOException("simulated blob store failure");
+        await Assert.ThrowsAsync<IOException>(() => store.CreateAsync(entity, Ct));
+        var uploads = 0;
+        store.Blobs.BeforeUpload = (_, _) =>
+        {
+            uploads++;
+            return Task.CompletedTask;
+        };
+
+        await source.DisposeAsync(); // prepared (hashed) already, and now closed
+
+        var ex = await Record.ExceptionAsync(() => store.CreateAsync(entity, Ct));
+
+        Assert.Equal(0, uploads);
+        Assert.Equal(0, store.PhysicalRowCount);
+        Assert.Empty(store.Blobs.Names);
+        var invalid = Assert.IsType<InvalidOperationException>(ex);
+        Assert.Contains("'Second'", invalid.Message, StringComparison.Ordinal);
+        Assert.Contains("Create the content again", invalid.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task SuccessPath_SeekableSource_IsLeftWhereItsContentStarts_AfterTheHashingPass()
     {
         // Unchanged behaviour: the hashing pass rewinds, the upload then reads the source to its end.
