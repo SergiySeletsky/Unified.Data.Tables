@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.Serialization;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -814,14 +815,26 @@ public static class TableEntitySerializer
     /// <see cref="FlattenProperty(string, object)"/> for a column path of <paramref name="ownerType"/>
     /// (<c>"Inner_Body"</c>): refuses a path that reaches a large-value member, which the untyped
     /// overload cannot see. For a large-value aware type whose read-side resolution of the path throws (its
-    /// constructor or a getter fails), the path may name one, so it is refused too.
+    /// constructor or a getter fails), the path may name one, so it is refused too. A path that meets a
+    /// misused <see cref="TableValueSplitAttribute"/> is refused with the misuse: for every type, when
+    /// <paramref name="ownerType"/> or the declared type of a property along the path is or implements an
+    /// interface with a member marked <see cref="TableValueSplitAttribute"/> (by reflection alone); for an aware
+    /// type, also when the read-side resolution meets a type whose attribute is misused.
     /// </summary>
     /// <exception cref="NotSupportedException">
     /// The path names a large-value member, or (aware type) resolving it failed, so whether it does is not known.
     /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The path meets a misused <see cref="TableValueSplitAttribute"/>: the exception a whole-entity write of the
+    /// type reports (the misuse of the attribute on an interface or abstract property type is a
+    /// <see cref="NotSupportedException"/>, there and here).
+    /// </exception>
     internal static Dictionary<string, object> FlattenProperty(Type ownerType, string columnPath, object value)
     {
         ArgumentNullException.ThrowIfNull(ownerType);
+        // [TableValueSplit] on an interface member (R11) is a misuse a builder update meets on no metadata it
+        // builds: refused before anything else, for every type, by reflection alone.
+        TypeMetadataCache.RefuseInterfaceMemberSplitOnPath(ownerType, columnPath);
         // A type that opts into nothing by its declared types takes the path of 0.8.3: it builds no
         // metadata for the declared types along the column path (one may be a type the serializer cannot
         // build metadata for, such as an interface that declares two indexers) and constructs nothing. No
@@ -849,6 +862,9 @@ public static class TableEntitySerializer
         // cell merged beside its split cells would read back the old value.
         if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath, out var unresolved))
             throw new NotSupportedException(PartialUpdateRefusal(columnPath));
+        // A misused attribute met on the way is reported as a whole-entity write of the type reports it.
+        if (unresolved is not null && TypeMetadataCache.IsMisusedAttribute(unresolved))
+            ExceptionDispatchInfo.Throw(unresolved);
         // A column the read-side resolution could not resolve may be a large value: refused, never merged.
         if (unresolved is not null)
             throw new NotSupportedException(UndecidablePartialUpdateRefusal(ownerType, columnPath, unresolved), unresolved);
@@ -1884,6 +1900,8 @@ internal static class TypeMetadataCache
     private static readonly ConcurrentDictionary<Type, LargeValueInfo> _declaredLargeValues = new();
     private static readonly ConcurrentDictionary<(Type Type, string Column), PropertyInfo?> _readTargets = new();
     private static readonly ConcurrentDictionary<(Type Type, string Column), bool> _largeOnRead = new();
+    private static readonly ConcurrentDictionary<Type, (Type Contract, PropertyInfo Marked)?> _interfaceMemberSplits = new();
+    private static readonly ConditionalWeakTable<Exception, Exception> _misuses = new();
 
     public static TypeMetadata GetMetadata(Type t)
         => _cache.GetOrAdd(t, CreateMetadata);
@@ -2552,56 +2570,124 @@ internal static class TypeMetadataCache
         return new TypeMetadata(props, map, BuildAliasMap(t, map), BuildSplitOptions(t, props), creator);
     }
 
-    // [TableValueSplit] per property; see SplitFor. A misused attribute fails here, on first use of the type.
+    // [TableValueSplit] per property; see SplitFor. A misused attribute fails here, on first use of the type;
+    // the exception is remembered as a misuse (IsMisusedAttribute), so that a builder update that meets it
+    // while it resolves a column reports it as it is.
     private static Dictionary<string, TableValueSplitAttribute> BuildSplitOptions(Type t, ImmutableList<PropertyInfo> props)
     {
-        RefuseInterfaceMemberSplit(t);
-        var options = new Dictionary<string, TableValueSplitAttribute>(StringComparer.Ordinal);
-        var classLevel = ClassLevelSplit(t);
-        foreach (var prop in props)
+        try
         {
-            if (SplitFor(t, prop, classLevel, validate: true) is { } split)
-                options[prop.Name] = split;
-        }
+            RefuseInterfaceMemberSplit(t);
+            var options = new Dictionary<string, TableValueSplitAttribute>(StringComparer.Ordinal);
+            var classLevel = ClassLevelSplit(t);
+            foreach (var prop in props)
+            {
+                if (SplitFor(t, prop, classLevel, validate: true) is { } split)
+                    options[prop.Name] = split;
+            }
 
-        return options;
+            return options;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
+        {
+            _misuses.AddOrUpdate(ex, ex);
+            throw;
+        }
     }
+
+    /// <summary>
+    /// True when <paramref name="ex"/> is the exception with which the serializer reported a misused
+    /// <see cref="TableValueSplitAttribute"/> of a type (the metadata of the type could not be built).
+    /// </summary>
+    internal static bool IsMisusedAttribute(Exception ex) => _misuses.TryGetValue(ex, out _);
 
     // [TableValueSplit] on a member declared on an interface that t implements is a misused attribute: .NET
     // does not pass the attributes of an interface member to the implementing class, so the writer, which
     // reads the members of the runtime type, would store the value as an ordinary cell (and a trimming
     // OversizedCellPolicy would trim it). It opts nothing in (SplitFor ignores it) and fails here, on every
-    // use of a type that implements the interface. Attributes are read by reflection alone; an interface
-    // whose members cannot be read is skipped (the serializer never reads its attributes otherwise).
+    // use of a type that implements the interface.
     private static void RefuseInterfaceMemberSplit(Type t)
     {
-        if (t.IsInterface)
-            return;
+        if (!t.IsInterface && InterfaceMemberSplit(t) is { } found)
+            throw new InvalidOperationException(InterfaceMemberSplitMisuse(t, found.Contract, found.Marked));
+    }
 
-        foreach (var contract in t.GetInterfaces())
+    /// <summary>
+    /// Refuses a builder update of <paramref name="columnPath"/> of <paramref name="root"/> when
+    /// <paramref name="root"/>, or the declared type of a property along the path, is or implements an
+    /// interface that declares a member marked <see cref="TableValueSplitAttribute"/> (ruling R11): the update
+    /// would write that member as an ordinary cell. Declared types and attributes are read by reflection
+    /// alone (nothing is constructed, no getter is called, no metadata is built) and remembered per type.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The misuse, naming the interface member and the remedy.</exception>
+    internal static void RefuseInterfaceMemberSplitOnPath(Type root, string columnPath)
+    {
+        var owner = root;
+        foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries).Prepend(null))
         {
-            PropertyInfo? marked;
-#pragma warning disable CA1031 // an interface the check cannot read has no attribute it could report
-            try
+            if (segment is not null)
             {
-                marked = Array.Find(contract.GetProperties(BindingFlags.Public | BindingFlags.Instance),
-                    static p => p.IsDefined(typeof(TableValueSplitAttribute), inherit: false));
-            }
-            catch (Exception)
-            {
-                continue;
-            }
+                PropertyInfo? property;
+#pragma warning disable CA1031 // a type the check cannot read ends the walk: the update goes on as before
+                try
+                {
+                    property = owner.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                        .FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
+                }
+                catch (Exception)
+                {
+                    return;
+                }
 #pragma warning restore CA1031
-            if (marked is not null)
-                throw new InvalidOperationException(
-                    $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface that {t.Name} implements: " +
-                    ".NET does not pass the attributes of an interface member to the implementing class, so the attribute cannot be " +
-                    $"honoured (the value would be stored as an ordinary cell, and could be trimmed). Put [TableValueSplit] on " +
-                    $"{t.Name}.{marked.Name} (the property of the implementing class), or on the class {t.Name}, and remove it from " +
-                    $"{contract.Name}. Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
-                    "mark the entity class with [TableValueSplit] as well, so that the entity is large-value aware.");
+                if (property is null)
+                    return;
+                owner = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+            }
+            if (InterfaceMemberSplit(owner) is { } found)
+                throw new InvalidOperationException(InterfaceMemberSplitMisuse(owner, found.Contract, found.Marked));
         }
     }
+
+    // The first member marked [TableValueSplit] of an interface that t implements (or, t an interface, of t
+    // or an interface it inherits), remembered per type. Attributes are read by reflection alone; an
+    // interface whose members cannot be read is skipped (the serializer never reads its attributes otherwise).
+    private static (Type Contract, PropertyInfo Marked)? InterfaceMemberSplit(Type t) =>
+        _interfaceMemberSplits.GetOrAdd(t, static type =>
+        {
+            foreach (var contract in type.IsInterface ? type.GetInterfaces().Prepend(type) : type.GetInterfaces())
+            {
+                PropertyInfo? marked;
+#pragma warning disable CA1031 // an interface the check cannot read has no attribute it could report
+                try
+                {
+                    marked = Array.Find(contract.GetProperties(BindingFlags.Public | BindingFlags.Instance),
+                        static p => p.IsDefined(typeof(TableValueSplitAttribute), inherit: false));
+                }
+                catch (Exception)
+                {
+                    continue;
+                }
+#pragma warning restore CA1031
+                if (marked is not null)
+                    return (contract, marked);
+            }
+            return null;
+        });
+
+    // The misuse of ruling R11 for t, a class that implements contract, or an interface that is or inherits it.
+    private static string InterfaceMemberSplitMisuse(Type t, Type contract, PropertyInfo marked) => t.IsInterface
+        ? $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface" +
+          (t == contract ? "" : $" that {t.Name} inherits") + ": .NET does not pass the attributes of an interface member to the " +
+          "implementing class, so the attribute cannot be honoured (the value would be stored as an ordinary cell, and could be " +
+          $"trimmed). Put [TableValueSplit] on the property {marked.Name} of each class that implements {contract.Name}, or on " +
+          $"the class, and remove it from {contract.Name}. Where an entity holds such a class in a property declared as {t.Name} " +
+          "(or as another type), mark the entity class with [TableValueSplit] as well, so that the entity is large-value aware."
+        : $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface that {t.Name} implements: " +
+          ".NET does not pass the attributes of an interface member to the implementing class, so the attribute cannot be " +
+          $"honoured (the value would be stored as an ordinary cell, and could be trimmed). Put [TableValueSplit] on " +
+          $"{t.Name}.{marked.Name} (the property of the implementing class), or on the class {t.Name}, and remove it from " +
+          $"{contract.Name}. Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
+          "mark the entity class with [TableValueSplit] as well, so that the entity is large-value aware.";
 
     // The class-level [TableValueSplit] that applies to t: the nearest one, on t itself or on a base
     // class (a derived class inherits it, and may declare its own).
