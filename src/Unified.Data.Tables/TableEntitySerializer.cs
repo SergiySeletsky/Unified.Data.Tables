@@ -170,11 +170,39 @@ public static class TableEntitySerializer
         var declare = ownerPath.Count == 0
             ? $"declare {root.Name}.{member} as TableBlobContent"
             : $"declare {root.Name}.{holder} with the type that carries the member ({ownerType.Name})";
-        return $"{where} (column '{column}') is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. " +
-               $"{root.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity " +
-               "as one plain row and can neither split, offload nor read back such a value, whatever its size. " +
+        var refused = $"{where} (column '{column}') is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. " +
+                      $"{root.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity " +
+                      "as one plain row and can neither split, offload nor read back such a value, whatever its size. ";
+        // Below a nullable struct the class-level opt-in alone leads to the next refusal (a read cannot
+        // create the struct of a nullable property); declaring the property with the struct itself works.
+        if (NullableStructOnPath(root, ownerPath) is { } nullable)
+            return refused +
+                   $"A read cannot create the struct of the nullable property {nullable.Owner.Name}.{nullable.Property.Name} " +
+                   $"({nullable.Struct.Name}?), so a large value below it cannot be stored as one (marking {root.Name} with " +
+                   $"[TableValueSplit] is not enough on its own). Declare {nullable.Owner.Name}.{nullable.Property.Name} as " +
+                   $"{nullable.Struct.Name}, not nullable, so that {root.Name} is large-value aware by its declared types and reads " +
+                   "the value back. Nothing was serialized.";
+        return refused +
                $"Mark {root.Name} with [TableValueSplit], or {declare}, so that {root.Name} is large-value aware by its declared types. " +
                "Nothing was serialized.";
+    }
+
+    // The first property along ownerPath (property names from root, by reflection only) declared as a
+    // nullable struct, with the declared type that has it; null when there is none.
+    private static (Type Owner, PropertyInfo Property, Type Struct)? NullableStructOnPath(Type root, IReadOnlyList<string> ownerPath)
+    {
+        var owner = root;
+        foreach (var name in ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))
+        {
+            var property = owner.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(p => p.Name == name && p.GetIndexParameters().Length == 0);
+            if (property is null)
+                return null;
+            if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
+                return (owner, property, underlying);
+            owner = property.PropertyType;
+        }
+        return null;
     }
 
     /// <summary>
