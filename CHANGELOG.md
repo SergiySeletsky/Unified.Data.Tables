@@ -16,36 +16,76 @@ Lossless storage of large values, opt-in per property.
   replace or upsert from that reader drops the value. Deploy the package bump first with no attributes
   (types that opt into nothing write exactly what 0.8.3 wrote), and add `[TableValueSplit]` or
   `TableBlobContent` in a later deploy, once no older reader (a swapped slot, a rollback target, another
-  service) remains.
+  service) remains. Values that each fit one cell are not exempt: an entity whose opted-in values together
+  exceed one entity is written with split cells and continuation rows too.
 - Back up and restore an entity's main row, continuation rows and offload blobs together. A table copied
-  raw shares the source's blobs (the references hold the source table's blob paths): give the copy its own
-  copy of them, or enable blob versioning or soft delete on the container.
+  raw shares the source's blobs (the references hold the source table's blob paths). Writes through the
+  copy never delete them, but the source's own replaces, deletes, partition deletes and sweeps can: give
+  the copy its own copy of them before the source changes, or enable blob versioning or soft delete on
+  the container.
 - The offload container is exclusive to the library. Orphan blobs are removed only by
   `SweepOrphanBlobsAsync`: schedule it, or register `AddUnifiedOrphanBlobSweep`.
-- Reads of split-aware types cost one extra range query per entity with continuation rows, plus a blob
-  download per eager offloaded value, queries included.
+- Reads of split-aware types (those with a `[TableValueSplit]` or `TableBlobContent` member) cost one
+  extra range query per entity with continuation rows, plus a blob download per eager offloaded value,
+  queries included.
+- Once a type opts in, its `UpsertAsync`, `UpdateAsync(entity)`, `DeleteAsync` and `UpsertBatchAsync` read
+  the row before they write, and `UpsertAsync`, a `LastWriterWins` `UpdateAsync`, `DeleteAsync` and
+  `UpsertBatchAsync` can throw `ConcurrencyConflictException` under contention (see Changed). Code that
+  assumed an upsert or a delete never conflicts needs a catch or a retry.
 
 ### Added
 
 - **`[TableValueSplit(SplitEncoding)]`** (property or class, `Offload` = `BlobOffload.AboveThreshold`
-  or `Never`) stores strings and `byte[]` beyond the 64 KB cell and 1 MB row limits without trimming:
-  split cells, continuation rows (`{RowKey}~0001..`) in the same entity-group transaction, or an Azure
-  Blob, with a SHA-256 over the stored bytes verified on read. `SplitEncoding.Text` and `Gzip`; strings
-  that are not well-formed UTF-16 are stored as `utf16le`.
+  or `Never`) stores strings, `byte[]` and JSON-stored properties beyond the 64 KB cell and 1 MB row
+  limits without trimming: split cells, continuation rows (`{RowKey}~0001..`) in the same entity-group
+  transaction, or an Azure Blob, with a SHA-256 over the stored bytes verified on read.
+  `SplitEncoding.Text` and `Gzip`; strings that are not well-formed UTF-16 are stored as `utf16le`.
+  - On a class the attribute covers every `string`, `byte[]` and JSON-stored property the class declares
+    or inherits, except the entity `Id`, which stays a key column that can be filtered. A derived class
+    inherits the attribute of its base class; an attribute on a property wins over the one on its class;
+    a property that overrides or hides (`new`) another keeps that one's attribute.
+  - A member of a runtime subtype is supported: declare the property as an interface, an abstract class
+    or a base class and initialise it with an instance of the type that has the member
+    (`public IShape Shape { get; set; } = new Circle();`). A read keeps that instance and maps the
+    columns through its type. A write of a value that needs split cells or a blob below an object whose
+    type a read would not recreate throws `NotSupportedException` naming the column, and stores nothing.
+  - When many opted-in values that each fit one cell exceed one entity together, the largest are stored
+    in split form so that their chunks can go to continuation rows; a row that fits one entity is stored
+    as before, every value in its own cell.
+  - `[ColumnAlias]` on a renamed `[TableValueSplit]` or `TableBlobContent` property reads the value
+    stored under the old column in every form: one cell, `__Json`, `__GZip`, split cells, continuation
+    rows or a blob reference. The next save stores it under the new column and removes the old blob
+    after the row has committed.
 - **`BlobOffload`**, **`BlobOffloadOptions`** (`ContainerName`, `ThresholdBytes`, `CleanupGrace`,
   `ServiceClient`, `UseRegisteredServiceClient`) and `UnifiedTableStorageOptions.BlobOffload`.
+  `CleanupGrace = TimeSpan.MaxValue` switches the cleanup after writes, deletes and partition deletes
+  off and leaves every released blob to the sweep.
 - **`TableBlobContent`** for files: always offloaded, lazy `OpenReadAsync`, `FromBytes`/`FromStream`
   (never buffers in memory; leaves the caller's stream open; a non-seekable stream is copied to a
   delete-on-close temp file under `Path.GetTempPath()`, a seekable one is read twice and must not change
   until the write completes), `Length`/`Sha256` known after the write.
+  - The stream verifies length and SHA-256 by the time it has delivered the content: the read that would
+    return the last byte throws `TableValueIntegrityException` instead when the content does not match,
+    so reading exactly `Length` bytes is verified too. It is not disturbed by the entity being saved
+    again while it is read, and a blob deleted under it fails the read with
+    `TableValueIntegrityException`, not with the blob service's own error.
+  - A write that fails can be retried with the same content when it came from a seekable stream or from
+    bytes. A content from a non-seekable stream whose write failed before its blobs were uploaded must
+    be created again: every later write of it throws `InvalidOperationException` before anything is read
+    or uploaded.
+  - One content can be assigned to several properties or entities, and a content read from one row can
+    be written into another: each row gets its own blob, and the written property is given its own
+    `TableBlobContent`, so the entity it came from is not affected.
 - **`IOrphanBlobSweeper.SweepOrphanBlobsAsync(partitionKey, olderThan)`** and the table-wide
   **`SweepOrphanBlobsAsync(olderThan)`** delete unreferenced blobs, implemented by `TableStorage<T>` and
   `InMemoryStorage<T>`, with matching extension methods on `IStorage<T>` (they throw
-  `NotSupportedException` for a store without the capability). Best-effort cleanup after replace/delete
-  only removes blobs untouched for `CleanupGrace`, so schedule the sweep; `olderThan` must exceed the
-  longest write duration. The table-wide sweep lists partitions with the delimiter `/`, isolates a failing
-  partition and throws the failures as one `AggregateException` at the end. Sweeps and partition deletes
-  only delete names of the exact offload shape; the container is for offload alone.
+  `NotSupportedException` for a store without the capability). Best-effort cleanup after a replace or
+  delete only removes the row's own blobs (names under `{table}/{partitionKey}/{rowKey}/`), and only
+  those untouched for `CleanupGrace`, so schedule the sweep; `olderThan` must exceed the longest write
+  duration. The table-wide sweep lists partitions with the delimiter `/`, isolates a failing partition
+  and throws the failures as one `AggregateException` at the end. Sweeps and partition deletes only
+  delete names of the exact offload shape that no row of the partition references; the container is for
+  offload alone.
 - **`AddUnifiedOrphanBlobSweep(o => ...)`** and **`AddUnifiedOrphanBlobSweep<T>()`**: a hosted service
   (`IHostedService`) that runs the table-wide sweep of each registered type every
   `OrphanBlobSweepOptions.Interval` (default 1 hour) with `OlderThan` (default 1 hour), first after
@@ -54,7 +94,11 @@ Lossless storage of large values, opt-in per property.
   options throw `ArgumentOutOfRangeException` at registration.
 - **`TableValueIntegrityException`** and **`OversizedValueException`** (with `ColumnName`, `EncodedBytes`,
   `Reason` and `OffloadForbiddenByProperty`, which is true when offload is configured but the property
-  sets `BlobOffload.Never`; the message names the matching fix).
+  sets `BlobOffload.Never`). `OversizedValueException` reports every entity that cannot be stored for
+  its size: a value that needs blob offload and cannot have it, cells that cannot leave the main row and
+  exceed one entity (252 properties, 1,000,000 estimated bytes), or a row that does not fit one
+  transaction. It names a column of the entity, and its message ends with what to do. A second
+  constructor, `OversizedValueException(columnName, encodedBytes, reason, remedy)`, takes that advice.
 - **`BlobOffloadNotConfiguredException`** (an `InvalidOperationException` with `TableName` and
   `ColumnName`): a row holds a `{Prop}__blob` reference and the store has no `BlobOffload` configured.
 - **`TableRequestSize`** for callers that build their own transactions: `EstimateEntityBytes`,
@@ -67,10 +111,16 @@ Lossless storage of large values, opt-in per property.
   `BlobServiceClient` when `UseRegisteredServiceClient` is true, else the one the connection-string or
   credential overload derives. The library keeps that client under its own key and never registers or
   takes the host's unkeyed `BlobServiceClient`. A store constructed directly uses
-  `BlobOffloadOptions.ServiceClient` only when no client is passed to the constructor.
+  `BlobOffloadOptions.ServiceClient` only when no client is passed to the constructor. When
+  `AddUnifiedTableStorage` is called more than once, the first call's options are the registered ones; a
+  later call supplies the offload client, by the same order, when the registered options set
+  `BlobOffload` and no call has supplied one yet (a module registers the options, the host registers the
+  connection string). A client an earlier call supplied, or its choice of the host's client, is never
+  replaced, and a first call without `BlobOffload` still wins over a later one that sets it.
 - Storage-provider SPI in `Unified.Data.Tables.Providers` (`LargeValueRows`, `LargeValueTable`,
   `LargeValueWritePlan`, `IOffloadBlobStore`, `BlobState`, `BlobReference`), hidden from IntelliSense, for
-  provider implementations such as the in-memory package. The in-memory store supports all of the above.
+  provider implementations such as the in-memory package. The in-memory store supports all of the above,
+  with the same planning, retries, cleanup rules and exceptions.
 
 ### Changed
 
@@ -82,30 +132,73 @@ Lossless storage of large values, opt-in per property.
   sweep's `BackgroundService`; any ASP.NET Core or generic host already has it).
 - The connection-string overload derives an offload client only when the string has a blob endpoint
   (`BlobEndpoint`, `UseDevelopmentStorage=true`, or an `AccountName` with no `TableEndpoint` or an Azure
-  Storage one) and throws `ArgumentException` at registration when that endpoint is malformed. For a
-  custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a Cosmos Table API host, set
-  `BlobOffloadOptions.ServiceClient`.
+  Storage one) and throws `ArgumentException` at registration when that endpoint is malformed and the
+  call is the one that has to supply the client (a call that is not asked for a client does not look at
+  the blob endpoint). For a custom or emulator `TableEndpoint` with a key and no `BlobEndpoint`, or a
+  Cosmos Table API host, set `BlobOffloadOptions.ServiceClient`.
 - `Unified.Data.Tables` depends on exactly the same version of `Unified.Data.Tables.Abstractions`
   (`[0.9.0]`), and `Unified.Data.Tables.InMemory` on exactly the same version of `Unified.Data.Tables`: they
   share internals and the provider SPI, which may change in any minor version. Upgrade them together.
-- Split-aware writes do one point read first. A `LastWriterWins` `UpdateAsync` on such a type can throw
-  `ConcurrencyConflictException` after three lost races. For split-aware types, writes and partial updates
-  refuse only a RowKey ending with `~` and four digits (the continuation-row shape, e.g. `r~0001`); any
-  other `~` is allowed, and deletes accept every key (deleting a continuation row's id is a no-op). They
-  also refuse, with `ArgumentException`, a partition or row key that is not well-formed UTF-16 (an
-  unpaired surrogate escapes to the same blob name as U+FFFD), so two keys never share a blob and the
-  table-wide sweep never reads the wrong partition. A split-aware `UpsertBatchAsync` replaces each row
-  conditionally on the version it read and can throw `ConcurrencyConflictException` after three lost
-  races.
-- A split-aware write that needs a new continuation row at a key another row already holds (one written
-  before the type opted in, or by another type in the table) fails as a whole with
+- For a split-aware type, `UpsertAsync`, `UpdateAsync(entity)`, `DeleteAsync` and `UpsertBatchAsync` are
+  not single round trips: each reads the row first (one point read, to find the continuation rows and
+  blobs it replaces) and writes on condition of the version it read. `UpsertAsync`, a `LastWriterWins`
+  `UpdateAsync`, `DeleteAsync` and `UpsertBatchAsync` still mean "last writer wins", but a call that
+  loses its condition to a concurrent writer reads again and retries after a short random pause (5 to
+  10 ms before the first retry, doubling each time, at most 150 ms in all, honouring the cancellation
+  token): five attempts in all, then `ConcurrencyConflictException`. Up to four concurrent writes of one
+  row therefore all succeed; with more, a conflict is unlikely but possible. `Strict` updates, and `Auto`
+  updates with an ETag, conflict at once, as for any type. `CreateAsync` and `CreateBatchAsync` read
+  nothing first. The XML documentation of `UpsertAsync`, `UpdateAsync(entity, mode)`, `DeleteAsync` and
+  `UpsertBatchAsync` on `IStorage<T>` says so.
+- For split-aware types, writes and partial updates refuse, with `ArgumentException`, a RowKey ending
+  with `~` and four digits (the continuation-row shape, e.g. `r~0001`) and a RowKey longer than 480
+  characters; any other `~` is allowed, and deletes accept every key (deleting a continuation row's id
+  is a no-op). They also refuse a partition or row key that is not well-formed UTF-16 (an unpaired
+  surrogate escapes to the same blob name as U+FFFD), so two keys never share a blob and the table-wide
+  sweep never reads the wrong partition.
+- A split-aware write that needs a new continuation row at a key a foreign row already holds (one
+  written before the type opted in, or by another type in the table) fails as a whole with
   `InvalidOperationException` naming that key, instead of overwriting the row: new continuation rows are
-  inserted, and only those the stored row declares are replaced. The provider SPI gains
-  `LargeValueWritePlan.StoredPartCount`/`IsNewPart`, `LargeValueTable.ValidateKeys` and
-  `LargeValueTable.ContinuationKeyTaken`.
+  inserted, and only the entity's own are replaced. A continuation row whose `_SplitOf` cell names the
+  entity is its own even when no main row declares it. Such leftover rows (from a writer that does not
+  know continuation rows, or a partition delete that raced an upsert) do not block the key: the write
+  replaces the ones the new value needs and deletes the others in the same transaction, each on
+  condition of the version it was read at, and `DeleteAsync` of an id that has no main row removes them.
+  A write looks for leftovers only when one holds a key it needs; reads, queries and `CountAsync` never
+  return them. The provider SPI gains `LargeValueWritePlan.StoredPartCount`/`IsNewPart`,
+  `LargeValueTable.ValidateKeys`, `LargeValueTable.ContinuationKeyTaken` and
+  `LargeValueTable.PlanOverOwnParts`.
 - `QueryPageAsync` can return a page with no items and a non-null continuation token when it held only
   continuation rows; keep paging until the token is null.
 - A projected `QueryPageAsync` no longer warms the entity cache for any type.
+- A projected query (`QueryOptions.Select` on `QueryAsync(options)`, `QueryStreamAsync(options)` and
+  `QueryPageAsync`) no longer sends `odata.etag` in `$select`, for every entity type. The row's version
+  is not a column: the service returns it with every entity whatever `$select` names, so every projected
+  entity still carries its `ETag`. A caller that names `odata.etag` in `QueryOptions.Select` has it
+  dropped (a `Select` of that name alone is still a projection: the system columns and nothing else).
+  This is the one deliberate difference in the requests a plain type makes compared with 0.8.3.
+- The read cache no longer keeps a version that a write or delete has replaced, for every entity type.
+  A read that overlapped a write or delete made through the same `IMemoryCache` could fetch the row,
+  let the write commit, and then cache what it had fetched: later `OneAsync` calls returned the old
+  version for the cache TTL (one hour, sliding, by default), `ExistsAsync` stayed true for a deleted
+  entity, and a read-then-upsert caller wrote the old value back. The cached `QueryAsync(partition)` and
+  `QueryAsync()` lists, and the entities that `QueryPageAsync` and the predicate queries warm, had the
+  same defect, which 0.8.3 has too. A read now caches what it found only if no write or delete of that
+  entity has completed since the read began, and a list only if nothing was written in its partition
+  (anywhere in the table, for the whole-table list). After such an overlap the next read goes to the
+  table; nothing else changes. Writes made by another process, or through another `IMemoryCache`, are
+  still not seen until the entry expires, and two concurrent writes of one entity can still leave the
+  earlier one's version cached.
+- The entity cache holds one entry per row, however its id is spelled. `"a"` and `"a|a"` address the
+  same row but had separate entries, so a write or delete under one spelling left the entry cached under
+  the other, and `DeletePartitionAsync` did not evict an entity whose id has one segment: it stayed
+  readable through `OneAsync`, and `ExistsAsync` stayed true, for the cache TTL (in 0.8.3 too).
+- `DeletePartitionAsync` invalidates the caches also when one of its transactions fails or is cancelled:
+  an entity that an earlier transaction deleted is no longer answered from the cache.
+- When a store type is first used, an entity type with a property that can hold a nested object (a type
+  that flattens into columns, an interface, an abstract class) is constructed once, with its public
+  parameterless constructor, to find the large-value members of runtime subtypes. An exception from the
+  constructor is ignored; a type without such a property is not constructed.
 - Polymorphic stores (`PolymorphicTableStorage<TBase>`, `InMemoryPolymorphicStorage<TBase>`) now throw
   `InvalidOperationException` naming the column when they read a row holding an offloaded reference
   (`{Prop}__blob`), instead of returning the property as null; they cannot fetch blobs.
@@ -133,8 +226,10 @@ Lossless storage of large values, opt-in per property.
   that omits the property still leaves it at its default. `ExistsAsync` on a plain type does not cache an
   entity from a row with large-value cells.
 - `[TableValueSplit]` on a property of an interface or abstract (non-collection) type is refused with
-  `NotSupportedException` on first use of the type: such a value may flatten into columns at runtime, where
-  the attribute was silently ignored.
+  `NotSupportedException`: such a value may flatten into columns at runtime, where the attribute was
+  silently ignored. Like every misused attribute (`InvalidOperationException` on a native scalar, on a
+  type that flattens into columns and on a `TableBlobContent`) it is reported when an entity of the type
+  is first written or a row of it is first read, not when the store is constructed.
 - A create-only blob upload that conflicts with an orphan which a sweep deletes before the follow-up state
   read, or between that read and the touch, uploads again (three attempts in all) instead of failing the
   write with an integrity error.
@@ -145,10 +240,10 @@ Lossless storage of large values, opt-in per property.
   have changed since it was read.
 - Blob cleanup and sweep cutoffs are taken from the storage service's clock (the commit response's
   `Date`, or the blob service's time before listing) instead of the client clock, which could make a
-  freshly touched blob look old when it ran ahead; the cleanup cutoff is taken from the commit, before the
-  post-commit re-read. Without a service time the client clock is used less a further 5 minutes. The
-  provider SPI `IOffloadBlobStore` gains `GetServiceTimeAsync`, and `LargeValueTable.DeleteReleasedBlobsAsync`
-  takes the commit's service time.
+  freshly touched blob look old when it ran ahead; the cleanup cutoff is taken from the commit. Without a
+  service time the client clock is used less a further 5 minutes. The provider SPI `IOffloadBlobStore`
+  gains `GetServiceTimeAsync`, and `LargeValueTable.DeleteReleasedBlobsAsync` takes the commit's service
+  time.
 - `CreateBatchAsync` and `UpsertBatchAsync` of a split-aware type are transactional again, with the plain
   batch contract: per partition, each entity's rows (main row, continuation rows, stale-part deletes) are
   one unit packed into entity-group transactions (at most 100 actions, within the byte and 4 MiB wire
@@ -156,18 +251,20 @@ Lossless storage of large values, opt-in per property.
   blobs are uploaded just before it (so a blob waits for its row no longer than in a single write, and the
   sweep's `OlderThan` need only exceed one transaction) and released ones are deleted after it commits. An
   upsert transaction that loses a race (409, 412, or a stale part already gone) is re-read, planned again
-  and retried. Two small rows in one partition
-  are one transaction, not two separate writes. A key repeated in a create batch throws
-  `DuplicateKeyException` before anything is written; in an upsert batch its last occurrence wins. An
-  existing key fails its create transaction as a whole; earlier transactions stay committed. The
-  in-memory store packs and fails the same transactions. The provider SPI gains
-  `LargeValueTable.PlanTransactions`.
+  and retried after a short pause, five attempts in all. Two small rows in one partition are one
+  transaction, not two separate writes. A row repeated in a create batch throws `DuplicateKeyException`
+  before anything is written; in an upsert batch its last occurrence wins. The ids `"a"` and `"a|a"`
+  address the same row and count as a repetition (they were sent as two rows of one transaction, which
+  the service refuses with `InvalidDuplicateRow`). An existing key fails its create transaction as a
+  whole; earlier transactions stay committed. The in-memory store packs and fails the same transactions.
+  The provider SPI gains `LargeValueTable.PlanTransactions`, `MaxWriteAttempts` and
+  `WaitBeforeRetryAsync`.
 - A split-aware write or delete that has committed is no longer reported as failed when the caller's token
-  is cancelled, or the version re-read fails, after the commit: the re-read and the blob cleanup run without
-  the caller's token, and a failed re-read leaves `ETag` null. Previously the cleanup was skipped too,
-  leaving the old blobs to the sweep. The same holds for the blob cleanup after `DeletePartitionAsync`.
-  Once the token is cancelled, the cleanup runs for at most 5 more seconds and then leaves the rest to the
-  sweep, so a cancelled partition delete with many blobs does not hold a shutting-down host.
+  is cancelled after the commit: the blob cleanup runs without the caller's token. Previously the cleanup
+  was skipped too, leaving the old blobs to the sweep. The same holds for the blob cleanup after
+  `DeletePartitionAsync`. Once the token is cancelled, the cleanup runs for at most 5 more seconds and
+  then leaves the rest to the sweep, so a cancelled partition delete with many blobs does not hold a
+  shutting-down host.
 - With `BlobOffload` set and no blob client, every `IStorage<T>` failed to resolve; now only a type with
   `[TableValueSplit]` or `TableBlobContent` members does, as `UnifiedTableStorageOptions.BlobOffload`
   documents. The overloads no longer build a throwaway `BlobServiceClient` (swallowing every exception) to
@@ -180,17 +277,147 @@ Lossless storage of large values, opt-in per property.
   clone and the public `ToTableEntity` no longer allocate an empty pending-blob list.
 - `BlobOffloadOptions.ThresholdBytes` is validated: between 1 and `BlobOffloadOptions.MaxThresholdBytes`
   (4,194,304, one transaction's payload limit); anything else throws `ArgumentOutOfRangeException`.
+- Types that opt into nothing behave as on 0.8.3. A type with a `System.Text.Json.Nodes.JsonNode` or
+  `JsonValue` property (directly or inside a nested object), with a property whose declared type is an
+  interface or abstract class that declares more than one indexer, or with a nested type that hides a
+  base property with one of another type made `TableStorage<T>` and `InMemoryStorage<T>` throw
+  `TypeInitializationException` on construction, on DI resolution and on every operation, and made a
+  polymorphic insert of such an item throw `ArgumentException`. These stores construct, and write the
+  same cells with the same SDK calls as 0.8.3. A builder partial update through an interface-typed
+  property (`b.SetProperty(x => x.Lookup.Label, value)`) works as on 0.8.3, and a type with an invalid
+  `[ColumnAlias]` declaration is reported by its first read or write (`InvalidOperationException`), not
+  by `TypeInitializationException` when the store is constructed.
+- Constructing a store no longer hangs for an entity whose nested types form a dense graph (many types
+  that each have a property of every other one), and no longer overflows the stack, which ended the
+  process, for a generic type whose property is a deeper instantiation of itself
+  (`Node<T> { Node<Node<T>> Next }`).
+- A class-level `[TableValueSplit]` covers the properties a class inherits, not only the ones it declares:
+  an attribute on a derived class left the inherited `string` and `byte[]` properties out, and a derived
+  class that declared the attribute again dropped the opt-in of its base class's properties. It no longer
+  opts in the `Id` of a type that implements `IEntity` directly, so LINQ filters on `Id` work for such a
+  type, and a property that hides (`new`) a base property marked `[TableValueSplit]` keeps that attribute.
+- A `[TableValueSplit]` or `TableBlobContent` member of a runtime subtype is read back. When a property is
+  declared as an interface, an abstract class or a base class and holds an object of a type that has such
+  a member, a value too large for one cell was written as split cells (or a blob) and came back as `null`
+  with no exception; the next save then dropped it. A read maps a large value the way it sets an ordinary
+  cell: through the object that is already in the property. A builder partial update of such a member is
+  refused with `NotSupportedException`.
+- `[ColumnAlias]` on an opted-in property, and on a renamed `TableBlobContent` property, reads the value
+  stored under the old column in every form. Only a value of one cell was read; a larger one loaded as
+  `null`, and the next save dropped it and its blob.
+- Many opted-in values that each fit one cell no longer make the entity unstorable. Twenty
+  `[TableValueSplit]` strings of 30,000 characters were refused with an `OversizedValueException` that
+  named the row key as the property and advised configuring `BlobOffload`, although the same entity with
+  32,001 characters per property was stored.
+- `OversizedValueException` names a column of the entity and gives an accurate reason. When the cells that
+  cannot leave the main row exceed one entity, it names the largest of them and both limits; it no longer
+  names the row key, and it does not advise configuring `BlobOffload` when ordinary cells are what does
+  not fit.
+- A large value that cannot be set on its property (the property's type changed since the row was written)
+  is reported with at most 200 characters of the value and its total length, not with the whole value in
+  the `SerializationException` message.
+- After `DeletePartitionAsync` has deleted the rows it listed, it deletes a blob stored under the
+  partition only if no row that is in the partition at that moment references it. A row another writer
+  creates while the partition is being deleted survives the delete and keeps its blob, however long the
+  delete took; every blob under the partition older than `CleanupGrace` used to be deleted, so such a row
+  could become unreadable (`TableValueIntegrityException`, blob missing). When some blob is old enough,
+  the cleanup reads the partition's rows once more; a blob younger than `CleanupGrace` is no longer sent
+  a delete request at all. The provider SPI `LargeValueTable.DeletePartitionBlobsAsync` takes the entity
+  type and a delegate that returns the rows that are in the partition now.
+- For a split-aware type `DeletePartitionAsync` deletes a main row and its continuation rows in the same
+  entity-group transaction, never across two (a transaction still holds at most 100 deletes), so a failure
+  or a cancellation between two transactions leaves whole entities, never continuation rows without their
+  main row. `InMemoryStorage<T>` deletes a partition of such a type in the same transactions and checks
+  the cancellation token before each. The provider SPI gains `LargeValueTable.PlanPartitionDelete`.
+- The cleanup that follows `UpsertAsync`, `UpdateAsync`, `UpsertBatchAsync` or `DeleteAsync` deletes a blob
+  the row no longer references only when it is that row's own: a name of the offload shape under
+  `{table}/{partitionKey}/{rowKey}/`. Saving or deleting a row through a table copied raw, or through a
+  row re-keyed by copying its cells, deleted the source row's blob once it was older than `CleanupGrace`,
+  and the source row then failed every read. The provider SPI `LargeValueTable.DeleteReleasedBlobsAsync`
+  takes the keys of the row that was written or deleted and a callback for the paths that are not its own.
+- A null `{Prop}__blob` cell means "no reference". The service returns a selected property the row does
+  not have as null (the emulator omits it), and the point read before every large-value write selects
+  each reference cell, so on a real account every large-value property that was not offloaded would have
+  logged the warning "ignoring a malformed blob reference" on every write.
+- A `CleanupGrace` longer than the time since year 1 (`TimeSpan.MaxValue`, say) no longer throws
+  `ArgumentOutOfRangeException` after the row change has committed; with such a grace nothing is deleted.
+- The version a write stamps on the entity is the write's own. After a write through an entity-group
+  transaction (a value with continuation rows, or a shrink that deletes them) the row was read again to
+  learn its new ETag; when another writer committed between the transaction and that read, the entity got
+  the other writer's ETag over this writer's content, and its next `UpdateAsync` replaced the other
+  writer's row without a `ConcurrencyConflictException`. The ETag now comes from the transaction's own
+  response for the main row and the row is not read again (one round trip less). When that response
+  carries no ETag, the entity's `ETag` is null after the write, as after a batch. The ETag of the
+  transaction's response was compared with a point read on the storage emulator only; it was not checked
+  against a real storage account.
+- The point read before a split-aware `UpsertAsync`, `UpdateAsync(entity)`, `DeleteAsync` and
+  `UpsertBatchAsync` no longer names `odata.etag` in its `$select`. The version is taken from the entity
+  or from the response's `ETag` header; when neither carries one, the call throws
+  `InvalidOperationException` and writes nothing, because a replace or delete without a version would be
+  unconditional. With the projected queries (see Changed), the library names `odata.etag` in no `$select`.
+- A missing table is not a concurrency conflict. When the table was deleted under a running store, a
+  split-aware `UpsertAsync`, `LastWriterWins` `UpdateAsync` or `UpsertBatchAsync` retried and then threw
+  `ConcurrencyConflictException`; it now throws the service's own error at once (`RequestFailedException`,
+  status 404, error code `TableNotFound`; a `TableTransactionFailedException` when the write was a
+  transaction). Only a missing row is a lost race.
+- A damaged row can be deleted. A main row whose `_SplitParts` cell is not a count made `DeleteAsync`
+  throw `TableValueIntegrityException`; `DeleteAsync` now deletes such a row with the continuation rows it
+  finds, on condition of the row's version, and releases its blobs. Reading, upserting or updating such a
+  row still throws `TableValueIntegrityException`: delete it, then create it again.
+- A retried file write no longer stores a truncated file. When a write failed while a seekable stream was
+  being hashed, a retry with the same `TableBlobContent` stored only the unread rest of the stream, with
+  a matching length and SHA-256. Every attempt, and every upload, reads the stream from the position it
+  had at the first attempt. A content that can no longer be written (a non-seekable stream partly read by
+  a failed write, or one whose temporary copy a failed write released; a stream that cannot be put back
+  where the content starts) is refused with `InvalidOperationException` before anything is read or
+  uploaded, never with `ObjectDisposedException` and never by storing a partial or empty file.
+- Reading a file while its entity is saved again no longer fails with `RequestFailedException` 412
+  (`ConditionNotMet`), for the lazy stream of a `TableBlobContent` and for the eager download of an
+  offloaded value. A blob deleted while it is read fails the read with `TableValueIntegrityException`
+  ("was deleted while it was being read"), not with a raw `RequestFailedException`; an eager read then
+  reads the row again and, when its version changed, is retried from the new version.
+- A read of exactly `Length` bytes of a `TableBlobContent` stream is verified: the read that would return
+  the last expected byte throws `TableValueIntegrityException` when the content does not match (such a
+  caller used to get the bytes and no exception), and bytes beyond the expected length are never handed
+  out.
+- Writing a `TableBlobContent` taken from one row into another row no longer re-points the first row's
+  entity, or its cached copy, at the second row's blob (it then failed with
+  `TableValueIntegrityException` once the second row was deleted or replaced). One content from a
+  non-seekable stream on two entities of one batch is stored in full for both; it threw
+  `ObjectDisposedException` for the second.
 
 ### Tests and CI
 
 - The Azurite integration tests skip only when the emulator is not reachable at all; any other probe
   failure is retried and then fails the run. `UNIFIED_TABLES_REQUIRE_AZURITE=1` turns a skip into a
-  failure. The publish and pull-request workflows start a pinned Azurite 3.35.0 and set it.
+  failure. Every workflow starts a pinned Azurite 3.35.0 and sets it.
+- New workflow `.github/workflows/ci.yml` (`CI`, job `Build and test`): on every pull request and every
+  push to `main` it builds the solution in Release and runs all tests on `ubuntu-latest`. It uses no
+  secret. This is the check that gates a pull request on the tests: require `CI / Build and test` in
+  branch protection.
+- The SonarQube workflow no longer hides a failed build or a failed test. Its scanner `begin`,
+  `dotnet build`, `dotnet test` and scanner `end` are separate steps, and a failure skips the steps after
+  it, so the analysis of a commit whose tests fail is not uploaded. The four commands shared one
+  PowerShell step, whose result is the exit code of the last command: a failing test passed the check
+  whenever the scanner's `end` succeeded. The `SonarQube / Build and analyze` check needs a valid
+  `SONAR_TOKEN` and fails at `Begin analysis` without one, whatever the tests do.
+- The publish workflow fails before the push unless the packed `Unified.Data.Tables` depends on
+  `Unified.Data.Tables.Abstractions` `[x.y.z]` and the packed `Unified.Data.Tables.InMemory` on
+  `Unified.Data.Tables` `[x.y.z]`, where `x.y.z` is the version of the sibling package packed in the same
+  run.
+- `AzuriteTableStorageIntegrationTests` gives every test its own partitions (the name plus a GUID), so
+  several test runs can share one Azurite.
+- A test class that calls `AddUnifiedTableStorage` or `AddUnifiedInMemoryStorage`, or sets
+  `TableEntitySerializer.OversizedCellPolicy`, must carry `[Collection("OversizedCellPolicy")]`: the
+  policy is process-wide state, and one class outside the collection now and then failed the policy
+  tests. `OversizedCellPolicyCollectionTests` fails the test run when a class of the main test project
+  writes the policy outside that collection.
 
 ### Unchanged
 
-- Types that opt into nothing produce the same columns and make the same SDK calls as 0.8.3.
-  `OversizedCellPolicy` gains no value.
+- Types that opt into nothing produce the same columns and make the same SDK calls as 0.8.3, with the
+  differences listed under Changed: the `$select` of a projected query, the cache corrections, and one
+  construction of an entity type that has a nested-object property. `OversizedCellPolicy` gains no value.
 
 ## [0.8.3] — 2026-08-21
 
