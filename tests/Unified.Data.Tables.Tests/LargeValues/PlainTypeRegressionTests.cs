@@ -931,6 +931,53 @@ public class PlainTypeRegressionTests
         Assert.False(LargeValueTable.IsLargeValueAware(type));
     }
 
+    private static Type[] LoadableTypes(Assembly assembly)
+    {
+        try
+        {
+            return assembly.GetTypes();
+        }
+        catch (ReflectionTypeLoadException partly)
+        {
+            return partly.Types.Where(t => t is not null).ToArray()!;
+        }
+    }
+
+    [Fact]
+    public void EveryFrameworkType_IsNotLargeValueAware_AndTheAnswerNeverThrows()
+    {
+        // "Any type": thousands of them, public or not, as nobody would write them in a test model
+        // (open generics, pointers, by-ref-like structs, COM and runtime internals, types with several
+        // indexers, hidden members, cyclic and deep graphs).
+        Assembly[] assemblies =
+        [
+            typeof(object).Assembly, typeof(JsonNode).Assembly, typeof(Uri).Assembly, typeof(Queue<>).Assembly,
+            typeof(Enumerable).Assembly, typeof(System.Net.Http.HttpClient).Assembly, typeof(TableEntity).Assembly,
+            typeof(Response).Assembly, typeof(Azure.Storage.Blobs.BlobClient).Assembly,
+        ];
+
+        var checkedTypes = 0;
+        foreach (var assembly in assemblies)
+        {
+            foreach (var type in LoadableTypes(assembly))
+            {
+                bool aware;
+                try
+                {
+                    aware = TypeMetadataCache.IsLargeValueAware(type);
+                }
+                catch (Exception ex)
+                {
+                    Assert.Fail($"IsLargeValueAware({type}) threw {ex.GetType().Name}: {ex.Message}");
+                    return;
+                }
+                Assert.False(aware, $"{type} is reported as large-value aware.");
+                checkedTypes++;
+            }
+        }
+        Assert.InRange(checkedTypes, 5_000, int.MaxValue);
+    }
+
     [Fact]
     public void ItemThatOptsIntoNothing_CarriesNoBlobContent()
     {
@@ -1132,6 +1179,30 @@ public class PlainTypeRegressionTests
     {
         public override PropertyInfo[] GetProperties(BindingFlags bindingAttr) =>
             base.GetProperties(bindingAttr).Select(p => p.Name == "Broken" ? new UnreflectableProperty(p) : p).ToArray();
+    }
+
+    private sealed class PlainUnreflectableMarker
+    {
+        public string? Name { get; set; }
+
+        public string? Broken { get; set; }
+    }
+
+    private sealed class PlainUnreflectableType() : TypeDelegator(typeof(PlainUnreflectableMarker))
+    {
+        public override PropertyInfo[] GetProperties(BindingFlags bindingAttr) =>
+            base.GetProperties(bindingAttr).Select(p => p.Name == "Broken" ? new UnreflectableProperty(p) : p).ToArray();
+    }
+
+    [Fact]
+    public void FlatteningMetadataOfAPlainType_ResolvesNoPropertyType_AsOn083()
+    {
+        // 0.8.3 built a type's metadata from property names and attributes alone. A plain type must
+        // not start failing there because one of its property types cannot be loaded.
+        var metadata = TypeMetadataCache.GetMetadata(new PlainUnreflectableType());
+
+        Assert.Equal(["Broken", "Name"], metadata.PropertyMap.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Empty(metadata.SplitOptions);
     }
 
     private sealed class UnreflectableProperty(PropertyInfo inner) : PropertyInfo

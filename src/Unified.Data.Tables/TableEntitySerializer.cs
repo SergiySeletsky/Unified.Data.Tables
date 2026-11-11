@@ -1771,48 +1771,49 @@ internal static class TypeMetadataCache
     // the property is simply not opted in (the large-value walk, which must not throw).
     private static TableValueSplitAttribute? SplitFor(Type t, PropertyInfo prop, TableValueSplitAttribute? classLevel, bool validate)
     {
-        var type = prop.PropertyType;
-        if (PropertyLevelSplit(prop) is { } own)
-        {
-            if (type == typeof(TableBlobContent))
-                return !validate ? null : throw new InvalidOperationException(
-                    $"[TableValueSplit] on {t.Name}.{prop.Name}: a TableBlobContent is always stored in blob storage. Remove the attribute.");
-            if (IsScalar(type) && type != typeof(string) && type != typeof(byte[]))
-                return !validate ? null : throw new InvalidOperationException(
-                    $"[TableValueSplit] on {t.Name}.{prop.Name}: a {type.Name} is a native cell and cannot be split. " +
-                    "Only string, byte[] and JSON-stored properties can.");
-            if (FlattensIntoColumns(type) && !type.IsInterface && !type.IsAbstract)
-                return !validate ? null : throw new InvalidOperationException(
-                    $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is flattened into columns. " +
-                    "Put [TableValueSplit] on its members instead.");
-            // An interface or abstract type flattens or not depending on the runtime value; a
-            // flattened value would silently ignore the attribute (and could then be trimmed).
-            if (!IsSplittable(type))
-                return !validate ? null : throw new NotSupportedException(
-                    $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is an interface or abstract type, which may be " +
-                    "flattened into columns at runtime, so the attribute cannot be honoured. Declare the property as " +
-                    "string, byte[] or a concrete type stored as JSON, or put [TableValueSplit] on the members of its implementations.");
-            return own;
-        }
+        // The property's type is resolved only for a property an attribute may cover: the metadata of
+        // a type that opts into nothing is built from property names and attributes alone, as on 0.8.3.
+        if (PropertyLevelSplit(prop) is not { } own)
+            return classLevel is not null && IsOrdinaryColumn(t, prop) && IsSplittable(prop.PropertyType) ? classLevel : null;
 
-        return classLevel is not null && IsSplittable(type) && IsOrdinaryColumn(t, prop) ? classLevel : null;
+        var type = prop.PropertyType;
+        if (type == typeof(TableBlobContent))
+            return !validate ? null : throw new InvalidOperationException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: a TableBlobContent is always stored in blob storage. Remove the attribute.");
+        if (IsScalar(type) && type != typeof(string) && type != typeof(byte[]))
+            return !validate ? null : throw new InvalidOperationException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: a {type.Name} is a native cell and cannot be split. " +
+                "Only string, byte[] and JSON-stored properties can.");
+        if (FlattensIntoColumns(type) && !type.IsInterface && !type.IsAbstract)
+            return !validate ? null : throw new InvalidOperationException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is flattened into columns. " +
+                "Put [TableValueSplit] on its members instead.");
+        // An interface or abstract type flattens or not depending on the runtime value; a
+        // flattened value would silently ignore the attribute (and could then be trimmed).
+        if (!IsSplittable(type))
+            return !validate ? null : throw new NotSupportedException(
+                $"[TableValueSplit] on {t.Name}.{prop.Name}: {type.Name} is an interface or abstract type, which may be " +
+                "flattened into columns at runtime, so the attribute cannot be honoured. Declare the property as " +
+                "string, byte[] or a concrete type stored as JSON, or put [TableValueSplit] on the members of its implementations.");
+        return own;
     }
 
     // The property's own [TableValueSplit], or that of the base property it re-declares: an override
     // inherits it through reflection; a property that hides (new) a base property of the same name and
-    // type does not, so the hidden declarations are looked up.
+    // type does not, so the hidden declarations are looked up (by name first: a property that
+    // re-declares nothing resolves no type).
     private static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
     {
         if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
             return own;
-        if (prop.GetIndexParameters().Length > 0)
-            return null;
 
         for (var cur = prop.DeclaringType?.BaseType; cur is not null; cur = cur.BaseType)
         {
             foreach (var hidden in cur.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
             {
-                if (hidden.Name == prop.Name && hidden.PropertyType == prop.PropertyType && hidden.GetIndexParameters().Length == 0
+                if (hidden.Name == prop.Name
+                    && hidden.GetIndexParameters().Length == 0 && prop.GetIndexParameters().Length == 0
+                    && hidden.PropertyType == prop.PropertyType
                     && hidden.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } inherited)
                     return inherited;
             }
