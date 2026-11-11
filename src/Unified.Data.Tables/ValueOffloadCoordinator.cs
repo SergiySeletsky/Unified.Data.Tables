@@ -130,18 +130,19 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             // A row values were moved off is a split row: its first row is kept within the request
             // budget of one entity too, as far as moving more of them can. (Cells that cannot be moved
             // are held to the stored size alone, as on every row.)
-            if (split.Count > 0)
+            if (split.Count > 0 && inline.Count > 0)
             {
                 var first = SplitRowLayout.FirstRowWireExcess(plan);
-                var gains = inline.ConvertAll(value => (value.Column, Gain: SplitRowLayout.PromotionGain(row, value)));
-                var moved = first.Excess > 0
-                    ? SplitRowLayout.ChoosePromotions(
-                        first.Properties, first.Excess, gains.Where(g => g.Gain.Bytes > 0).Select(g => (g.Column, g.Gain.Wire)))
-                    : [];
-                if (moved.Count > 0)
+                if (first.Excess > 0)
                 {
-                    split.UnionWith(moved);
-                    continue;
+                    var gains = inline.ConvertAll(value => (value.Column, Gain: SplitRowLayout.PromotionGain(row, value)));
+                    var moved = SplitRowLayout.ChoosePromotions(
+                        first.Properties, first.Excess, gains.Where(g => g.Gain.Bytes > 0).Select(g => (g.Column, g.Gain.Wire)));
+                    if (moved.Count > 0)
+                    {
+                        split.UnionWith(moved);
+                        continue;
+                    }
                 }
             }
 

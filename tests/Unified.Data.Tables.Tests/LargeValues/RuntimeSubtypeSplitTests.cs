@@ -234,6 +234,21 @@ public class RuntimeSubtypeSplitTests
         public string? Title { get; set; }
     }
 
+    /// <summary>The noted shape created by the constructor of a nested object that a new entity does not have.</summary>
+    public sealed class RuntimeNotedMid
+    {
+        public IRuntimeNoted Shape { get; set; } = new RuntimeNoted();
+
+        public string? Name { get; set; }
+    }
+
+    public sealed class NotedMidHolder : Entity
+    {
+        public RuntimeNotedMid? Mid { get; set; }
+
+        public string? Title { get; set; }
+    }
+
     /// <summary>A file on a runtime subtype.</summary>
     public sealed class RuntimeAttachment : IRuntimeShape
     {
@@ -800,6 +815,36 @@ public class RuntimeSubtypeSplitTests
         var read = await stores.Store<NotedHolder>().OneAsync(id, Ct);
         Assert.Equal("l2", read!.Shape.Label);
         Assert.Equal(notes, read.Shape.Notes, StringComparer.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(LargeValueStores.Memory)]
+    [InlineData(LargeValueStores.Azurite)]
+    public async Task PartialUpdate_OfALargeValueBelowAnObjectOnlyAReadCreates_IsRefused(string store)
+    {
+        await using var stores = await LargeValueStores.OpenAsync(store);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        var id = stores!.Id("r1");
+        var notes = Ascii(40_000);
+
+        // Mid is null on a new entity, so the type lists no large-value column and its store takes the
+        // plain path; the value is still stored as split cells (in the one row) and read back.
+        Assert.False(TypeMetadataCache.IsLargeValueAware(typeof(NotedMidHolder)));
+        await stores.Store<NotedMidHolder>().CreateAsync(
+            new NotedMidHolder { Id = id, Mid = new RuntimeNotedMid { Name = "m", Shape = new RuntimeNoted { Notes = notes, Label = "l1" } } }, Ct);
+        Assert.Equal(2, Assert.Single(await stores.RawRowsAsync<NotedMidHolder>())["Mid_Shape_Notes__chunks"]);
+
+        // A merged plain cell beside those split cells would read back the old value: refused here too.
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            stores.Store<NotedMidHolder>().UpdateAsync(id, b => b.SetProperty(x => x.Mid!.Shape.Notes, "new"), Ct));
+        Assert.Contains("Mid_Shape_Notes", ex.Message, StringComparison.Ordinal);
+
+        await stores.Store<NotedMidHolder>().UpdateAsync(id, b => b.SetProperty(x => x.Mid!.Shape.Label, "l2"), Ct);
+        await stores.Store<NotedMidHolder>().UpdateAsync(id, b => b.SetProperty(x => x.Mid!.Name, "m2"), Ct);
+        var read = await stores.Store<NotedMidHolder>().OneAsync(id, Ct);
+        Assert.Equal("m2", read!.Mid!.Name);
+        Assert.Equal("l2", read.Mid.Shape.Label);
+        Assert.Equal(notes, read.Mid.Shape.Notes, StringComparer.Ordinal);
     }
 
     // ── shapes a read cannot map back ──────────────────────────────────────

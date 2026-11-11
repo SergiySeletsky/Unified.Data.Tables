@@ -545,9 +545,15 @@ public static class TableEntitySerializer
         ArgumentNullException.ThrowIfNull(ownerType);
         // A type that opts into nothing has no member to refuse. It takes the path of 0.8.3, which builds
         // no metadata for the declared types along the column path (one may be a type the serializer
-        // cannot build metadata for, such as an interface that declares two indexers).
+        // cannot build metadata for, such as an interface that declares two indexers). The one member
+        // such a type can still have is a large value of an object that only a read creates (below a
+        // property that is empty on a new entity): the read's own resolution finds it, and never throws.
         if (!TypeMetadataCache.IsLargeValueAware(ownerType))
+        {
+            if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath))
+                throw new NotSupportedException(PartialUpdateRefusal(columnPath));
             return FlattenProperty(columnPath, value);
+        }
 
         // The entity type is one the serializer flattens: its metadata is built here as on any first
         // use, so a misused attribute is reported. The types further along the path are declared types,
@@ -566,25 +572,9 @@ public static class TableEntitySerializer
         // The same question for the object a read finds along the path: a default instance may be of a
         // runtime type that opts the member in although the declared type's member is ordinary. A plain
         // cell merged beside its split cells would read back the old value.
-        if (IsLargeValueOnRead(ownerType, columnPath))
+        if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath))
             throw new NotSupportedException(PartialUpdateRefusal(columnPath));
         return FlattenProperty(columnPath, value);
-    }
-
-    private static bool IsLargeValueOnRead(Type ownerType, string columnPath)
-    {
-#pragma warning disable CA1031 // a path a read cannot resolve has no runtime member to refuse; the declared types were checked above
-        try
-        {
-            return TypeMetadataCache.ReadTarget(ownerType, columnPath) is { ReflectedType: { } owner } leaf
-                && (leaf.PropertyType == typeof(TableBlobContent)
-                    || TypeMetadataCache.GetMetadata(owner).SplitOptions.ContainsKey(leaf.Name));
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-#pragma warning restore CA1031
     }
 
     /// <summary>
@@ -1560,6 +1550,7 @@ internal static class TypeMetadataCache
     private static readonly ConcurrentDictionary<Type, LargeValueInfo> _largeValues = new();
     private static readonly ConcurrentDictionary<Type, LargeValueInfo> _declaredLargeValues = new();
     private static readonly ConcurrentDictionary<(Type Type, string Column), PropertyInfo?> _readTargets = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Column), bool> _largeOnRead = new();
 
     public static TypeMetadata GetMetadata(Type t)
         => _cache.GetOrAdd(t, CreateMetadata);
@@ -2037,6 +2028,33 @@ internal static class TypeMetadataCache
         if (_readTargets.Count < MaxRememberedReadTargets)
             _readTargets.TryAdd((type, column), target);
         return target;
+    }
+
+    /// <summary>
+    /// True when the property a read of <paramref name="type"/> sets <paramref name="column"/> on is a
+    /// large-value member: a <see cref="TableBlobContent"/>, or one its owner's runtime type opts in.
+    /// Never throws, and the answer is remembered: a column a read cannot resolve is not one.
+    /// </summary>
+    internal static bool IsLargeValueOnRead(Type type, string column)
+    {
+        if (_largeOnRead.TryGetValue((type, column), out var known))
+            return known;
+
+        bool large;
+#pragma warning disable CA1031 // a path a read cannot resolve names no member to refuse
+        try
+        {
+            large = ReadTarget(type, column) is { ReflectedType: { } owner } leaf
+                && (leaf.PropertyType == typeof(TableBlobContent) || GetMetadata(owner).SplitOptions.ContainsKey(leaf.Name));
+        }
+        catch (Exception)
+        {
+            large = false;
+        }
+#pragma warning restore CA1031
+        if (_largeOnRead.Count < MaxRememberedReadTargets)
+            _largeOnRead.TryAdd((type, column), large);
+        return large;
     }
 
     /// <summary>
