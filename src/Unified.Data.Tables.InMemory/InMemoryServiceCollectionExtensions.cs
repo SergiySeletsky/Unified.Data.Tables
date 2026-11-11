@@ -25,8 +25,9 @@ public static class InMemoryServiceCollectionExtensions
         configure?.Invoke(options);
 
         // First-registration-wins, mirroring AddUnifiedTableStorage: the fake round-trips through
-        // the same (static) serializer, so it applies the same process-wide policy.
-        var optionsAlreadyRegistered = services.Any(d => d.ServiceType == typeof(UnifiedTableStorageOptions));
+        // the same (static) serializer, so it applies the same process-wide policy. Only an unkeyed
+        // registration counts, as for TryAddSingleton: a keyed one of the host is never what a store receives.
+        var optionsAlreadyRegistered = services.Any(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions));
         if (!optionsAlreadyRegistered)
             TableEntitySerializer.OversizedCellPolicy = options.OversizedCells;
 

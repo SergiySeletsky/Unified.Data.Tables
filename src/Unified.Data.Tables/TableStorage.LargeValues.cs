@@ -557,13 +557,16 @@ public partial class TableStorage<T>
     /// coherent. The entity gets the version the write itself produced, or null when that is unknown
     /// (re-read before an optimistic update, as after a batch). Only a single call's result is cached; a
     /// transaction's result and an unknown version evict the entry instead, so the next read goes to the
-    /// store.
+    /// store. A single call's result is cached only if no other write or delete of the entity was noted
+    /// since <paramref name="mark"/>, taken before the write's first storage call; otherwise the entry is
+    /// evicted (see <c>WriteGenerations</c>): what this write does after its commit, such as the cleanup
+    /// of the replaced row's blobs, can outlast a later write.
     /// </summary>
-    private void CommitLargeWrite(T entity, string partitionKey, LargeWriteResult result)
+    private void CommitLargeWrite(T entity, string partitionKey, LargeWriteResult result, ReadMark mark)
     {
         entity.ETag = result.ETag == default ? null : result.ETag.ToString();
         if (result.Cacheable && result.ETag != default)
-            CacheEntity(entity.Id, entity, result.ETag);
+            CacheEntity(entity.Id, entity, result.ETag, mark);
         else
             cache.Remove(EntityCacheKey(entity.Id));
         InvalidateQueryCache(partitionKey);
