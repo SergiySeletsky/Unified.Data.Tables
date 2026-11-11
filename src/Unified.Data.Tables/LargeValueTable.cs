@@ -314,18 +314,27 @@ public sealed class LargeValueTable
     }
 
     /// <summary>
-    /// Storage-provider SPI, not for application code. Deletes blobs no row references any more, after
-    /// the write or delete that released them has committed. Each delete is conditional on the blob not
-    /// having been modified within <see cref="BlobOffloadOptions.CleanupGrace"/> before
-    /// <paramref name="serviceNow"/>, so a blob a concurrent writer has just touched survives. Best
-    /// effort: a failure goes to <paramref name="onFailure"/>.
+    /// Storage-provider SPI, not for application code. Deletes the blobs the row
+    /// (<paramref name="partitionKey"/>, <paramref name="rowKey"/>) no longer references, after the write
+    /// or delete that released them has committed. Only the row's own blobs are deleted: names of the
+    /// exact offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>) under
+    /// <c>{table}/{partitionKey}/{rowKey}/</c> of this table. A row copied cell for cell from another
+    /// table, or to another row key, still references the source row's blobs; such a path belongs to the
+    /// source row, so it goes to <paramref name="onForeign"/> and is left alone. Each delete is
+    /// conditional on the blob not having been modified within
+    /// <see cref="BlobOffloadOptions.CleanupGrace"/> before <paramref name="serviceNow"/>, so a blob a
+    /// concurrent writer has just touched survives. Best effort: a failure goes to
+    /// <paramref name="onFailure"/>.
     /// </summary>
-    /// <param name="paths">The released blob names.</param>
+    /// <param name="partitionKey">The partition key of the row that was written or deleted.</param>
+    /// <param name="rowKey">The row key of the row that was written or deleted.</param>
+    /// <param name="paths">The blob names the row referenced and no longer does.</param>
     /// <param name="serviceNow">
     /// The storage service's time of the commit that released them (its response <c>Date</c>), or null
     /// to ask the blob store (<see cref="IOffloadBlobStore.GetServiceTimeAsync"/>); only when neither is
     /// known is the client clock used, less <see cref="ClientClockMargin"/>.
     /// </param>
+    /// <param name="onForeign">Called with each path that is not the row's own blob; it is not deleted.</param>
     /// <param name="onFailure">
     /// Called with the blob name and the error of each failed delete; when cleanup stops after the caller
     /// cancelled, called once more, with the first blob not deleted and an
@@ -338,12 +347,15 @@ public sealed class LargeValueTable
     /// <returns>A task that completes when every delete was attempted, or cleanup stopped.</returns>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public async Task DeleteReleasedBlobsAsync(
-        IEnumerable<string> paths, DateTimeOffset? serviceNow, Action<string, Exception>? onFailure, CancellationToken ct)
+        string partitionKey, string rowKey, IEnumerable<string> paths, DateTimeOffset? serviceNow,
+        Action<string>? onForeign, Action<string, Exception>? onFailure, CancellationToken ct)
     {
+        ArgumentNullException.ThrowIfNull(partitionKey);
+        ArgumentNullException.ThrowIfNull(rowKey);
         ArgumentNullException.ThrowIfNull(paths);
         if (blobs is null)
             return;
-        var released = paths.ToList();
+        var released = OwnBlobs(partitionKey, rowKey, paths, onForeign);
         if (released.Count == 0)
             return;
         using var budget = new CleanupBudget(ct, CancelledCleanupBudget);
@@ -358,6 +370,34 @@ public sealed class LargeValueTable
         {
             onFailure?.Invoke(released[next], CleanupStopped(released.Count - next, ex));
         }
+    }
+
+    // The paths that are blobs of the row itself: offload-shaped names under {table}/{pk}/{rk}/. Every
+    // blob a write of the row uploads has such a name, so anything else was not written for this row: a
+    // row copied raw from another table, or to another row key, still references the source row's
+    // blobs. Those are the source's to release, so they are reported and never deleted here. A key that
+    // is not well-formed UTF-16 names no blob at all (writes refuse one).
+    private List<string> OwnBlobs(string partitionKey, string rowKey, IEnumerable<string> paths, Action<string>? onForeign)
+    {
+        string? partitionPrefix = null;
+        string? rowPrefix = null;
+        if (SplitCodec.IsWellFormedUtf16(partitionKey) && SplitCodec.IsWellFormedUtf16(rowKey))
+        {
+            partitionPrefix = ValueOffloadCoordinator.PartitionPrefix(tableName, partitionKey);
+            rowPrefix = ValueOffloadCoordinator.RowPrefix(tableName, partitionKey, rowKey);
+        }
+
+        var own = new List<string>();
+        foreach (var path in paths)
+        {
+            if (rowPrefix is not null
+                && path.StartsWith(rowPrefix, StringComparison.Ordinal)
+                && OffloadBlobNames.IsOffloadBlobName(path, partitionPrefix!))
+                own.Add(path);
+            else
+                onForeign?.Invoke(path);
+        }
+        return own;
     }
 
     // Cleanup after a committed change ignores the caller's token until CancelledCleanupBudget has passed

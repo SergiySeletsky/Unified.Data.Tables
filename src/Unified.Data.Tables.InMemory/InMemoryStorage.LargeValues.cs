@@ -146,7 +146,8 @@ public sealed partial class InMemoryStorage<T>
             // write is never reported as failed: a cancelled token only bounds how long cleanup may take.
             AfterLargeCommit?.Invoke();
             if (prior is { Blobs.Count: > 0 })
-                await large.DeleteReleasedBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), serviceNow: null, onFailure: null, ct);
+                await large.DeleteReleasedBlobsAsync(keys.PartitionKey, keys.RowKey,
+                    prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), serviceNow: null, onForeign: null, onFailure: null, ct);
             entity.ETag = ETagOf(version);
             return entity;
         }
@@ -305,8 +306,8 @@ public sealed partial class InMemoryStorage<T>
             foreach (var unit in chunk)
             {
                 if (unit.Prior is { Blobs.Count: > 0 })
-                    await large.DeleteReleasedBlobsAsync(unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal),
-                        serviceNow: null, onFailure: null, ct);
+                    await large.DeleteReleasedBlobsAsync(unit.Keys.PartitionKey, unit.Keys.RowKey,
+                        unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), serviceNow: null, onForeign: null, onFailure: null, ct);
             }
         }
     }
@@ -338,7 +339,7 @@ public sealed partial class InMemoryStorage<T>
 
         // The entity is gone: its blobs follow (a cancelled token only bounds how long that may take).
         AfterLargeCommit?.Invoke();
-        await large.DeleteReleasedBlobsAsync(released, serviceNow: null, onFailure: null, ct);
+        await large.DeleteReleasedBlobsAsync(keys.PartitionKey, keys.RowKey, released, serviceNow: null, onForeign: null, onFailure: null, ct);
     }
 
     private async Task<int> DeletePartitionLargeAsync(string partition, CancellationToken ct)

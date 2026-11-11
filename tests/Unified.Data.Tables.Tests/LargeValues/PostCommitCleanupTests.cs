@@ -17,7 +17,8 @@ public class PostCommitCleanupTests
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
-    private static string Name(int i) => $"T/p/r{i}/Body/{Sha}";
+    // One blob per column of the row p|r: released blobs are always the written row's own.
+    private static string Name(int i) => $"T/p/r/C{i}/{Sha}";
 
     private static LargeValueTable Table(IOffloadBlobStore blobs, TimeSpan budget) =>
         new("T", new BlobOffloadOptions { CleanupGrace = TimeSpan.Zero }, blobs) { CancelledCleanupBudget = budget };
@@ -32,7 +33,7 @@ public class PostCommitCleanupTests
         var watch = Stopwatch.StartNew();
 
         await Table(blobs, TimeSpan.FromMilliseconds(100))
-            .DeleteReleasedBlobsAsync(Enumerable.Range(0, 3).Select(Name).ToList(), DateTimeOffset.UtcNow, (p, e) => failures.Add((p, e)), cts.Token);
+            .DeleteReleasedBlobsAsync("p", "r", Enumerable.Range(0, 3).Select(Name).ToList(), DateTimeOffset.UtcNow, onForeign: null, (p, e) => failures.Add((p, e)), cts.Token);
 
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(20), $"cleanup took {watch.Elapsed}");
         Assert.Equal(1, blobs.Deletes);
@@ -51,7 +52,7 @@ public class PostCommitCleanupTests
         await cts.CancelAsync();
 
         await Table(blobs, TimeSpan.FromSeconds(30))
-            .DeleteReleasedBlobsAsync(Enumerable.Range(0, 3).Select(Name).ToList(), serviceNow: null, (p, _) => failures.Add(p), cts.Token);
+            .DeleteReleasedBlobsAsync("p", "r", Enumerable.Range(0, 3).Select(Name).ToList(), serviceNow: null, onForeign: null, (p, _) => failures.Add(p), cts.Token);
 
         Assert.Equal(3, blobs.Deletes);
         Assert.Empty(failures);
@@ -63,7 +64,7 @@ public class PostCommitCleanupTests
         var blobs = new HangingBlobStore { Hang = false, DeleteDelay = TimeSpan.FromMilliseconds(50) };
 
         await Table(blobs, TimeSpan.FromMilliseconds(10))
-            .DeleteReleasedBlobsAsync(Enumerable.Range(0, 4).Select(Name).ToList(), serviceNow: null, onFailure: null, Ct);
+            .DeleteReleasedBlobsAsync("p", "r", Enumerable.Range(0, 4).Select(Name).ToList(), serviceNow: null, onForeign: null, onFailure: null, Ct);
 
         Assert.Equal(4, blobs.Deletes);
     }

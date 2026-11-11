@@ -142,7 +142,7 @@ public partial class TableStorage<T>
             // written again maps to the same name, which the new row still references). A committed write
             // is never reported as failed: a cancelled token only bounds how long its cleanup may take.
             if (prior is { Blobs.Count: > 0 })
-                await DeleteBlobsAsync(prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), result.CommittedAt, ct);
+                await DeleteBlobsAsync(pk, rk, prior.Blobs.Except(plan.BlobPaths, StringComparer.Ordinal), result.CommittedAt, ct);
             return result;
         }
 
@@ -214,14 +214,21 @@ public partial class TableStorage<T>
             : null;
 
     /// <summary>
-    /// Deletes blobs no row references any more, after the write or delete that released them has
-    /// committed, each on condition that it was not modified within the cleanup grace (a concurrent
-    /// writer that reuses the same content touches the blob before committing its row; the orphan sweep
-    /// collects a blob that really is unreferenced). Best effort: a failure is logged, never thrown. A
-    /// cancelled token gives it a few more seconds, then leaves the rest to the orphan sweep.
+    /// Deletes the blobs the row <paramref name="pk"/>|<paramref name="rk"/> no longer references, after
+    /// the write or delete that released them has committed, each on condition that it was not modified
+    /// within the cleanup grace (a concurrent writer that reuses the same content touches the blob before
+    /// committing its row; the orphan sweep collects a blob that really is unreferenced). Only the row's
+    /// own blobs go: a path outside its <c>{table}/{pk}/{rk}/</c> prefix (the row was copied from another
+    /// table or key and still referenced the source row's blob) is left alone. Best effort: a failure is
+    /// logged, never thrown. A cancelled token gives it a few more seconds, then leaves the rest to the
+    /// orphan sweep.
     /// </summary>
-    private Task DeleteBlobsAsync(IEnumerable<string> paths, DateTimeOffset? committedAt, CancellationToken ct) =>
-        large.DeleteReleasedBlobsAsync(paths, committedAt, LogBlobDeleteFailure, ct);
+    private Task DeleteBlobsAsync(string pk, string rk, IEnumerable<string> paths, DateTimeOffset? committedAt, CancellationToken ct) =>
+        large.DeleteReleasedBlobsAsync(pk, rk, paths, committedAt,
+            path => logger.LogDebug(
+                "{Type} {PartitionKey}|{RowKey}: blob {Blob} is not under this row's own prefix (the row was copied from another table or key); it is left alone",
+                typeName, pk, rk, path),
+            LogBlobDeleteFailure, ct);
 
     private void LogBlobDeleteFailure(string path, Exception ex) =>
         logger.LogWarning(ex, "{Type}: could not delete blob {Blob}; an orphan sweep will remove it", typeName, path);
@@ -498,7 +505,7 @@ public partial class TableStorage<T>
             }
 
             // The entity is gone: the blobs it referenced follow (best effort; a cancelled token only bounds it).
-            await DeleteBlobsAsync(prior.Blobs, committedAt, ct);
+            await DeleteBlobsAsync(pk, rk, prior.Blobs, committedAt, ct);
             return;
         }
 
@@ -651,7 +658,7 @@ public partial class TableStorage<T>
             foreach (var unit in chunk)
             {
                 if (unit.Prior is { Blobs.Count: > 0 })
-                    await DeleteBlobsAsync(unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), committedAt, ct);
+                    await DeleteBlobsAsync(unit.Pk, unit.Rk, unit.Prior.Blobs.Except(unit.Plan.BlobPaths, StringComparer.Ordinal), committedAt, ct);
             }
         }
     }

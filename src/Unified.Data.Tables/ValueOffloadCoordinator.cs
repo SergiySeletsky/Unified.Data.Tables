@@ -364,6 +364,10 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     internal static string PartitionPrefix(string table, string pk) =>
         TablePrefix(table) + OffloadBlobNames.EscapeSegment(pk) + "/";
 
+    /// <summary><c>{table}/{partitionKey}/{rowKey}/</c>, each segment escaped: the prefix of every blob of a row.</summary>
+    internal static string RowPrefix(string table, string pk, string rk) =>
+        PartitionPrefix(table, pk) + OffloadBlobNames.EscapeSegment(rk) + "/";
+
     /// <summary><c>{table}/</c>, escaped: the prefix of every blob of the table.</summary>
     internal static string TablePrefix(string table) => OffloadBlobNames.EscapeSegment(table) + "/";
 
