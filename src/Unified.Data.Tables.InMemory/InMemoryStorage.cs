@@ -816,7 +816,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             {
                 throw new UnauthorizedAccessException(
                     $"Property '{prop.Name}' on {typeof(T).Name} is protected (requires roles: {attr.Roles}). " +
-                    (large
+                    (large || ProtectedLargeValues.HoldsLargeValue(typeof(T), oldVal, newVal)
                         ? ProtectedLargeValues.DescribeRefusedChange(oldVal, newVal)
                         : $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'."));
             }

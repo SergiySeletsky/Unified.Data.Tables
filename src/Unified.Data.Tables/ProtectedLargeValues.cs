@@ -40,6 +40,63 @@ public static class ProtectedLargeValues
     }
 
     /// <summary>
+    /// Storage-provider SPI, not for application code. True when <paramref name="stored"/> or
+    /// <paramref name="written"/>, the values of a protected property of <paramref name="entityType"/>, holds a
+    /// large value below it: an object the serializer flattens into columns whose runtime type has, at any depth,
+    /// a <see cref="TableBlobContent"/> or a member opted in by <see cref="TableValueSplitAttribute"/>. The refusal
+    /// of a change to such a property then describes the values (<see cref="DescribeRefusedChange"/>) instead of
+    /// quoting them: their text would hold the large value whole. False, with nothing of the values read, for a
+    /// type that is not large-value aware, which keeps the message of 0.8.3; so does a value that holds no
+    /// large-value member.
+    /// </summary>
+    /// <param name="entityType">The entity type the store writes.</param>
+    /// <param name="stored">The value of the stored entity.</param>
+    /// <param name="written">The value of the entity being written.</param>
+    /// <returns>Whether either value holds a large-value member.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="entityType"/> is null.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static bool HoldsLargeValue(Type entityType, object? stored, object? written)
+    {
+        ArgumentNullException.ThrowIfNull(entityType);
+        if (!TypeMetadataCache.IsLargeValueAware(entityType))
+            return false;
+        var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        return HoldsLargeValueBelow(stored, seen, 0) || HoldsLargeValueBelow(written, seen, 0);
+    }
+
+    // Walks where the serializer flattens (an object that is not a scalar, an enum or a JSON-stored value).
+    private static bool HoldsLargeValueBelow(object? value, HashSet<object> seen, int depth)
+    {
+        if (value is TableBlobContent)
+            return true;
+        if (value is null or string or byte[] || depth > MaxDescribedDepth || value.GetType().IsEnum
+            || TableEntityValue.IsPrimitive(value.GetType()) || !TableEntityValue.CanSerializeWithoutJson(value)
+            || (!value.GetType().IsValueType && !seen.Add(value)))
+            return false;
+
+#pragma warning disable CA1031 // a value the check cannot inspect is described, never quoted
+        try
+        {
+            var metadata = TypeMetadataCache.GetMetadata(value.GetType());
+            foreach (var property in metadata.Properties)
+            {
+                if (property.PropertyType == typeof(TableBlobContent) || metadata.SplitOptions.ContainsKey(property.Name)
+                    || HoldsLargeValueBelow(property.GetValue(value), seen, depth + 1))
+                    return true;
+            }
+            return false;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+#pragma warning restore CA1031
+    }
+
+    // As deep as a column of the service's longest property name can lie.
+    private const int MaxDescribedDepth = 128;
+
+    /// <summary>
     /// Storage-provider SPI, not for application code. True when the value <paramref name="written"/> to a
     /// large-value property leaves the <paramref name="stored"/> one as it is: the same instance; two
     /// <see cref="TableBlobContent"/> of the same blob (the same SHA-256, length and content type, both known);
@@ -68,8 +125,9 @@ public static class ProtectedLargeValues
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The end of the refusal of a change to a protected
-    /// large-value property: the kind and the length of the stored and the new value, never the values
-    /// themselves (a large value can be megabytes, and the stored one is protected).
+    /// large-value property, or to a protected property whose value holds one (<see cref="HoldsLargeValue"/>):
+    /// the kind and the length of the stored and the new value, never the values themselves (a large value can
+    /// be megabytes, and the stored one is protected).
     /// </summary>
     /// <param name="stored">The value of the stored entity.</param>
     /// <param name="written">The value of the entity being written.</param>
