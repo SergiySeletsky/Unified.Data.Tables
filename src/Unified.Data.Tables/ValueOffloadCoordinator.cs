@@ -87,6 +87,20 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         foreach (var (_, content) in contents)
             content.Enlist();
 
+        // A subclass written through a store of its base type: a content in a column the base type does not
+        // read is refused before its source is read (the serializer refuses it too, after this point). After the
+        // contents are counted: the write's ReleasePrepared, which runs whatever is thrown here, ends each once.
+        if (EntityType is { } readType && entity.GetType() != readType)
+        {
+            foreach (var (column, _) in contents)
+            {
+                var property = column.Split(TableEntityValue.PathDelimiter)[0];
+                if (!TypeMetadataCache.ReadsBack(readType, property))
+                    throw new NotSupportedException(
+                        TableEntitySerializer.SubclassThroughBaseStoreRefusal(entity.GetType(), readType, column, plainStore: false));
+            }
+        }
+
         // Refused before any source is read and any blob uploaded. A content another write is using is
         // waited for (one write at a time hashes, copies, uploads from or binds a content).
         foreach (var (column, content) in contents)

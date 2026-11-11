@@ -258,6 +258,25 @@ public class SubclassThroughBaseTypedStoreTests
         Assert.IsType<Article>(read);
     }
 
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task AwareBaseStore_RefusesAFileOfAColumnOnlyTheSubclassDeclares_BeforeReadingTheCallersStream(string kind)
+    {
+        await using var stores = await LargeValueStores.OpenAsync(kind);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        var source = new MergedLaneSeamTests.CountingStream(RandomBytes(50_000));
+        var file = TableBlobContent.FromStream(source, "application/pdf");
+
+        var refused = await Record.ExceptionAsync(() => stores.Store<Article>().CreateAsync(
+            new LongArticle { Id = stores.Id("r"), Title = "t", Scan = file }, Ct));
+
+        AssertSubclassRefusal(refused, nameof(LongArticle), nameof(Article), nameof(LongArticle.Scan));
+        Assert.Equal(0, source.Reads);
+        // The content was never prepared, so it can still be written through a store of its own type.
+        await stores.Store<LongArticle>().CreateAsync(new LongArticle { Id = stores.Id("r"), Title = "t", Scan = file }, Ct);
+        Assert.NotNull((await stores.Store<LongArticle>().OneAsync(stores.Id("r"), Ct))!.Scan);
+    }
+
     // ── the reproduction of the review (SERIALIZER-3), with its offloaded scenario ───────────────
 
     [Fact]
