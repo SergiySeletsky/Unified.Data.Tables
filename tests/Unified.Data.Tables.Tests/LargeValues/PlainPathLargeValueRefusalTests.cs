@@ -102,7 +102,9 @@ public class PlainPathLargeValueRefusalTests
             new Attachment { Id = "p|r", File = TableBlobContent.FromBytes([1], "application/octet-stream") }.ToTableEntity("p", "r"));
 
         Assert.Contains("Attachment.File (column 'File')", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("declare Attachment.File as TableBlobContent", ex.Message, StringComparison.Ordinal);
+        // SERIALIZER-4 (fix wave 4): the only remedy named is the declaration that lets a read give the file back.
+        Assert.Contains("Declare Attachment.File as TableBlobContent", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Mark Attachment with [TableValueSplit]", ex.Message, StringComparison.Ordinal);
     }
 
     public sealed class Payment

@@ -172,8 +172,16 @@ public static class TableEntitySerializer
     /// The message for a large-value member that the plain serializer met below <paramref name="root"/>, a
     /// type that is not large-value aware: <paramref name="member"/> of the object at
     /// <paramref name="ownerPath"/> (empty: of the root itself), whose runtime type is <paramref name="ownerType"/>.
+    /// It names only remedies that work for the shape: <paramref name="partial"/>, the refused write is a
+    /// partial update, which never writes a large value (replace the entity instead);
+    /// <paramref name="contentInAnotherType"/>, the member holds a <see cref="TableBlobContent"/> but is not
+    /// declared as one (only that declaration lets a read give it back); <paramref name="runtimeNullable"/>,
+    /// the nullable struct the plain serializer met on the path through runtime owners, which a read cannot
+    /// create.
     /// </summary>
-    internal static string PlainPathRefusal(Type root, IReadOnlyList<string> ownerPath, Type ownerType, string member)
+    internal static string PlainPathRefusal(
+        Type root, IReadOnlyList<string> ownerPath, Type ownerType, string member, bool partial = false,
+        bool contentInAnotherType = false, (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<string> OwnerPath)? runtimeNullable = null)
     {
         var column = string.Join(TableEntityValue.PathDelimiter, ownerPath.Append(member));
         var holder = string.Join('.', ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)));
@@ -186,18 +194,59 @@ public static class TableEntitySerializer
         var refused = $"{where} (column '{column}') is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. " +
                       $"{root.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity " +
                       "as one plain row and can neither split, offload nor read back such a value, whatever its size. ";
+        string remedy;
         // Below a nullable struct the class-level opt-in alone leads to the next refusal (a read cannot
         // create the struct of a nullable property); declaring the property with the struct itself works.
         if (NullableStructOnPath(root, ownerPath) is { } nullable)
-            return refused +
-                   $"A read cannot create the struct of the nullable property {nullable.Owner.Name}.{nullable.Property.Name} " +
-                   $"({nullable.Struct.Name}?), so a large value below it cannot be stored as one (marking {root.Name} with " +
-                   $"[TableValueSplit] is not enough on its own). Declare {nullable.Owner.Name}.{nullable.Property.Name} as " +
-                   $"{nullable.Struct.Name}, not nullable, so that {root.Name} is large-value aware by its declared types and reads " +
-                   "the value back. Nothing was serialized.";
-        return refused +
-               $"Mark {root.Name} with [TableValueSplit], or {declare}, so that {root.Name} is large-value aware by its declared types. " +
-               "Nothing was serialized.";
+            remedy =
+                $"A read cannot create the struct of the nullable property {nullable.Owner.Name}.{nullable.Property.Name} " +
+                $"({nullable.Struct.Name}?), so a large value below it cannot be stored as one (marking {root.Name} with " +
+                $"[TableValueSplit] is not enough on its own). Declare {nullable.Owner.Name}.{nullable.Property.Name} as " +
+                $"{nullable.Struct.Name}, not nullable, so that {root.Name} is large-value aware by its declared types and reads " +
+                "the value back.";
+        // The same struct reached through a runtime owner (a property declared as an interface, an abstract or
+        // a base class): the declared types from the root do not lead to it, so both declarations are named.
+        else if (runtimeNullable is { } below)
+            remedy =
+                $"A value below a nullable struct cannot be stored as a large value: a read cannot create the struct of the " +
+                $"nullable property {below.Owner.Name}.{below.Property.Name} ({below.Struct.Name}?), and marking {root.Name} " +
+                $"with [TableValueSplit] does not change that. Declare {below.Owner.Name}.{below.Property.Name} as " +
+                $"{below.Struct.Name}, not nullable" +
+                (below.OwnerPath.Count == 0 ? "" :
+                    $", and declare {root.Name}.{string.Join('.', below.OwnerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))} " +
+                    $"with the type that has it ({below.Owner.Name})") +
+                $", so that {root.Name} is large-value aware by its declared types and reads the value back.";
+        // A read gives a TableBlobContent back only to a property declared as one: marking the type does not.
+        else if (contentInAnotherType)
+            remedy = ownerPath.Count == 0
+                ? $"A read gives a TableBlobContent back only to a property declared as TableBlobContent, so marking {root.Name} " +
+                  $"with [TableValueSplit] is not enough. Declare {root.Name}.{member} as TableBlobContent, so that {root.Name} is " +
+                  "large-value aware by its declared types."
+                : $"A read gives a TableBlobContent back only to a property declared as TableBlobContent, so marking {root.Name} " +
+                  $"with [TableValueSplit] is not enough. Declare {ownerType.Name}.{member} as TableBlobContent, and {declare}, so " +
+                  $"that {root.Name} is large-value aware by its declared types.";
+        else
+            remedy = $"Mark {root.Name} with [TableValueSplit], or {declare}, so that {root.Name} is large-value aware by its declared types.";
+
+        return partial
+            ? refused + "A partial update (UpdateAsync with a builder) cannot write a large value on any store, also once the type " +
+              "is large-value aware: replace the entity instead (a whole-entity write). For that write to store the value: " +
+              remedy + " Nothing was serialized."
+            : refused + remedy + " Nothing was serialized.";
+    }
+
+    // The outermost property, on the path from the root to node (its owners, by their runtime types), that
+    // holds a struct and is declared as a nullable struct: its owner's runtime type, the property, the
+    // struct and the path of the owner. Null when there is none.
+    private static (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<string> OwnerPath)? RuntimeNullableStructOnPath(TableEntityValue node)
+    {
+        (Type, PropertyInfo, Type, IReadOnlyList<string>)? outermost = null;
+        for (var cur = node; cur is { HeldBy: { } property, Parent: { Type: { } ownerType } parent }; cur = parent)
+        {
+            if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
+                outermost = (ownerType, property, underlying, parent.Path);
+        }
+        return outermost;
     }
 
     // The first property along ownerPath (property names from root, by reflection only) declared as a
@@ -224,8 +273,11 @@ public static class TableEntitySerializer
     /// <paramref name="storeType"/>. <paramref name="plainStore"/>: <paramref name="storeType"/> is not
     /// large-value aware (its store refuses every large-value form); otherwise the value needs split cells
     /// or a blob in a column a read of <paramref name="storeType"/> maps to no property.
+    /// <paramref name="contentIn"/>: the property that holds a <see cref="TableBlobContent"/> and is not declared
+    /// as one; a read gives the content back only to a property declared as <see cref="TableBlobContent"/>, so
+    /// that declaration is the remedy named.
     /// </summary>
-    internal static string SubclassThroughBaseStoreRefusal(Type runtimeType, Type storeType, string column, bool plainStore)
+    internal static string SubclassThroughBaseStoreRefusal(Type runtimeType, Type storeType, string column, bool plainStore, PropertyInfo? contentIn = null)
     {
         var why = plainStore
             ? $"{storeType.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity as one " +
@@ -236,6 +288,13 @@ public static class TableEntitySerializer
             ? $"Store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> (a store of the runtime type)"
             : $"Mark {runtimeType.Name} with [TableValueSplit] and store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> " +
               "(a store of the runtime type)";
+        // A file in a property not declared TableBlobContent: only that declaration lets a read give it back.
+        if (contentIn is { DeclaringType: { } declaring })
+            remedy = !TableEntityValue.ContainsPathDelimiter(column) && declaring.IsAssignableFrom(storeType)
+                ? $"A read gives a TableBlobContent back only to a property declared as TableBlobContent: declare {declaring.Name}.{contentIn.Name} " +
+                  $"as TableBlobContent, so that {storeType.Name} is large-value aware by its declared types and its reads give the content back"
+                : $"A read gives a TableBlobContent back only to a property declared as TableBlobContent: declare {declaring.Name}.{contentIn.Name} " +
+                  $"as TableBlobContent and store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> (a store of the runtime type)";
         return $"'{column}' of {runtimeType.Name} is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. This " +
                $"{runtimeType.Name} is written through an IStorage<{storeType.Name}>, and {why}. {remedy}. Nothing was stored.";
     }
@@ -738,8 +797,9 @@ public static class TableEntitySerializer
         var dict = new Dictionary<string, object>();
         if (value == null) return dict;
 
+        // A type that is not aware declares no TableBlobContent property: the content is in another type.
         if (plainRoot is not null && value is TableBlobContent)
-            throw new NotSupportedException(PlainPathRefusal(plainRoot, [], plainRoot, propertyName));
+            throw new NotSupportedException(PlainPathRefusal(plainRoot, [], plainRoot, propertyName, partial: true, contentInAnotherType: true));
 
         var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
         var node = new TableEntityValue(ImmutableList<string>.Empty.Add(propertyName), value);
@@ -905,14 +965,17 @@ public static class TableEntitySerializer
             // it); a partial update refuses the member as it does for any type, with this message.
             if (state.PlainRoot is { } plainRoot && (childVal is not null || state.Partial)
                 && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
+            {
+                var contentIn = childVal is TableBlobContent && prop.PropertyType != typeof(TableBlobContent) ? prop : null;
                 throw new NotSupportedException(state.Subclass is { } subclass
-                    ? SubclassThroughBaseStoreRefusal(subclass, plainRoot, string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name)), plainStore: true)
-                    : PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name));
+                    ? SubclassThroughBaseStoreRefusal(subclass, plainRoot, string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name)), plainStore: true, contentIn)
+                    : PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name, state.Partial, contentIn is not null, RuntimeNullableStructOnPath(value)));
+            }
             if (state.Partial && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
                 throw new NotSupportedException(
                     PartialUpdateRefusal(string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name))));
 
-            var childNode = new TableEntityValue(value.Path.Add(prop.Name), childVal!);
+            var childNode = new TableEntityValue(value.Path.Add(prop.Name), childVal!) { Parent = value, HeldBy = prop };
             // A write may have to put another content instance on this property (PendingBlob.Assign).
             if (childVal is TableBlobContent && !value.Type.IsValueType)
                 childNode.BlobContentOwner = (value.Value, prop);
@@ -1196,6 +1259,15 @@ internal sealed class TableEntityValue
     /// write can put another content instance there. Null when that object is held by value.
     /// </summary>
     public (object Owner, PropertyInfo Property)? BlobContentOwner { get; set; }
+
+    /// <summary>
+    /// While flattening: the value of the object that holds this one, and the property it is held in (null at
+    /// the root). A refusal message reads them to name the owners along the path by their runtime types.
+    /// </summary>
+    public TableEntityValue? Parent { get; init; }
+
+    /// <inheritdoc cref="Parent"/>
+    public PropertyInfo? HeldBy { get; init; }
 
     /// <summary>Whether a column is a truncation marker — metadata that must be skipped on read.</summary>
     internal static bool IsTruncationMarker(string column) =>
