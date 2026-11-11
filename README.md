@@ -524,8 +524,10 @@ Customer     back = row.FromTableEntity<Customer>();
 
 A table cell holds 64&nbsp;KB and a row 1&nbsp;MB. By default an oversized value throws
 (`OversizedCellPolicy.Throw`); nothing is ever trimmed. Opt a property in and it is stored
-losslessly instead. Types with no `[TableValueSplit]` and no `TableBlobContent` property produce the
-same columns and make the same SDK calls as before.
+losslessly instead. A type with a `[TableValueSplit]` or `TableBlobContent` member is called
+*split-aware* below. Types with neither produce the same columns and make the same SDK calls as before;
+the one request that differs from 0.8.3, for every type, is a projected query, whose `$select` no longer
+names `odata.etag` (the entities still carry their `ETag`).
 
 > **Roll forward only.** Rows written split or offloaded cannot be read correctly by 0.8.x or older.
 > Deploy the 0.9.0 package bump first with no attributes, and add `[TableValueSplit]` or
@@ -545,16 +547,76 @@ public sealed class Document : Entity
 }
 ```
 
-The attribute goes on a property, or on a class to cover every `string`/`byte[]` property of it. On a
-property it must be a `string`, a `byte[]` or a type stored as one JSON cell (a collection, or a concrete
-type that does not flatten into columns); on an interface or abstract type, which may flatten at runtime,
-it throws `NotSupportedException` on first use of the entity type, as it does on a native scalar or a type
-that flattens.
+The attribute goes on a property or on a class. On a property it must be a `string`, a `byte[]` or a
+type stored as one JSON cell (a collection, or a concrete type that does not flatten into columns).
+Anywhere else it is a misuse, reported the first time an entity of the type is written or a row of it is
+read, not when the store is constructed or resolved from DI: `InvalidOperationException` on a native
+scalar, on a concrete type that flattens into columns and on a `TableBlobContent`;
+`NotSupportedException` on an interface or abstract type, which may flatten at runtime. The message names
+the member.
+
+On a class the attribute covers every `string`, `byte[]` and JSON-stored property of the class, whether
+the class declares the property or inherits it, except the entity `Id`, which stays an ordinary key
+column that can be filtered. A derived class inherits the attribute of its base class; when it declares
+its own, that one applies to all its properties. An attribute on a property wins over the one on its
+class (encoding and `Offload`), and a property that a derived class overrides or hides (`new`) keeps the
+attribute of the property it re-declares. Every covered property is a large property, which cannot be
+used in a LINQ filter or in a builder partial update (see [Limitations](#limitations)): to keep a
+`string` property filterable, put the attribute on the properties that need it instead of on the class.
+
+A member of a runtime subtype can be a large value too. When a property is declared as an interface, an
+abstract class or a base class, its `[TableValueSplit]` and `TableBlobContent` members are those of the
+object it holds. A read does not know that object's type: it keeps the instance the entity's constructor
+puts in the property, and creates the declared type where there is none. So initialise such a property
+with an instance of the type that has the members:
+
+```csharp
+public interface IShape { }
+
+public sealed class Circle : IShape
+{
+    [TableValueSplit(SplitEncoding.Text)]
+    public string Notes { get; set; } = "";
+}
+
+public sealed class Drawing : Entity
+{
+    public IShape Shape { get; set; } = new Circle();   // the instance a read keeps
+}
+```
+
+`Shape_Notes` is then stored and read back at every size, a projection that names `Shape_Notes` or
+`Shape` returns it, and the blob of a replaced or deleted row is released. `Drawing` is split-aware
+although none of its declared property types has a large-value member. To find such members the library
+constructs the entity type once, with its public parameterless constructor, when its store type is first
+used (only an entity type with a property that can hold a nested object; an exception from the
+constructor is ignored). Without a default instance of the right type a read could not map the column
+back to a property, so the write is refused instead: a value that needs split cells or a blob (every
+`TableBlobContent` does) below an object whose type a read would not recreate throws
+`NotSupportedException` naming the column, and nothing is stored. A value of the same member that fits
+one cell is an ordinary cell, as it always was (a read drops the members the created type does not
+have). An interface-typed or abstract-typed property with no default instance is not refused on write:
+it fails on read, as it does for its ordinary cells (`SerializationException`: the declared type cannot
+be instantiated), also when the row holds only the large value.
+
+`[ColumnAlias]` works with large values. `[ColumnAlias("Old")]` on a renamed `[TableValueSplit]` or
+`TableBlobContent` property, or the class-level `[ColumnAlias("Property", "Old")]`, reads a value stored
+under the old column in every form: one cell, `Old__Json` or `Old__GZip` (written by a type that had not
+opted in), split cells, continuation rows, or a blob reference `Old__blob`. A projection that names the
+renamed property returns it. A read moves nothing. The next save through the new type stores the value
+under the new column and drops the old cells and continuation rows with the replaced row; an offloaded
+value is uploaded again under the new column's blob name (a `TableBlobContent` is copied from the old
+blob), and the old blob is deleted after the new row has committed, subject to `CleanupGrace`.
+
 `Offload = BlobOffload.Never` forbids tier 3 below; a value that would need it throws
-`OversizedValueException` (a `SerializationException`). Its `ColumnName`, `EncodedBytes` and `Reason`
-describe the value, and `OffloadForbiddenByProperty` tells you which fix applies: `true` means blob offload
-is configured but this property forbids it (set its `Offload` to `BlobOffload.AboveThreshold`), `false`
-means no offload is configured (set `UnifiedTableStorageOptions.BlobOffload`). The message names that fix.
+`OversizedValueException` (a `SerializationException`). The same exception reports every entity that is
+too large to store: also one whose ordinary cells, which cannot leave the main row, exceed one entity.
+Its `ColumnName` (a column of the entity), `EncodedBytes` and `Reason` describe what does not fit, and
+its message ends with what to do. `OffloadForbiddenByProperty` is `true` when blob offload is configured
+and the property forbids it (set its `Offload` to `BlobOffload.AboveThreshold`). When it is `false`,
+follow the message: configure `UnifiedTableStorageOptions.BlobOffload` when a value needs a blob and no
+offload is configured; mark the large properties (or the class) `[TableValueSplit]`, or store less in
+one entity, when the cells that must stay on the main row are what does not fit.
 
 ### Tiers
 
@@ -562,13 +624,22 @@ For each opted-in property the smallest tier that fits is used:
 
 1. **Inline** - one cell, exactly as before, when the value fits.
 2. **Split** - cells `{Prop}__c0..cN` (strings in chunks of at most 32,000 chars, never splitting a
-   surrogate pair; `byte[]` as raw binary cells of at most 65,536 bytes), plus `{Prop}__chunks`,
-   `{Prop}__sha256`, `{Prop}__enc` and `{Prop}__len`. When the cells do not fit one row, the rest go to
-   continuation rows with RowKey `{RowKey}~0001`, `~0002`, ... in the same partition, written in **one**
-   entity-group transaction with the main row.
+   surrogate pair; `byte[]` as raw binary cells of at most 65,536 bytes), plus the four manifest cells
+   `{Prop}__chunks`, `{Prop}__sha256`, `{Prop}__enc` and `{Prop}__len`. When the cells do not fit one
+   row, the rest go to continuation rows with RowKey `{RowKey}~0001`, `~0002`, ... in the same partition,
+   written in **one** entity-group transaction with the main row.
 3. **Blob offload** - when the encoded value exceeds `BlobOffloadOptions.ThresholdBytes` (default
    3,145,728) or the row would not fit one transaction, the row holds only `{Prop}__blob` (reference
    JSON: path, sha256, length, content type, encoding) and the bytes live in an Azure Blob.
+
+Many opted-in values that each fit one cell can exceed one entity together (twenty strings of 30,000
+characters are 1.2&nbsp;MB). When the cells that must stay on the main row, which is every cell but the
+chunks of split values, exceed one entity (1,000,000 estimated bytes), the largest of the values that
+sit in one cell are stored in split form instead (one chunk and the manifest), only as many as it takes,
+so that their chunks can go to continuation rows; tier 3 then applies to them as to any split value. A
+row that fits one entity is stored exactly as before: every value in its own cell, one row, no manifest.
+A moved value keeps four cells on the main row where it had one, so the limit of 252 properties can be
+what stops it; the `OversizedValueException` then says so.
 
 "Fits one transaction" is measured as the SDK sends it, not only as the service stores it: the SDK
 JSON-escapes every non-ASCII character and `"`, `\`, `<`, `>`, `&`, `'`, `+` and `` ` `` as `\uXXXX`, so
