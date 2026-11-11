@@ -669,9 +669,11 @@ public sealed partial class InMemoryStorage<T>
     /// <summary>
     /// The entity an assembled row holds, its offloaded values downloaded outside the gate. A writer that
     /// replaces or deletes the row meanwhile can delete a blob the snapshot references: as in
-    /// TableStorage, the row is then read again and, when its version changed, the read retries from the
-    /// new version (at most <see cref="MaxLargeReadAttempts"/> attempts); an unchanged version is a genuine
-    /// integrity failure; a row deleted meanwhile is null.
+    /// TableStorage, the row is then read again after every failed attempt, the last included: an
+    /// unchanged version is a genuine integrity failure; a row deleted meanwhile is null; a changed
+    /// version retries the read from the new version after the writers' pause, and when the version
+    /// changed during each of the <see cref="MaxLargeReadAttempts"/> attempts the read throws
+    /// <see cref="ConcurrencyConflictException"/> with the last integrity failure as its inner exception.
     /// </summary>
     private async Task<T?> MaterializeAsync(StoredRow row, CancellationToken ct)
     {
@@ -685,7 +687,7 @@ public sealed partial class InMemoryStorage<T>
                 entity.Timestamp = row.Timestamp;
                 return entity;
             }
-            catch (TableValueIntegrityException) when (attempt < MaxLargeReadAttempts)
+            catch (TableValueIntegrityException failure)
             {
                 StoredRow? current;
                 lock (gate)
@@ -698,13 +700,17 @@ public sealed partial class InMemoryStorage<T>
                     return null;
                 if (current.Version == row.Version)
                     throw;
+                if (attempt >= MaxLargeReadAttempts)
+                    throw new ConcurrencyConflictException(
+                        ConcurrencyMessages.ReadKeptChanging(typeof(T).Name, keys.PartitionKey, keys.RowKey, MaxLargeReadAttempts), failure);
+                await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 row = current;
             }
         }
     }
 
     /// <summary>How many times a read whose blobs belonged to another version of the row is attempted in all (as TableStorage).</summary>
-    private const int MaxLargeReadAttempts = 3;
+    private const int MaxLargeReadAttempts = LargeValueTable.MaxWriteAttempts;
 
     private async Task<List<T>> MaterializeAllAsync(List<StoredRow> source, CancellationToken ct)
     {

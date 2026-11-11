@@ -78,19 +78,22 @@ public class ReadRetryTests
         await h.Table.Received(2).GetEntityIfExistsAsync<TableEntity>(Pk, Rk, Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
+    // Changed with CACHE-5 (ruling R5): it gave up after three attempts with TableValueIntegrityException.
+    // A read whose row changed during each attempt gets as many attempts as a write and then reports the
+    // lost races, not corruption.
     [Fact]
-    public async Task VersionKeepsChanging_GivesUpAfterThreeAttempts()
+    public async Task VersionKeepsChanging_GivesUpAfterFiveAttempts_WithAConcurrencyConflict()
     {
-        var v1 = SplitRows(new string('a', 600_000), "W/\"v1\"");
-        var v2 = SplitRows(new string('b', 600_000), "W/\"v2\"");
-        var v3 = SplitRows(new string('c', 600_000), "W/\"v3\"");
-        var v4 = SplitRows(new string('d', 600_000), "W/\"v4\"");
+        var versions = Enumerable.Range(1, 6).Select(i => SplitRows(new string((char)('a' + i), 600_000), $"W/\"v{i}\"")).ToList();
+        var parts = SplitRows(new string('z', 600_000), "W/\"v7\"");
         using var h = new StorageHarness<SplitTextEntity>();
-        PrimaryReads(h, v1[0], v2[0], v3[0], v4[0]);
-        PartQueries(h, [.. v4.Skip(1)]);
+        h.Store.LargeValueRetryDelay = (_, _) => Task.CompletedTask;
+        PrimaryReads(h, [.. versions.Select(v => v[0])]);
+        PartQueries(h, [.. parts.Skip(1)]);
 
-        await Assert.ThrowsAsync<TableValueIntegrityException>(() => h.Store.OneAsync(Id, Ct));
-        await h.Table.Received(3).GetEntityIfExistsAsync<TableEntity>(Pk, Rk, Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+        var conflict = await Assert.ThrowsAsync<ConcurrencyConflictException>(() => h.Store.OneAsync(Id, Ct));
+        Assert.IsType<TableValueIntegrityException>(conflict.InnerException);
+        await h.Table.Received(6).GetEntityIfExistsAsync<TableEntity>(Pk, Rk, Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]

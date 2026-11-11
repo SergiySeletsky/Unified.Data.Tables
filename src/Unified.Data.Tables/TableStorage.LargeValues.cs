@@ -562,17 +562,23 @@ public partial class TableStorage<T>
         return SplitRowLayout.Assemble(primary, parts);
     }
 
-    /// <summary>How many times a read whose parts or blobs belonged to another version of the row is attempted in all.</summary>
-    private const int MaxLargeReadAttempts = 3;
+    /// <summary>
+    /// How many times a read whose parts or blobs belonged to another version of the row is attempted in
+    /// all: as many as a write that keeps losing its condition (<see cref="LargeValueTable.MaxWriteAttempts"/>).
+    /// </summary>
+    private const int MaxLargeReadAttempts = LargeValueTable.MaxWriteAttempts;
 
     /// <summary>
     /// The logical row and entity <paramref name="primary"/> holds: continuation rows reassembled,
     /// offloaded values downloaded and verified. The primary is read before its parts and blobs, so a
     /// writer committing in between can make them belong to another version and fail verification. On
-    /// such a failure the primary is read again: an unchanged version is a genuine integrity failure and
-    /// throws; a changed one retries the whole read from the new version (at most
-    /// <see cref="MaxLargeReadAttempts"/> attempts); a row deleted meanwhile returns null. Data of two
-    /// versions is never combined.
+    /// such a failure the primary is read again, after every attempt including the last: an unchanged
+    /// version is a genuine integrity failure and throws <see cref="TableValueIntegrityException"/>; a row
+    /// deleted meanwhile returns null; a changed one retries the whole read from the new version, after the
+    /// writers' pause (<see cref="LargeValueTable.WaitBeforeRetryAsync"/>). When the version changed during
+    /// each of the <see cref="MaxLargeReadAttempts"/> attempts the read throws
+    /// <see cref="ConcurrencyConflictException"/> (the row kept changing; the read can be repeated), whose
+    /// inner exception is the last integrity failure. Data of two versions is never combined.
     /// </summary>
     private async Task<(TableEntity Row, T Entity)?> ReadLargeAsync(TableEntity primary, CancellationToken ct)
     {
@@ -583,15 +589,19 @@ public partial class TableStorage<T>
                 var row = await AssembleAsync(primary, ct);
                 return (row, await ToEntityAsync(row, ct));
             }
-            catch (TableValueIntegrityException) when (attempt < MaxLargeReadAttempts)
+            catch (TableValueIntegrityException failure)
             {
                 var current = await client.GetEntityIfExistsAsync<TableEntity>(primary.PartitionKey, primary.RowKey, cancellationToken: ct);
                 if (!current.HasValue || current.Value is null || SplitRowLayout.IsPartRow(current.Value))
                     return null;
                 if (current.Value.ETag == primary.ETag)
                     throw;
+                if (attempt >= MaxLargeReadAttempts)
+                    throw new ConcurrencyConflictException(
+                        ConcurrencyMessages.ReadKeptChanging(typeName, primary.PartitionKey, primary.RowKey, MaxLargeReadAttempts), failure);
                 logger.LogDebug("{Type} {PartitionKey}|{RowKey}: the row changed while it was read; reading it again",
                     typeName, primary.PartitionKey, primary.RowKey);
+                await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 primary = current.Value;
             }
         }
