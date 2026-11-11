@@ -727,10 +727,17 @@ If the constructor or a getter throws then, the exception is ignored, the column
 stand for that operation, and a later use tries again; it never makes the store treat the type as plain.
 Once the constructor succeeds, replaces and deletes release the blobs of members of runtime subtypes again
 (a blob that an operation during the failure did not release is left to the orphan sweep). A write of
-such a type may construct the entity too (and the declared type of an empty nested property), for each
-column of a `[TableValueSplit]` value below a nested object (or of a subclass written through a store of
-its base type) that the store has not resolved before, to learn whether a read returns that column into a
-large-value member (see the refused writes below). A builder partial update of such a type may construct
+such a type may construct the entity too (and the declared type of an empty nested property), once for
+each column of a `TableBlobContent`, and of a `[TableValueSplit]` value below a nested object (or of a
+subclass written through a store of its base type), that has not been resolved before, to learn whether a
+read returns that column into a large-value member (see the refused writes below). While that
+constructor or a getter throws, such a write of a value below a nested object, or of such a subclass,
+that needs split cells or a blob (every `TableBlobContent` does) is refused with `NotSupportedException`
+naming the column, before anything is uploaded or stored. It carries no inner exception; for an entity of
+the store's own type its message says that a read cannot create the object that owns the value. A value
+of one cell is written, and so is every top-level value of an entity of the store's own type, a file
+included. The failure is not remembered: write the entity again once the constructor succeeds. A
+builder partial update of such a type may construct
 the entity (and the declared type of an empty nested property on the updated path) once per column it
 names for the first time, to learn whether the column is a large value as a read would see it, and copies
 a cached entity it keeps warm once, as for a plain type. While that constructor or a getter throws, or an

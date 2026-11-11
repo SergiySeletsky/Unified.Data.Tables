@@ -364,9 +364,14 @@ Lossless storage of large values, opt-in per property.
   of its large-value columns, to learn the columns of the objects the constructor puts in its properties;
   an exception from the constructor or a getter is ignored (the declared columns stand for that operation)
   and a later use tries again, after which replaces and deletes release the blobs of members of runtime
-  subtypes again. A write of such a type may construct it for each column of a `[TableValueSplit]` value
-  below a nested object that is not resolved yet, to learn whether a read returns that column into a
-  large-value member. A builder partial update of such a type may construct it once per column it first
+  subtypes again. A write of such a type may construct it once for each column of a `TableBlobContent`,
+  and of a `[TableValueSplit]` value below a nested object or of a subclass written through a store of its
+  base type, that is not resolved yet, to learn whether a read returns that column into a large-value
+  member; while the constructor or a getter throws, such a write of a value below a nested object, or of
+  such a subclass, that needs split cells or a blob is refused with `NotSupportedException` before
+  anything is uploaded or stored (a value of one cell is written, and so is every top-level value of an
+  entity of the store's own type, a file included). A builder partial update of such a type may
+  construct it once per column it first
   names; while the constructor or a getter throws (or an object along the path cannot be created), a
   builder update that names a column not resolved before (a top-level one too) is refused with
   `NotSupportedException` before anything is written, because whether the column is a large value cannot

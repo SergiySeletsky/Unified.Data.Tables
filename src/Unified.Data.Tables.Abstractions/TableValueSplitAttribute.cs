@@ -39,10 +39,16 @@ namespace Unified.Data.Tables;
 /// type where there is none, and below an object of the declared type such a value that needs split cells
 /// or a blob is refused (below). The attribute still covers the entity's own string, <c>byte[]</c> and
 /// JSON-stored properties as above. The store of such an entity constructs it when it first needs the
-/// columns of the objects its constructor puts in those properties, and once for each column of such a
-/// member that a write or a builder update meets before it was resolved; it never constructs a type that
-/// is not large-value aware. A type that is not large-value aware refuses to store a value in such a
-/// member below a runtime subtype, whatever its size, with <see cref="System.NotSupportedException"/>.
+/// columns of the objects its constructor puts in those properties, once for each column a builder update
+/// names before it was resolved, and once for each column of a <see cref="TableBlobContent"/>, or of a
+/// <c>[TableValueSplit]</c> value below a nested object (or of a subclass written through a store of its
+/// base type), that a write meets before it was resolved; it never constructs a type that is not
+/// large-value aware. While that construction throws (the constructor or a getter fails), such a builder
+/// update is refused with <see cref="System.NotSupportedException"/>, and so is such a write of a value
+/// below a nested object, or of such a subclass, that needs split cells or a blob; a value of one cell, and
+/// a top-level value of an entity of the store's own type, are written. A type that is not large-value
+/// aware refuses to store a value in such a member below a runtime subtype, whatever its size, with
+/// <see cref="System.NotSupportedException"/>.
 /// </para>
 /// <para>
 /// A value too large for one cell is stored only where a read returns it into a large-value member of the
