@@ -1,4 +1,4 @@
-using System.Linq.Expressions;
+﻿using System.Linq.Expressions;
 using System.Reflection;
 using Unified.Data.Tables.Providers;
 
@@ -117,6 +117,8 @@ public class InterfaceInheritedMemberMatrixTests
         ("inherited two levels, nested", typeof(Nested<IInh2, AllImpl>), "W_Doc_Inner_Notes"),
         ("inherited through a generic interface, nested", typeof(Nested<IGen, AllImpl>), "W_Doc_Inner_Notes"),
         ("declared on two inherited interfaces, nested", typeof(Nested<ITwo, AllImpl>), "W_Doc_Inner_Notes"),
+        ("the same name with different types on two inherited interfaces, top-level", typeof(Top<IDiff, DiffImpl>), "Doc_Inner_Notes"),
+        ("the same name with different types on two inherited interfaces, nested", typeof(Nested<IDiff, DiffImpl>), "W_Doc_Inner_Notes"),
         ("the entity itself", typeof(SelfAll), "Inner_Notes"),
     ];
 
@@ -188,6 +190,41 @@ public class InterfaceInheritedMemberMatrixTests
         {
             TableEntitySerializer.OversizedCellPolicy = before;
         }
+    }
+
+    // Two inherited interfaces declare Inner with different types (the class implements one explicitly): the
+    // declared walk sees both, the type is aware, and the column is listed once.
+    public sealed class LeafOk2
+    {
+        [TableValueSplit(SplitEncoding.Text)]
+        public string? Notes { get; set; }
+    }
+
+    public interface IDiffA
+    {
+        LeafOk Inner { get; set; }
+    }
+
+    public interface IDiffB
+    {
+        LeafOk2 Inner { get; set; }
+    }
+
+    public interface IDiff : IDiffA, IDiffB
+    {
+    }
+
+    public sealed class DiffImpl : IDiff
+    {
+        public LeafOk Inner { get; set; } = new();
+        LeafOk2 IDiffB.Inner { get; set; } = new();
+    }
+
+    [Fact]
+    public void SameMemberNameWithDifferentTypesOnTwoInheritedInterfaces_IsAware_AndListsTheColumnOnce()
+    {
+        Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(Top<IDiff, DiffImpl>)));
+        Assert.Equal(["Doc_Inner_Notes"], TypeMetadataCache.LargeValueColumns(typeof(Top<IDiff, DiffImpl>)).Where(c => c.StartsWith("Doc", StringComparison.Ordinal)));
     }
 
     // The read target resolved through declared types (the path a type that is not aware takes).

@@ -2289,7 +2289,9 @@ internal static class TypeMetadataCache
             columns.Clear();
             ListNearestPaths(root, members, leads, columns);
         }
-        return new LargeValueInfo(true, columns.AsReadOnly());
+        // Two members of one name (an interface may inherit it from two interfaces, with different types) may
+        // lead to the same column: it is listed once.
+        return new LargeValueInfo(true, columns.Distinct(StringComparer.Ordinal).ToList().AsReadOnly());
     }
 
     // Every path through the types that lead to a large-value member, depth first in declaration
