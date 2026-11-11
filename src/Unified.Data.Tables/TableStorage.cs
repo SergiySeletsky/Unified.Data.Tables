@@ -780,6 +780,20 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         await EnsureTableAsync(ct);
 
+        // A type with large values refuses a reserved or unsplittable key before any entity is stamped
+        // (as InMemoryStorage does), so a refused batch leaves the caller's entities as they were.
+        if (LargeValueAware)
+        {
+            foreach (var entity in entities)
+            {
+                if (entity is not null && !string.IsNullOrWhiteSpace(entity.Id))
+                {
+                    var (pk, rk) = GetEntityKeys(NormalizeId(entity.Id));
+                    SplitRowLayout.ValidateKeys(pk, rk);
+                }
+            }
+        }
+
         var now = DateTimeOffset.UtcNow;
         var rows = new List<(string Partition, string Id, TableEntity Row)>(entities.Count);
         foreach (var entity in entities)
