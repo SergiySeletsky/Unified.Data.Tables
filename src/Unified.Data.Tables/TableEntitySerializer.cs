@@ -77,20 +77,37 @@ public static class TableEntitySerializer
         ArgumentNullException.ThrowIfNull(ctx);
         if (pending is null && ctx.Offload is not null)
             throw new ArgumentNullException(nameof(pending), "A write with blob offload must collect its pending blobs.");
-        return Build(root, partitionKey, rowKey, persistType: false, ctx, pending, plainEntry: false);
+        return Build(root, partitionKey, rowKey, persistType: false, ctx, pending, plainEntry: false, ctx.ReadType);
+    }
+
+    /// <summary>
+    /// The plain serializer as a store of <paramref name="storeType"/> writes <paramref name="root"/>: a
+    /// read of the row creates a <paramref name="storeType"/>. When that type is not large-value aware,
+    /// every large-value member met in the graph is refused, also one that only the runtime type of
+    /// <paramref name="root"/> (a subclass of <paramref name="storeType"/>) declares.
+    /// </summary>
+    internal static TableEntity ToPlainTableEntity(object root, string partitionKey, string rowKey, Type storeType)
+    {
+        ArgumentNullException.ThrowIfNull(storeType);
+        return Build(root, partitionKey, rowKey, persistType: false, ValueWriteContext.Public, pending: null, plainEntry: true, storeType);
     }
 
     // plainEntry: the public serializer, which every store of a type that is not large-value aware writes
-    // through. For a root whose runtime type is not aware it refuses every large-value member it meets.
+    // through. For a root whose read type is not aware it refuses every large-value member it meets.
+    // readType: the type a read of the row creates (the store's entity type); the runtime type when null.
     private static TableEntity Build(
-        object root, string partitionKey, string rowKey, bool persistType, ValueWriteContext ctx, List<PendingBlob>? pending, bool plainEntry)
+        object root, string partitionKey, string rowKey, bool persistType, ValueWriteContext ctx, List<PendingBlob>? pending, bool plainEntry,
+        Type? readType = null)
     {
         var entity = new TableEntity(partitionKey, rowKey);
         if (root == null) return entity;
 
         var rootType = root.GetType();
-        var plainRoot = plainEntry && !TypeMetadataCache.IsLargeValueAware(rootType) ? rootType : null;
-        var flat = Flatten(root, persistType, new FlattenState(ctx, pending, Partial: false, partitionKey, rowKey, rootType, plainRoot));
+        readType ??= rootType;
+        var plainRoot = plainEntry && !TypeMetadataCache.IsLargeValueAware(readType) ? readType : null;
+        // A subclass written through a store of its base type: a read creates the base type.
+        var subclass = readType != rootType ? rootType : null;
+        var flat = Flatten(root, persistType, new FlattenState(ctx, pending, Partial: false, partitionKey, rowKey, readType, plainRoot, subclass));
         foreach (var kv in flat)
             entity[kv.Key] = kv.Value;
 
@@ -158,6 +175,28 @@ public static class TableEntitySerializer
                "as one plain row and can neither split, offload nor read back such a value, whatever its size. " +
                $"Mark {root.Name} with [TableValueSplit], or {declare}, so that {root.Name} is large-value aware by its declared types. " +
                "Nothing was serialized.";
+    }
+
+    /// <summary>
+    /// The message for a large value in <paramref name="column"/> of <paramref name="runtimeType"/>, an
+    /// instance written through a store of its base type <paramref name="storeType"/>, whose reads create a
+    /// <paramref name="storeType"/>. <paramref name="plainStore"/>: <paramref name="storeType"/> is not
+    /// large-value aware (its store refuses every large-value form); otherwise the value needs split cells
+    /// or a blob in a column a read of <paramref name="storeType"/> maps to no property.
+    /// </summary>
+    internal static string SubclassThroughBaseStoreRefusal(Type runtimeType, Type storeType, string column, bool plainStore)
+    {
+        var why = plainStore
+            ? $"{storeType.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity as one " +
+              "plain row and can neither split, offload nor read back such a value, whatever its size"
+            : $"the value needs split cells or a blob, and a read through that store creates a {storeType.Name}, which maps no property " +
+              $"to '{column}': the value would never be read back, and the next save of the entity would drop it";
+        var remedy = TypeMetadataCache.IsLargeValueAware(runtimeType)
+            ? $"Store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> (a store of the runtime type)"
+            : $"Mark {runtimeType.Name} with [TableValueSplit] and store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> " +
+              "(a store of the runtime type)";
+        return $"'{column}' of {runtimeType.Name} is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. This " +
+               $"{runtimeType.Name} is written through an IStorage<{storeType.Name}>, and {why}. {remedy}. Nothing was stored.";
     }
 
     /// <summary>The message for a large value reached by a partial (Merge) update.</summary>
@@ -811,7 +850,9 @@ public static class TableEntitySerializer
             // it); a partial update refuses the member as it does for any type, with this message.
             if (state.PlainRoot is { } plainRoot && (childVal is not null || state.Partial)
                 && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
-                throw new NotSupportedException(PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name));
+                throw new NotSupportedException(state.Subclass is { } subclass
+                    ? SubclassThroughBaseStoreRefusal(subclass, plainRoot, string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name)), plainStore: true)
+                    : PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name));
             if (state.Partial && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
                 throw new NotSupportedException(
                     PartialUpdateRefusal(string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name))));
@@ -965,11 +1006,14 @@ public static class TableEntitySerializer
 /// update (which must refuse large values), the row keys blob names are built from, the type of
 /// the object being flattened (the type a read of the row materializes; null for a partial update), and,
 /// for the plain serializer over an entity type that is not large-value aware, that type
-/// (<paramref name="PlainRoot"/>: every large-value member met in the graph is refused).
+/// (<paramref name="PlainRoot"/>: every large-value member met in the graph is refused), and the runtime type
+/// of the object being flattened when it is a subclass of <paramref name="RootType"/> written through a store
+/// of that type (<paramref name="Subclass"/>: a large value in a column a read of <paramref name="RootType"/>
+/// maps to no property is refused).
 /// </summary>
 internal readonly record struct FlattenState(
     ValueWriteContext Ctx, List<PendingBlob>? Pending, bool Partial, string PartitionKey, string RowKey, Type? RootType = null,
-    Type? PlainRoot = null)
+    Type? PlainRoot = null, Type? Subclass = null)
 {
     /// <summary>
     /// Records a blob to upload before the entity write. Only a context with blob offload produces one,
@@ -1363,11 +1407,17 @@ internal sealed class TableEntityValue
 
     // A large value is stored outside the cell of its property (split cells, continuation rows, a blob),
     // so a read must map its column back to that property: a value below an object whose runtime type a
-    // read does not recreate would be stored and then left out of every read. A top-level column always
-    // maps (the entity type has the property), and a clone is read back from the same object.
+    // read does not recreate would be stored and then left out of every read. A top-level column maps when
+    // the object written is of the type a read creates (that type has the property); a subclass written
+    // through a store of its base type may declare columns the base type does not read. A clone is read
+    // back from the same object.
     private void RefuseUnreadable(FlattenState? state, string columnName)
     {
-        if (Path.Count < 2 || state is not { RootType: { } root, Ctx.IsClone: false })
+        if (state is not { RootType: { } root, Ctx.IsClone: false } st)
+            return;
+        if (st.Subclass is { } subclass && !TypeMetadataCache.ReadsBack(root, Path[0]))
+            throw new NotSupportedException(TableEntitySerializer.SubclassThroughBaseStoreRefusal(subclass, root, columnName, plainStore: false));
+        if (Path.Count < 2)
             return;
         if (!TypeMetadataCache.ReadsBack(root, columnName, out var unresolved))
             throw new NotSupportedException(unresolved

@@ -82,7 +82,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         // table name TableStorage<T> would resolve, so blob names match the real store's.
         var tableName = opts.TableNameResolver?.Invoke(typeof(T));
         large = new LargeValueTable(string.IsNullOrWhiteSpace(tableName) ? typeof(T).Name : tableName,
-            opts.BlobOffload, opts.BlobOffload is null ? null : Blobs);
+            opts.BlobOffload, opts.BlobOffload is null ? null : Blobs, typeof(T));
     }
 
     /// <summary>The offloaded-value blobs of this store (for tests); empty when blob offload is not configured.</summary>
@@ -699,6 +699,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         if (LargeValueAware)
             return WriteBatchLargeAsync(prepared, upsert, ct);
 
+        // Every entity is serialized before the first is stored, as TableStorage<T> serializes the whole
+        // batch before it sends it: an entity the serializer refuses fails the batch with nothing written.
+        var serialized = prepared.ConvertAll(p => Serialize(p.Keys, p.Entity));
         lock (gate)
         {
             if (!upsert)
@@ -712,8 +715,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
                         new RequestFailedException(409, $"The specified entity already exists. Id: {duplicate.Entity.Id}"));
             }
 
-            foreach (var (keys, entity) in prepared)
-                Store(keys, entity);
+            for (var i = 0; i < prepared.Count; i++)
+                Store(prepared[i].Keys, serialized[i]);
         }
 
         return Task.FromResult(prepared.Count);
@@ -746,15 +749,19 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         rows.OrderBy(kv => kv.Key.PartitionKey, StringComparer.Ordinal)
             .ThenBy(kv => kv.Key.RowKey, StringComparer.Ordinal);
 
-    private StoredRow Store((string PartitionKey, string RowKey) keys, T entity)
+    private StoredRow Store((string PartitionKey, string RowKey) keys, T entity) =>
+        Store(keys, Serialize(keys, entity));
+
+    private StoredRow Store((string PartitionKey, string RowKey) keys, TableEntity serialized)
     {
-        var row = new StoredRow(
-            entity.ToTableEntity(keys.PartitionKey, keys.RowKey),
-            ++versionCounter,
-            DateTimeOffset.UtcNow);
+        var row = new StoredRow(serialized, ++versionCounter, DateTimeOffset.UtcNow);
         rows[keys] = row;
         return row;
     }
+
+    // The plain path, as TableStorage<T> serializes it: the row a read of a T comes from.
+    private static TableEntity Serialize((string PartitionKey, string RowKey) keys, T entity) =>
+        LargeValueRows.ToPlainTableEntity(entity, keys.PartitionKey, keys.RowKey, typeof(T));
 
     private static T Materialize(StoredRow row)
     {

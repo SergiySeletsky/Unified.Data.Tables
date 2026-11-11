@@ -32,6 +32,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     internal Action<string, string>? BlobMissing { get; set; }
 
     /// <summary>
+    /// The store's entity type, the type a read of every row creates; null: the runtime type of the entity
+    /// written. A subclass written through the store is refused a large value in a column this type does not read.
+    /// </summary>
+    internal Type? EntityType { get; set; }
+
+    /// <summary>
     /// <c>{table}/{partitionKey}/{rowKey}/{column}/{sha256}</c>, each segment escaped by
     /// <see cref="OffloadBlobNames.EscapeSegment"/> (so no segment is ever <c>.</c>, <c>..</c> or empty).
     /// </summary>
@@ -202,7 +208,7 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         {
             var pending = new List<PendingBlob>();
             var inline = new List<InlineValue>();
-            var ctx = new ValueWriteContext(options, tableName, force, IsClone: false) { ForceSplit = split, Inline = inline };
+            var ctx = new ValueWriteContext(options, tableName, force, IsClone: false) { ForceSplit = split, Inline = inline, ReadType = EntityType };
             var row = TableEntitySerializer.ToTableEntity(entity, pk, rk, ctx, pending);
             if (SplitRowLayout.TryPlan(row, out var overflow) is not { } plan)
             {

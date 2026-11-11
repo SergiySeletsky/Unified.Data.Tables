@@ -110,6 +110,27 @@ public sealed class LargeValueTable
     internal void OnBlobMissing(Action<string, string> forget) => coordinator.BlobMissing = forget;
 
     /// <summary>
+    /// Storage-provider SPI, not for application code. Creates the large-value rules of the table
+    /// <paramref name="tableName"/> for a store of <paramref name="entityType"/>: a read of every row creates
+    /// that type, so the write of a subclass instance through the store is refused (with
+    /// <see cref="NotSupportedException"/>, before anything is uploaded or written) a value it would store as
+    /// split cells or a blob in a column <paramref name="entityType"/> maps to no property.
+    /// </summary>
+    /// <param name="tableName">The store's resolved table name, the first segment of every blob name.</param>
+    /// <param name="options">The blob offload settings; null when blob offload is not configured.</param>
+    /// <param name="blobs">The blob store; ignored (treated as null) when <paramref name="options"/> is null.</param>
+    /// <param name="entityType">The store's entity type.</param>
+    /// <exception cref="ArgumentException"><paramref name="tableName"/> is null or whitespace.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="entityType"/> is null.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public LargeValueTable(string tableName, BlobOffloadOptions? options, IOffloadBlobStore? blobs, Type entityType)
+        : this(tableName, options, blobs)
+    {
+        ArgumentNullException.ThrowIfNull(entityType);
+        coordinator.EntityType = entityType;
+    }
+
+    /// <summary>
     /// Storage-provider SPI, not for application code. True when <paramref name="entityType"/> has a
     /// member that may be stored as split cells, continuation rows or a blob.
     /// </summary>

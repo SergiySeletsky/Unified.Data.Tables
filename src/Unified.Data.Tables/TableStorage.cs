@@ -132,7 +132,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         tableName = ResolveTableName(opts);
         client = serviceClient.GetTableClient(tableName);
         tableInitializer = new TableInitializer(client);
-        large = new LargeValueTable(tableName, opts.BlobOffload, blobs);
+        large = new LargeValueTable(tableName, opts.BlobOffload, blobs, typeof(T));
         large.OnBlobMissing(ForgetRowWithMissingBlob);
     }
 
@@ -197,7 +197,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             return entity;
         }
 
-        var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
+        var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
         Response addResponse;
         try
         {
@@ -834,7 +834,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
             var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
             // A split-aware entity is serialized by its own per-entity write below.
-            rows.Add((partitionKey, entity.Id, LargeValueAware ? null! : entity.ToTableEntity(partitionKey, rowKey)));
+            rows.Add((partitionKey, entity.Id, LargeValueAware ? null! : TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T))));
         }
 
         try
@@ -1116,7 +1116,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             return entity;
         }
 
-        var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
+        var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
 
         try
         {
@@ -1174,7 +1174,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             return entity;
         }
 
-        var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
+        var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
         Response upsertResponse;
         try
         {

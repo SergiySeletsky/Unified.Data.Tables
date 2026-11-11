@@ -38,6 +38,25 @@ public static class LargeValueRows
         TableEntitySerializer.FlattenProperty(ownerType, columnPath, value);
 
     /// <summary>
+    /// Storage-provider SPI, not for application code. Serializes <paramref name="entity"/> as a store of
+    /// <paramref name="storeType"/> writes it on the plain path (one row, no large-value form): what
+    /// <see cref="TableEntitySerializer.ToTableEntity(object, string, string, bool)"/> writes, except that
+    /// the type a read of the row creates is <paramref name="storeType"/>, not the runtime type of
+    /// <paramref name="entity"/>. When <paramref name="storeType"/> is not large-value aware, a value in a
+    /// large-value member is refused wherever it is met, also in a member only a subclass declares.
+    /// </summary>
+    /// <param name="entity">The entity to write: an instance of <paramref name="storeType"/> or of a subclass.</param>
+    /// <param name="partitionKey">Its partition key.</param>
+    /// <param name="rowKey">Its row key.</param>
+    /// <param name="storeType">The store's entity type.</param>
+    /// <returns>The row.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="storeType"/> is null.</exception>
+    /// <exception cref="NotSupportedException">The entity holds a value the plain path cannot store.</exception>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public static TableEntity ToPlainTableEntity(object entity, string partitionKey, string rowKey, Type storeType) =>
+        TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, storeType);
+
+    /// <summary>
     /// Storage-provider SPI, not for application code. True when <paramref name="item"/> holds a
     /// <see cref="TableBlobContent"/> in a flattened column (it needs a blob upload to be written).
     /// </summary>

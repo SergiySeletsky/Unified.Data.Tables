@@ -30,6 +30,13 @@ internal sealed record ValueWriteContext(
     /// </summary>
     public ICollection<InlineValue>? Inline { get; init; }
 
+    /// <summary>
+    /// The type a read of the row creates: the store's entity type. A subclass written through a store of
+    /// its base type is refused a large value in a column that type maps to no property. Null: the
+    /// runtime type of the object written.
+    /// </summary>
+    public Type? ReadType { get; init; }
+
     /// <summary>The public serializer API: no offload, not a clone; split values form an unbounded bag.</summary>
     public static ValueWriteContext Public { get; } = new(null, null, NoColumns, false);
 
