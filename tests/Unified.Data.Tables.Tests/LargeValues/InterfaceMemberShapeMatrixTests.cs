@@ -15,17 +15,19 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// <para>
 /// The member <c>Inner</c> (or <c>Item</c>) of the interface the property <c>Doc</c> is declared as: get/set, get-only,
 /// set-only, init, [IgnoreDataMember], implemented by a get-only or an [IgnoreDataMember] class property (which the
-/// writer does not store), a default body, an explicit implementation beside a public member, an explicit
+/// writer does not store), implemented by a struct, a default body, an explicit implementation beside a public member, an explicit
 /// implementation only, an explicit implementation in a derived interface, re-declared with <c>new</c> and the same
-/// type, re-declared with <c>new</c> and another type, inherited one and two levels, get-only inherited two levels, from
-/// two bases with the same type, from two bases with different types (both orders, and with the marked one get-only),
-/// generic, generic inherited, covariant, covariant inherited, and an own indexer beside an inherited member of the same
-/// name and type. Each below a top-level and a nested property, in three families: (A) a correctly marked value below
-/// the member (large-value aware, its column listed once, the whole-entity write stores it and every read returns it,
-/// no builder update writes it), (B) the misused attribute of ruling R11 below it (opts nothing in, a whole-entity write
-/// reports it where the class stores the member, every builder update is refused with the misuse), (P) an ordinary value
-/// below it (rule 2: the plain path, no user code, the same cells). Then the plain-store refusal message (a member the
-/// interface lacks; a nullable struct below six shapes) and the class-owner controls.
+/// type, re-declared with <c>new</c> and another type, inherited one and two levels, get-only inherited two levels, a
+/// diamond, from two bases with the same type, from two bases with different types (both orders, and with the leaf's
+/// one get-only), generic, generic inherited, covariant, covariant inherited, an own indexer beside an inherited member
+/// of the same name and type, and two interface levels that are each get-only. Each below a top-level and a nested
+/// property, in four families: (A) a correctly marked value below the member (large-value aware, its column listed
+/// once, the whole-entity write stores it and every read returns it, no builder update writes it), (T) a
+/// <see cref="TableBlobContent"/> below the member or in it (the same decisions), (B) the misused attribute of ruling
+/// R11 below it (opts nothing in, a whole-entity write reports it where the class stores the member, every builder
+/// update is refused with the misuse), (P) an ordinary value below it (rule 2: the plain path, no user code, the same
+/// cells). Then the plain-store refusal messages (a member the interface lacks; a nullable struct below six shapes;
+/// an interface-typed property with no instance), each named declaration followed, and the class-owner controls.
 /// </para>
 /// </summary>
 [Collection("OversizedCellPolicy")]
@@ -96,6 +98,9 @@ public class InterfaceMemberShapeMatrixTests
     public interface IInherited2A : IInherited1A { }
     public interface IGetOnly1A : IGetOnlyA { }
     public interface IGetOnly2A : IGetOnly1A { }
+    public interface IDiamondLeftA : IGetOnlyA { }
+    public interface IDiamondRightA : IGetOnlyA { }
+    public interface IDiamondA : IDiamondLeftA, IDiamondRightA { }
     public interface IGetSetSecondA { LeafA Inner { get; set; } }
     public interface ITwoSameA : IGetSetA, IGetSetSecondA { }
     public interface IOtherBaseA { OtherA Inner { get; set; } }
@@ -106,15 +111,26 @@ public class InterfaceMemberShapeMatrixTests
     public interface IBoxInheritedA : IBox<LeafA> { }
     public interface IItemBaseA { LeafA Item { get; set; } }
     public interface IItemA : IItemBaseA { LeafA this[int index] { get; } }
+    public interface IMidA { LeafA Inner { get; } }
+    public interface IOuterA { IMidA Mid { get; } }
 
     public sealed class ImplA : IGetSetA, IGetOnly2A, ISetOnlyA, IIgnoredA, IDefaultBodyA, IExplicitInInterfaceA, INewSameA, IInherited2A,
-        ITwoSameA, IGenInheritedA, IBoxInheritedA
+        IDiamondA, ITwoSameA, IGenInheritedA, IBoxInheritedA
     {
         public LeafA Inner { get; set; } = new();
     }
 
     public sealed class InitImplA : IInitA { public LeafA Inner { get; init; } = new(); }
     public sealed class GetOnlyImplA : IGetOnlyA { public LeafA Inner { get; } = new(); }
+
+    public struct StructImplA : IGetOnlyA
+    {
+        public StructImplA()
+        {
+        }
+
+        public LeafA Inner { get; set; } = new();
+    }
     public sealed class IgnoredImplA : IGetSetA { [IgnoreDataMember] public LeafA Inner { get; set; } = new(); }
 
     public sealed class ExplicitImplA : IExplicitA
@@ -142,6 +158,62 @@ public class InterfaceMemberShapeMatrixTests
         public LeafA Item { get; set; } = new();
         LeafA IItemA.this[int index] => Item;
     }
+
+    public sealed class MidImplA : IMidA { public LeafA Inner { get; set; } = new(); }
+    public sealed class OuterImplA : IOuterA { public IMidA Mid { get; set; } = new MidImplA(); }
+
+    // ── Family T: a TableBlobContent below the member (or the member typed TableBlobContent) ─────────────────
+
+    public sealed class BlobLeafT
+    {
+        public TableBlobContent? File { get; set; }
+    }
+
+    public sealed class OtherT
+    {
+        public object? File { get; set; }
+    }
+
+    public interface IGetSetT { BlobLeafT Inner { get; set; } }
+    public interface IGetOnlyT { BlobLeafT Inner { get; } }
+    public interface ISetOnlyT { BlobLeafT Inner { set; } }
+    public interface IIgnoredT { [IgnoreDataMember] BlobLeafT Inner { get; set; } }
+    public interface IDefaultBodyT { BlobLeafT Inner => new(); }
+    public interface INewSameT : IGetSetT { new BlobLeafT Inner { get; } }
+    public interface IGetOnly1T : IGetOnlyT { }
+    public interface IGetOnly2T : IGetOnly1T { }
+    public interface IOtherBaseT { OtherT Inner { get; set; } }
+    public interface ITwoOtherFirstGetOnlyT : IOtherBaseT, IGetOnlyT { }
+    public interface IItemBaseT { BlobLeafT Item { get; set; } }
+    public interface IItemT : IItemBaseT { BlobLeafT this[int index] { get; } }
+
+    public interface IFileGetSetT { TableBlobContent? File { get; set; } }
+    public interface IFileGetOnlyT { TableBlobContent? File { get; } }
+    public interface IFileSetOnlyT { TableBlobContent? File { set; } }
+    public interface IFileIgnoredT { [IgnoreDataMember] TableBlobContent? File { get; set; } }
+    public interface IFileGetOnly1T : IFileGetOnlyT { }
+    public interface IFileGetOnly2T : IFileGetOnly1T { }
+
+    public sealed class ImplT : IGetSetT, IGetOnly2T, ISetOnlyT, IIgnoredT, IDefaultBodyT, INewSameT, IBox<BlobLeafT>
+    {
+        public BlobLeafT Inner { get; set; } = new();
+    }
+
+    public sealed class TwoImplT : ITwoOtherFirstGetOnlyT
+    {
+        public BlobLeafT Inner { get; set; } = new();
+        OtherT IOtherBaseT.Inner { get; set; } = new();
+    }
+
+    public sealed class ItemImplT : IItemT
+    {
+        public BlobLeafT Item { get; set; } = new();
+        BlobLeafT IItemT.this[int index] => Item;
+    }
+
+    public sealed class FileImplT : IFileGetSetT, IFileGetOnly2T, IFileSetOnlyT, IFileIgnoredT { public TableBlobContent? File { get; set; } }
+
+    public sealed class BoxFileImplT : IBox<TableBlobContent?> { public TableBlobContent? Inner { get; set; } }
 
     // ── Family B: the misused attribute (R11) below the member ───────────────────────────────────────────
 
@@ -176,6 +248,9 @@ public class InterfaceMemberShapeMatrixTests
     public interface IInherited2B : IInherited1B { }
     public interface IGetOnly1B : IGetOnlyB { }
     public interface IGetOnly2B : IGetOnly1B { }
+    public interface IDiamondLeftB : IGetOnlyB { }
+    public interface IDiamondRightB : IGetOnlyB { }
+    public interface IDiamondB : IDiamondLeftB, IDiamondRightB { }
     public interface IGetSetSecondB { MarkedB Inner { get; set; } }
     public interface ITwoSameB : IGetSetB, IGetSetSecondB { }
     public interface IOtherBaseB { OtherB Inner { get; set; } }
@@ -186,15 +261,26 @@ public class InterfaceMemberShapeMatrixTests
     public interface IBoxInheritedB : IBox<MarkedB> { }
     public interface IItemBaseB { MarkedB Item { get; set; } }
     public interface IItemB : IItemBaseB { MarkedB this[int index] { get; } }
+    public interface IMidB { MarkedB Inner { get; } }
+    public interface IOuterB { IMidB Mid { get; } }
 
     public sealed class ImplB : IGetSetB, IGetOnly2B, ISetOnlyB, IIgnoredB, IDefaultBodyB, IExplicitInInterfaceB, INewSameB, IInherited2B,
-        ITwoSameB, IGenInheritedB, IBoxInheritedB
+        IDiamondB, ITwoSameB, IGenInheritedB, IBoxInheritedB
     {
         public MarkedB Inner { get; set; } = new();
     }
 
     public sealed class InitImplB : IInitB { public MarkedB Inner { get; init; } = new(); }
     public sealed class GetOnlyImplB : IGetOnlyB { public MarkedB Inner { get; } = new(); }
+
+    public struct StructImplB : IGetOnlyB
+    {
+        public StructImplB()
+        {
+        }
+
+        public MarkedB Inner { get; set; } = new();
+    }
     public sealed class IgnoredImplB : IGetSetB { [IgnoreDataMember] public MarkedB Inner { get; set; } = new(); }
 
     public sealed class ExplicitImplB : IExplicitB
@@ -222,6 +308,9 @@ public class InterfaceMemberShapeMatrixTests
         public MarkedB Item { get; set; } = new();
         MarkedB IItemB.this[int index] => Item;
     }
+
+    public sealed class MidImplB : IMidB { public MarkedB Inner { get; set; } = new(); }
+    public sealed class OuterImplB : IOuterB { public IMidB Mid { get; set; } = new MidImplB(); }
 
     // Class owners keep the writer's rule for what is a column; the R11 walk still follows every member a path names.
     public sealed class OwnerGetOnlyB { public MarkedB Inner { get; } = new(); }
@@ -259,6 +348,9 @@ public class InterfaceMemberShapeMatrixTests
     public interface IInherited2P : IInherited1P { }
     public interface IGetOnly1P : IGetOnlyP { }
     public interface IGetOnly2P : IGetOnly1P { }
+    public interface IDiamondLeftP : IGetOnlyP { }
+    public interface IDiamondRightP : IGetOnlyP { }
+    public interface IDiamondP : IDiamondLeftP, IDiamondRightP { }
     public interface IGetSetSecondP { LeafP Inner { get; set; } }
     public interface ITwoSameP : IGetSetP, IGetSetSecondP { }
     public interface IOtherBaseP { OtherP Inner { get; set; } }
@@ -269,10 +361,12 @@ public class InterfaceMemberShapeMatrixTests
     public interface IBoxInheritedP : IBox<LeafP> { }
     public interface IItemBaseP { LeafP Item { get; set; } }
     public interface IItemP : IItemBaseP { LeafP this[int index] { get; } }
+    public interface IMidP { LeafP Inner { get; } }
+    public interface IOuterP { IMidP Mid { get; } }
 
     // Every constructor and getter of the implementing classes counts as user code run.
     public sealed class ImplP : IGetSetP, IGetOnly2P, ISetOnlyP, IIgnoredP, IDefaultBodyP, IExplicitInInterfaceP, INewSameP, IInherited2P,
-        ITwoSameP, IGenInheritedP, IBoxInheritedP
+        IDiamondP, ITwoSameP, IGenInheritedP, IBoxInheritedP
     {
         private LeafP _inner = new();
         public ImplP() => PlainCode.Runs++;
@@ -284,6 +378,13 @@ public class InterfaceMemberShapeMatrixTests
         private readonly LeafP _inner = new();
         public InitImplP() => PlainCode.Runs++;
         public LeafP Inner { get { PlainCode.Runs++; return _inner; } init => _inner = value; }
+    }
+
+    public struct StructImplP : IGetOnlyP
+    {
+        private LeafP _inner = new();
+        public StructImplP() => PlainCode.Runs++;
+        public LeafP Inner { readonly get { PlainCode.Runs++; return _inner; } set => _inner = value; }
     }
 
     public sealed class GetOnlyImplP : IGetOnlyP
@@ -343,86 +444,109 @@ public class InterfaceMemberShapeMatrixTests
         LeafP IItemP.this[int index] => Item;
     }
 
+    public sealed class MidImplP : IMidP
+    {
+        private LeafP _inner = new();
+        public MidImplP() => PlainCode.Runs++;
+        public LeafP Inner { get { PlainCode.Runs++; return _inner; } set => _inner = value; }
+    }
+
+    public sealed class OuterImplP : IOuterP
+    {
+        private IMidP _mid = new MidImplP();
+        public OuterImplP() => PlainCode.Runs++;
+        public IMidP Mid { get { PlainCode.Runs++; return _mid; } set => _mid = value; }
+    }
+
     // ── The catalogue ──────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// One shape: the declared type of <c>Doc</c>, the class a new holder puts there, the member the path names,
-    /// whether that class stores the member (the implementing class decides: the writer writes the public properties of
-    /// the runtime class with a getter and a setter and no [IgnoreDataMember], so an explicit implementation alone, a
-    /// get-only class property or an ignored one stores nothing, as for every type), and whether a path expression
-    /// can be built through the member (it cannot read through a set-only member: no C# lambda compiles, CS0154, and
-    /// <see cref="Expression.Property(Expression, PropertyInfo)"/> refuses to read through it; only a key of
-    /// <see cref="UpdateBuilder{T}.Updates"/> names it).
+    /// One shape: the declared type of <c>Doc</c>, the class a new holder puts there, the path from <c>Doc</c> to the
+    /// value, whether that class stores the member (the implementing class decides: the writer writes the public
+    /// properties of the runtime class with a getter and a setter and no [IgnoreDataMember], so an explicit
+    /// implementation alone, a get-only class property or an ignored one stores nothing, as for every type), and whether
+    /// a path expression can be built through the member (it cannot read through a set-only member: no C# lambda
+    /// compiles, CS0154, and <see cref="Expression.Property(Expression, PropertyInfo)"/> refuses to read through it; only
+    /// a key of <see cref="UpdateBuilder{T}.Updates"/> names it).
     /// </summary>
-    public sealed record Shape(string Name, Type Declared, Type Impl, string Member = "Inner", bool Stored = true, bool Expression = true);
+    public sealed record Shape(string Name, Type Declared, Type Impl, string Path = "Inner_Notes", bool Stored = true, bool Expression = true);
 
-    private static Shape[] Catalogue(
-        Type getSet, Type getOnly, Type setOnly, Type init, Type ignored, Type defaultBody, Type @explicit, Type explicitOnly,
-        Type explicitInInterface, Type newSame, Type newOther, Type inherited1, Type inherited2, Type getOnly2, Type twoSame,
-        Type twoMarkedFirst, Type twoOtherFirst, Type twoOtherFirstGetOnly, Type leaf, Type genInherited, Type boxInherited, Type item,
-        Type impl, Type initImpl, Type getOnlyImpl, Type ignoredImpl, Type explicitImpl, Type explicitOnlyImpl, Type newOtherImpl, Type twoImpl,
-        Type itemImpl) =>
+    // The shapes of a family, each type named by its shape and the family's suffix.
+    private static Shape[] Catalogue(string family, Type leaf)
+    {
+        Type Of(string name) => typeof(InterfaceMemberShapeMatrixTests).GetNestedType(name + family)
+            ?? throw new InvalidOperationException($"No type {name}{family}.");
+        return
+        [
+            new("get/set", Of("IGetSet"), Of("Impl")),
+            new("get-only", Of("IGetOnly"), Of("Impl")),
+            new("set-only", Of("ISetOnly"), Of("Impl"), Expression: false),
+            new("init", Of("IInit"), Of("InitImpl")),
+            new("[IgnoreDataMember]", Of("IIgnored"), Of("Impl")),
+            new("get-only, implemented by a get-only property", Of("IGetOnly"), Of("GetOnlyImpl"), Stored: false),
+            new("get-only, implemented by a struct", Of("IGetOnly"), Of("StructImpl")),
+            new("get/set, implemented by an [IgnoreDataMember] property", Of("IGetSet"), Of("IgnoredImpl"), Stored: false),
+            new("a default body (get-only)", Of("IDefaultBody"), Of("Impl")),
+            new("an explicit implementation beside a public member", Of("IExplicit"), Of("ExplicitImpl")),
+            new("an explicit implementation only", Of("IExplicitOnly"), Of("ExplicitOnlyImpl"), Stored: false),
+            new("an explicit implementation in a derived interface", Of("IExplicitInInterface"), Of("Impl")),
+            new("re-declared with new and the same type (get-only)", Of("INewSame"), Of("Impl")),
+            new("re-declared with new and another type", Of("INewOther"), Of("NewOtherImpl")),
+            new("inherited one level", Of("IInherited1"), Of("Impl")),
+            new("inherited two levels", Of("IInherited2"), Of("Impl")),
+            new("get-only, inherited two levels", Of("IGetOnly2"), Of("Impl")),
+            new("get-only, a diamond", Of("IDiamond"), Of("Impl")),
+            new("from two bases with the same type", Of("ITwoSame"), Of("Impl")),
+            new("from two bases with different types, the leaf's first", Of("ITwoMarkedFirst"), Of("TwoImpl")),
+            new("from two bases with different types, the other first", Of("ITwoOtherFirst"), Of("TwoImpl")),
+            new("from two bases with different types, the other first and the leaf's get-only", Of("ITwoOtherFirstGetOnly"), Of("TwoImpl")),
+            new("generic", typeof(IGen<>).MakeGenericType(leaf), Of("Impl")),
+            new("generic, inherited", Of("IGenInherited"), Of("Impl")),
+            new("covariant", typeof(IBox<>).MakeGenericType(leaf), Of("Impl")),
+            new("covariant, inherited", Of("IBoxInherited"), Of("Impl")),
+            new("an own indexer beside an inherited member of the same name and type", Of("IItem"), Of("ItemImpl"), Path: "Item_Notes"),
+            new("two interface levels, each get-only", Of("IOuter"), Of("OuterImpl"), Path: "Mid_Inner_Notes"),
+        ];
+    }
+
+    public static readonly Shape[] FamilyA = Catalogue("A", typeof(LeafA));
+
+    public static readonly Shape[] FamilyT =
     [
-        new("get/set", getSet, impl),
-        new("get-only", getOnly, impl),
-        new("set-only", setOnly, impl, Expression: false),
-        new("init", init, initImpl),
-        new("[IgnoreDataMember]", ignored, impl),
-        new("get-only, implemented by a get-only property", getOnly, getOnlyImpl, Stored: false),
-        new("get/set, implemented by an [IgnoreDataMember] property", getSet, ignoredImpl, Stored: false),
-        new("a default body (get-only)", defaultBody, impl),
-        new("an explicit implementation beside a public member", @explicit, explicitImpl),
-        new("an explicit implementation only", explicitOnly, explicitOnlyImpl, Stored: false),
-        new("an explicit implementation in a derived interface", explicitInInterface, impl),
-        new("re-declared with new and the same type (get-only)", newSame, impl),
-        new("re-declared with new and another type", newOther, newOtherImpl),
-        new("inherited one level", inherited1, impl),
-        new("inherited two levels", inherited2, impl),
-        new("get-only, inherited two levels", getOnly2, impl),
-        new("from two bases with the same type", twoSame, impl),
-        new("from two bases with different types, the leaf's first", twoMarkedFirst, twoImpl),
-        new("from two bases with different types, the other first", twoOtherFirst, twoImpl),
-        new("from two bases with different types, the other first and the leaf's get-only", twoOtherFirstGetOnly, twoImpl),
-        new("generic", typeof(IGen<>).MakeGenericType(leaf), impl),
-        new("generic, inherited", genInherited, impl),
-        new("covariant", typeof(IBox<>).MakeGenericType(leaf), impl),
-        new("covariant, inherited", boxInherited, impl),
-        new("an own indexer beside an inherited member of the same name and type", item, itemImpl, Member: "Item"),
+        new("get/set, a TableBlobContent below", typeof(IGetSetT), typeof(ImplT), "Inner_File"),
+        new("get-only, a TableBlobContent below", typeof(IGetOnlyT), typeof(ImplT), "Inner_File"),
+        new("set-only, a TableBlobContent below", typeof(ISetOnlyT), typeof(ImplT), "Inner_File", Expression: false),
+        new("[IgnoreDataMember], a TableBlobContent below", typeof(IIgnoredT), typeof(ImplT), "Inner_File"),
+        new("a default body (get-only), a TableBlobContent below", typeof(IDefaultBodyT), typeof(ImplT), "Inner_File"),
+        new("re-declared with new and the same type (get-only), a TableBlobContent below", typeof(INewSameT), typeof(ImplT), "Inner_File"),
+        new("get-only, inherited two levels, a TableBlobContent below", typeof(IGetOnly2T), typeof(ImplT), "Inner_File"),
+        new("covariant, a TableBlobContent below", typeof(IBox<BlobLeafT>), typeof(ImplT), "Inner_File"),
+        new("from two bases with different types, the other first and the leaf's get-only, a TableBlobContent below", typeof(ITwoOtherFirstGetOnlyT), typeof(TwoImplT), "Inner_File"),
+        new("an own indexer beside an inherited member of the same name and type, a TableBlobContent below", typeof(IItemT), typeof(ItemImplT), "Item_File"),
+        new("the member typed TableBlobContent, get/set", typeof(IFileGetSetT), typeof(FileImplT), "File"),
+        new("the member typed TableBlobContent, get-only", typeof(IFileGetOnlyT), typeof(FileImplT), "File"),
+        new("the member typed TableBlobContent, set-only", typeof(IFileSetOnlyT), typeof(FileImplT), "File", Expression: false),
+        new("the member typed TableBlobContent, [IgnoreDataMember]", typeof(IFileIgnoredT), typeof(FileImplT), "File"),
+        new("the member typed TableBlobContent, get-only, inherited two levels", typeof(IFileGetOnly2T), typeof(FileImplT), "File"),
+        new("the member typed TableBlobContent, covariant", typeof(IBox<TableBlobContent>), typeof(BoxFileImplT), "Inner"),
     ];
-
-    public static readonly Shape[] FamilyA = Catalogue(
-        typeof(IGetSetA), typeof(IGetOnlyA), typeof(ISetOnlyA), typeof(IInitA), typeof(IIgnoredA), typeof(IDefaultBodyA), typeof(IExplicitA),
-        typeof(IExplicitOnlyA), typeof(IExplicitInInterfaceA), typeof(INewSameA), typeof(INewOtherA), typeof(IInherited1A), typeof(IInherited2A),
-        typeof(IGetOnly2A), typeof(ITwoSameA), typeof(ITwoMarkedFirstA), typeof(ITwoOtherFirstA), typeof(ITwoOtherFirstGetOnlyA), typeof(LeafA),
-        typeof(IGenInheritedA), typeof(IBoxInheritedA), typeof(IItemA),
-        typeof(ImplA), typeof(InitImplA), typeof(GetOnlyImplA), typeof(IgnoredImplA), typeof(ExplicitImplA), typeof(ExplicitOnlyImplA), typeof(NewOtherImplA), typeof(TwoImplA), typeof(ItemImplA));
 
     public static readonly Shape[] FamilyB =
     [
-        .. Catalogue(
-            typeof(IGetSetB), typeof(IGetOnlyB), typeof(ISetOnlyB), typeof(IInitB), typeof(IIgnoredB), typeof(IDefaultBodyB), typeof(IExplicitB),
-            typeof(IExplicitOnlyB), typeof(IExplicitInInterfaceB), typeof(INewSameB), typeof(INewOtherB), typeof(IInherited1B), typeof(IInherited2B),
-            typeof(IGetOnly2B), typeof(ITwoSameB), typeof(ITwoMarkedFirstB), typeof(ITwoOtherFirstB), typeof(ITwoOtherFirstGetOnlyB), typeof(MarkedB),
-            typeof(IGenInheritedB), typeof(IBoxInheritedB), typeof(IItemB),
-            typeof(ImplB), typeof(InitImplB), typeof(GetOnlyImplB), typeof(IgnoredImplB), typeof(ExplicitImplB), typeof(ExplicitOnlyImplB), typeof(NewOtherImplB), typeof(TwoImplB), typeof(ItemImplB)),
+        .. Catalogue("B", typeof(MarkedB)),
         // A class owner: the member is not a column the writer stores, but it is a property along the updated path.
         new("a get-only member of a class owner", typeof(OwnerGetOnlyB), typeof(OwnerGetOnlyB), Stored: false),
         new("an [IgnoreDataMember] member of a class owner", typeof(OwnerIgnoredB), typeof(OwnerIgnoredB), Stored: false),
     ];
 
-    public static readonly Shape[] FamilyP = Catalogue(
-        typeof(IGetSetP), typeof(IGetOnlyP), typeof(ISetOnlyP), typeof(IInitP), typeof(IIgnoredP), typeof(IDefaultBodyP), typeof(IExplicitP),
-        typeof(IExplicitOnlyP), typeof(IExplicitInInterfaceP), typeof(INewSameP), typeof(INewOtherP), typeof(IInherited1P), typeof(IInherited2P),
-        typeof(IGetOnly2P), typeof(ITwoSameP), typeof(ITwoMarkedFirstP), typeof(ITwoOtherFirstP), typeof(ITwoOtherFirstGetOnlyP), typeof(LeafP),
-        typeof(IGenInheritedP), typeof(IBoxInheritedP), typeof(IItemP),
-        typeof(ImplP), typeof(InitImplP), typeof(GetOnlyImplP), typeof(IgnoredImplP), typeof(ExplicitImplP), typeof(ExplicitOnlyImplP), typeof(NewOtherImplP), typeof(TwoImplP), typeof(ItemImplP));
+    public static readonly Shape[] FamilyP = Catalogue("P", typeof(LeafP));
 
     private static readonly string[] Positions = ["top-level", "nested"];
 
     // The entity type and the column of a shape at a position.
     private static (Type Entity, string Column) Case(Shape shape, string position) => position == "top-level"
-        ? (typeof(Top<,>).MakeGenericType(shape.Declared, shape.Impl), $"Doc_{shape.Member}_Notes")
-        : (typeof(Nested<,>).MakeGenericType(shape.Declared, shape.Impl), $"W_Doc_{shape.Member}_Notes");
+        ? (typeof(Top<,>).MakeGenericType(shape.Declared, shape.Impl), $"Doc_{shape.Path}")
+        : (typeof(Nested<,>).MakeGenericType(shape.Declared, shape.Impl), $"W_Doc_{shape.Path}");
 
     private static TheoryData<string, string> ShapesPositions(Shape[] family)
     {
@@ -446,23 +570,33 @@ public class InterfaceMemberShapeMatrixTests
 
     public static TheoryData<string, string> FamilyAShapes() => ShapesPositions(FamilyA);
     public static TheoryData<string, string, string, OversizedCellPolicy> FamilyAShapesStoresPolicies() => ShapesPositionsStoresPolicies(FamilyA);
+    public static TheoryData<string, string> FamilyTShapes() => ShapesPositions(FamilyT);
+    public static TheoryData<string, string, string, OversizedCellPolicy> FamilyTShapesStoresPolicies() => ShapesPositionsStoresPolicies(FamilyT);
     public static TheoryData<string, string> FamilyBShapes() => ShapesPositions(FamilyB);
     public static TheoryData<string, string, string, OversizedCellPolicy> FamilyBShapesStoresPolicies() => ShapesPositionsStoresPolicies(FamilyB);
     public static TheoryData<string, string> FamilyPShapes() => ShapesPositions(FamilyP);
 
-    // ── Family A: awareness and the listed column ──────────────────────────────────────────────────────────
+    // ── Families A and T: awareness and the listed column ──────────────────────────────────────────────────
 
     [Theory]
     [MemberData(nameof(FamilyAShapes))]
-    public void CorrectlyMarkedValue_BelowEveryInterfaceMemberShape_IsLargeValueAware_AndListsItsColumnOnce(string shape, string position)
+    public void CorrectlyMarkedValue_BelowEveryInterfaceMemberShape_IsLargeValueAware_AndListsItsColumnOnce(string shape, string position) =>
+        AssertAwareWithColumn(FamilyA, shape, position);
+
+    [Theory]
+    [MemberData(nameof(FamilyTShapes))]
+    public void TableBlobContent_BelowOrInEveryInterfaceMemberShape_IsLargeValueAware_AndListsItsColumnOnce(string shape, string position) =>
+        AssertAwareWithColumn(FamilyT, shape, position);
+
+    private static void AssertAwareWithColumn(Shape[] family, string shape, string position)
     {
-        var (entity, column) = Case(FamilyA.Single(s => s.Name == shape), position);
+        var (entity, column) = Case(family.Single(s => s.Name == shape), position);
         var columns = TypeMetadataCache.LargeValueColumns(entity);
         Assert.True(TypeMetadataCache.IsLargeValueAware(entity) && columns.Count(c => c == column) == 1,
             $"{shape}, {position}: aware={TypeMetadataCache.IsLargeValueAware(entity)}, columns=[{string.Join(", ", columns)}]");
     }
 
-    // ── Family A: the whole-entity write stores it, every read returns it, no builder update writes it ─────────
+    // ── Families A and T: the whole-entity write stores it, every read returns it, no builder update writes it ─
 
     [Theory]
     [MemberData(nameof(FamilyAShapesStoresPolicies))]
@@ -470,44 +604,76 @@ public class InterfaceMemberShapeMatrixTests
     {
         var s = FamilyA.Single(x => x.Name == shape);
         var (entity, column) = Case(s, position);
-        return Invoke(nameof(StoredWholeAsync), entity, $"{shape}, {position}, {kind}, {policy}", column, s.Stored, s.Expression, kind, policy);
+        return Invoke(nameof(StoredWholeAsync), entity, $"{shape}, {position}, {kind}, {policy}", column, s.Stored, s.Expression, false, kind, policy);
     }
 
-    private static async Task StoredWholeAsync<T>(string name, string column, bool stored, bool expression, string kind, OversizedCellPolicy policy) where T : class, IEntity, new()
+    [Theory]
+    [MemberData(nameof(FamilyTShapesStoresPolicies))]
+    public Task TableBlobContent_BelowOrInEveryInterfaceMemberShape_IsStoredWhole_AndNoBuilderUpdateWritesIt(string shape, string position, string kind, OversizedCellPolicy policy)
+    {
+        var s = FamilyT.Single(x => x.Name == shape);
+        var (entity, column) = Case(s, position);
+        return Invoke(nameof(StoredWholeAsync), entity, $"{shape}, {position}, {kind}, {policy}", column, s.Stored, s.Expression, true, kind, policy);
+    }
+
+    // content: the value is a TableBlobContent (stored as a blob, read back as content whose bytes are compared);
+    // otherwise a string of Large characters (split cells).
+    private static async Task StoredWholeAsync<T>(string name, string column, bool stored, bool expression, bool content, string kind, OversizedCellPolicy policy)
+        where T : class, IEntity, new()
     {
         await using var stores = await LargeValueStores.OpenAsync(kind);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
         var id = stores.Id("a");
+        var bytes = Bytes(70_000, name.Length);
         var notes = BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(Large, name.Length);
-        // An explicit implementation alone is no public property: the writer stores nothing for it (as for any type).
-        var expected = stored ? notes : null;
         var store = stores.Store<T>(Table);
         await WithPolicyAsync(policy, async () =>
         {
             var written = new T { Id = id };
-            Set(written, column, notes);
+            Set(written, column, content ? TableBlobContent.FromBytes(bytes, "application/octet-stream") : notes);
             var thrown = await Record.ExceptionAsync(() => store.CreateAsync(written, Ct));
             Assert.True(thrown is null, $"{name}: whole-entity write {thrown?.GetType().Name}: {thrown?.Message}");
             foreach (var read in new[] { await store.OneAsync(id, Ct), await store.OneAsync(id, Ct), await stores.Store<T>(Table).OneAsync(id, Ct) })
-                Assert.True(Get(read!, column) == expected, $"{name}: read back {Get(read!, column)?.Length ?? -1} of {expected?.Length ?? -1} characters");
+                await AssertReadBackAsync(name, read!, column, stored, content, bytes, notes);
 
             foreach (var (source, length) in Sources(expression))
             {
-                var update = BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(length, 7);
+                object update = content
+                    ? TableBlobContent.FromBytes(Bytes(length, 7), "application/octet-stream")
+                    : BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(length, 7);
                 Exception? refused = null;
                 var writes = await stores.StorageWritesAsync(store, async () =>
                     refused = await Record.ExceptionAsync(() => store.UpdateAsync(id, b => SetPath(b, source, column, update), Ct)));
                 Assert.True(refused is NotSupportedException && writes.Count == 0,
-                    $"{name}, builder update ({source}) of {length} characters: {refused?.GetType().Name ?? "accepted"}: {refused?.Message}; writes: [{string.Join(", ", writes)}]");
+                    $"{name}, builder update ({source}) of {length}: {refused?.GetType().Name ?? "accepted"}: {refused?.Message}; writes: [{string.Join(", ", writes)}]");
             }
 
-            Assert.True(Get((await stores.Store<T>(Table).OneAsync(id, Ct))!, column) == expected, $"{name}: changed by a refused builder update");
+            await AssertReadBackAsync(name + ", after the refused builder updates", (await stores.Store<T>(Table).OneAsync(id, Ct))!, column, stored, content, bytes, notes);
             var row = (await stores.RawRowsAsync<T>(Table)).Single(r => r.RowKey == "a");
-            Assert.False(row.ContainsKey(column) || row.ContainsKey(column + "__GZip") || row.ContainsKey(column + "__Truncated"),
+            Assert.False(row.ContainsKey(column) || row.ContainsKey(column + "__GZip") || row.ContainsKey(column + "__Json") || row.ContainsKey(column + "__Truncated"),
                 $"{name}: an ordinary cell for {column}: [{string.Join(", ", row.Keys)}]");
             Assert.True(stored || !row.Keys.Any(k => k.StartsWith(column, StringComparison.Ordinal)),
                 $"{name}: a cell for a member the class does not store: [{string.Join(", ", row.Keys)}]");
         });
+    }
+
+    private static async Task AssertReadBackAsync(string name, object read, string column, bool stored, bool content, byte[] bytes, string notes)
+    {
+        var value = Get(read, column);
+        if (!stored)
+        {
+            // The class does not store the member (as for every type): a read returns what a new instance holds.
+            Assert.True(value is null, $"{name}: read back a value for a member the class does not store");
+            return;
+        }
+        if (!content)
+        {
+            Assert.True((string?)value == notes, $"{name}: read back {((string?)value)?.Length ?? -1} of {notes.Length} characters");
+            return;
+        }
+        Assert.True(value is TableBlobContent, $"{name}: read back {value?.GetType().Name ?? "null"}, not a TableBlobContent");
+        await using var stream = await ((TableBlobContent)value!).OpenReadAsync(Ct);
+        Assert.Equal(bytes, await OffloadTestSupport.ReadAllAsync(stream));
     }
 
     // ── Family B: the misuse opts nothing in, and a whole-entity write reports it where the class stores it ───
@@ -524,8 +690,8 @@ public class InterfaceMemberShapeMatrixTests
         written.Id = "a|b";
         Set(written, column, "x");
         var whole = Record.Exception(() => TableEntitySerializer.ToTableEntity(written, "a", "b"));
-        // Where the class does not store the member (an explicit implementation only; a get-only or ignored member of a
-        // class owner), the writer never meets the misused type, as for every type.
+        // Where the class does not store the member (an explicit implementation only, a get-only or ignored class
+        // property), the writer never meets the misused type, as for every type.
         Assert.True(s.Stored
                 ? whole is InvalidOperationException && whole.Message.Contains("[TableValueSplit] on IMarked.Notes", StringComparison.Ordinal)
                 : whole is null,
@@ -595,7 +761,7 @@ public class InterfaceMemberShapeMatrixTests
         Assert.DoesNotContain(row.Keys, k => k.StartsWith(column + "__", StringComparison.Ordinal));
     }
 
-    // ── The plain-store refusal message ────────────────────────────────────────────────────────────────────
+    // ── The plain-store refusal messages ───────────────────────────────────────────────────────────────────
 
     // The member is not on the interface at all (only the implementing class has it): the declared types reach no
     // large-value member, the type is not aware, and the refusal names the declaration that is missing (Doc.Inner with
@@ -743,7 +909,50 @@ public class InterfaceMemberShapeMatrixTests
         Set(stored, "Doc_Extra", new SMarked { Notes = notes });
         await stores.Store<TDeclared>(Table).CreateAsync(stored, Ct);
         var read = (await stores.Store<TDeclared>(Table).OneAsync(stores.Id("d"), Ct))!;
-        Assert.Equal(notes, ((SMarked)Locate(read, "Doc_Extra").Leaf.GetValue(Locate(read, "Doc_Extra").Owner)!).Notes);
+        Assert.Equal(notes, ((SMarked)Get(read, "Doc_Extra")!).Notes);
+    }
+
+    // The interface-typed property holds no instance on a new entity: the entity is aware by its declared types (the
+    // member below counts, whatever its accessors), and a value that needs split cells is refused because a read
+    // cannot create the interface (ruling R15); the refusal names remedies that are not in place, and the first,
+    // followed (an instance in the constructor: the holders of family A), stores it and reads it back (the matrix).
+    public sealed class NoInstance<TDoc> : Entity
+    {
+        public TDoc? Doc { get; set; }
+    }
+
+    public static TheoryData<string, string> NoInstanceShapesStores()
+    {
+        var d = new TheoryData<string, string>();
+        foreach (var s in new[] { "get-only", "set-only", "[IgnoreDataMember]", "get-only, inherited two levels", "covariant" })
+            foreach (var k in Kinds)
+                d.Add(s, k);
+        return d;
+    }
+
+    [Theory]
+    [MemberData(nameof(NoInstanceShapesStores))]
+    public Task AValueBelowAnInterfaceTypedPropertyWithNoInstance_IsRefused_NamingRemediesThatAreNotInPlace(string shape, string kind)
+    {
+        var s = FamilyA.Single(x => x.Name == shape);
+        return (Task)typeof(InterfaceMemberShapeMatrixTests).GetMethod(nameof(NoInstanceRefusedAsync), BindingFlags.NonPublic | BindingFlags.Static)!
+            .MakeGenericMethod(typeof(NoInstance<>).MakeGenericType(s.Declared), s.Impl)
+            .Invoke(null, [shape, kind])!;
+    }
+
+    private static async Task NoInstanceRefusedAsync<T, TImpl>(string shape, string kind) where T : class, IEntity, new() where TImpl : new()
+    {
+        await using var stores = await LargeValueStores.OpenAsync(kind);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        Assert.True(TypeMetadataCache.IsLargeValueAware(typeof(T)), $"{shape}: not large-value aware");
+        var entity = new T { Id = stores.Id("x") };
+        typeof(T).GetProperty("Doc")!.SetValue(entity, new TImpl());
+        Set(entity, "Doc_Inner_Notes", BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(Large, 4));
+        var refused = await Record.ExceptionAsync(() => stores.Store<T>(Table).CreateAsync(entity, Ct));
+        Assert.True(refused is NotSupportedException && refused.Message.Contains("initialise the property with an instance in the constructor", StringComparison.Ordinal),
+            $"{shape}: {refused?.GetType().Name}: {refused?.Message}");
+        Assert.Empty(await stores.RawRowsAsync<T>(Table));
+        Assert.Empty(await stores.BlobNamesAsync<T>(Table));
     }
 
     // ── Class owners keep the writer's rule for what is a column ────────────────────────────────────────────
@@ -788,14 +997,22 @@ public class InterfaceMemberShapeMatrixTests
         }
     }
 
+    private static byte[] Bytes(int length, int seed)
+    {
+        var bytes = new byte[length];
+        new Random(seed).NextBytes(bytes);
+        return bytes;
+    }
+
     // The ways a builder update names the column, at a size that fits one cell and one that does not.
     private static (string Source, int Length)[] Sources(bool expression) => expression
         ? [("expression", 10), ("expression", Large), ("Updates", 10), ("Updates", Large)]
         : [("Updates", 10), ("Updates", Large)];
 
     // The builder update of the column: an expression built through the declared members (as a lambda names them; a
-    // set-only member, which no lambda can name, is built the same way), or the key of the public Updates dictionary.
-    private static void SetPath<T>(UpdateBuilder<T> builder, string source, string column, string value)
+    // set-only member, which no lambda can name, only through the Updates dictionary), or the key of the public
+    // Updates dictionary.
+    private static void SetPath<T>(UpdateBuilder<T> builder, string source, string column, object value)
     {
         if (source == "Updates")
             builder.Updates[column] = value;
@@ -803,13 +1020,14 @@ public class InterfaceMemberShapeMatrixTests
             builder.SetProperty(PathOf<T>(column), value);
     }
 
-    private static Expression<Func<T, string?>> PathOf<T>(string column)
+    // x => (object)x.A.B.C for the column "A_B_C" (the builder takes the member path below the conversion).
+    private static Expression<Func<T, object>> PathOf<T>(string column)
     {
         var x = Expression.Parameter(typeof(T), "x");
         Expression body = x;
         foreach (var segment in column.Split('_'))
             body = Expression.Property(body, Member(body.Type, segment));
-        return Expression.Lambda<Func<T, string?>>(body, x);
+        return Expression.Lambda<Func<T, object>>(Expression.Convert(body, typeof(object)), x);
     }
 
     // The member a path through the declared type names, as the C# compiler resolves it: the type's own member first,
@@ -845,9 +1063,9 @@ public class InterfaceMemberShapeMatrixTests
         leaf.SetValue(owner, value);
     }
 
-    private static string? Get(object entity, string column)
+    private static object? Get(object entity, string column)
     {
         var (owner, leaf) = Locate(entity, column);
-        return (string?)leaf.GetValue(owner);
+        return leaf.GetValue(owner);
     }
 }
