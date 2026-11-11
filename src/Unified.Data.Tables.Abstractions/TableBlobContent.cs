@@ -208,9 +208,10 @@ public sealed class TableBlobContent
     /// <see cref="InvalidOperationException"/> before anything is uploaded when it delivers nothing (the
     /// retry that would store an empty file). So a new, empty payload on a reused stream object is refused
     /// as well: store an empty file with <see cref="FromBytes"/> and an empty array, or from a seekable
-    /// stream. Two contents over one non-seekable stream written by one write are refused the same way. A stream a failed write read only part of, and a seekable stream a write could not put
-    /// back, are refused for every later content (so a server that reuses a request-body object which a
-    /// failed write read part-way refuses every later content over it: buffer the body into a seekable
+    /// stream. Two contents over one non-seekable stream written by one write are refused the same way. A
+    /// stream a failed write read only part of, and a seekable stream a write could not put back, are
+    /// refused for every later content (so a server that reuses a request-body object which a failed write
+    /// read part-way refuses every later content over it: buffer the body into a seekable
     /// stream, or close the connection after such a failure). What is remembered about a stream holds for the streams
     /// below it that the framework wrappers expose (<c>BufferedStream</c>, <c>GZipStream</c>,
     /// <c>DeflateStream</c>, <c>ZLibStream</c>, <c>BrotliStream</c>, followed recursively), so a new such
