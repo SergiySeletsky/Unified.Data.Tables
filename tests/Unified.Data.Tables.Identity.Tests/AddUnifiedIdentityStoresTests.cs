@@ -4,6 +4,9 @@ using Unified.Data.Tables.InMemory;
 
 namespace Unified.Data.Tables.Identity.Tests;
 
+// AddUnifiedInMemoryStorage applies its options to the process-wide TableEntitySerializer.OversizedCellPolicy.
+// Nothing in this assembly sets another policy yet; the collection keeps it that way for a class that does.
+[Collection("OversizedCellPolicy")]
 public class AddUnifiedIdentityStoresTests
 {
     private static IServiceCollection Base()
