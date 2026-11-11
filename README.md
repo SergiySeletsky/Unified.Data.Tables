@@ -37,8 +37,9 @@ copy-pasted into each one.
   `ConcurrencyMode.Strict` / `LastWriterWins` overloads make intent greppable, and
   `MutateAsync(id, e => e.Count++)` packages the read → mutate → strict-write → retry loop that makes
   derived values (counters, unions) correct under concurrency.
-- **Upsert & batches** — `UpsertAsync` (single round-trip insert-or-replace), `CreateBatchAsync` /
-  `UpsertBatchAsync` (partition-grouped 100-row transactions), `CountAsync` (keys-only projection).
+- **Upsert & batches** — `UpsertAsync` (single round-trip insert-or-replace; a point read and a
+  conditional write for a type with large values), `CreateBatchAsync` / `UpsertBatchAsync`
+  (partition-grouped 100-row transactions), `CountAsync` (keys-only projection).
 - **Bounded queries** — `QueryAsync(QueryOptions)` and streaming `QueryStreamAsync` with partition scope,
   canonical RowKey-prefix ranges, and `Take` — never cached, never a disguised full scan.
 - **Server-side LINQ, paging & append logs** — `QueryAsync(x => x.Status == Open)` translates to an OData
@@ -175,7 +176,7 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | Method | Description |
 | --- | --- |
 | `CreateAsync(entity)` | Insert a new row (`DuplicateKeyException` when it exists); returns it with its populated `ETag`. |
-| `UpsertAsync(entity)` | Insert-or-replace in one round trip. Unconditional by design (last writer wins); preserves a caller-supplied `CreatedAt`. |
+| `UpsertAsync(entity)` | Insert-or-replace in one round trip. Unconditional by design (last writer wins); preserves a caller-supplied `CreatedAt`. For a type with [large values](#large-values-split-and-blob-offload) it is a point read and a conditional write, retried on a lost race; `ConcurrencyConflictException` after five. |
 | `OneAsync(id)` | Fetch one row by composite id, or `null`. |
 | `ExistsAsync(id)` | Whether a row exists (cache-aware). |
 | `QueryAsync(partition?)` | All rows, or just one partition (the cached read path). |
@@ -188,7 +189,7 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `AppendAsync(partition, entity, subStream?)` | Extension: append a time-ordered event (inverted-ticks RowKey); the `Id` is assigned for you. |
 | `RecentAsync(partition, count, subStream?)` | Extension: read the newest N events, newest-first — one bounded partition scan. |
 | `UpdateAsync(entity)` | Full replace with adaptive (`Auto`) ETag concurrency. |
-| `UpdateAsync(entity, mode)` | Full replace with explicit `ConcurrencyMode`. |
+| `UpdateAsync(entity, mode)` | Full replace with explicit `ConcurrencyMode`. `LastWriterWins` on a type with large values can throw `ConcurrencyConflictException` after five lost races. |
 | `UpdateAsync(id, builder)` | Partial `Merge` — writes only the declared columns (nested paths supported, optional `WithETag`); returns the new ETag. |
 | `MutateAsync(id, e => …)` | Extension: read → mutate → `Strict` write, re-reading and re-applying on conflict (CAS). |
 | `GetOrCreateAsync(id, factory)` | Extension: read-or-insert; a lost create race converges on the winner's row. |
@@ -196,9 +197,9 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `TryMutateAsync(id, e => …)` | Extension: outcome-returning CAS — `Updated` / `NotFound` / `Conflicted`, nothing thrown for expected branches. |
 | `TryTransitionAsync(id, when, apply)` | Extension: exactly-once transition as a result — the race-loser gets `PreconditionFailed` with the winner's row. |
 | `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction, atomic per transaction (`DuplicateKeyException` on an existing or repeated key). Split-aware types too: an entity's continuation rows ride in its transaction. |
-| `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking. |
+| `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking. A type with large values reads each row first and replaces it conditionally; `ConcurrencyConflictException` after five lost races. |
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
-| `DeleteAsync(id)` | Delete one row (idempotent). |
+| `DeleteAsync(id)` | Delete one row (idempotent). For a type with large values it reads the row first and deletes it, with its continuation rows and blobs, on condition of the version read; `ConcurrencyConflictException` after five lost races. |
 | `DeletePartitionAsync(partition)` | Batch-delete a whole partition; returns the count. |
 | `SweepOrphanBlobsAsync(partition, olderThan)` | Extension (`IOrphanBlobSweeper`): delete offloaded blobs of the partition that no row references and that are older than `olderThan`; returns the count. See [Large values](#large-values-split-and-blob-offload). |
 | `SweepOrphanBlobsAsync(olderThan)` | Extension (`IOrphanBlobSweeper`): the same for every partition of the table. |
@@ -758,31 +759,63 @@ so a scaled-out app may register it in one instance only.
 
 - In RowKeys of split-aware types, only the continuation-row shape is reserved: a key ending with `~`
   and exactly four digits (`r~0001`, `a~b~0042`). Writes, batch writes and partial updates refuse it with
-  `ArgumentException`; every other `~` is allowed (`a~b`, `x~12`, `a~0001x`, append-log keys). Deletes
-  accept any key, so a row written before the type opted in stays deletable; deleting a continuation row's
-  id is a no-op. A row from before the opt-in (or of another type sharing the table) keyed
-  `{RowKey}~0001` is never overwritten: a write of `{RowKey}` that needs that key for a new continuation
-  row fails as a whole with `InvalidOperationException` naming the key, and stores nothing. The escaped
-  blob name must fit 1,024 characters.
+  `ArgumentException`, as they refuse a row key longer than 480 characters (which leaves room for the
+  continuation-row suffix); every other `~` is allowed (`a~b`, `x~12`, `a~0001x`, append-log keys).
+  Deletes accept any key, so a row written before the type opted in stays deletable; deleting a
+  continuation row's id is a no-op. A row keyed `{RowKey}~0001` that is not a continuation row of that
+  entity (one from before the opt-in, or of another type sharing the table) is never overwritten: a write
+  of `{RowKey}` that needs that key for a new continuation row fails as a whole with
+  `InvalidOperationException` naming the key, and stores nothing. The escaped blob name must fit 1,024
+  characters.
+- A continuation row whose `_SplitOf` cell names an entity belongs to that entity even when no main row
+  declares it. Such leftover rows appear when a writer that does not know continuation rows (a type
+  without `[TableValueSplit]` on the same table, a 0.8.x instance, the raw SDK) deletes or replaces the
+  main row or stops halfway through a partition delete, and when a partition delete races an upsert that
+  adds continuation rows. Reads, queries and `CountAsync` never return them, and they do not block the
+  key: a write of the entity that needs a leftover's key replaces it and deletes the entity's other
+  leftovers in the same transaction (at the cost of one failed transaction and one range query), and
+  `DeleteAsync` of an id that has no main row removes them (so a `DeleteAsync` that finds no row costs a
+  split-aware type one range query more). A write looks for leftovers only when one holds a key it needs,
+  so the others stay, unseen, until the entity grows onto them, shrinks or is deleted while its main row
+  declares continuation rows, `DeleteAsync` finds no main row at its id, or the partition is deleted.
 - Keys of split-aware types must be well-formed UTF-16: a partition or row key with an unpaired surrogate
   (`"a\uD800"`) would name the same blobs as one with U+FFFD in its place, so writes refuse it with
   `ArgumentException`. Plain types are unaffected.
-- No LINQ filter and no partial update (`UpdateAsync(id, builder)`) on a large property; not supported by
-  `IPolymorphicStorage`.
+- No LINQ filter and no partial update (`UpdateAsync(id, builder)`) on a large property (both throw
+  `NotSupportedException`); not supported by `IPolymorphicStorage`. That includes every property a
+  class-level attribute covers. One filter is not refused: on a member that an interface or base class
+  declares without the attribute and the runtime type opts in. It translates, and does not match rows whose
+  value is stored split or offloaded.
 - Batch writes of these types keep the batch contract: per partition, each entity's rows (main row,
   continuation rows, deletes of stale ones) are one unit, units are packed in order into entity-group
   transactions (at most 100 actions and the same byte and 4&nbsp;MiB wire budgets as a single write), and
   each transaction is atomic; an entity's rows never straddle two. Atomicity is per transaction only: a
   failing transaction leaves earlier ones committed. Each transaction's blobs are uploaded just before it
-  and released ones deleted after it commits. A key repeated in `CreateBatchAsync` throws
+  and released ones deleted after it commits. A row repeated in `CreateBatchAsync` throws
   `DuplicateKeyException` before anything is written; in `UpsertBatchAsync` its last occurrence is
-  written. Upserts do one point read per entity first, and each replace is conditional on the version
-  read: a transaction that loses a race is planned again and retried, and after three lost races
-  `UpsertBatchAsync` throws `ConcurrencyConflictException` naming the entity (earlier transactions stay
-  committed).
-- Split-aware writes do one point read first (to find stale parts and old blobs): order is table get,
-  blob get, blob upload, table update. A `LastWriterWins` `UpdateAsync` can therefore throw
-  `ConcurrencyConflictException` after three lost races.
+  written (the ids `"a"` and `"a|a"` address the same row). Upserts do one point read per entity first,
+  and each replace is conditional on the version read: a transaction that loses a race is planned again
+  and retried as a single write is (next bullet), and after five lost races `UpsertBatchAsync` throws
+  `ConcurrencyConflictException` naming the entity (earlier transactions stay committed).
+- For a split-aware type `UpsertAsync`, `UpdateAsync(entity)`, `DeleteAsync` and `UpsertBatchAsync` are
+  not single round trips: each reads the row first (one point read, to find the continuation rows and
+  blobs it replaces) and writes on condition of the version it read. For a write the order is table get,
+  blob get, blob upload, table update. A `Strict` update, or an `Auto` update with an ETag, that finds
+  another version is a conflict at once, as for any type. `UpsertAsync`, a `LastWriterWins` `UpdateAsync`,
+  `DeleteAsync` and `UpsertBatchAsync` still mean "last writer wins", but a call that loses its condition
+  to a concurrent writer reads again and retries: five attempts in all, then
+  `ConcurrencyConflictException`. Before each retry the call waits a random time (5 to 10 ms before the
+  first retry, doubling each time, at most 150 ms in all; the wait honours the cancellation token). Each
+  lost attempt is caused by another writer's commit, so up to four concurrent writes of one row all
+  succeed. With more, a conflict is unlikely but possible: catch `ConcurrencyConflictException` and retry,
+  or serialize the writes of that row. `CreateAsync` and `CreateBatchAsync` read nothing first (an
+  existing key is `DuplicateKeyException`). They are retried only when they take back leftover
+  continuation rows (above), and end in `ConcurrencyConflictException` only if those rows keep changing
+  under them.
+- After a write that needed an entity-group transaction (continuation rows were written or removed), the
+  entity's `ETag` is the version the transaction's response reports for the main row; the row is not read
+  again, and the entity is not put in the entity cache. If that response carries no version, `ETag` is
+  null after the write, as after a batch: read the entity again before an optimistic update.
 - A `QueryPageAsync` page can hold zero items with a non-null continuation token when it contained only
   continuation rows; keep paging until the token is null.
 - Reads and scans cost more for these types: an entity whose value is split across continuation rows
@@ -798,6 +831,34 @@ so a scaled-out app may register it in one instance only.
 - A projection of a plain type (one that does not opt the property in) that names a property another type
   stored split or offloaded reads it as null: the plain store neither fetches nor recognises the value's
   cells. Read such rows through the opted-in type.
+- The store learns a type's large-value columns from its declared property types (along every path that
+  does not pass through the same type twice) and from the objects a new entity holds. Three shapes fall
+  outside that: a large value below a repeated type (`Head.Next.Body` when the node type refers to
+  itself); a runtime subtype that only the constructor of a nested object creates, below a property that
+  is null on a new entity (`Order.Payment` is null by default and `Payment`'s constructor sets
+  `Method = new Card()`); and a type graph with more paths to large-value members than can be listed in
+  10,000 steps, where only the columns nearest the entity are known. Such a value is still written split
+  and read back whole, and a partial update of it is refused, but the store does not track its column:
+  the blob a replaced or deleted row referenced there is left to the orphan sweep, and through
+  `TableStorage<T>` a projection that names that column reads the property as null (`InMemoryStorage<T>`
+  returns the value). If the entity type has no other large-value member, its store takes the plain
+  path: the value has to fit the one row, with no continuation rows and no blob offload. Give the outer
+  property a default instance where you can, and read such entities without a projection.
+- Limits of one split-aware entity, and what a caller gets beyond them:
+  - a row key of at most 480 characters and an escaped blob name of at most 1,024 (`ArgumentException`);
+  - at most 252 properties and 1,000,000 estimated bytes for the cells that cannot leave the main row:
+    everything but the chunks of split values (`OversizedValueException` naming the largest of them);
+  - a main row and at most 99 continuation rows, written in one transaction of at most 100 actions,
+    3,000,000 estimated bytes and 4&nbsp;MiB less 64&nbsp;KiB on the wire, the deletes of stale
+    continuation rows included. A value that does not fit is offloaded; when nothing more can be offloaded
+    the write throws `OversizedValueException` and stores nothing.
+- The storage emulator limits an entity by its request body, the service by its stored size. Split
+  cells are placed so that each row's request body stays within 1&nbsp;MB, and a main row whose values
+  had to be moved is brought within it as far as moving opted-in values can. Cells that are not split
+  count by their stored size only (binary is base64 on the wire, escaped text up to six bytes per
+  character), for plain types too. Azurite accepts an insert of a row whose request body exceeds
+  1&nbsp;MiB and refuses to replace, merge or upsert it (`EntityTooLarge`): fourteen ordinary binary cells
+  of 60,000 bytes can be created there and not updated.
 - Storage-provider SPI types (namespace `Unified.Data.Tables.Providers`) are public only so other
   providers, such as the in-memory package, can share the implementation. They are hidden from
   IntelliSense and not for application code.
