@@ -178,7 +178,8 @@ public class NewWrapperOverAConsumedStreamTests(ITestOutputHelper output)
 
     /// <summary>
     /// After a failed write, a new wrapper over the inner stream that was given a new payload is stored
-    /// whole; and once a write over a wrapper has committed, the inner stream is forgotten as well.
+    /// whole; and after a write over a wrapper has committed, the inner stream stays remembered (ruling R9 as
+    /// revised in fix wave 5; wave 4 forgot it): read directly, it is refused when it delivers nothing.
     /// </summary>
     [Fact]
     public async Task ANewWrapperOverARecycledInnerStream_IsStoredWhole_AfterAFailedWriteAndAfterACommittedOne()
@@ -195,10 +196,17 @@ public class NewWrapperOverAConsumedStreamTests(ITestOutputHelper output)
         await store.CreateAsync(new FileEntity { Id = "p|a", File = TableBlobContent.FromStream(Wrap("GZipStream", body), "application/octet-stream") }, Ct);
         Assert.Equal(second, await ReadFileAsync((await store.OneAsync("p|a", Ct))!.File!));
 
-        // Committed: the inner stream is a new payload next time, also read directly (here an empty one).
+        // Committed: the inner stream is still remembered, also read directly; an empty payload is refused.
         body.Load([]);
-        await store.CreateAsync(new FileEntity { Id = "p|b", File = TableBlobContent.FromStream(body, "application/octet-stream") }, Ct);
-        Assert.Equal(0, (await store.OneAsync("p|b", Ct))!.File!.Length);
+        RecycledForwardOnlyStreamTests.AssertConsumedAndEmpty(await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.CreateAsync(new FileEntity { Id = "p|b", File = TableBlobContent.FromStream(body, "application/octet-stream") }, Ct)));
+        Assert.Null(await store.OneAsync("p|b", Ct));
+
+        // A new payload under a new wrapper after that commit is stored whole.
+        var third = RandomBytes(Size, seed: 47);
+        body.Load(Wire("GZipStream", third));
+        await store.CreateAsync(new FileEntity { Id = "p|c", File = TableBlobContent.FromStream(Wrap("GZipStream", body), "application/octet-stream") }, Ct);
+        Assert.Equal(third, await ReadFileAsync((await store.OneAsync("p|c", Ct))!.File!));
     }
 
     /// <summary>The inner stream a failed write read only part of, through a wrapper, is refused under a new wrapper too.</summary>

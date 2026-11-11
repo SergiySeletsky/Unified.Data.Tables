@@ -290,23 +290,26 @@ public class ReusedSourceStreamTests(ITestOutputHelper output)
     }
 
     /// <summary>
-    /// A forward-only stream that a successful write has read: that write committed, so the stream is
-    /// forgotten and a new content over the same object is a new payload, whatever it delivers, an empty
-    /// one included (ruling R9 point 1 of fix wave 4, CONTENT-1: a server reuses one request-body object
-    /// for every request of a connection). Before R9 this content was refused for the life of the stream.
-    /// The refusal after a write that did NOT commit is <see cref="MutateAsync_SettingAFileFromAForwardOnlyStream_RetriedAfterAConflict_IsRefusedAndKeepsThePreviousFile"/>.
+    /// A forward-only stream that a successful write has read to its end: the stream stays remembered after
+    /// that commit (ruling R9 as revised in fix wave 5; wave 4 forgot it and stored an empty file here), so a
+    /// new content over the same object that delivers nothing is refused before anything is uploaded. A new
+    /// payload of at least one byte would be stored (<see cref="RecycledForwardOnlyStreamTests"/>). The
+    /// refusal after a write that did NOT commit is <see cref="MutateAsync_SettingAFileFromAForwardOnlyStream_RetriedAfterAConflict_IsRefusedAndKeepsThePreviousFile"/>.
     /// </summary>
     [Fact]
-    public async Task ANewContentOverAForwardOnlyStreamThatACommittedWriteHasRead_IsANewPayload_AnEmptyOneIncluded()
+    public async Task ANewContentOverAForwardOnlyStreamThatACommittedWriteHasRead_ThatDeliversNothing_IsRefused()
     {
         var data = RandomBytes(Size, seed: 213);
         var store = Store();
         var stream = new FaultyContentStream(data, seekable: false);
         await store.CreateAsync(new FileEntity { Id = "p|a", File = File(stream) }, Ct);
+        var blobs = store.OffloadedBlobNames();
 
-        await store.CreateAsync(new FileEntity { Id = "p|b", File = File(stream) }, Ct);
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => store.CreateAsync(new FileEntity { Id = "p|b", File = File(stream) }, Ct));
 
-        Assert.Equal(0, (await store.OneAsync("p|b", Ct))!.File!.Length);
+        AssertAlreadyReadForwardOnly(refused);
+        Assert.Null(await store.OneAsync("p|b", Ct));
+        Assert.Equal(blobs, store.OffloadedBlobNames());
         Assert.Equal(data, await ReadFileAsync((await store.OneAsync("p|a", Ct))!.File!));
     }
 

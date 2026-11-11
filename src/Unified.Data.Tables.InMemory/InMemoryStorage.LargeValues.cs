@@ -88,10 +88,7 @@ public sealed partial class InMemoryStorage<T>
         try
         {
             await large.PrepareAsync(entity, ct);
-            var written = await WritePreparedAsync(entity, keys, kind, ifMatch, ct);
-            // Committed: a stream its contents read to the end is a new payload next time (R9).
-            LargeValueTable.Committed(entity);
-            return written;
+            return await WritePreparedAsync(entity, keys, kind, ifMatch, ct);
         }
         finally
         {
@@ -450,7 +447,6 @@ public sealed partial class InMemoryStorage<T>
             DateTimeOffset? committedAt = null;
             foreach (var unit in chunk)
             {
-                LargeValueTable.Committed(unit.Entity);
                 if (unit.Prior is { Blobs.Count: > 0 })
                 {
                     committedAt ??= await large.CommitTimeAsync(CancellationToken.None);
