@@ -284,7 +284,8 @@ public sealed class LargeValueTable
     }
 
     // The projection of the point read before a write or delete, per entity type, built on first use (by
-    // an operation, never by a store's type initializer: listing the columns may construct the entity).
+    // an operation, never by a store's type initializer: listing the columns may construct the entity) and
+    // kept once it was built from a complete column list.
     private static readonly ConcurrentDictionary<Type, PriorRowProjection> PriorRowProjections = new();
 
     private sealed record PriorRowProjection(string[]? Select, HashSet<string>? ReferenceColumns);
@@ -296,7 +297,9 @@ public sealed class LargeValueTable
     /// <c>{column}__blob</c> cell per large-value column of the type (legacy alias columns included). When
     /// that list would name more columns, or be longer as a URL-encoded <c>$select</c> value, than the
     /// orphan sweep allows itself, the row is read whole instead (null), so the read always stays within
-    /// the service's projection and URL limits. Computed on first use and kept.
+    /// the service's projection and URL limits. Computed on first use and kept, once the type's column list is
+    /// complete: while the entity's constructor or a getter fails (the default-instance probe of
+    /// <c>TypeMetadataCache.LargeValueColumns</c>), the columns of the declared types are used for that call only.
     /// </summary>
     /// <param name="entityType">The store's entity type.</param>
     /// <returns>The columns to select, or null to read the row whole.</returns>
@@ -343,10 +346,20 @@ public sealed class LargeValueTable
         return paths;
     }
 
-    private static PriorRowProjection PriorRowProjectionOf(Type entityType) =>
-        PriorRowProjections.GetOrAdd(entityType, static type =>
+    // Kept per type only once it was built from a column list TypeMetadataCache remembered (a complete
+    // default-instance probe); a list from a probe whose constructor or getter failed is used for this
+    // call only, and the next call builds the projection again.
+    private static PriorRowProjection PriorRowProjectionOf(Type entityType)
+    {
+        if (PriorRowProjections.TryGetValue(entityType, out var known))
+            return known;
+
+        var columns = TypeMetadataCache.LargeValueColumns(entityType, out var remembered);
+        var projection = PriorRowProjectionFor(columns);
+        return remembered ? PriorRowProjections.GetOrAdd(entityType, projection) : projection;
+
+        static PriorRowProjection PriorRowProjectionFor(IReadOnlyList<string> columns)
         {
-            var columns = TypeMetadataCache.LargeValueColumns(type);
             if (columns.Count > ValueOffloadCoordinator.MaxSweepSelectColumns)
                 return new PriorRowProjection(null, null);
             // The version is not a column: the service returns it with every entity (and may refuse a
@@ -360,7 +373,8 @@ public sealed class LargeValueTable
             return ValueOffloadCoordinator.SelectLength(select) > ValueOffloadCoordinator.MaxSweepSelectLength
                 ? new PriorRowProjection(null, null)
                 : new PriorRowProjection(select, new HashSet<string>(columns, StringComparer.Ordinal));
-        });
+        }
+    }
 
     /// <summary>
     /// Storage-provider SPI, not for application code. Seals every <see cref="TableBlobContent"/> of

@@ -172,8 +172,16 @@ public static class TableEntitySerializer
     /// The message for a large-value member that the plain serializer met below <paramref name="root"/>, a
     /// type that is not large-value aware: <paramref name="member"/> of the object at
     /// <paramref name="ownerPath"/> (empty: of the root itself), whose runtime type is <paramref name="ownerType"/>.
+    /// It names only remedies that work for the shape: <paramref name="partial"/>, the refused write is a
+    /// partial update, which never writes a large value (replace the entity instead);
+    /// <paramref name="contentInAnotherType"/>, the member holds a <see cref="TableBlobContent"/> but is not
+    /// declared as one (only that declaration lets a read give it back); <paramref name="runtimeNullable"/>,
+    /// the nullable struct the plain serializer met on the path through runtime owners, which a read cannot
+    /// create.
     /// </summary>
-    internal static string PlainPathRefusal(Type root, IReadOnlyList<string> ownerPath, Type ownerType, string member)
+    internal static string PlainPathRefusal(
+        Type root, IReadOnlyList<string> ownerPath, Type ownerType, string member, bool partial = false,
+        bool contentInAnotherType = false, (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<string> OwnerPath)? runtimeNullable = null)
     {
         var column = string.Join(TableEntityValue.PathDelimiter, ownerPath.Append(member));
         var holder = string.Join('.', ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)));
@@ -186,18 +194,59 @@ public static class TableEntitySerializer
         var refused = $"{where} (column '{column}') is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. " +
                       $"{root.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity " +
                       "as one plain row and can neither split, offload nor read back such a value, whatever its size. ";
+        string remedy;
         // Below a nullable struct the class-level opt-in alone leads to the next refusal (a read cannot
         // create the struct of a nullable property); declaring the property with the struct itself works.
         if (NullableStructOnPath(root, ownerPath) is { } nullable)
-            return refused +
-                   $"A read cannot create the struct of the nullable property {nullable.Owner.Name}.{nullable.Property.Name} " +
-                   $"({nullable.Struct.Name}?), so a large value below it cannot be stored as one (marking {root.Name} with " +
-                   $"[TableValueSplit] is not enough on its own). Declare {nullable.Owner.Name}.{nullable.Property.Name} as " +
-                   $"{nullable.Struct.Name}, not nullable, so that {root.Name} is large-value aware by its declared types and reads " +
-                   "the value back. Nothing was serialized.";
-        return refused +
-               $"Mark {root.Name} with [TableValueSplit], or {declare}, so that {root.Name} is large-value aware by its declared types. " +
-               "Nothing was serialized.";
+            remedy =
+                $"A read cannot create the struct of the nullable property {nullable.Owner.Name}.{nullable.Property.Name} " +
+                $"({nullable.Struct.Name}?), so a large value below it cannot be stored as one (marking {root.Name} with " +
+                $"[TableValueSplit] is not enough on its own). Declare {nullable.Owner.Name}.{nullable.Property.Name} as " +
+                $"{nullable.Struct.Name}, not nullable, so that {root.Name} is large-value aware by its declared types and reads " +
+                "the value back.";
+        // The same struct reached through a runtime owner (a property declared as an interface, an abstract or
+        // a base class): the declared types from the root do not lead to it, so both declarations are named.
+        else if (runtimeNullable is { } below)
+            remedy =
+                $"A value below a nullable struct cannot be stored as a large value: a read cannot create the struct of the " +
+                $"nullable property {below.Owner.Name}.{below.Property.Name} ({below.Struct.Name}?), and marking {root.Name} " +
+                $"with [TableValueSplit] does not change that. Declare {below.Owner.Name}.{below.Property.Name} as " +
+                $"{below.Struct.Name}, not nullable" +
+                (below.OwnerPath.Count == 0 ? "" :
+                    $", and declare {root.Name}.{string.Join('.', below.OwnerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))} " +
+                    $"with the type that has it ({below.Owner.Name})") +
+                $", so that {root.Name} is large-value aware by its declared types and reads the value back.";
+        // A read gives a TableBlobContent back only to a property declared as one: marking the type does not.
+        else if (contentInAnotherType)
+            remedy = ownerPath.Count == 0
+                ? $"A read gives a TableBlobContent back only to a property declared as TableBlobContent, so marking {root.Name} " +
+                  $"with [TableValueSplit] is not enough. Declare {root.Name}.{member} as TableBlobContent, so that {root.Name} is " +
+                  "large-value aware by its declared types."
+                : $"A read gives a TableBlobContent back only to a property declared as TableBlobContent, so marking {root.Name} " +
+                  $"with [TableValueSplit] is not enough. Declare {ownerType.Name}.{member} as TableBlobContent, and {declare}, so " +
+                  $"that {root.Name} is large-value aware by its declared types.";
+        else
+            remedy = $"Mark {root.Name} with [TableValueSplit], or {declare}, so that {root.Name} is large-value aware by its declared types.";
+
+        return partial
+            ? refused + "A partial update (UpdateAsync with a builder) cannot write a large value on any store, also once the type " +
+              "is large-value aware: replace the entity instead (a whole-entity write). For that write to store the value: " +
+              remedy + " Nothing was serialized."
+            : refused + remedy + " Nothing was serialized.";
+    }
+
+    // The outermost property, on the path from the root to node (its owners, by their runtime types), that
+    // holds a struct and is declared as a nullable struct: its owner's runtime type, the property, the
+    // struct and the path of the owner. Null when there is none.
+    private static (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<string> OwnerPath)? RuntimeNullableStructOnPath(TableEntityValue node)
+    {
+        (Type, PropertyInfo, Type, IReadOnlyList<string>)? outermost = null;
+        for (var cur = node; cur is { HeldBy: { } property, Parent: { Type: { } ownerType } parent }; cur = parent)
+        {
+            if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
+                outermost = (ownerType, property, underlying, parent.Path);
+        }
+        return outermost;
     }
 
     // The first property along ownerPath (property names from root, by reflection only) declared as a
@@ -224,8 +273,11 @@ public static class TableEntitySerializer
     /// <paramref name="storeType"/>. <paramref name="plainStore"/>: <paramref name="storeType"/> is not
     /// large-value aware (its store refuses every large-value form); otherwise the value needs split cells
     /// or a blob in a column a read of <paramref name="storeType"/> maps to no property.
+    /// <paramref name="contentIn"/>: the property that holds a <see cref="TableBlobContent"/> and is not declared
+    /// as one; a read gives the content back only to a property declared as <see cref="TableBlobContent"/>, so
+    /// that declaration is the remedy named.
     /// </summary>
-    internal static string SubclassThroughBaseStoreRefusal(Type runtimeType, Type storeType, string column, bool plainStore)
+    internal static string SubclassThroughBaseStoreRefusal(Type runtimeType, Type storeType, string column, bool plainStore, PropertyInfo? contentIn = null)
     {
         var why = plainStore
             ? $"{storeType.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity as one " +
@@ -236,6 +288,13 @@ public static class TableEntitySerializer
             ? $"Store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> (a store of the runtime type)"
             : $"Mark {runtimeType.Name} with [TableValueSplit] and store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> " +
               "(a store of the runtime type)";
+        // A file in a property not declared TableBlobContent: only that declaration lets a read give it back.
+        if (contentIn is { DeclaringType: { } declaring })
+            remedy = !TableEntityValue.ContainsPathDelimiter(column) && declaring.IsAssignableFrom(storeType)
+                ? $"A read gives a TableBlobContent back only to a property declared as TableBlobContent: declare {declaring.Name}.{contentIn.Name} " +
+                  $"as TableBlobContent, so that {storeType.Name} is large-value aware by its declared types and its reads give the content back"
+                : $"A read gives a TableBlobContent back only to a property declared as TableBlobContent: declare {declaring.Name}.{contentIn.Name} " +
+                  $"as TableBlobContent and store {runtimeType.Name} entities through an IStorage<{runtimeType.Name}> (a store of the runtime type)";
         return $"'{column}' of {runtimeType.Name} is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. This " +
                $"{runtimeType.Name} is written through an IStorage<{storeType.Name}>, and {why}. {remedy}. Nothing was stored.";
     }
@@ -243,6 +302,17 @@ public static class TableEntitySerializer
     /// <summary>The message for a large value reached by a partial (Merge) update.</summary>
     internal static string PartialUpdateRefusal(string name) =>
         $"'{name}' is a large value; partial updates cannot write it — replace the entity instead.";
+
+    /// <summary>
+    /// The message for a partial update of <paramref name="column"/> of an aware <paramref name="root"/> whose
+    /// read-side resolution threw <paramref name="failure"/>: whether the column is a large value is not known.
+    /// </summary>
+    internal static string UndecidablePartialUpdateRefusal(Type root, string column, Exception failure) =>
+        $"The partial update of '{column}' of {root.Name} was refused: deciding whether the column is a large value needs a " +
+        $"new {root.Name} as a read creates it, and that failed ({failure.GetType().Name}: {failure.Message}). The type's " +
+        "constructor or a getter failed (or an object along the path cannot be created), so the library cannot tell whether " +
+        $"'{column}' is a large value, which a partial update cannot write. Nothing was written. Send the update again once " +
+        "the constructor and getters succeed, or replace the entity instead.";
 
     /// <summary>The message for a large value whose column a read of <paramref name="root"/> maps to no property.</summary>
     internal static string UnreadableLargeValue(Type root, string column) =>
@@ -727,8 +797,9 @@ public static class TableEntitySerializer
         var dict = new Dictionary<string, object>();
         if (value == null) return dict;
 
+        // A type that is not aware declares no TableBlobContent property: the content is in another type.
         if (plainRoot is not null && value is TableBlobContent)
-            throw new NotSupportedException(PlainPathRefusal(plainRoot, [], plainRoot, propertyName));
+            throw new NotSupportedException(PlainPathRefusal(plainRoot, [], plainRoot, propertyName, partial: true, contentInAnotherType: true));
 
         var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
         var node = new TableEntityValue(ImmutableList<string>.Empty.Add(propertyName), value);
@@ -742,9 +813,12 @@ public static class TableEntitySerializer
     /// <summary>
     /// <see cref="FlattenProperty(string, object)"/> for a column path of <paramref name="ownerType"/>
     /// (<c>"Inner_Body"</c>): refuses a path that reaches a large-value member, which the untyped
-    /// overload cannot see.
+    /// overload cannot see. For a large-value aware type whose read-side resolution of the path throws (its
+    /// constructor or a getter fails), the path may name one, so it is refused too.
     /// </summary>
-    /// <exception cref="NotSupportedException">The path names a large-value member.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The path names a large-value member, or (aware type) resolving it failed, so whether it does is not known.
+    /// </exception>
     internal static Dictionary<string, object> FlattenProperty(Type ownerType, string columnPath, object value)
     {
         ArgumentNullException.ThrowIfNull(ownerType);
@@ -773,8 +847,11 @@ public static class TableEntitySerializer
         // The same question for the object a read finds along the path: a default instance may be of a
         // runtime type that opts the member in although the declared type's member is ordinary. A plain
         // cell merged beside its split cells would read back the old value.
-        if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath))
+        if (TypeMetadataCache.IsLargeValueOnRead(ownerType, columnPath, out var unresolved))
             throw new NotSupportedException(PartialUpdateRefusal(columnPath));
+        // A column the read-side resolution could not resolve may be a large value: refused, never merged.
+        if (unresolved is not null)
+            throw new NotSupportedException(UndecidablePartialUpdateRefusal(ownerType, columnPath, unresolved), unresolved);
         return FlattenProperty(columnPath, value);
     }
 
@@ -891,14 +968,17 @@ public static class TableEntitySerializer
             // it); a partial update refuses the member as it does for any type, with this message.
             if (state.PlainRoot is { } plainRoot && (childVal is not null || state.Partial)
                 && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
+            {
+                var contentIn = childVal is TableBlobContent && prop.PropertyType != typeof(TableBlobContent) ? prop : null;
                 throw new NotSupportedException(state.Subclass is { } subclass
-                    ? SubclassThroughBaseStoreRefusal(subclass, plainRoot, string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name)), plainStore: true)
-                    : PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name));
+                    ? SubclassThroughBaseStoreRefusal(subclass, plainRoot, string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name)), plainStore: true, contentIn)
+                    : PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name, state.Partial, contentIn is not null, RuntimeNullableStructOnPath(value)));
+            }
             if (state.Partial && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
                 throw new NotSupportedException(
                     PartialUpdateRefusal(string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name))));
 
-            var childNode = new TableEntityValue(value.Path.Add(prop.Name), childVal!);
+            var childNode = new TableEntityValue(value.Path.Add(prop.Name), childVal!) { Parent = value, HeldBy = prop };
             // A write may have to put another content instance on this property (PendingBlob.Assign).
             if (childVal is TableBlobContent && !value.Type.IsValueType)
                 childNode.BlobContentOwner = (value.Value, prop);
@@ -1182,6 +1262,15 @@ internal sealed class TableEntityValue
     /// write can put another content instance there. Null when that object is held by value.
     /// </summary>
     public (object Owner, PropertyInfo Property)? BlobContentOwner { get; set; }
+
+    /// <summary>
+    /// While flattening: the value of the object that holds this one, and the property it is held in (null at
+    /// the root). A refusal message reads them to name the owners along the path by their runtime types.
+    /// </summary>
+    public TableEntityValue? Parent { get; init; }
+
+    /// <inheritdoc cref="Parent"/>
+    public PropertyInfo? HeldBy { get; init; }
 
     /// <summary>Whether a column is a truncation marker — metadata that must be skipped on read.</summary>
     internal static bool IsTruncationMarker(string column) =>
@@ -1849,11 +1938,20 @@ internal static class TypeMetadataCache
     /// getter that fails leaves the columns of the declared types, and a later call tries again. Never
     /// throws; empty, and nothing constructed, for a type that is not large-value aware.
     /// </summary>
-    internal static IReadOnlyList<string> LargeValueColumns(Type t) => LargeValues(t).Columns;
+    internal static IReadOnlyList<string> LargeValueColumns(Type t) => LargeValues(t, out _).Columns;
 
-    private static LargeValueInfo LargeValues(Type t)
+    /// <summary>
+    /// <see cref="LargeValueColumns(Type)"/>, with <paramref name="remembered"/> true when the list is the one
+    /// remembered for the type (the probe completed, or the type is not large-value aware) and false when a
+    /// constructor or getter of the default instance failed: a caller that keeps something built from the
+    /// list keeps it only when it is true.
+    /// </summary>
+    internal static IReadOnlyList<string> LargeValueColumns(Type t, out bool remembered) => LargeValues(t, out remembered).Columns;
+
+    private static LargeValueInfo LargeValues(Type t, out bool remembered)
     {
         ArgumentNullException.ThrowIfNull(t);
+        remembered = true;
         // A type that opts into nothing by its declared types is never constructed to answer this.
         if (!IsLargeValueAware(t))
             return DeclaredLargeValues(t);
@@ -1861,6 +1959,7 @@ internal static class TypeMetadataCache
             return known;
 
         var info = WithDefaultInstances(t, DeclaredLargeValues(t), out var complete);
+        remembered = complete;
         return complete ? _largeValues.GetOrAdd(t, info) : info;
     }
 
@@ -2347,27 +2446,41 @@ internal static class TypeMetadataCache
     /// <summary>
     /// True when the property a read of <paramref name="type"/> sets <paramref name="column"/> on is a
     /// large-value member: a <see cref="TableBlobContent"/>, or one its owner's runtime type opts in.
-    /// Never throws, and the answer is remembered: a column a read cannot resolve is not one. False, with
-    /// nothing constructed, for a type that is not large-value aware (<see cref="IsLargeValueAware"/>).
+    /// Never throws. The answer is remembered once the column was resolved; when resolving it throws (the
+    /// entity's constructor or a getter failed, or an owner along the path cannot be created) the answer
+    /// is false and is not remembered: <see cref="IsLargeValueOnRead(Type, string, out Exception?)"/> tells
+    /// that case apart. False, with nothing constructed, for a type that is not large-value aware
+    /// (<see cref="IsLargeValueAware"/>).
     /// </summary>
-    internal static bool IsLargeValueOnRead(Type type, string column)
+    internal static bool IsLargeValueOnRead(Type type, string column) => IsLargeValueOnRead(type, column, out _);
+
+    /// <summary>
+    /// <see cref="IsLargeValueOnRead(Type, string)"/>, with <paramref name="unresolved"/> set to the exception
+    /// of the resolution when it threw: then the library cannot tell whether the column is a large value, and
+    /// a write that depends on the answer refuses rather than take the false for "not one".
+    /// </summary>
+    internal static bool IsLargeValueOnRead(Type type, string column, out Exception? unresolved)
     {
         ArgumentNullException.ThrowIfNull(type);
+        unresolved = null;
         if (!IsLargeValueAware(type))
             return false;
         if (_largeOnRead.TryGetValue((type, column), out var known))
             return known;
 
         bool large;
-#pragma warning disable CA1031 // a path a read cannot resolve names no member to refuse
+#pragma warning disable CA1031 // a path the check cannot resolve is reported to the caller, never remembered
         try
         {
             large = ReadTarget(type, column) is { ReflectedType: { } owner } leaf
                 && (leaf.PropertyType == typeof(TableBlobContent) || GetMetadata(owner).SplitOptions.ContainsKey(leaf.Name));
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            large = false;
+            // Not remembered: the constructor or a getter may succeed at the next call, and the answer
+            // must not depend on whether it failed once.
+            unresolved = ex;
+            return false;
         }
 #pragma warning restore CA1031
         if (_largeOnRead.Count < MaxRememberedReadTargets)
@@ -2442,6 +2555,7 @@ internal static class TypeMetadataCache
     // [TableValueSplit] per property; see SplitFor. A misused attribute fails here, on first use of the type.
     private static Dictionary<string, TableValueSplitAttribute> BuildSplitOptions(Type t, ImmutableList<PropertyInfo> props)
     {
+        RefuseInterfaceMemberSplit(t);
         var options = new Dictionary<string, TableValueSplitAttribute>(StringComparer.Ordinal);
         var classLevel = ClassLevelSplit(t);
         foreach (var prop in props)
@@ -2451,6 +2565,42 @@ internal static class TypeMetadataCache
         }
 
         return options;
+    }
+
+    // [TableValueSplit] on a member declared on an interface that t implements is a misused attribute: .NET
+    // does not pass the attributes of an interface member to the implementing class, so the writer, which
+    // reads the members of the runtime type, would store the value as an ordinary cell (and a trimming
+    // OversizedCellPolicy would trim it). It opts nothing in (SplitFor ignores it) and fails here, on every
+    // use of a type that implements the interface. Attributes are read by reflection alone; an interface
+    // whose members cannot be read is skipped (the serializer never reads its attributes otherwise).
+    private static void RefuseInterfaceMemberSplit(Type t)
+    {
+        if (t.IsInterface)
+            return;
+
+        foreach (var contract in t.GetInterfaces())
+        {
+            PropertyInfo? marked;
+#pragma warning disable CA1031 // an interface the check cannot read has no attribute it could report
+            try
+            {
+                marked = Array.Find(contract.GetProperties(BindingFlags.Public | BindingFlags.Instance),
+                    static p => p.IsDefined(typeof(TableValueSplitAttribute), inherit: false));
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+#pragma warning restore CA1031
+            if (marked is not null)
+                throw new InvalidOperationException(
+                    $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface that {t.Name} implements: " +
+                    ".NET does not pass the attributes of an interface member to the implementing class, so the attribute cannot be " +
+                    $"honoured (the value would be stored as an ordinary cell, and could be trimmed). Put [TableValueSplit] on " +
+                    $"{t.Name}.{marked.Name} (the property of the implementing class), or on the class {t.Name}, and remove it from " +
+                    $"{contract.Name}. Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
+                    "mark the entity class with [TableValueSplit] as well, so that the entity is large-value aware.");
+        }
     }
 
     // The class-level [TableValueSplit] that applies to t: the nearest one, on t itself or on a base
@@ -2476,8 +2626,12 @@ internal static class TypeMetadataCache
     // nothing to split; one on an interface or abstract type that may flatten at runtime cannot be
     // honoured. With validate such a misuse throws (the serializer, on first use of the type); without,
     // the property is simply not opted in (the large-value walk, which must not throw).
+    // A member declared on an interface (t is the interface) is never opted in: the writer reads the
+    // members of the implementing class, where the attribute is not visible (RefuseInterfaceMemberSplit).
     private static TableValueSplitAttribute? SplitFor(Type t, PropertyInfo prop, TableValueSplitAttribute? classLevel, bool validate)
     {
+        if (t.IsInterface)
+            return null;
         // The property's type is resolved only for a property an attribute may cover: the metadata of
         // a type that opts into nothing is built from property names and attributes alone, as on 0.8.3.
         if (PropertyLevelSplit(prop) is not { } own)

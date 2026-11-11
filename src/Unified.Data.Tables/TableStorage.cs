@@ -1249,7 +1249,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             {
                 throw new UnauthorizedAccessException(
                     $"Property '{prop.Name}' on {typeName} is protected (requires roles: {attr.Roles}). " +
-                    (large
+                    (large || ProtectedLargeValues.HoldsLargeValue(typeof(T), oldVal, newVal)
                         ? ProtectedLargeValues.DescribeRefusedChange(oldVal, newVal)
                         : $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'."));
             }
