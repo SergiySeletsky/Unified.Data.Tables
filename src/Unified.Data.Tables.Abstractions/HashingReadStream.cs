@@ -3,10 +3,14 @@ using System.Security.Cryptography;
 namespace Unified.Data.Tables;
 
 /// <summary>
-/// A read-only pass-through stream that hashes what it hands out and, when the inner stream ends,
-/// checks the byte count and SHA-256 against the expected values. A mismatch throws the exception
-/// <c>onMismatch</c> builds from the reason, so a reader never mistakes changed or partial content for
-/// the real thing. With no expected values it is a plain non-closing (when <c>leaveOpen</c>) wrapper.
+/// A read-only pass-through stream that hashes what it hands out and checks the byte count and SHA-256
+/// against the expected values. The hash is compared as soon as the expected number of bytes is in: the
+/// read that would hand out the final byte throws instead of returning it when the content does not
+/// match, so a caller that reads exactly the expected length never gets changed content. Bytes beyond
+/// the expected length are never handed out, and a stream that ends early fails at its end. A mismatch
+/// throws the exception <c>onMismatch</c> builds from the reason, so a reader never mistakes changed or
+/// partial content for the real thing. With no expected values it is a plain non-closing (when
+/// <c>leaveOpen</c>) wrapper.
 /// </summary>
 internal sealed class HashingReadStream : Stream
 {
@@ -17,6 +21,7 @@ internal sealed class HashingReadStream : Stream
     private readonly bool leaveOpen;
     private readonly IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
     private long read;
+    private bool hashChecked;
     private bool verified;
 
     internal HashingReadStream(Stream inner, long? expectedLength, string? expectedSha256, Func<string, Exception> onMismatch, bool leaveOpen)
@@ -34,8 +39,9 @@ internal sealed class HashingReadStream : Stream
     internal bool Verified => verified;
 
     /// <summary>
-    /// The exception the end-of-stream check raised, kept so a caller can report it even when the
-    /// consumer (an SDK pipeline) wrapped, retried past or swallowed it; null while no check failed.
+    /// The exception a failed check raised, kept so a caller can report it even when the consumer (an
+    /// SDK pipeline) wrapped, retried past or swallowed it; null while no check failed. Once set, every
+    /// later read throws it again: no more data is handed out.
     /// </summary>
     internal Exception? Mismatch { get; private set; }
 
@@ -77,12 +83,13 @@ internal sealed class HashingReadStream : Stream
     {
         if (n > 0)
         {
+            BeforeDelivering(n);
             hash.AppendData(buffer.Slice(0, n));
-            read += n;
+            AfterDelivering(n);
         }
         else if (buffer.Length > 0)
         {
-            Verify();
+            VerifyEnd();
         }
         return n;
     }
@@ -104,27 +111,54 @@ internal sealed class HashingReadStream : Stream
     {
         if (n > 0)
         {
+            BeforeDelivering(n);
             hash.AppendData(buffer, offset, n);
-            read += n;
+            AfterDelivering(n);
         }
         else if (count > 0)
         {
-            Verify();
+            VerifyEnd();
         }
         return n;
     }
 
-    private void Verify()
+    // Before n more bytes are handed out: none after a failed check, and none beyond the expected length.
+    private void BeforeDelivering(int n)
+    {
+        if (Mismatch is not null) throw Mismatch;
+        if (expectedLength is long length && read + n > length)
+            throw Mismatch = onMismatch($"the content is longer than the expected {length} bytes");
+    }
+
+    // After n bytes were hashed: the hash is compared the moment the last expected byte is in, so the
+    // read that would hand out that byte throws instead when the content does not match.
+    private void AfterDelivering(int n)
+    {
+        read += n;
+        if (expectedLength is long length && read == length)
+            CheckHash();
+    }
+
+    // The inner stream ended: it must have held exactly the expected bytes.
+    private void VerifyEnd()
     {
         if (verified) return;
-        // The hash is consumed by the first check: report that outcome again rather than a new one.
+        // A failed check is final: report that outcome again rather than a new one.
         if (Mismatch is not null) throw Mismatch;
-        var actual = Hex.Lower(hash.GetHashAndReset());
         if (expectedLength is long length && read != length)
             throw Mismatch = onMismatch($"read {read} bytes, expected {length}");
+        CheckHash();
+        verified = true;
+    }
+
+    // Compares the SHA-256 of everything handed out so far; the hash is consumed, so it runs once.
+    private void CheckHash()
+    {
+        if (hashChecked) return;
+        var actual = Hex.Lower(hash.GetHashAndReset());
         if (expectedSha256 is not null && !string.Equals(actual, expectedSha256, StringComparison.OrdinalIgnoreCase))
             throw Mismatch = onMismatch($"SHA-256 mismatch (expected {expectedSha256}, computed {actual})");
-        verified = true;
+        hashChecked = true;
     }
 
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
