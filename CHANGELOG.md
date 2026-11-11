@@ -532,7 +532,9 @@ Lossless storage of large values, opt-in per property.
 
 - The Azurite integration tests skip only when the emulator is not reachable at all; any other probe
   failure is retried and then fails the run. `UNIFIED_TABLES_REQUIRE_AZURITE=1` turns a skip into a
-  failure. Every workflow starts a pinned Azurite 3.35.0 and sets it.
+  failure. Every workflow starts a pinned Azurite 3.35.0 and sets it. The "Start Azurite" step of
+  `ci.yml` and `publish.yml` waits until the blob (10000) and table (10002) endpoints each answer an HTTP
+  request, and fails the job after 60 s with a message and the container's log.
 - New workflow `.github/workflows/ci.yml` (`CI`, job `Build and test`): on every pull request and every
   push to `main` it builds the solution in Release and runs all tests on `ubuntu-latest`. It uses no
   secret. This is the check that gates a pull request on the tests: require `CI / Build and test` in
