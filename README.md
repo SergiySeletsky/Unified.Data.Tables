@@ -693,6 +693,16 @@ With no client found, only types that have `[TableValueSplit]` or `TableBlobCont
 (`InvalidOperationException` naming the fix); every other `IStorage<T>` resolves as before. Without offload
 configured, tiers 1 and 2 still work and a value that needs tier 3 throws `OversizedValueException`.
 
+`AddUnifiedTableStorage` may be called more than once, by a library module and by the host, say. The
+first call's options are the registered ones, and the options of a later call are not used. A later call
+does one thing: when the registered options set `BlobOffload` and no call has supplied the blob client
+yet, it supplies it, in the order above (its own `BlobOffloadOptions.ServiceClient`, the host's client
+when it sets `UseRegisteredServiceClient`, else the client its connection string or endpoint derives).
+So `AddUnifiedTableStorage(o => o.BlobOffload = new BlobOffloadOptions())` followed by
+`AddUnifiedTableStorage(connectionString)` resolves large-value stores. The other order does not turn
+offload on (the first call's options win), and a client or a choice of the host's client that an earlier
+call made is never replaced.
+
 The container belongs to offload alone: do not store other blobs in it. Sweeps and partition deletes
 only ever delete names of the exact offload shape (see below) and skip anything else, but they list
 the whole `{table}/` prefix.
@@ -703,17 +713,58 @@ A `TableBlobContent` property is always offloaded, whatever its size, and readin
 downloads it. `TableBlobContent.FromBytes(bytes, contentType)` and `FromStream(stream, contentType)` create
 one; `FromStream` never buffers the content in memory and leaves your stream open. A non-seekable stream
 is copied to a delete-on-close temporary file under `Path.GetTempPath()` (so the host needs temp disk space
-and access); a seekable stream is read twice (hash, then upload) and must not change until the write completes. `Length` and `Sha256`
-are known after the write (immediately for `FromBytes`). On a loaded entity, `await content.OpenReadAsync()`
-streams the blob lazily and verifies the SHA-256 when the stream reaches its end.
+and access); a seekable stream is read from its current position, twice (hash, then upload), and must not
+change until the write completes. `Length` and `Sha256` are known after the write (immediately for
+`FromBytes`).
+
+On a loaded entity, `await content.OpenReadAsync()` streams the blob lazily and has verified it by the
+time it has delivered it: the read that would return the last byte of the expected length compares the
+SHA-256 first, and throws `TableValueIntegrityException` instead of returning that data when it does
+not match. A caller that reads exactly `Length` bytes therefore never gets changed content. Bytes beyond
+the expected length are never handed out, a blob that ends early fails at the end of the stream, and
+once a check has failed every later read of that stream throws the same exception. Nothing is verified
+before the last byte: a caller that processes the content while reading it has processed all but the
+last read when a mismatch is reported, so buffer first when that matters. Saving the entity again while
+one of its files is being read does not disturb the read. A blob that is deleted under an open stream
+(the row was replaced with other content or deleted, and cleanup or a sweep removed the blob) fails the
+read with `TableValueIntegrityException`, unless the stream already holds the rest of its bytes: read
+the entity again and open the new content.
+
+A write that fails can be retried with the same content when it was created from bytes or from a
+seekable stream: every attempt reads the stream from the position it had at the first one, and a failed
+or cancelled attempt puts it back there. A content from a non-seekable stream may not survive a failed
+write: when the write fails before its blobs are uploaded, the stream has been partly read or its
+temporary copy has been deleted, and every later write of that content throws
+`InvalidOperationException` before anything is read or uploaded (as it does for a seekable stream that
+can no longer be put back where the content starts, one disposed in the meantime, say). Create the
+content again from its source. So use `FromBytes` or a seekable stream wherever a write may be retried,
+in particular inside `MutateAsync` and `MutateOrCreateAsync`, which apply the mutation again with the
+same content instance after a conflict; with a non-seekable source, create the content inside the
+mutation from something that can be opened again.
+
+One content may be assigned to several properties or entities, and a content taken from a loaded entity
+may be written into another one: every row gets a blob of its own. A content that already streams a blob
+keeps streaming that blob, and the property that was written is given a new `TableBlobContent` for the
+blob of its own row. With `a` read from the table, after
+`b.Attachment = a.Attachment; await storage.CreateAsync(b);` the two are therefore not the same object:
+both return the same bytes, each from its own blob, and replacing or deleting one row does not affect
+the other entity or its cached copy. Content created with `FromBytes` reads its own bytes and is never
+replaced.
 
 ### Ordering and integrity
 
 - **Write** - the blob is uploaded create-only first (an existing blob with the same name and matching
   `sha256` counts as success, and its `Last-Modified` is touched), then the entity is written.
 - **Replace** - new blob, entity swap guarded by the ETag, then best-effort delete of old blobs the new
-  row no longer references.
-- **Delete** - the entity first, then its blobs.
+  row no longer references. Only the row's own blobs are deleted, those named
+  `{table}/{partitionKey}/{rowKey}/...`: a reference to any other blob, as a row copied raw from another
+  table or key carries, is left alone.
+- **Delete** - the entity first, then its own blobs.
+- **Partition delete** - the rows first, in transactions of at most 100 deletes that never divide a main
+  row from its continuation rows, so a failure or a cancelled token between two transactions leaves whole
+  entities (the call throws; call it again to finish). The count returned is of entities, not rows. Then
+  the blobs under the partition that are older than `CleanupGrace` and that no row of the partition
+  references at that moment: a row another writer created meanwhile keeps its blobs.
 - A failed entity write never deletes a blob. Blobs are named
   `{table}/{partitionKey}/{rowKey}/{property}/{sha256}`, so rewriting identical content reuses the blob.
   Each segment is percent-escaped (`Uri.EscapeDataString`) with `.` also escaped as `%2E`, and an empty
@@ -723,7 +774,9 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
   chunk, continuation row or blob throws `TableValueIntegrityException`; partial data is never returned.
   A transport that transparently decompresses `Content-Encoding: gzip` would break the hash check.
 - A read that races a replace or delete (the main row is read before its continuation rows and blobs) can
-  see parts or a missing blob of another version. On such a failure the main row is read again: if its
+  see parts or a missing blob of another version, or have a blob deleted while it downloads it (a blob
+  that is only touched, by a write that reuses its content, does not disturb the download). On such a
+  failure the main row is read again: if its
   ETag changed, the whole read is retried from the new version (three attempts in all); a row deleted
   meanwhile reads as absent (`OneAsync` returns null, a query skips it); only an unchanged ETag is reported
   as `TableValueIntegrityException`. Data of two versions is never combined.
@@ -743,12 +796,19 @@ streams the blob lazily and verifies the SHA-256 when the stream reaches its end
 
 ### Sweeping orphans
 
-Lost races, crashes and failed deletes leave unreferenced blobs. Best-effort cleanup after a replace or
-delete only removes blobs untouched for `BlobOffloadOptions.CleanupGrace` (default 5 minutes); younger ones
-are left for the sweep, which must be scheduled: call it yourself, or register the
-[hosted sweep](#hosted-sweep). A committed write or delete is never reported as failed because its token
-was cancelled: its cleanup runs on for at most 5 more seconds, then stops and leaves the rest of the blobs
-(a large partition's, say, during a host shutdown) to the sweep.
+Lost races, crashes and failed deletes leave unreferenced blobs. Best-effort cleanup after a replace,
+delete or partition delete only removes blobs untouched for `BlobOffloadOptions.CleanupGrace` (default
+5 minutes), and after a replace or delete only the row's own; the others are left for the sweep, which
+must be scheduled: call it yourself, or register the [hosted sweep](#hosted-sweep). A committed write or
+delete is never reported as failed because its token was cancelled: its cleanup runs on for at most 5
+more seconds, then stops and leaves the rest of the blobs (a large partition's, say, during a host
+shutdown) to the sweep.
+
+Keep `CleanupGrace` well above the time a write takes from its blob upload to its row commit. A blob's
+`Last-Modified` has one-second resolution, so a grace below one second cannot tell a blob that a
+concurrent writer has just touched from an old one: use zero only in tests.
+`CleanupGrace = TimeSpan.MaxValue` switches this cleanup off: nothing is deleted after a write, a delete
+or a partition delete, and every released blob is left for the sweep.
 
 Both ages are measured on the storage service's clock, the one that stamps a blob's `Last-Modified`: the
 cleanup after a write or delete uses the `Date` of the commit response, and the sweep and the cleanup after
@@ -756,7 +816,9 @@ a partition delete ask the blob service for its time (one container properties r
 A client clock that runs ahead therefore cannot make a freshly touched blob look old. Only when no service
 time is available is the client clock used, moved back by a further 5 minutes
 (`LargeValueTable.ClientClockMargin`). The service clock has one-second resolution, so a blob written in
-the current second is not yet older than `TimeSpan.Zero`.
+the current second is not yet older than `TimeSpan.Zero`. Like the sweep, the cleanup after a partition
+delete reads the partition's rows once (keys and reference cells) to see which blobs are still
+referenced, and only when some blob is old enough.
 
 ```csharp
 int deleted = await storage.SweepOrphanBlobsAsync("tenant-a", olderThan: TimeSpan.FromHours(1));
@@ -809,7 +871,8 @@ so a scaled-out app may register it in one instance only.
   continuation rows (`{RowKey}~0001`, ...) as entities of their own, reads `Stages__c0` as the nested path
   `[Stages, c0]` so a split collection reads as empty, and sees an offloaded property as null. A later
   replace or upsert from that reader writes the empty value back and the data is lost (its blob is then
-  an orphan the sweep deletes). Deploy in two steps: first the package bump with no `[TableValueSplit]` or
+  an orphan the sweep deletes). Values that each fit one cell are not exempt: an entity whose opted-in
+  values together exceed one entity is written with split cells and continuation rows too. Deploy in two steps: first the package bump with no `[TableValueSplit]` or
   `TableBlobContent`, which writes exactly what 0.8.3 wrote; then, once no older reader remains (swapped
   slots drained, rollback no longer to a pre-0.9.0 build, every service that reads the table upgraded), the
   attributes. Rolling back past the second deploy needs the data rewritten first.
@@ -817,10 +880,14 @@ so a scaled-out app may register it in one instance only.
   RowKeys `{RowKey}~NNNN`) and its blobs in the offload container, taken together. A row restored without
   its parts or blobs (or with those of another version) reads as `TableValueIntegrityException`.
 - **A table copied raw shares the source's blobs**: each `{Prop}__blob` reference holds the blob path
-  under the source table's name, so the copy reads the source's blobs, and once the source replaces or
-  deletes those rows its cleanup and sweep delete blobs the copy still reads. Give the copy its own copy of
-  the blobs (rewrite the entities through the library, or copy the container and point the copy's
-  `ContainerName` at it). Blob versioning or soft delete on the container makes such a mistake recoverable.
+  under the source table's name, so the copy reads the source's blobs (a row copied raw to another key
+  likewise reads the blobs of the row it was copied from). Writes through the copy never delete them:
+  cleanup removes only a row's own blobs, so loading a copied entity and saving it through the library
+  uploads a blob of the copy's own and leaves the source's untouched. The other direction is not
+  protected: once the source replaces or deletes those rows, its cleanup, partition delete and sweep
+  delete blobs the copy still reads. Give the copy its own copy of the blobs before the source changes
+  (rewrite the entities through the library, or copy the container and point the copy's `ContainerName`
+  at it). Blob versioning or soft delete on the container makes such a mistake recoverable.
 - **The offload container is the library's.** Do not put other blobs in it, and do not share it between
   applications whose tables have the same names.
 - **Schedule the sweep** (above): nothing else removes orphans younger than `CleanupGrace` or left by a
