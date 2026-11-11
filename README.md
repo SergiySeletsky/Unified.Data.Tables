@@ -140,6 +140,16 @@ All overloads register `IMemoryCache`, the configured options, and the open-gene
 > same tables makes `Sliding` caching unbounded-stale in the readers. Use `CachePolicy.Disabled` in
 > secondary processes and `Absolute` with a short TTL in the primary.
 
+Within one process the cache follows the writes made through it. A read that is in flight while a write
+or delete of the same entity completes may still return the version it fetched, but it does not leave
+that version in the cache: a read that starts after the write or delete has returned is not served it.
+The same holds for the cached `QueryAsync(partition)` lists, and across all stores of one entity type
+that share an `IMemoryCache` (the DI registration shares one). Two limits remain. A write made by
+another process, or through a store over another `IMemoryCache`, is not seen until the cache entry
+expires, hence the note above. And two writes of the same entity that run at the same time each cache
+their own version when they return, so the earlier one's can be the one that stays: use ETags
+(`ConcurrencyMode.Strict`, `MutateAsync`) for an entity that several callers write at once.
+
 ### 3. Use it
 
 ```csharp
@@ -1134,7 +1144,11 @@ enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `
 and results arrive in lexical key order — so a green test against the fake means the same code holds
 against Azure Tables. `[TableValueSplit]` and `TableBlobContent` work too: the fake keeps offloaded blobs in
 an in-memory dictionary, with the same integrity checks and `SweepOrphanBlobsAsync` support (it needs no
-`BlobServiceClient` and ignores `BlobOffloadOptions.ServiceClient`).
+`BlobServiceClient` and ignores `BlobOffloadOptions.ServiceClient`). It plans the same rows and
+transactions, refuses the same keys and shapes, takes back leftover continuation rows, cleans up only a
+row's own blobs and retries a write that lost a race with the same five attempts and pauses. Two differences are
+worth knowing: it has no read cache, and a stream opened on a `TableBlobContent` holds the bytes it was
+opened with, so a blob deleted meanwhile does not fail that read.
 
 The polymorphic store has the same mirror, keyed the same way:
 
@@ -1244,9 +1258,26 @@ The test suite mixes fast unit tests (Azure SDK mocked with NSubstitute) with in
 against a local **Azurite** emulator (tables on port 10002, blobs on 10000). The integration tests skip
 only when nothing is listening there (connection refused, host unreachable), so `dotnet test` is safe to
 run anywhere; an emulator that answers but fails (a timeout, an error) fails them after three attempts.
-Set `UNIFIED_TABLES_REQUIRE_AZURITE=1` to make an absent emulator a failure too: CI does, and starts a
-pinned Azurite (3.35.0, `--loose --skipApiVersionCheck`) before the tests, so a release or pull request
-is never gated by skipped integration tests.
+Set `UNIFIED_TABLES_REQUIRE_AZURITE=1` to make an absent emulator a failure too. Each integration test
+uses partitions of its own (a name plus a GUID), so several test runs can share one emulator.
+
+Three GitHub workflows run the suite with that variable set and a pinned Azurite (3.35.0,
+`--loose --skipApiVersionCheck`), so nothing is gated by skipped integration tests:
+
+- **CI** (`.github/workflows/ci.yml`, job `Build and test`) runs on every pull request and every push to
+  `main`: it builds the solution in Release and runs all tests on `ubuntu-latest`. It needs no secret.
+  This is the check that gates a change on the tests; require `CI / Build and test` in branch protection.
+- **SonarQube** (`sonarqube.yml`, job `Build and analyze`) runs the scanner's begin, the build, the tests
+  and the scanner's end as separate steps, so a failed build or test fails the job and its analysis is
+  not uploaded. It needs a valid `SONAR_TOKEN` and fails at `Begin analysis` without one, whatever the
+  tests do.
+- **Publish** (`publish.yml`) runs the tests, packs, and stops before the push unless the packed
+  `Unified.Data.Tables` depends on `Unified.Data.Tables.Abstractions` `[x.y.z]` and
+  `Unified.Data.Tables.InMemory` on `Unified.Data.Tables` `[x.y.z]`, the versions packed in the same run.
+
+`TableEntitySerializer.OversizedCellPolicy` is process-wide state, so a test class that sets it, or
+calls `AddUnifiedTableStorage` or `AddUnifiedInMemoryStorage` (which set it), must carry
+`[Collection("OversizedCellPolicy")]`; a test of the main test project fails when one does not.
 
 ---
 
