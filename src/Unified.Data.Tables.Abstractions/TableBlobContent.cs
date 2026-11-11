@@ -309,22 +309,33 @@ public sealed class TableBlobContent
     /// <param name="columnName">The column named by an integrity failure; defaults to <paramref name="path"/>.</param>
     /// <returns>
     /// True when the content serves reads of <paramref name="path"/>: it is bound to that blob now, or was
-    /// already, or it keeps its bytes in memory and never reads a blob. False when it streams another
-    /// blob and was not changed; the caller then gives the written entity a content of its own.
+    /// already (it then reads the blob through <paramref name="open"/>, the store that wrote it last),
+    /// or it keeps its bytes in memory and never reads a blob. False when it streams another blob and
+    /// was not changed; the caller then gives the written entity a content of its own.
     /// </returns>
     internal bool Bind(string path, Func<CancellationToken, Task<Stream>> open, string? columnName = null)
     {
         Guard.NotNull(path, nameof(path));
         Guard.NotNull(open, nameof(open));
         if (BoundPath is { } bound)
-            return bytes is not null || string.Equals(bound, path, StringComparison.Ordinal);
+        {
+            if (bytes is not null)
+                return true;
+            if (!string.Equals(bound, path, StringComparison.Ordinal))
+                return false;
+        }
+        else
+        {
+            BoundPath = path;
+            Abandoned = false;
+            ReleaseSpool();
+            Source = null;
+        }
 
-        // The opener last: a concurrent OpenReadAsync that sees it also sees the names it reports.
+        // The opener last: a concurrent OpenReadAsync that sees it also sees the name it reports. For a
+        // content already bound to this blob only the way to it changes (the row may have been read by
+        // a store that could not open it, and written by one that can).
         column = columnName;
-        BoundPath = path;
-        Abandoned = false;
-        ReleaseSpool();
-        Source = null;
         this.open = open;
         return true;
     }

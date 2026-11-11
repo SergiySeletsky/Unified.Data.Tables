@@ -178,6 +178,27 @@ public class BoundContentRewriteTests
     }
 
     [Fact]
+    public async Task ContentLoadedByAStoreWithoutOffload_SavedToItsOwnRow_ReadsThroughTheStoreThatSavedIt()
+    {
+        var data = RandomBytes(Size, seed: 115);
+        var writer = Store<FileEntity>();
+        await writer.CreateAsync(new FileEntity { Id = "p|a", File = Stream(data) }, Ct);
+        // The same row read by a store that has no blob offload: its file is loaded lazily but cannot be opened.
+        var plain = new InMemoryStorage<FileEntity>(null, new UnifiedTableStorageOptions());
+        plain.SeedPhysicalRow(writer.PhysicalRow("p", "a")!);
+        var loaded = await plain.OneAsync("p|a", Ct);
+        var file = loaded!.File!;
+        await Assert.ThrowsAsync<BlobOffloadNotConfiguredException>(() => file.OpenReadAsync(Ct));
+
+        // Saved through the store that has offload: the same blob, which that store can open.
+        await writer.UpsertAsync(loaded, Ct);
+
+        Assert.Same(file, loaded.File);
+        Assert.Equal(data, await BytesAsync(loaded.File));
+        Assert.Single(writer.Blobs.Names);
+    }
+
+    [Fact]
     public async Task OneNewContentOnTwoProperties_EachPropertyEndsUpBoundToItsOwnBlob()
     {
         var data = RandomBytes(Size, seed: 107);
