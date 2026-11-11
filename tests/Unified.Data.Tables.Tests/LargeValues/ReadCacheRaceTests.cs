@@ -240,17 +240,17 @@ public class ReadCacheRaceTests
 
     // ── a point read that raced a write or delete ──────────────────────────
 
-    private static async Task PointReadRacesAsync<T>(Rig<T> rig, Mutation mutation) where T : class, IEntity, IRaceDoc, new()
+    private static async Task PointReadRacesAsync<T>(Rig<T> rig, Mutation mutation, string id = Id) where T : class, IEntity, IRaceDoc, new()
     {
-        await rig.SeedAsync(Id);
+        await rig.SeedAsync(id);
 
-        var paused = await rig.PauseAsync(() => rig.Store.OneAsync(Id, Ct));
-        await rig.MutateAsync(mutation);
+        var paused = await rig.PauseAsync(() => rig.Store.OneAsync(id, Ct));
+        await rig.MutateAsync(mutation, id);
         var raced = await paused.ResumeAsync();
 
         // The racing read itself answers with what it started on; what matters is what it left behind.
         Assert.Equal(1, raced!.Version);
-        await rig.AssertStoreAnswersWhatTheTableHoldsAsync(mutation);
+        await rig.AssertStoreAnswersWhatTheTableHoldsAsync(mutation, id);
     }
 
     [Theory]
@@ -267,6 +267,17 @@ public class ReadCacheRaceTests
     {
         using var rig = Plain();
         await PointReadRacesAsync(rig, mutation);
+    }
+
+    // An id of one segment is its own partition and row key. The partition delete evicts such an entity
+    // under the two-segment spelling of its id, the read caches it under the one it was asked for: the
+    // write generation follows the row, not the spelling.
+    [Theory]
+    [MemberData(nameof(AllMutations))]
+    public async Task PointRead_OfASingleSegmentId_ThatRacedAWriteOrDelete_LeavesNothingOlderInTheCache(Mutation mutation)
+    {
+        using var rig = Plain();
+        await PointReadRacesAsync(rig, mutation, id: "solo");
     }
 
     private static async Task ExistsRacesADeleteAsync<T>(Rig<T> rig) where T : class, IEntity, IRaceDoc, new()
@@ -346,13 +357,11 @@ public class ReadCacheRaceTests
     // The read finishes after the write committed and before the writer touched the cache: the read may
     // cache the old version for that instant (the write has not returned yet), and the writer's own cache
     // maintenance then removes or replaces it.
-    [Theory]
-    [MemberData(nameof(ShapesAndMutations))]
-    public async Task PointRead_FinishingBetweenTheCommitAndTheWritersCacheMaintenance_LeavesNothingOlder(Shape shape, Mutation mutation)
+    private static async Task PointReadFinishesRightAfterTheCommitAsync<T>(Rig<T> rig, Mutation mutation, string id = Id)
+        where T : class, IEntity, IRaceDoc, new()
     {
-        using var rig = Split(shape);
-        await rig.SeedAsync(Id);
-        var paused = await rig.PauseAsync(() => rig.Store.OneAsync(Id, Ct));
+        await rig.SeedAsync(id);
+        var paused = await rig.PauseAsync(() => rig.Store.OneAsync(id, Ct));
 
         var commits = 0;
         rig.Table.Committed = _ =>
@@ -360,19 +369,37 @@ public class ReadCacheRaceTests
             if (Interlocked.Increment(ref commits) == 1)
                 paused.ResumeAsync().GetAwaiter().GetResult();
         };
-        await rig.MutateAsync(mutation);
+        await rig.MutateAsync(mutation, id);
 
-        var next = await rig.Store.OneAsync(Id, Ct);
+        var next = await rig.Store.OneAsync(id, Ct);
         if (Deletes(mutation))
         {
             Assert.Null(next);
-            Assert.False(await rig.Store.ExistsAsync(Id, Ct));
+            Assert.False(await rig.Store.ExistsAsync(id, Ct));
         }
         else
         {
             Assert.Equal(2, next!.Version);
-            Assert.Equal(BodyOf(shape, mutation == Mutation.Merge ? 1 : 2), next.Body, StringComparer.Ordinal);
+            Assert.Equal(BodyOf(rig.Shape, mutation == Mutation.Merge ? 1 : 2), next.Body, StringComparer.Ordinal);
         }
+    }
+
+    [Theory]
+    [MemberData(nameof(ShapesAndMutations))]
+    public async Task PointRead_FinishingBetweenTheCommitAndTheWritersCacheMaintenance_LeavesNothingOlder(Shape shape, Mutation mutation)
+    {
+        using var rig = Split(shape);
+        await PointReadFinishesRightAfterTheCommitAsync(rig, mutation);
+    }
+
+    // Here the writer has to remove the entry the read put: for an id of one segment the partition
+    // delete names the row by both keys, and that must reach the entry cached under the single segment.
+    [Theory]
+    [MemberData(nameof(AllMutations))]
+    public async Task PointRead_OfASingleSegmentId_FinishingBetweenTheCommitAndTheWritersCacheMaintenance_LeavesNothingOlder(Mutation mutation)
+    {
+        using var rig = Plain();
+        await PointReadFinishesRightAfterTheCommitAsync(rig, mutation, id: "solo");
     }
 
     // ── a cached query that raced a write or delete ────────────────────────
@@ -659,6 +686,75 @@ public class ReadCacheRaceTests
         await paused.ResumeAsync();
 
         await rig.AssertStoreAnswersWhatTheTableHoldsAsync(mutation);
+    }
+
+    // ── one cache entry per row, however its id is spelled ─────────────────
+
+    // An id of one segment is its own partition and row key, and "solo|solo" spells the same row. The
+    // partition delete names every row by both keys; a caller may use either spelling.
+    [Fact]
+    public async Task PartitionDelete_OfAnEntityWhoseIdHasOneSegment_EvictsTheCachedEntity()
+    {
+        using var rig = Plain();
+        await rig.Store.UpsertAsync(rig.Doc("solo", 1), Ct);
+        Assert.Equal(1, (await rig.Store.OneAsync("solo", Ct))!.Version);
+
+        Assert.Equal(1, await rig.Store.DeletePartitionAsync("solo", Ct));
+
+        Assert.Null(await rig.Store.OneAsync("solo", Ct));
+        Assert.False(await rig.Store.ExistsAsync("solo", Ct));
+    }
+
+    [Fact]
+    public async Task WriteOrDeleteUnderTheOtherSpellingOfAnId_ReachesTheCachedEntity()
+    {
+        using var rig = Plain();
+        await rig.SeedAsync("solo");
+        Assert.Equal(1, (await rig.Store.OneAsync("solo", Ct))!.Version);
+        Assert.Equal(1, (await rig.Store.OneAsync("solo|solo", Ct))!.Version);
+        Assert.Equal(1, rig.Table.Count(r => r.IsWholeRowPointRead)); // one row, one entry
+
+        await rig.Store.UpsertAsync(rig.Doc("solo|solo", 2), Ct);
+        Assert.Equal(2, (await rig.Store.OneAsync("solo", Ct))!.Version);
+
+        await rig.Store.UpdateAsync("solo|solo", b => b.SetProperty(x => x.Version, 3), Ct);
+        Assert.Equal(3, (await rig.Store.OneAsync("solo", Ct))!.Version);
+
+        await rig.Store.DeleteAsync("solo|solo", Ct);
+        Assert.Null(await rig.Store.OneAsync("solo", Ct));
+        Assert.False(await rig.Store.ExistsAsync("solo", Ct));
+    }
+
+    // The read asks for "solo", the write names the same row "solo|solo", and the read finishes right after
+    // the writer's first cache step: the write generation follows the row too, not the spelling.
+    [Theory]
+    [MemberData(nameof(AllMutations))]
+    public async Task PointRead_UnderOneSpellingOfAnId_ThatRacedAWriteUnderTheOther_LeavesNothingOlder(Mutation mutation)
+    {
+        using var rig = Plain();
+        await rig.SeedAsync("solo");
+        var paused = await rig.PauseAsync(() => rig.Store.OneAsync("solo", Ct));
+
+        var steps = 0;
+        rig.Cache.After = (_, _) =>
+        {
+            if (Interlocked.Increment(ref steps) == 1)
+                paused.ResumeAsync().GetAwaiter().GetResult();
+        };
+        await rig.MutateAsync(mutation, "solo|solo");
+        rig.Cache.After = null;
+
+        var next = await rig.Store.OneAsync("solo", Ct);
+        if (Deletes(mutation))
+        {
+            Assert.Null(next);
+            Assert.False(await rig.Store.ExistsAsync("solo", Ct));
+        }
+        else
+        {
+            Assert.Equal(2, next!.Version);
+            Assert.Equal(rig.StoredETag("solo"), next.ETag);
+        }
     }
 
     // ── the cache still works ──────────────────────────────────────────────
@@ -955,5 +1051,21 @@ public class ReadCacheRaceTests
         Assert.Equal(expected, (await store.OneAsync(Id, Ct))?.Version);
         Assert.Equal(!delete, await store.ExistsAsync(Id, Ct));
         Assert.Equal(expectedList, Versions(await store.QueryAsync(Pk, Ct)));
+    }
+
+    [Fact]
+    public async Task InMemory_AnIdOfOneSegment_IsOneRowUnderEitherSpelling()
+    {
+        var store = new InMemoryStorage<RacePlainDoc>();
+        await store.UpsertAsync(new RacePlainDoc { Id = "solo", Version = 1 }, Ct);
+
+        await store.UpsertAsync(new RacePlainDoc { Id = "solo|solo", Version = 2 }, Ct);
+        Assert.Equal(2, (await store.OneAsync("solo", Ct))!.Version);
+        await store.UpdateAsync("solo|solo", b => b.SetProperty(x => x.Version, 3), Ct);
+        Assert.Equal(3, (await store.OneAsync("solo", Ct))!.Version);
+
+        Assert.Equal(1, await store.DeletePartitionAsync("solo", Ct));
+        Assert.Null(await store.OneAsync("solo", Ct));
+        Assert.False(await store.ExistsAsync("solo|solo", Ct));
     }
 }

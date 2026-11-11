@@ -1168,8 +1168,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // (e.g. "vision|execution|agent" → partition "vision", row "execution|agent").
     private static (string PartitionKey, string RowKey) GetEntityKeys(string id) => EntityId.Split(id);
 
-    // The cache key of an entity, for a read: a lookup, or the read's own put (CacheRead).
-    private string EntityKey(string id) => $"{cacheKeyPrefix}:entity:{id}";
+    // The cache key of an entity, for a read: a lookup, or the read's own put (CacheRead). One entry per
+    // ROW, however its id is spelled ("a" and "a|a" are the same row): a write or delete evicts the entry
+    // a read cached under the other spelling, and a partition delete, which names every row by both
+    // keys, evicts an entity whose id has one segment.
+    private string EntityKey(string id) => $"{cacheKeyPrefix}:entity:{EntityId.Canonicalize(id)}";
 
     // The cache key of an entity, for a MUTATION: every caller has just committed (or lost) a write or
     // delete of the entity and is about to evict or patch its entry. The write is noted here, before the
