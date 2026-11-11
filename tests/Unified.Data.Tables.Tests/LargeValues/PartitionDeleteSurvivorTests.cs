@@ -452,7 +452,9 @@ public sealed class AzuritePartitionDeleteSurvivorTests : AzuriteCleanupTestBase
     public async Task NoSurvivor_BlobsOlderThanTheGraceGo_YoungerOnesStayForTheSweep()
     {
         SkipUnlessAvailable();
-        var grace = TimeSpan.FromSeconds(4);
+        // Long enough that the delete below, which follows the young row's create at once, still finds
+        // that row's blob younger than the grace even on a busy emulator.
+        var grace = TimeSpan.FromSeconds(6);
         var store = Store<SplitTextEntity>(grace);
         await store.CreateAsync(Row("old", Text), Ct);
         await BlobsOlderThanAsync(grace);
