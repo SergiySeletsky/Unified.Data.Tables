@@ -98,8 +98,13 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
             {
                 var property = column.Split(TableEntityValue.PathDelimiter)[0];
                 if (!TypeMetadataCache.ReadsBack(readType, property))
+                {
+                    // A file in a top-level property that is not declared TableBlobContent: a read gives the
+                    // content back only to a property declared as one, so that declaration is the remedy named.
+                    var contentIn = column == property ? DeclaredAsAnotherType(entity.GetType(), property) : null;
                     throw new NotSupportedException(
-                        TableEntitySerializer.SubclassThroughBaseStoreRefusal(entity.GetType(), readType, column, plainStore: false));
+                        TableEntitySerializer.SubclassThroughBaseStoreRefusal(entity.GetType(), readType, column, plainStore: false, contentIn));
+                }
             }
         }
 
@@ -600,6 +605,21 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 #pragma warning restore CA1031
         {
         }
+    }
+
+    // The public property of that name (the most derived declaration, when a subclass hides one of its
+    // base) when it is not declared TableBlobContent; null when it is, or when there is none. Never throws.
+    private static System.Reflection.PropertyInfo? DeclaredAsAnotherType(Type type, string name)
+    {
+        System.Reflection.PropertyInfo? found = null;
+        foreach (var candidate in type.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+        {
+            if (candidate.Name != name || candidate.GetIndexParameters().Length != 0)
+                continue;
+            if (found?.DeclaringType is not { } declaring || (candidate.DeclaringType is { } other && declaring.IsAssignableFrom(other)))
+                found = candidate;
+        }
+        return found is not null && found.PropertyType != typeof(TableBlobContent) ? found : null;
     }
 
     // The partition and row key a blob name of this library holds ({table}/{pk}/{rk}/{column}/{sha256});

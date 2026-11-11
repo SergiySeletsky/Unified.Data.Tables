@@ -131,6 +131,44 @@ public class RefusalRemedyThatWorksTests
         Assert.NotNull((await declaredBase.OneAsync("p|1", Ct))!.Payload);
     }
 
+    // The same shape through a store whose base type IS large-value aware: the refusal comes from the
+    // check before the file's source is read, and names the declaration too.
+    public class AwareBaseEnvelope : Entity
+    {
+        [TableValueSplit(SplitEncoding.Text)]
+        public string? Body { get; set; }
+    }
+
+    public sealed class AwareDerivedEnvelope : AwareBaseEnvelope
+    {
+        public object? Payload { get; set; }
+    }
+
+    // The remedy that refusal names, followed: the subclass declares the property as TableBlobContent and
+    // is stored through a store of its own type.
+    public sealed class DeclaredAwareDerivedEnvelope : AwareBaseEnvelope
+    {
+        public TableBlobContent? Payload { get; set; }
+    }
+
+    [Fact]
+    public async Task FileInAnObjectTypedPropertyOfASubclass_ThroughAnAwareBaseStore_RefusalNamesTheDeclaration()
+    {
+        var baseStore = new InMemoryStorage<AwareBaseEnvelope>(null, Offload());
+        var refusal = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            baseStore.CreateAsync(new AwareDerivedEnvelope { Id = "p|1", Payload = File() }, Ct));
+
+        Assert.Contains("declare AwareDerivedEnvelope.Payload as TableBlobContent", refusal.Message, StringComparison.Ordinal);
+        Assert.Contains("IStorage<AwareDerivedEnvelope>", refusal.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Mark AwareDerivedEnvelope with [TableValueSplit]", refusal.Message, StringComparison.Ordinal);
+        Assert.Null(await baseStore.OneAsync("p|1", Ct));
+
+        // The remedy, followed, stores the file and reads it back.
+        var declared = new InMemoryStorage<DeclaredAwareDerivedEnvelope>(null, Offload());
+        await declared.CreateAsync(new DeclaredAwareDerivedEnvelope { Id = "p|1", Payload = File() }, Ct);
+        Assert.NotNull((await declared.OneAsync("p|1", Ct))!.Payload);
+    }
+
     // ── SERIALIZER-5: a nullable struct below a runtime subtype ──────────────
 
     public struct Attachment
