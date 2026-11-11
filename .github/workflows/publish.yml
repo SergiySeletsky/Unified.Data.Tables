@@ -68,6 +68,42 @@ jobs:
             dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts
           fi
 
+      # Unified.Data.Tables binds to the abstractions' internals and Unified.Data.Tables.InMemory to the
+      # main package's provider SPI, so each must depend on EXACTLY the version packed beside it:
+      # [1.2.3], not NuGet's default >= 1.2.3. The pins come from a target in Directory.Build.targets
+      # that hooks a private NuGet target; if an SDK update renames that target they vanish without a
+      # warning. Read them back from the packages about to be pushed and stop the publish without them.
+      - name: Verify exact sibling-package versions
+        shell: bash
+        run: |
+          nuspec() {  # nuspec <package id>: prints the nuspec of the one packed <package id>.<version>.nupkg
+            local id="$1" packages
+            packages=(artifacts/"$id".[0-9]*.nupkg)
+            [ -f "${packages[0]}" ] || packages=()  # a pattern that matches nothing stays as written
+            if [ "${#packages[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one packed $id in artifacts/, found: ${packages[*]:-none}" >&2
+              return 1
+            fi
+            unzip -p "${packages[0]}" "$id.nuspec"
+          }
+          require_exact() {  # require_exact <package id> <dependency id>
+            local package="$1" dependency="$2" spec sibling version pins
+            spec="$(nuspec "$package")" || exit 1
+            sibling="$(nuspec "$dependency")" || exit 1
+            # The version the dependency was packed as, without build metadata (a range never has it).
+            version="$(sed -n 's:.*<version>\([^<+]*\).*:\1:p' <<<"$sibling" | sort -u | paste -sd ' ' -)"
+            # The version attribute of every <dependency id="$dependency"> element, whatever the layout.
+            pins="$(tr '>' '\n' <<<"$spec" | grep -F '<dependency ' | grep -F " id=\"$dependency\"" \
+              | sed -n 's:.* version="\([^"]*\)".*:\1:p' | LC_ALL=C sort -u | paste -sd ' ' - || true)"
+            if [ -z "$version" ] || [ "$pins" != "[$version]" ]; then
+              echo "::error::$package must depend on $dependency [${version:-version not found}] (exactly the version packed beside it), but its nuspec says: ${pins:-no such dependency}"
+              exit 1
+            fi
+            echo "$package depends on $dependency [$version]"
+          }
+          require_exact Unified.Data.Tables Unified.Data.Tables.Abstractions
+          require_exact Unified.Data.Tables.InMemory Unified.Data.Tables
+
       - name: NuGet login (OIDC trusted publishing)
         id: login
         uses: NuGet/login@v1
