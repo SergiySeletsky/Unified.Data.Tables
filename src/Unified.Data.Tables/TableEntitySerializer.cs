@@ -255,15 +255,15 @@ public static class TableEntitySerializer
         return (outermost.Parent!.Type!, outermost.HeldBy!, outermost.Type!, holders);
     }
 
-    // The first property along ownerPath (property names from root, by reflection only) declared as a
-    // nullable struct, with the declared type that has it; null when there is none.
+    // The first property along ownerPath (property names from root, by reflection only, a member an interface
+    // inherits counting as one it declares) declared as a nullable struct, with the declared type that has it;
+    // null when there is none.
     private static (Type Owner, PropertyInfo Property, Type Struct)? NullableStructOnPath(Type root, IReadOnlyList<string> ownerPath)
     {
         var owner = root;
         foreach (var name in ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))
         {
-            var property = owner.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(p => p.Name == name && p.GetIndexParameters().Length == 0);
+            var property = Array.Find(TypeMetadataCache.DeclaredProperties(owner), p => p.Name == name && p.GetIndexParameters().Length == 0);
             if (property is null)
                 return null;
             if (Nullable.GetUnderlyingType(property.PropertyType) is { } underlying)
@@ -1906,6 +1906,8 @@ internal static class TypeMetadataCache
     private static readonly ConcurrentDictionary<(Type Type, string Column), PropertyInfo?> _readTargets = new();
     private static readonly ConcurrentDictionary<(Type Type, string Column), bool> _largeOnRead = new();
     private static readonly ConcurrentDictionary<Type, (Type Contract, PropertyInfo Marked)?> _interfaceMemberSplits = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Column), (Type Owner, Type Contract, PropertyInfo Marked)?> _interfaceMemberSplitsOnPath = new();
+    private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _declaredProperties = new();
     private static readonly ConditionalWeakTable<Exception, Exception> _misuses = new();
 
     public static TypeMetadata GetMetadata(Type t)
@@ -2333,7 +2335,7 @@ internal static class TypeMetadataCache
         try
         {
             var classLevel = ClassLevelSplit(type);
-            foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            foreach (var prop in DeclaredProperties(type))
             {
                 try
                 {
@@ -2374,7 +2376,7 @@ internal static class TypeMetadataCache
     /// </summary>
     internal static bool TryGetMember(Type owner, string name, out Type memberType, out bool largeValue)
     {
-        foreach (var prop in SerializedProperties(owner))
+        foreach (var prop in DeclaredSerializedProperties(owner))
         {
             if (prop.Name != name || prop.GetIndexParameters().Length > 0)
                 continue;
@@ -2459,7 +2461,7 @@ internal static class TypeMetadataCache
         {
             if (property is not null)
                 owner = property.PropertyType;
-            property = SerializedProperties(owner).FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
+            property = DeclaredSerializedProperties(owner).FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
             if (property is null)
                 return null;
         }
@@ -2553,6 +2555,52 @@ internal static class TypeMetadataCache
     private static IEnumerable<PropertyInfo> SerializedProperties(Type t) =>
         t.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(IsSerialized);
 
+    // SerializedProperties of a declared type, read through DeclaredProperties.
+    private static IEnumerable<PropertyInfo> DeclaredSerializedProperties(Type t) => DeclaredProperties(t).Where(IsSerialized);
+
+    /// <summary>
+    /// The public instance properties of <paramref name="t"/> as a declared type: for a class or a struct
+    /// those <see cref="Type.GetProperties(BindingFlags)"/> lists; for an interface also the members of every
+    /// interface it inherits, at any depth (<see cref="Type.GetProperties(BindingFlags)"/> lists only the
+    /// members an interface declares), so that a member an interface inherits counts in every walk of the
+    /// declared types as one it declares. A member declared again with the same name and type is listed
+    /// once, the nearest declaration first. Reflection alone, remembered per type; an inherited interface
+    /// whose members cannot be read is skipped. Throws what listing the type's own members throws.
+    /// </summary>
+    internal static PropertyInfo[] DeclaredProperties(Type t) =>
+        _declaredProperties.GetOrAdd(t, static type =>
+        {
+            var own = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            if (!type.IsInterface)
+                return own;
+            var all = new List<PropertyInfo>(own);
+#pragma warning disable CA1031 // an inherited interface the walk cannot read contributes nothing, as an unreadable type does
+            try
+            {
+                foreach (var inherited in type.GetInterfaces())
+                {
+                    try
+                    {
+                        foreach (var member in inherited.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                        {
+                            if (!all.Exists(p => p.Name == member.Name && p.PropertyType == member.PropertyType))
+                                all.Add(member);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // This inherited interface's members cannot be listed.
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // The inherited interfaces cannot be listed: the interface's own members stand.
+            }
+#pragma warning restore CA1031
+            return [.. all];
+        });
+
     private static bool IsSerialized(PropertyInfo p) =>
         p.CanRead && p.CanWrite
         && p.GetCustomAttribute<IgnoreDataMemberAttribute>() == null
@@ -2621,11 +2669,27 @@ internal static class TypeMetadataCache
     /// Refuses a builder update of <paramref name="columnPath"/> of <paramref name="root"/> when
     /// <paramref name="root"/>, or the declared type of a property along the path, is or implements an
     /// interface that declares a member marked <see cref="TableValueSplitAttribute"/> (ruling R11): the update
-    /// would write that member as an ordinary cell. Declared types and attributes are read by reflection
-    /// alone (nothing is constructed, no getter is called, no metadata is built) and remembered per type.
+    /// would write that member as an ordinary cell. A member an interface-typed owner inherits from another
+    /// interface is found as one it declares (<see cref="DeclaredProperties"/>). Declared types and attributes
+    /// are read by reflection alone (nothing is constructed, no getter is called, no metadata is built); what
+    /// the walk finds is remembered per type and column path (up to <see cref="MaxRememberedReadTargets"/>).
     /// </summary>
     /// <exception cref="InvalidOperationException">The misuse, naming the interface member and the remedy.</exception>
     internal static void RefuseInterfaceMemberSplitOnPath(Type root, string columnPath)
+    {
+        if (!_interfaceMemberSplitsOnPath.TryGetValue((root, columnPath), out var found))
+        {
+            found = InterfaceMemberSplitOnPath(root, columnPath);
+            if (_interfaceMemberSplitsOnPath.Count < MaxRememberedReadTargets)
+                _interfaceMemberSplitsOnPath.TryAdd((root, columnPath), found);
+        }
+        if (found is { } misuse)
+            throw new InvalidOperationException(InterfaceMemberSplitMisuse(misuse.Owner, misuse.Contract, misuse.Marked));
+    }
+
+    // The first declared type along the path (root first) that is or implements an interface with a member
+    // marked [TableValueSplit], with that member; null when there is none.
+    private static (Type Owner, Type Contract, PropertyInfo Marked)? InterfaceMemberSplitOnPath(Type root, string columnPath)
     {
         var owner = root;
         foreach (var segment in columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries).Prepend(null))
@@ -2636,21 +2700,21 @@ internal static class TypeMetadataCache
 #pragma warning disable CA1031 // a type the check cannot read ends the walk: the update goes on as before
                 try
                 {
-                    property = owner.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                        .FirstOrDefault(p => p.Name == segment && p.GetIndexParameters().Length == 0);
+                    property = Array.Find(DeclaredProperties(owner), p => p.Name == segment && p.GetIndexParameters().Length == 0);
                 }
                 catch (Exception)
                 {
-                    return;
+                    return null;
                 }
 #pragma warning restore CA1031
                 if (property is null)
-                    return;
+                    return null;
                 owner = property.PropertyType;
             }
             if (InterfaceMemberSplit(owner) is { } found)
-                throw new InvalidOperationException(InterfaceMemberSplitMisuse(owner, found.Contract, found.Marked));
+                return (owner, found.Contract, found.Marked);
         }
+        return null;
     }
 
     // The first member marked [TableValueSplit] of an interface that t implements (or, t an interface, of t
