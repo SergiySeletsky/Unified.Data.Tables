@@ -348,7 +348,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
                 // merged plain cell beside the old split cells would read back the OLD value.
                 foreach (var (col, cell) in LargeValueRows.FlattenPropertyForUpdate(typeof(T), name, value))
                 {
-                    merged[col] = cell;
+                    merged[col] = Detached(cell);
                 }
             }
             merged[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
@@ -754,7 +754,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
 
     private StoredRow Store((string PartitionKey, string RowKey) keys, TableEntity serialized)
     {
-        var row = new StoredRow(serialized, ++versionCounter, DateTimeOffset.UtcNow);
+        // A copy: the serialized cells may be arrays the writer still holds.
+        var row = new StoredRow(CopyOf(serialized), ++versionCounter, DateTimeOffset.UtcNow);
         rows[keys] = row;
         return row;
     }
@@ -771,18 +772,23 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         return entity;
     }
 
-    // Isolate stored state from caller mutations (the serializer round-trip already deep-copies
-    // values on materialize; this guards the stored TableEntity itself).
+    // Isolate stored state from caller mutations: every row goes in and comes out through a copy. The
+    // serializer passes a byte[] cell through by reference both ways (every other cell value is
+    // immutable), so each array is copied too: a stored row never holds an array a caller passed in or
+    // received.
     private static TableEntity CopyOf(TableEntity source)
     {
         var copy = new TableEntity(source.PartitionKey, source.RowKey);
         foreach (var kv in source)
         {
             if (kv.Key is not ("PartitionKey" or "RowKey" or "odata.etag" or "Timestamp"))
-                copy[kv.Key] = kv.Value;
+                copy[kv.Key] = Detached(kv.Value);
         }
         return copy;
     }
+
+    // A cell value that shares nothing mutable with the given one.
+    private static object Detached(object value) => value is byte[] bytes ? bytes.Clone() : value;
 
     private void EnforceProtectedProperties(T entity)
     {
@@ -808,10 +814,11 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         {
             var oldVal = prop.GetValue(stored);
             var newVal = prop.GetValue(entity);
-            // As TableStorage: a large value is compared by content and never quoted; any other property
-            // keeps the comparison and the message of 0.8.3.
+            // As TableStorage: a large value is compared by content and never quoted, a byte[] is compared by
+            // content (a read never hands back the stored array), and any other property keeps the comparison
+            // of 0.8.3; every value that is not large keeps its message.
             var large = ProtectedLargeValues.IsLargeValue(typeof(T), prop);
-            if (!(large ? ProtectedLargeValues.IsUnchanged(oldVal, newVal) : Equals(oldVal, newVal))
+            if (!(large || oldVal is byte[] ? ProtectedLargeValues.IsUnchanged(oldVal, newVal) : Equals(oldVal, newVal))
                 && !(authorizer?.IsAllowed(attr.Roles) ?? false))
             {
                 throw new UnauthorizedAccessException(
