@@ -27,21 +27,24 @@ public class UnreadStreamAfterTemporaryCopyFailureTests(ITestOutputHelper output
         return await ReadAllAsync(stream);
     }
 
-    // Runs the write while TMP and TEMP name a directory that does not exist, so no temporary file can be created.
+    // The variables the temporary directory is taken from: TMP and TEMP on Windows, TMPDIR elsewhere.
+    private static readonly string[] TemporaryDirectoryVariables = ["TMP", "TEMP", "TMPDIR"];
+
+    // Runs the write while those variables name a directory that does not exist, so no temporary file can be created.
     private static async Task<Exception?> WithoutATemporaryDirectoryAsync(Func<Task> write)
     {
-        var saved = (Tmp: Environment.GetEnvironmentVariable("TMP"), Temp: Environment.GetEnvironmentVariable("TEMP"));
+        var saved = Array.ConvertAll(TemporaryDirectoryVariables, Environment.GetEnvironmentVariable);
         var missing = Path.Combine(Path.GetTempPath(), "unified-tables-" + Guid.NewGuid().ToString("N"), "missing");
         try
         {
-            Environment.SetEnvironmentVariable("TMP", missing);
-            Environment.SetEnvironmentVariable("TEMP", missing);
+            foreach (var name in TemporaryDirectoryVariables)
+                Environment.SetEnvironmentVariable(name, missing);
             return await Record.ExceptionAsync(write);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("TMP", saved.Tmp);
-            Environment.SetEnvironmentVariable("TEMP", saved.Temp);
+            for (var i = 0; i < TemporaryDirectoryVariables.Length; i++)
+                Environment.SetEnvironmentVariable(TemporaryDirectoryVariables[i], saved[i]);
         }
     }
 
