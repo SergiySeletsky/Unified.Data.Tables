@@ -353,7 +353,7 @@ public sealed class LargeValueTable
         ArgumentNullException.ThrowIfNull(partitionKey);
         ArgumentNullException.ThrowIfNull(rowKey);
         ArgumentNullException.ThrowIfNull(paths);
-        if (blobs is null)
+        if (blobs is null || NeverCleansUp)
             return;
         var released = OwnBlobs(partitionKey, rowKey, paths, onForeign);
         if (released.Count == 0)
@@ -362,7 +362,10 @@ public sealed class LargeValueTable
         var next = 0;
         try
         {
-            var unmodifiedSince = (serviceNow ?? await ServiceNowAsync(budget.Token)) - cleanupGrace;
+            var unmodifiedSince = Cutoff(serviceNow ?? await ServiceNowAsync(budget.Token), cleanupGrace);
+            // No blob is old enough: none is asked for (rather than sent a condition no blob can meet).
+            if (unmodifiedSince == DateTimeOffset.MinValue)
+                return;
             for (; next < released.Count; next++)
                 await DeleteBlobAsync(released[next], unmodifiedSince, onFailure, budget.Token);
         }
@@ -457,7 +460,7 @@ public sealed class LargeValueTable
     {
         ArgumentNullException.ThrowIfNull(partitionKey);
         // No blob is ever named after a key that is not well-formed UTF-16 (writes refuse one).
-        if (blobs is null || !SplitCodec.IsWellFormedUtf16(partitionKey))
+        if (blobs is null || NeverCleansUp || !SplitCodec.IsWellFormedUtf16(partitionKey))
             return;
         var prefix = ValueOffloadCoordinator.PartitionPrefix(tableName, partitionKey);
         using var budget = new CleanupBudget(ct, CancelledCleanupBudget);
@@ -467,7 +470,10 @@ public sealed class LargeValueTable
         try
         {
             // The service time before the listing: no later than any time the listing could report.
-            var cutoff = await ServiceNowAsync(token) - cleanupGrace;
+            var cutoff = Cutoff(await ServiceNowAsync(token), cleanupGrace);
+            // No blob is old enough: nothing is listed or asked for.
+            if (cutoff == DateTimeOffset.MinValue)
+                return;
             try
             {
                 await foreach (var (name, lastModified) in blobs.ListAsync(prefix, token).WithCancellation(token))
@@ -538,12 +544,18 @@ public sealed class LargeValueTable
     }
 
     // Ages are measured on the service clock, read before the listing (so never later than it).
-    private async Task<DateTimeOffset> SweepCutoffAsync(TimeSpan olderThan, CancellationToken ct)
-    {
-        var now = await ServiceNowAsync(ct);
-        // An age beyond the start of the calendar makes no blob old enough (instead of overflowing).
-        return olderThan >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - olderThan;
-    }
+    private async Task<DateTimeOffset> SweepCutoffAsync(TimeSpan olderThan, CancellationToken ct) =>
+        Cutoff(await ServiceNowAsync(ct), olderThan);
+
+    // The instant before which a blob is old enough for a cleanup or a sweep: now less the age. An age
+    // that reaches back beyond the start of the calendar makes no blob old enough
+    // (DateTimeOffset.MinValue) instead of overflowing the subtraction. Every cutoff is computed here.
+    private static DateTimeOffset Cutoff(DateTimeOffset now, TimeSpan age) =>
+        age >= now - DateTimeOffset.MinValue ? DateTimeOffset.MinValue : now - age;
+
+    // A cleanup grace longer than the calendar ("never clean up after a write", TimeSpan.MaxValue): no
+    // blob can be that old whatever the time is, so the service is not even asked for it.
+    private bool NeverCleansUp => cleanupGrace >= DateTimeOffset.MaxValue - DateTimeOffset.MinValue;
 
     /// <summary>
     /// Storage-provider SPI, not for application code. The core of
