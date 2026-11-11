@@ -438,8 +438,15 @@ public partial class TableStorage<T>
     // required again.
     private static bool LostRace(RequestFailedException ex, LargeWriteKind kind) =>
         IsPrimaryFailure(ex)
-            ? kind == LargeWriteKind.Create ? ex.Status == 409 : ex.Status is 404 or 409 or 412
-            : ex.Status is 404 or 412;
+            ? kind == LargeWriteKind.Create ? ex.Status == 409 : ex.Status is 409 or 412 || IsMissingRow(ex)
+            : ex.Status == 412 || IsMissingRow(ex);
+
+    // A 404 that says a row is gone: the service's code for a missing entity ("ResourceNotFound";
+    // "EntityNotFound" is the other one it documents), or no code at all. A 404 that names anything
+    // else is no lost race: when the table itself is gone ("TableNotFound") reading again cannot help,
+    // and the caller must see the service's own error, not a concurrency conflict.
+    private static bool IsMissingRow(RequestFailedException ex) =>
+        ex.Status == 404 && (string.IsNullOrEmpty(ex.ErrorCode) || ex.ErrorCode is "ResourceNotFound" or "EntityNotFound");
 
     // A transaction fails at one action; the primary is action 0, and a single SDK call is always the primary.
     private static bool IsPrimaryFailure(RequestFailedException ex) =>
@@ -637,7 +644,7 @@ public partial class TableStorage<T>
                 }
 
                 blobs = BlobPaths(row.Row, pk, rk);
-                var parts = SplitRowLayout.PartCount(row.Row) == 0 ? [] : await QueryPartsAsync(pk, rk, PartKeys, ct);
+                var parts = DeclaresNoParts(row.Row) ? [] : await QueryPartsAsync(pk, rk, PartKeys, ct);
                 if (parts.Count == 0)
                 {
                     committedAt = HeaderDate(await client.DeleteEntityAsync(pk, rk, row.ETag, ct));
@@ -665,6 +672,21 @@ public partial class TableStorage<T>
         }
 
         throw new ConcurrencyConflictException(typeName, $"{pk}{Separator}{rk}", lost);
+    }
+
+    // True when the stored row says it has no continuation rows. A part count that cannot be read (a
+    // damaged row) is not "none": the delete looks for the rows that are there, so a row no read can
+    // return is still deletable.
+    private static bool DeclaresNoParts(TableEntity row)
+    {
+        try
+        {
+            return SplitRowLayout.PartCount(row) == 0;
+        }
+        catch (TableValueIntegrityException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -776,15 +798,17 @@ public partial class TableStorage<T>
     }
 
     // A create batch refuses a repeated key up front (the same DuplicateKeyException the in-memory store
-    // throws); an upsert batch writes each key once, with its last occurrence (last writer wins).
+    // throws); an upsert batch writes each key once, with its last occurrence (last writer wins). The
+    // key is the row an id addresses, its (partition key, row key) pair, not the id's spelling: "a" and
+    // "a|a" are the same row, and one transaction cannot hold a row twice.
     private List<T> DistinctBatchKeys(IReadOnlyCollection<T> entities, LargeWriteKind kind)
     {
         if (kind == LargeWriteKind.Create)
         {
-            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var seen = new HashSet<(string PartitionKey, string RowKey)>();
             foreach (var entity in entities)
             {
-                if (!seen.Add(entity.Id))
+                if (!seen.Add(GetEntityKeys(entity.Id)))
                     throw new DuplicateKeyException(typeName, entity.Id,
                         new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}"));
             }
@@ -792,10 +816,10 @@ public partial class TableStorage<T>
         }
 
         var list = entities.ToList();
-        var last = new Dictionary<string, int>(StringComparer.Ordinal);
+        var last = new Dictionary<(string PartitionKey, string RowKey), int>();
         for (var i = 0; i < list.Count; i++)
-            last[list[i].Id] = i;
-        return list.Where((e, i) => last[e.Id] == i).ToList();
+            last[GetEntityKeys(list[i].Id)] = i;
+        return list.Where((e, i) => last[GetEntityKeys(e.Id)] == i).ToList();
     }
 
     /// <summary>
@@ -920,8 +944,8 @@ public partial class TableStorage<T>
     // continuation row the transaction counted on is gone (404) or has changed since it was read (412).
     private static bool BatchLostRace(RequestFailedException ex, LargeWriteKind kind, List<int> owners) =>
         IsBatchPrimaryFailure(ex, owners)
-            ? kind == LargeWriteKind.Upsert && ex.Status is 404 or 409 or 412
-            : ex.Status is 404 or 412;
+            ? kind == LargeWriteKind.Upsert && (ex.Status is 409 or 412 || IsMissingRow(ex))
+            : ex.Status == 412 || IsMissingRow(ex);
 
     // The id of the entity whose action failed ("{partition}|?" when the service did not say).
     private string FailedId(RequestFailedException ex, List<int> owners, List<BatchUnit> chunk)

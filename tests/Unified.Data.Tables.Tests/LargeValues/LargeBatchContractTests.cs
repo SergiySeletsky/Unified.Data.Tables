@@ -535,6 +535,31 @@ public abstract class LargeBatchContract : IAsyncLifetime
         Assert.Equal(["r1", "r1x", "r1~0001", "r1~0009", "r2", "r2~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
     }
 
+    [Theory]
+    [InlineData("text")]
+    [InlineData("negative")]
+    [InlineData("fraction")]
+    public async Task Delete_OfARowWhosePartCountCannotBeRead_RemovesItAndItsContinuationRows(string damage)
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        // A damaged primary: its _SplitParts cell is not a count. Its continuation rows are still its own.
+        object partCount = damage switch { "text" => "many", "negative" => -1, _ => 2.5 };
+        await SeedRowAsync<SplitTextEntity>(new TableEntity(Pk, "r1") { [SystemColumnNames.SplitParts] = partCount, ["Title"] = "damaged" });
+        await SeedLeftoversAsync("r1", TwoPartText);
+        await store.CreateAsync(Text("r2", SplitText), Ct);
+        // It cannot be read: the value is not whole.
+        await Assert.ThrowsAsync<TableValueIntegrityException>(() => store.OneAsync(Id("r1"), Ct));
+
+        await store.DeleteAsync(Id("r1"), Ct);
+
+        // Gone, with every continuation row found by looking for them; the neighbour is untouched.
+        Assert.Equal(["r2", "r2~0001"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Null(await store.OneAsync(Id("r1"), Ct));
+        await store.CreateAsync(Text("r1", SplitText), Ct);
+        Assert.Equal(SplitText, (await store.OneAsync(Id("r1"), Ct))!.Body, StringComparer.Ordinal);
+    }
+
     [Fact]
     public async Task Delete_OfALeftoverContinuationRowsOwnId_IsANoOp()
     {
@@ -628,6 +653,44 @@ public abstract class LargeBatchContract : IAsyncLifetime
         Assert.Equal(3, n);
         Assert.Equal(1, Transactions);
         Assert.Equal("last", (await store.OneAsync(Id("r1"), Ct))!.Body);
+        Assert.Equal(2, await store.CountAsync(Pk, Ct));
+    }
+
+    // An id without a separator uses the whole id as partition key and as row key, so "x" and "x|x"
+    // address the same row: a batch must treat them as one key.
+
+    [Fact]
+    public async Task CreateBatch_TheSameRowUnderBothSpellingsOfItsId_ThrowsDuplicateKey_BeforeAnythingIsWritten()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        ResetTransactions();
+        var oneSegment = new SplitTextEntity { Id = Pk, Body = "a" };
+        var twoSegments = new SplitTextEntity { Id = Pk + "|" + Pk, Body = "b" };
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(
+            () => store.CreateBatchAsync([oneSegment, Text("r1", "x"), twoSegments], Ct));
+
+        Assert.Equal(Pk + "|" + Pk, ex.Id);
+        Assert.Equal(0, Transactions);
+        Assert.Empty(await PhysicalRowKeysAsync<SplitTextEntity>());
+    }
+
+    [Fact]
+    public async Task UpsertBatch_TheSameRowUnderBothSpellingsOfItsId_IsWrittenOnce_WithItsLastOccurrence()
+    {
+        SkipUnlessAvailable();
+        var store = Store<SplitTextEntity>();
+        ResetTransactions();
+        var first = new SplitTextEntity { Id = Pk, Body = "first" };
+        var last = new SplitTextEntity { Id = Pk + "|" + Pk, Body = "last" };
+
+        var n = await store.UpsertBatchAsync([first, Text("r1", "x"), last], Ct);
+
+        Assert.Equal(3, n);
+        Assert.Equal(1, Transactions);
+        Assert.Equal([Pk, "r1"], await PhysicalRowKeysAsync<SplitTextEntity>());
+        Assert.Equal("last", (await store.OneAsync(Pk, Ct))!.Body);
         Assert.Equal(2, await store.CountAsync(Pk, Ct));
     }
 

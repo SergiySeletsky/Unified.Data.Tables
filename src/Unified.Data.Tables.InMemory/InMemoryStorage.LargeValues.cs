@@ -455,14 +455,15 @@ public sealed partial class InMemoryStorage<T>
             }
             else
             {
-                var prior = ReadPrior(keys)!;
-                if (prior.Parts > 0)
+                // A part count that cannot be read (a damaged row) is not "none": the continuation rows
+                // that are there go with the row, so a row no read can return is still deletable.
+                if (!DeclaresNoParts(stored.Data))
                 {
                     foreach (var part in ExistingPartKeys(keys))
                         rows.Remove((keys.PartitionKey, part));
                 }
                 rows.Remove(keys);
-                released = prior.Blobs;
+                released = LargeValueTable.BlobPaths(stored.Data);
             }
         }
 
@@ -628,6 +629,18 @@ public sealed partial class InMemoryStorage<T>
         var rk = primary.Data.RowKey;
         var parts = rows.Values.Select(r => r.Data).Where(d => LargeValueTable.IsPartOf(d, pk, rk));
         return primary with { Data = LargeValueTable.Assemble(primary.Data, parts) };
+    }
+
+    private static bool DeclaresNoParts(TableEntity row)
+    {
+        try
+        {
+            return LargeValueTable.PartCount(row) == 0;
+        }
+        catch (TableValueIntegrityException)
+        {
+            return false;
+        }
     }
 
     /// <summary>Under the gate: the stored entity row's version, part count and blobs; null when there is none.</summary>

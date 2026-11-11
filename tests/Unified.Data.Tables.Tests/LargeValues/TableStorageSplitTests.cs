@@ -67,10 +67,15 @@ public class TableStorageSplitTests
                     [.. actions.Select((_, i) => (Response)new FakeResponse(i == 0 ? primaryETag : "W/\"part\""))], new FakeResponse());
             });
 
-    /// <summary>A transaction failure at <paramref name="index"/>, as the SDK reports it (the index rides on the inner exception's Data).</summary>
+    /// <summary>
+    /// A transaction failure at <paramref name="index"/>, as the SDK reports it (the index rides on the inner
+    /// exception's Data), with the error code the service gives that status: a 404 at an action is a
+    /// missing row (<c>ResourceNotFound</c>; a missing table is <c>TableNotFound</c> and is no lost race).
+    /// </summary>
     private static TableTransactionFailedException TxFailed(int status, int index = 0)
     {
-        var inner = new RequestFailedException(status, "failed", status == 409 ? "EntityAlreadyExists" : "UpdateConditionNotSatisfied", null);
+        var code = status switch { 409 => "EntityAlreadyExists", 404 => "ResourceNotFound", _ => "UpdateConditionNotSatisfied" };
+        var inner = new RequestFailedException(status, "failed", code, null);
         inner.Data["FailedEntity"] = index.ToString(System.Globalization.CultureInfo.InvariantCulture);
         var ex = new TableTransactionFailedException(inner);
         Assert.Equal(index, ex.FailedTransactionActionIndex);
