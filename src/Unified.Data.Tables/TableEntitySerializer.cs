@@ -2516,8 +2516,10 @@ internal static class TypeMetadataCache
     /// <paramref name="forMisuse"/>: the walk of a builder update's path (<see cref="RefuseInterfaceMemberSplitOnPath"/>:
     /// the misuse of ruling R11, and a large-value member the path names), which takes every member a path can name
     /// (no index parameters), also one the writer does not store (a get-only property of a class is "a property
-    /// along the updated path"; an <c>[IgnoreDataMember]</c> member a subclass may override without it), and skips a
-    /// declared type whose members cannot be listed (it has nothing the check could report).
+    /// along the updated path"; an <c>[IgnoreDataMember]</c> member a subclass may override without it), follows a member
+    /// declared as a nullable struct <c>S?</c> into the members of <c>S</c> as well as those of <c>Nullable&lt;S&gt;</c>
+    /// (the serializer names the members of <c>S</c> with no <c>Value</c> segment, a lambda through <c>.Value</c>), and
+    /// skips a declared type whose members cannot be listed (it has nothing the check could report).
     /// </summary>
     internal static IEnumerable<List<(Type Owner, PropertyInfo Member)>> DeclaredPath(Type root, IEnumerable<string> segments, bool forMisuse)
     {
@@ -2546,6 +2548,8 @@ internal static class TypeMetadataCache
                     step.Add((owner, member));
                     if (!next.Contains(member.PropertyType))
                         next.Add(member.PropertyType);
+                    if (forMisuse && Nullable.GetUnderlyingType(member.PropertyType) is { } underlying && !next.Contains(underlying))
+                        next.Add(underlying);
                 }
             }
             if (step.Count == 0)
@@ -2905,7 +2909,12 @@ internal static class TypeMetadataCache
                     return ((property.PropertyType, found.Contract, found.Marked), false);
             }
         }
-        return (null, steps.Exists(step => step.Exists(m => IsLargeValueMember(m.Owner, m.Member))));
+        // A class-level attribute does not cover a nullable struct the serializer flattens into columns (its value is an
+        // S, stored as columns; the walk goes on into the members of S).
+        return (null, steps.Exists(step => step.Exists(m =>
+            Nullable.GetUnderlyingType(m.Member.PropertyType) is { } underlying && FlattensIntoColumns(underlying)
+                ? SplitFor(m.Owner, m.Member, classLevel: null, validate: false) is not null
+                : IsLargeValueMember(m.Owner, m.Member))));
     }
 
     // The first member marked [TableValueSplit] of an interface that t implements (or, t an interface, of t
