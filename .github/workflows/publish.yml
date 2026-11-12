@@ -21,6 +21,7 @@ jobs:
     name: Build & publish to NuGet.org
     runs-on: ubuntu-latest
     environment: production   # must match the 'Environment' in the nuget.org trusted-publishing policy
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -37,6 +38,24 @@ jobs:
           VERSION="${VERSION#v}"   # strip a leading 'v' (v1.2.3 -> 1.2.3)
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version: ${VERSION:-<.csproj default>}"
+
+      # A NuGet version cannot be deleted: refuse a release tag (or an explicit workflow_dispatch version)
+      # that differs from the <Version> the repository declares in Directory.Build.props.
+      - name: Check the version matches Directory.Build.props
+        shell: bash
+        env:
+          REQUESTED: ${{ steps.version.outputs.value }}
+        run: |
+          DECLARED="$(sed -n 's:.*<Version>\([^<]*\)</Version>.*:\1:p' Directory.Build.props | head -n 1)"
+          if [ -z "$DECLARED" ]; then
+            echo "::error::Directory.Build.props declares no <Version>"
+            exit 1
+          fi
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$DECLARED" ]; then
+            echo "::error::Requested version $REQUESTED differs from Directory.Build.props <Version>$DECLARED</Version>"
+            exit 1
+          fi
+          echo "Version $DECLARED matches Directory.Build.props"
 
       # The Azurite integration tests must run, not skip, before anything is published: start the
       # emulator (pinned, same flags as local development) and make an unreachable one a test failure.
