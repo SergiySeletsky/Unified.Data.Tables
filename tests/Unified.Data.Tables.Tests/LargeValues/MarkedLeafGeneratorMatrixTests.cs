@@ -15,15 +15,20 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// <item>member shapes of the owner's member <c>Inner</c>, as far as C# lets each kind have them (the catalogue below);</item>
 /// <item>holder kinds: the entity's property <c>Doc</c> declared as the owner type, as a base class (<see cref="EmptyBase"/>;
 /// for a struct <see cref="ValueType"/>), as an interface (<see cref="IEmpty"/>) or as <see cref="object"/>, the last three
-/// declaring nothing, each initialised with the owner's object on a new entity or empty;</item>
+/// declaring nothing, and, where the object is a struct, as its nullable form (<c>S?</c>; fix wave 9, RV8 SERIALIZER-1),
+/// each initialised with the owner's object on a new entity or empty;</item>
 /// <item>leaf kinds below <c>Inner</c>: a <c>[TableValueSplit]</c> string, <c>byte[]</c> or JSON-stored object, a
 /// <see cref="TableBlobContent"/>, a string a class-level <c>[TableValueSplit]</c> on the leaf's class covers, and (rule B)
 /// a <c>[TableValueSplit]</c> member declared as a type stored as one JSON value holding a subclass stored as columns,
 /// which is never stored.</item>
 /// </list>
 /// Every combination, on both stores, under every <see cref="OversizedCellPolicy"/>, at 10 and 200,000 characters (bytes):
-/// a builder update of <c>Doc_Inner_V</c> by lambda (where the declared types have the member) and by a key of
-/// <see cref="UpdateBuilder{T}.Updates"/>, and a whole-entity write. The outcomes allowed: refused before anything is
+/// a builder update of <c>Doc_Inner_V</c> by lambda (where the declared types have the member; below a nullable struct the
+/// lambda names <c>Doc_Value_Inner_V</c>) and by a key of <see cref="UpdateBuilder{T}.Updates"/>, and a whole-entity write.
+/// A second dimension (fix wave 9, RV8 SERIALIZER-2): every leaf kind as a top-level property with a legacy name
+/// (<see cref="ColumnAliasAttribute"/> on the property, on the entity class, on a base class, on a property declared by a
+/// base class): a key of <c>Updates</c> naming the legacy name is refused exactly as one naming the property is, and the
+/// legacy name of an ordinary property is still written and read back. The outcomes allowed: refused before anything is
 /// stored, or stored with every read (point read, after a cache hit, from a new store, query) returning the value
 /// whole; a builder update whose path the declared types name is refused with <see cref="NotSupportedException"/>
 /// (rule A). The documented exceptions, each asserted as documented:
@@ -106,6 +111,17 @@ public class MarkedLeafGeneratorMatrixTests
     public sealed class Empty<TDecl> : Entity
     {
         public TDecl? Doc { get; set; }
+    }
+
+    // A holder declared as the nullable form of the struct it holds (fix wave 9).
+    public sealed class NullableInitialised<TS> : Entity where TS : struct
+    {
+        public TS? Doc { get; set; } = new TS();
+    }
+
+    public sealed class NullableEmpty<TS> : Entity where TS : struct
+    {
+        public TS? Doc { get; set; }
     }
 
     public sealed class RowWriter : Entity
@@ -390,6 +406,9 @@ public class MarkedLeafGeneratorMatrixTests
 
     public static readonly string[] HolderKinds = ["the owner type", "a base class", "an interface", "object"];
 
+    /// <summary>The holder kind of a struct's nullable form, built where the object a holder holds is a struct.</summary>
+    public const string NullableHolderKind = "the nullable form of the struct it holds";
+
     /// <summary>
     /// One combination: its name, the owner type (closed), the declared type of the holder, the type of the object it
     /// holds, and the entity type the generator built.
@@ -399,7 +418,10 @@ public class MarkedLeafGeneratorMatrixTests
         public Type LeafType => LeafTypes[Leaf];
 
         /// <summary>The holder is declared as a type that does not show the member: the documented runtime-subtype shape.</summary>
-        public bool RuntimeSubtype => Holder != HolderKinds[0];
+        public bool RuntimeSubtype => Holder != HolderKinds[0] && !NullableHolder;
+
+        /// <summary>The holder is declared as the nullable form of the struct it holds (its members are the struct's).</summary>
+        public bool NullableHolder => Holder == NullableHolderKind;
 
         /// <summary>The writer's rule (0.8.3) on the object's class: a public member of the leaf's type with a getter and a setter, not ignored.</summary>
         public bool RuntimeStores => Runtime.GetProperties(BindingFlags.Public | BindingFlags.Instance)
@@ -417,7 +439,7 @@ public class MarkedLeafGeneratorMatrixTests
         public bool ReadCannotCreate => !Initialised && (Declared.IsAbstract || Declared.IsInterface);
 
         /// <summary>A struct holder declared as itself, holding the leaf's class (OLDER-1).</summary>
-        public bool StructDeclaredAsItself => !RuntimeSubtype && Declared.IsValueType;
+        public bool StructDeclaredAsItself => !RuntimeSubtype && !NullableHolder && Declared.IsValueType;
     }
 
     private static readonly Lazy<Dictionary<string, Case>> All = new(() => Build().ToDictionary(c => c.Name));
@@ -459,6 +481,16 @@ public class MarkedLeafGeneratorMatrixTests
                 yield return new Case(name, shape, generic, leaf, holder, initialised, owner, declared, runtime, entity);
             }
         }
+        // The nullable form of a struct the holder holds (fix wave 9): the serializer flattens its members with no
+        // "Value" segment, so Doc_Inner_V names the leaf through it, as Doc_Value_Inner_V (the lambda's column) does.
+        if (!runtime.IsValueType)
+            yield break;
+        foreach (var initialised in new[] { true, false })
+        {
+            var entity = (initialised ? typeof(NullableInitialised<>) : typeof(NullableEmpty<>)).MakeGenericType(runtime);
+            var name = $"{shape.Kind}{(generic ? ", generic" : "")}, {shape.Name}, leaf {LeafKinds[leaf]}, holder declared as {NullableHolderKind}, {(initialised ? "initialised" : "empty")}";
+            yield return new Case(name, shape, generic, leaf, NullableHolderKind, initialised, owner, typeof(Nullable<>).MakeGenericType(runtime), runtime, entity);
+        }
     }
 
     public static TheoryData<string, string> Cases()
@@ -477,10 +509,152 @@ public class MarkedLeafGeneratorMatrixTests
         var cases = All.Value.Values.ToList();
         TestContext.Current.TestOutputHelper?.WriteLine(
             $"{GenericShapes.Length} member shapes over 5 owner kinds; {cases.Count(c => c.Generic)} generic and {cases.Count(c => !c.Generic)} non-generic " +
-            $"combinations, {cases.Count} in all ({cases.Count(c => c.RuntimeSubtype)} of the runtime-subtype shape); {cases.Count * 2} theory rows; " +
+            $"combinations, {cases.Count} in all ({cases.Count(c => c.RuntimeSubtype)} of the runtime-subtype shape, {cases.Count(c => c.NullableHolder)} " +
+            $"below a nullable struct); {cases.Count * 2} theory rows; " +
             $"{cases.Count * 2 * Policies.Length * Sizes.Length} (combination, store, policy, size) runs." +
             "\nExcluded:\n  " + string.Join("\n  ", Excluded) + "\nSubstituted:\n  " + string.Join("\n  ", Substituted));
-        Assert.Equal(GenericShapes.Length * (LeafTypes.Length + 1) * HolderKinds.Length * 2, cases.Count);
+        Assert.Equal(GenericShapes.Length * (LeafTypes.Length + 1) * HolderKinds.Length * 2
+                     + GenericShapes.Count(s => s.Runtime.IsValueType) * (LeafTypes.Length + 1) * 2, cases.Count);
+        Assert.Equal(6, GenericShapes.Count(s => s.Runtime.IsValueType));
+        TestContext.Current.TestOutputHelper?.WriteLine(
+            $"Legacy names: {LegacyNameCases.Value.Count} combinations ({LegacyLeafKinds.Length} leaf kinds and an ordinary property, " +
+            $"{LegacyNameForms.Length} forms of [ColumnAlias]); {LegacyNameCases.Value.Count * 2} theory rows.");
+        Assert.Equal((LegacyLeafKinds.Length + 1) * LegacyNameForms.Length, LegacyNameCases.Value.Count);
+    }
+
+    // ── Legacy names (fix wave 9, RV8 SERIALIZER-2) ───────────────────────────────────────────────────────
+    // A read maps a legacy column ([ColumnAlias]) onto a top-level property when the row has no cell of the property's
+    // own name, so a builder update of the legacy name writes that property. Each leaf kind is the property Content of the
+    // entity, its legacy name "Legacy", in four forms; the marked forms (string, byte[], JSON-stored object, a JSON-stored
+    // type holding an object stored as columns), TableBlobContent (unmarked, declared as the content), a string a
+    // class-level [TableValueSplit] on the entity covers, and an ordinary string (the control, which is written).
+
+    private const string LegacyName = "Legacy";
+
+    public sealed class MarkedAliasOnProperty<TV> : Entity { [TableValueSplit(SplitEncoding.Text)][ColumnAlias(LegacyName)] public TV? Content { get; set; } }
+    [ColumnAlias("Content", LegacyName)] public sealed class MarkedAliasOnClass<TV> : Entity { [TableValueSplit(SplitEncoding.Text)] public TV? Content { get; set; } }
+    [ColumnAlias("Content", LegacyName)] public abstract class MarkedAliasOnBaseClassBase<TV> : Entity { [TableValueSplit(SplitEncoding.Text)] public TV? Content { get; set; } }
+    public sealed class MarkedAliasOnBaseClass<TV> : MarkedAliasOnBaseClassBase<TV> { }
+    public abstract class MarkedAliasOnBasePropertyBase<TV> : Entity { [TableValueSplit(SplitEncoding.Text)][ColumnAlias(LegacyName)] public TV? Content { get; set; } }
+    public sealed class MarkedAliasOnBaseProperty<TV> : MarkedAliasOnBasePropertyBase<TV> { }
+
+    public sealed class PlainAliasOnProperty<TV> : Entity { [ColumnAlias(LegacyName)] public TV? Content { get; set; } }
+    [ColumnAlias("Content", LegacyName)] public sealed class PlainAliasOnClass<TV> : Entity { public TV? Content { get; set; } }
+    [ColumnAlias("Content", LegacyName)] public abstract class PlainAliasOnBaseClassBase<TV> : Entity { public TV? Content { get; set; } }
+    public sealed class PlainAliasOnBaseClass<TV> : PlainAliasOnBaseClassBase<TV> { }
+    public abstract class PlainAliasOnBasePropertyBase<TV> : Entity { [ColumnAlias(LegacyName)] public TV? Content { get; set; } }
+    public sealed class PlainAliasOnBaseProperty<TV> : PlainAliasOnBasePropertyBase<TV> { }
+
+    [TableValueSplit(SplitEncoding.Text)] public sealed class ClassMarkedAliasOnProperty<TV> : Entity { [ColumnAlias(LegacyName)] public TV? Content { get; set; } }
+    [TableValueSplit(SplitEncoding.Text)][ColumnAlias("Content", LegacyName)] public sealed class ClassMarkedAliasOnClass<TV> : Entity { public TV? Content { get; set; } }
+    [TableValueSplit(SplitEncoding.Text)][ColumnAlias("Content", LegacyName)] public abstract class ClassMarkedAliasOnBaseClassBase<TV> : Entity { public TV? Content { get; set; } }
+    public sealed class ClassMarkedAliasOnBaseClass<TV> : ClassMarkedAliasOnBaseClassBase<TV> { }
+    [TableValueSplit(SplitEncoding.Text)] public abstract class ClassMarkedAliasOnBasePropertyBase<TV> : Entity { [ColumnAlias(LegacyName)] public TV? Content { get; set; } }
+    public sealed class ClassMarkedAliasOnBaseProperty<TV> : ClassMarkedAliasOnBasePropertyBase<TV> { }
+
+    /// <summary>The forms of <see cref="ColumnAliasAttribute"/>: the generic entity of each family (marked, plain, class-level marked).</summary>
+    internal static readonly (string Name, Type Marked, Type Plain, Type ClassMarked)[] LegacyNameForms =
+    [
+        ("on the property", typeof(MarkedAliasOnProperty<>), typeof(PlainAliasOnProperty<>), typeof(ClassMarkedAliasOnProperty<>)),
+        ("on the entity class", typeof(MarkedAliasOnClass<>), typeof(PlainAliasOnClass<>), typeof(ClassMarkedAliasOnClass<>)),
+        ("on a base class of the entity", typeof(MarkedAliasOnBaseClass<>), typeof(PlainAliasOnBaseClass<>), typeof(ClassMarkedAliasOnBaseClass<>)),
+        ("on the property, declared by a base class", typeof(MarkedAliasOnBaseProperty<>), typeof(PlainAliasOnBaseProperty<>), typeof(ClassMarkedAliasOnBaseProperty<>)),
+    ];
+
+    /// <summary>The large-value leaf kinds as a top-level property: its family (0 marked, 1 plain, 2 class-level marked) and its type.</summary>
+    internal static readonly (string Name, int Family, Type Value)[] LegacyLeafKinds =
+    [
+        ("[TableValueSplit] string", 0, typeof(string)),
+        ("[TableValueSplit] byte[]", 0, typeof(byte[])),
+        ("[TableValueSplit] JSON-stored object", 0, typeof(JsonBox)),
+        ("[TableValueSplit] JSON-stored type holding an object stored as columns", 0, typeof(JsonFlatBase)),
+        ("TableBlobContent", 1, typeof(TableBlobContent)),
+        ("string covered by a class-level attribute", 2, typeof(string)),
+    ];
+
+    public sealed record LegacyNameCase(string Name, string Form, string Leaf, bool Ordinary, Type Value, Type Entity);
+
+    private static readonly Lazy<Dictionary<string, LegacyNameCase>> LegacyNameCases = new(() =>
+    {
+        var cases = new Dictionary<string, LegacyNameCase>();
+        foreach (var form in LegacyNameForms)
+        {
+            foreach (var leaf in LegacyLeafKinds.Append(("ordinary string (the control)", 1, typeof(string))))
+            {
+                var definition = leaf.Item2 switch { 0 => form.Marked, 1 => form.Plain, _ => form.ClassMarked };
+                var ordinary = leaf.Item1.StartsWith("ordinary", StringComparison.Ordinal);
+                var name = $"legacy name {form.Name}, leaf {leaf.Item1}";
+                cases.Add(name, new LegacyNameCase(name, form.Name, leaf.Item1, ordinary, leaf.Item3, definition.MakeGenericType(leaf.Item3)));
+            }
+        }
+        return cases;
+    });
+
+    public static TheoryData<string, string> LegacyNames()
+    {
+        var d = new TheoryData<string, string>();
+        foreach (var name in LegacyNameCases.Value.Keys)
+            foreach (var kind in new[] { LargeValueStores.Memory, LargeValueStores.Azurite })
+                d.Add(name, kind);
+        return d;
+    }
+
+    [Theory]
+    [MemberData(nameof(LegacyNames))]
+    public Task EveryLegacyName_OfALargeValueMember_IsRefusedAsItsOwnNameIs_AndAnOrdinaryOneIsWritten(string name, string kind) =>
+        (Task)typeof(MarkedLeafGeneratorMatrixTests).GetMethod(nameof(RunLegacyNameAsync), BindingFlags.NonPublic | BindingFlags.Static)!
+            .MakeGenericMethod(LegacyNameCases.Value[name].Entity).Invoke(null, [LegacyNameCases.Value[name], kind])!;
+
+    private static async Task RunLegacyNameAsync<T>(LegacyNameCase c, string kind) where T : class, IEntity, new()
+    {
+        await using var stores = await LargeValueStores.OpenAsync(kind);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        var store = stores.Store<T>(Table);
+        var id = stores.Id("legacy");
+        await store.CreateAsync(new T { Id = id }, Ct);
+        var content = typeof(T).GetProperty("Content")!;
+        var seed = 0;
+        foreach (var policy in Policies)
+        {
+            // The control is an ordinary cell: a value of one cell (a trimming policy trims a longer one, as documented).
+            foreach (var size in c.Ordinary ? [10] : Sizes)
+            {
+                var label = $"{c.Name}, {kind}, {policy}, {size}";
+                var value = c.Value == typeof(JsonFlatBase)
+                    ? new JsonFlatSub { Body = BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(size, ++seed) }
+                    : Value(c.Value == typeof(TableBlobContent) ? typeof(LeafBlob) : c.Value == typeof(byte[]) ? typeof(LeafBytes) : c.Value == typeof(JsonBox) ? typeof(LeafJson) : typeof(LeafStr), size, ++seed);
+                var before = TableEntitySerializer.OversizedCellPolicy;
+                TableEntitySerializer.OversizedCellPolicy = policy;
+                try
+                {
+                    foreach (var column in c.Ordinary ? [LegacyName] : new[] { LegacyName, "Content" })
+                    {
+                        Exception? thrown = null;
+                        var requests = await stores.StorageWritesAsync(store, async () =>
+                            thrown = await Record.ExceptionAsync(() => store.UpdateAsync(id, b => b.Updates[column] = value, Ct)));
+                        var row = (await stores.RawRowsAsync<T>(Table)).Single(r => r.RowKey == "legacy");
+                        if (c.Ordinary)
+                        {
+                            Assert.True(thrown is null, $"{label}, Updates[{column}]: {thrown?.GetType().Name}: {thrown?.Message}");
+                            Assert.Equal(value, row[LegacyName]);
+                            Assert.Equal(value, content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
+                            Outcome("builder update of the legacy name of an ordinary property written and read back");
+                            continue;
+                        }
+                        Assert.True(thrown is NotSupportedException && requests.Count == 0
+                                    && !row.Keys.Any(k => k.StartsWith(LegacyName, StringComparison.Ordinal) || k.StartsWith("Content", StringComparison.Ordinal)),
+                            $"{label}, Updates[{column}]: {thrown?.GetType().Name ?? "accepted"}: {thrown?.Message}; requests [{string.Join(", ", requests)}]; cells [{string.Join(", ", row.Keys)}]");
+                        Assert.Equal(TableEntitySerializer.PartialUpdateRefusal(column), thrown!.Message);
+                        Assert.Null(content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
+                        Outcome(column == LegacyName ? "builder update of the legacy name refused (rule A)" : "builder update of the property's own name refused (rule A)");
+                    }
+                }
+                finally
+                {
+                    TableEntitySerializer.OversizedCellPolicy = before;
+                }
+            }
+        }
     }
 
     // ── The test ──────────────────────────────────────────────────────────────────────────────────────────
@@ -548,7 +722,7 @@ public class MarkedLeafGeneratorMatrixTests
             // Rule A: the declared types name the path to a marked member: refused before any request, no cell.
             Assert.True(thrown is NotSupportedException && requests.Count == 0 && row?.Keys.Any(k => k.StartsWith(Column, StringComparison.Ordinal)) != true,
                 $"{label}: {thrown?.GetType().Name ?? "accepted"}: {thrown?.Message}; requests [{string.Join(", ", requests)}]; cells [{string.Join(", ", row?.Keys ?? [])}]");
-            Assert.Equal(TableEntitySerializer.PartialUpdateRefusal(Column), thrown!.Message);
+            Assert.Equal(TableEntitySerializer.PartialUpdateRefusal(source == "Updates" ? Column : LambdaColumn(typeof(T))), thrown!.Message);
             Outcome($"builder update by {source} refused (rule A)");
             return;
         }
@@ -733,14 +907,23 @@ public class MarkedLeafGeneratorMatrixTests
 
     // x => (object)x.Doc.Inner.V, each member as the C# compiler resolves it through the declared types: the most
     // derived declaration of the name, then the interfaces.
+    // Through a nullable struct the compiler's path takes its Value (x.Doc.Value.Inner.V).
     private static Expression<Func<T, object>> PathOf<T>()
     {
         var x = Expression.Parameter(typeof(T), "x");
         Expression body = x;
         foreach (var segment in Column.Split('_'))
+        {
             body = Expression.Property(body, CompilerMember(body.Type, segment));
+            if (Nullable.GetUnderlyingType(body.Type) is not null)
+                body = Expression.Property(body, "Value");
+        }
         return Expression.Lambda<Func<T, object>>(Expression.Convert(body, typeof(object)), x);
     }
+
+    // The column the lambda of PathOf names: Doc_Value_Inner_V below a nullable struct.
+    private static string LambdaColumn(Type entity) =>
+        Nullable.GetUnderlyingType(entity.GetProperty("Doc")!.PropertyType) is null ? Column : "Doc_Value_Inner_V";
 
     private static PropertyInfo CompilerMember(Type type, string name)
     {
