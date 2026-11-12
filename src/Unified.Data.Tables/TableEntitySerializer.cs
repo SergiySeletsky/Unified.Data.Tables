@@ -58,7 +58,10 @@ public static class TableEntitySerializer
     /// property that holds the member with the type that carries it. Or the runtime type is large-value
     /// aware and a value that needs split cells is where a read of that type would not return it into a
     /// large-value member (see <see cref="TableValueSplitAttribute"/>): below an object a read cannot
-    /// create, or one whose type has no member of that name or does not mark it.
+    /// create, or one whose type has no member of that name or does not mark it. Or a property marked
+    /// <see cref="TableValueSplitAttribute"/> holds an object the serializer stores as columns (a subclass
+    /// of its declared type with a public parameterless constructor): the attribute applies to one value
+    /// in the property's own cells, at every size.
     /// </exception>
     public static TableEntity ToTableEntity(
         this object root,
@@ -183,11 +186,15 @@ public static class TableEntitySerializer
     /// the nullable struct the plain serializer met on the path through runtime owners, which a read cannot
     /// create, with the properties on that path whose declared type differs from the runtime type of their
     /// value (each is named with that runtime type, beside the struct property declared non-nullable).
+    /// <paramref name="holders"/>: the objects on the path whose type is not the declared type of the property that
+    /// holds them (<see cref="RuntimeHolders"/>), named instead of the owner's property when the declared types
+    /// already give that property the owner's type: a remedy that is already in place is not named.
     /// </summary>
     internal static string PlainPathRefusal(
         Type root, IReadOnlyList<string> ownerPath, Type ownerType, string member, bool partial = false,
         bool contentInAnotherType = false,
-        (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<(IReadOnlyList<string> Path, Type Type)> Holders)? runtimeNullable = null)
+        (Type Owner, PropertyInfo Property, Type Struct, IReadOnlyList<(IReadOnlyList<string> Path, Type Type)> Holders)? runtimeNullable = null,
+        IReadOnlyList<(IReadOnlyList<string> Path, Type Type)>? holders = null)
     {
         var column = string.Join(TableEntityValue.PathDelimiter, ownerPath.Append(member));
         var holder = string.Join('.', ownerPath.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)));
@@ -197,6 +204,12 @@ public static class TableEntitySerializer
         var declare = ownerPath.Count == 0
             ? $"declare {root.Name}.{member} as TableBlobContent"
             : $"declare {root.Name}.{holder} with the type that carries the member ({ownerType.Name})";
+        // That declaration is in place when the declared types already give the owner's property the owner's type
+        // (a property on the way is declared as a type that does not store the next member, or that is stored as
+        // one value, while the object it holds stores it): the properties whose objects are of another type are named.
+        if (ownerPath.Count > 0 && TypeMetadataCache.IsDeclaredAs(root, ownerPath, ownerType))
+            declare = string.Join(" and ", (holders ?? []).Select(h =>
+                $"declare {root.Name}.{string.Join('.', h.Path.SelectMany(p => p.Split(TableEntityValue.PathDelimiter)))} as {h.Type.Name}"));
         var refused = $"{where} (column '{column}') is a large value: it is marked [TableValueSplit] or holds a TableBlobContent. " +
                       $"{root.Name} is not large-value aware (its declared types opt into nothing), so its store writes every entity " +
                       "as one plain row and can neither split, offload nor read back such a value, whatever its size. ";
@@ -230,16 +243,31 @@ public static class TableEntitySerializer
                   $"with [TableValueSplit] is not enough. Declare {root.Name}.{member} as TableBlobContent, so that {root.Name} is " +
                   "large-value aware by its declared types."
                 : $"A read gives a TableBlobContent back only to a property declared as TableBlobContent, so marking {root.Name} " +
-                  $"with [TableValueSplit] is not enough. Declare {ownerType.Name}.{member} as TableBlobContent, and {declare}, so " +
-                  $"that {root.Name} is large-value aware by its declared types.";
+                  $"with [TableValueSplit] is not enough. Declare {ownerType.Name}.{member} as TableBlobContent" +
+                  (declare.Length > 0 ? $", and {declare}" : "") + $", so that {root.Name} is large-value aware by its declared types.";
         else
-            remedy = $"Mark {root.Name} with [TableValueSplit], or {declare}, so that {root.Name} is large-value aware by its declared types.";
+            remedy = $"Mark {root.Name} with [TableValueSplit]{(declare.Length > 0 ? $", or {declare}" : "")}, so that {root.Name} is large-value aware by its declared types.";
 
         return partial
             ? refused + "A partial update (UpdateAsync with a builder) cannot write a large value on any store, also once the type " +
               "is large-value aware: replace the entity instead (a whole-entity write). For that write to store the value: " +
               remedy + " Nothing was serialized."
             : refused + remedy + " Nothing was serialized.";
+    }
+
+    // The objects the plain serializer met on the path from the root to node (node included) whose type is not the
+    // declared type of the property that holds them, each with its column path and its type, from the root down:
+    // declaring those properties with those types lets the declared types reach node's members. A builder update's
+    // value (it has no property) is compared with the types the declared types give its column path.
+    private static List<(IReadOnlyList<string> Path, Type Type)> RuntimeHolders(Type root, TableEntityValue node)
+    {
+        var holders = new List<(IReadOnlyList<string> Path, Type Type)>();
+        for (var cur = node; cur is { Path.IsEmpty: false, Type: { } type }; cur = cur.Parent)
+        {
+            if (cur.HeldBy is { } held ? held.PropertyType != type : !TypeMetadataCache.IsDeclaredAs(root, cur.Path, type))
+                holders.Insert(0, (cur.Path, type));
+        }
+        return holders;
     }
 
     // The outermost property, on the path from the root to node (its owners, by their runtime types), that
@@ -309,6 +337,26 @@ public static class TableEntitySerializer
     /// <summary>The message for a large value reached by a partial (Merge) update.</summary>
     internal static string PartialUpdateRefusal(string name) =>
         $"'{name}' is a large value; partial updates cannot write it — replace the entity instead.";
+
+    /// <summary>
+    /// The message for the value of <paramref name="column"/>, a <paramref name="runtimeType"/> that the serializer
+    /// flattens into columns, held by <paramref name="property"/>, which is marked <see cref="TableValueSplitAttribute"/>:
+    /// the attribute applies to one value stored in the property's own cells, never to an object stored as columns. It
+    /// names only the remedy that does not depend on how System.Text.Json reads a JSON graph back: declare the property as
+    /// the runtime type (for a nullable struct, named <c>S?</c>, as <c>S</c>) and put the attribute on the members of that
+    /// type that hold large values.
+    /// </summary>
+    internal static string MarkedValueStoredAsColumns(string column, PropertyInfo property, Type runtimeType)
+    {
+        var name = $"{property.DeclaringType?.Name}.{property.Name}";
+        var declared = Nullable.GetUnderlyingType(property.PropertyType) is { } underlying ? underlying.Name + "?" : property.PropertyType.Name;
+        return $"'{column}' holds a {runtimeType.Name}, and {name} (declared as {declared}) is marked [TableValueSplit]. The " +
+               $"serializer stores a {runtimeType.Name} as columns, one for each of its members, not as one value, and [TableValueSplit] on a " +
+               "property applies to one value stored in the property's own cells (a string, a byte[] or an object stored as one JSON value), " +
+               $"not to an object stored as columns: its members would be stored as {runtimeType.Name} declares them, and a trimming " +
+               $"OversizedCellPolicy could trim them. Declare {name} as {runtimeType.Name} and move [TableValueSplit] from it to the members " +
+               $"of {runtimeType.Name} that can hold a large value. Nothing was stored.";
+    }
 
     /// <summary>
     /// The message for a partial update of <paramref name="column"/> of an aware <paramref name="root"/> whose
@@ -827,9 +875,19 @@ public static class TableEntitySerializer
         var dict = new Dictionary<string, object>();
         if (value == null) return dict;
 
-        // A type that is not aware declares no TableBlobContent property: the content is in another type.
+        // A builder update whose path the declared types lead to a TableBlobContent member was refused before this
+        // point. This content is in a member the declared types give another type (object), whose declaration is
+        // named, or in one only a runtime subtype declares, of which they tell nothing.
         if (plainRoot is not null && value is TableBlobContent)
-            throw new NotSupportedException(PlainPathRefusal(plainRoot, [], plainRoot, propertyName, partial: true, contentInAnotherType: true));
+        {
+            var segments = TypeMetadataCache.LegacyNameTargets(plainRoot, propertyName) is [var renamed]
+                ? [renamed]
+                : propertyName.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries);
+            var steps = TypeMetadataCache.DeclaredPath(plainRoot, segments, forMisuse: true).ToList();
+            throw new NotSupportedException(segments.Length > 0 && steps.Count == segments.Length
+                ? PlainPathRefusal(plainRoot, segments[..^1], steps[^1][0].Owner, segments[^1], partial: true, contentInAnotherType: true)
+                : PartialUpdateRefusal(propertyName));
+        }
 
         var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
         var node = new TableEntityValue(ImmutableList<string>.Empty.Add(propertyName), value);
@@ -843,7 +901,14 @@ public static class TableEntitySerializer
     /// <summary>
     /// <see cref="FlattenProperty(string, object)"/> for a column path of <paramref name="ownerType"/>
     /// (<c>"Inner_Body"</c>): refuses a path that reaches a large-value member, which the untyped
-    /// overload cannot see. For a large-value aware type whose read-side resolution of the path throws (its
+    /// overload cannot see. For every type, the path is walked through the declared types by reflection alone,
+    /// with every member of each segment's name whatever its accessors and attributes (inherited, hidden with
+    /// <c>new</c>, overridden; through a nullable struct into the members of the struct; a legacy column name of a
+    /// property, in any form a read maps onto it, as that property): a path that meets a member marked
+    /// <see cref="TableValueSplitAttribute"/> (on the property, or by a class-level attribute that covers it) or a
+    /// <see cref="TableBlobContent"/> member, at its
+    /// end or on the way, is refused. For a large-value aware type the path is also resolved as a read resolves it
+    /// (a default instance may hold a runtime subtype that opts the member in); when that resolution throws (its
     /// constructor or a getter fails), the path may name one, so it is refused too. A path that meets a
     /// misused <see cref="TableValueSplitAttribute"/> is refused with the misuse: for every type, when
     /// <paramref name="ownerType"/> or the declared type of a property along the path (each property of a
@@ -863,7 +928,9 @@ public static class TableEntitySerializer
     {
         ArgumentNullException.ThrowIfNull(ownerType);
         // [TableValueSplit] on an interface member (R11) is a misuse a builder update meets on no metadata it
-        // builds: refused before anything else, for every type, by reflection alone.
+        // builds: refused before anything else, for every type, by reflection alone. Then, for every type too, a
+        // path that any member of each segment's name leads to a large-value member: the declared types name it,
+        // whatever the walks below decide about the members an owner stores.
         TypeMetadataCache.RefuseInterfaceMemberSplitOnPath(ownerType, columnPath);
         // A type that opts into nothing by its declared types takes the path of 0.8.3: it builds no
         // metadata for the declared types along the column path (one may be a type the serializer cannot
@@ -874,12 +941,8 @@ public static class TableEntitySerializer
             return FlattenProperty(columnPath, value, plainRoot: ownerType);
 
         // The entity type is one the serializer flattens: its metadata is built here as on any first
-        // use, so a misused attribute is reported. The types further along the path are declared types,
-        // which the serializer may never flatten, so they are read by reflection alone, every member of
-        // each segment's name followed.
+        // use, so a misused attribute is reported. The declared types along the path were walked above.
         _ = TypeMetadataCache.GetMetadata(ownerType);
-        if (TypeMetadataCache.DeclaredPathMeetsLargeValue(ownerType, columnPath))
-            throw new NotSupportedException(PartialUpdateRefusal(columnPath));
 
         // The same question for the object a read finds along the path: a default instance may be of a
         // runtime type that opts the member in although the declared type's member is ordinary. A plain
@@ -1012,7 +1075,8 @@ public static class TableEntitySerializer
                 var contentIn = childVal is TableBlobContent && prop.PropertyType != typeof(TableBlobContent) ? prop : null;
                 throw new NotSupportedException(state.Subclass is { } subclass
                     ? SubclassThroughBaseStoreRefusal(subclass, plainRoot, string.Join(TableEntityValue.PathDelimiter, value.Path.Add(prop.Name)), plainStore: true, contentIn)
-                    : PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name, state.Partial, contentIn is not null, RuntimeNullableStructOnPath(value)));
+                    : PlainPathRefusal(plainRoot, value.Path, value.Type, prop.Name, state.Partial, contentIn is not null, RuntimeNullableStructOnPath(value),
+                        RuntimeHolders(plainRoot, value)));
             }
             if (state.Partial && (childSplit != null || prop.PropertyType == typeof(TableBlobContent) || childVal is TableBlobContent))
                 throw new NotSupportedException(
@@ -1493,7 +1557,8 @@ internal sealed class TableEntityValue
     // text as __Json), otherwise split cells; a column the planner moved (ValueWriteContext.ForceSplit)
     // is split whatever its size. Never trims and never consults OversizedCellPolicy.
     // False for a value that is not string, byte[] or JSON-stored (a scalar, or an object that
-    // flattens into columns) — it takes the ordinary path.
+    // flattens into columns) — it takes the ordinary path. An object that flattens into columns in a
+    // property marked [TableValueSplit] itself is refused instead (a class-level attribute does not cover it).
     private bool TrySerializeLarge(
         TableValueSplitAttribute split,
         FlattenState? state,
@@ -1514,6 +1579,12 @@ internal sealed class TableEntityValue
             case not null when IsPrimitive(Value.GetType()) || Value.GetType().IsEnum:
                 return false;
             case not null when Path.IsEmpty || CanSerializeWithoutJson(Value):
+                // An object the serializer flattens into columns. [TableValueSplit] on the property that holds it applies
+                // to one value in the property's own cells, never to columns: refused (a clone copies what a read made).
+                // A class-level attribute covers only values stored as one value: the object is not one, and its members
+                // are stored as its type declares them.
+                if (HeldBy is { } held && state is not { Ctx.IsClone: true } && TypeMetadataCache.PropertyLevelSplit(held) is not null)
+                    throw new NotSupportedException(TableEntitySerializer.MarkedValueStoredAsColumns(columnName, held, Type!));
                 return false;
             default:
                 payload = JsonSerializer.Serialize(Value, JsonOptions);
@@ -1946,7 +2017,7 @@ internal static class TypeMetadataCache
     private static readonly ConcurrentDictionary<(Type Type, string Column), PropertyInfo?> _readTargets = new();
     private static readonly ConcurrentDictionary<(Type Type, string Column), bool> _largeOnRead = new();
     private static readonly ConcurrentDictionary<Type, (Type Contract, PropertyInfo Marked)?> _interfaceMemberSplits = new();
-    private static readonly ConcurrentDictionary<(Type Type, string Column), (Type Owner, Type Contract, PropertyInfo Marked)?> _interfaceMemberSplitsOnPath = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Column), ((Type Owner, Type Contract, PropertyInfo Marked, PropertyInfo? NullableHolder)? Misuse, bool Large)> _interfaceMemberSplitsOnPath = new();
     private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _declaredProperties = new();
     private static readonly ConditionalWeakTable<Exception, Exception> _misuses = new();
 
@@ -2441,24 +2512,6 @@ internal static class TypeMetadataCache
         prop.PropertyType == typeof(TableBlobContent) || SplitFor(owner, prop, ClassLevelSplit(owner), validate: false) is not null;
 
     /// <summary>
-    /// True when a member that <paramref name="columnPath"/> (<c>"Inner_Body"</c>) names through the declared
-    /// types from <paramref name="root"/> is a large-value member (<see cref="TryGetMember"/>), on any path the
-    /// declared types allow (<see cref="DeclaredPath"/>: every member of each segment's name). Reflection alone.
-    /// </summary>
-    internal static bool DeclaredPathMeetsLargeValue(Type root, string columnPath)
-    {
-        foreach (var step in DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: false))
-        {
-            foreach (var (owner, member) in step)
-            {
-                if (IsLargeValueMember(owner, member))
-                    return true;
-            }
-        }
-        return false;
-    }
-
-    /// <summary>
     /// The members a column path names through the declared types from <paramref name="root"/>, one list per
     /// segment, in path order: at each segment, every member of that name (<see cref="IsDeclaredColumn"/>) of
     /// every declared type the path can be at, with that type; those are the declared types of the members of the
@@ -2467,10 +2520,13 @@ internal static class TypeMetadataCache
     /// <c>new</c> and another type), the order in which they are listed is not specified, and a column path
     /// carries the name only: so every one of them is taken, and the walk follows each. It ends at a segment that
     /// no such type has. Reflection alone; what listing a type's members throws is thrown.
-    /// <paramref name="forMisuse"/>: the walk of ruling R11, which takes every member a path can name (no index
-    /// parameters), also one the writer does not store (a get-only property of a class is "a property along the
-    /// updated path"), and skips a declared type whose members cannot be listed (it has nothing the check could
-    /// report).
+    /// <paramref name="forMisuse"/>: the walk of a builder update's path (<see cref="RefuseInterfaceMemberSplitOnPath"/>:
+    /// the misuse of ruling R11, and a large-value member the path names), which takes every member a path can name
+    /// (no index parameters), also one the writer does not store (a get-only property of a class is "a property
+    /// along the updated path"; an <c>[IgnoreDataMember]</c> member a subclass may override without it), follows a member
+    /// declared as a nullable struct <c>S?</c> into the members of <c>S</c> as well as those of <c>Nullable&lt;S&gt;</c>
+    /// (the serializer names the members of <c>S</c> with no <c>Value</c> segment, a lambda through <c>.Value</c>), and
+    /// skips a declared type whose members cannot be listed (it has nothing the check could report).
     /// </summary>
     internal static IEnumerable<List<(Type Owner, PropertyInfo Member)>> DeclaredPath(Type root, IEnumerable<string> segments, bool forMisuse)
     {
@@ -2499,6 +2555,8 @@ internal static class TypeMetadataCache
                     step.Add((owner, member));
                     if (!next.Contains(member.PropertyType))
                         next.Add(member.PropertyType);
+                    if (forMisuse && Nullable.GetUnderlyingType(member.PropertyType) is { } underlying && !next.Contains(underlying))
+                        next.Add(underlying);
                 }
             }
             if (step.Count == 0)
@@ -2506,6 +2564,19 @@ internal static class TypeMetadataCache
             yield return step;
             owners = next;
         }
+    }
+
+    /// <summary>
+    /// Whether the declared types from <paramref name="root"/> give the column path <paramref name="path"/> (whose
+    /// segments may hold the path delimiter) the type <paramref name="type"/>: a member of its last name that
+    /// <see cref="DeclaredPath"/> reaches (any member of each segment's name) is declared as <paramref name="type"/>.
+    /// Reflection alone.
+    /// </summary>
+    internal static bool IsDeclaredAs(Type root, IEnumerable<string> path, Type type)
+    {
+        var segments = path.SelectMany(p => p.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries)).ToList();
+        var steps = DeclaredPath(root, segments, forMisuse: true).ToList();
+        return segments.Count > 0 && steps.Count == segments.Count && steps[^1].Exists(m => m.Member.PropertyType == type);
     }
 
     /// <summary>
@@ -2796,17 +2867,28 @@ internal static class TypeMetadataCache
     }
 
     /// <summary>
-    /// Refuses a builder update of <paramref name="columnPath"/> of <paramref name="root"/> when
-    /// <paramref name="root"/>, or the declared type of a property along the path, is or implements an
-    /// interface that declares a member marked <see cref="TableValueSplitAttribute"/> (ruling R11): the update
-    /// would write that member as an ordinary cell. A member an interface-typed owner inherits from another
-    /// interface is found as one it declares (<see cref="DeclaredProperties"/>), and at every segment every
-    /// member of that name is followed (<see cref="DeclaredPath"/>), whatever its accessors and attributes and
-    /// whatever the order in which an interface lists the interfaces it inherits. Declared types and attributes
-    /// are read by reflection alone (nothing is constructed, no getter is called, no metadata is built); what
-    /// the walk finds is remembered per type and column path (up to <see cref="MaxRememberedReadTargets"/>).
+    /// Refuses a builder update of <paramref name="columnPath"/> of <paramref name="root"/> that would write a
+    /// member as an ordinary cell, as the declared types show it, for every type (large-value aware or not). First
+    /// the misuse of ruling R11: <paramref name="root"/>, or the declared type of a property along the path, is or
+    /// implements an interface that declares a member marked <see cref="TableValueSplitAttribute"/>. Then a
+    /// property along the path, or at its end, that is a large-value member: marked
+    /// <see cref="TableValueSplitAttribute"/> (on the property, or by a class-level attribute that covers it) or
+    /// declared as <see cref="TableBlobContent"/>, which a partial update cannot write. A member an interface-typed
+    /// owner inherits from another interface is found as one it declares (<see cref="DeclaredProperties"/>), and at
+    /// every segment every member of that name is followed (<see cref="DeclaredPath"/>, the walk of ruling R11),
+    /// whatever its accessors and attributes (also one the writer does not store, a member hidden with <c>new</c>
+    /// and an override) and whatever the order in which an interface lists the interfaces it inherits. Declared
+    /// types and attributes are read by reflection alone (nothing is constructed, no getter is called, no metadata
+    /// is built); what the walk finds is remembered per type and column path (up to
+    /// <see cref="MaxRememberedReadTargets"/>). A property declared as a nullable struct <c>S?</c> is followed into the
+    /// members of <c>S</c> (as the serializer names them, and through <c>Value</c>), and <c>S</c> is its declared type for
+    /// the misuse, as for a property declared <c>S</c> (its message also names declaring that property as <c>S</c>); and a
+    /// column that is a legacy name (<see cref="ColumnAliasAttribute"/>) of a property of <paramref name="root"/>, in any form a read maps onto that
+    /// property (the whole column, its <c>__Json</c> and <c>__GZip</c> cells, its split cells and blob reference), is walked
+    /// as that property too. A member only a runtime subtype declares is not seen.
     /// </summary>
     /// <exception cref="InvalidOperationException">The misuse, naming the interface member and the remedy.</exception>
+    /// <exception cref="NotSupportedException">The path names a large-value member.</exception>
     internal static void RefuseInterfaceMemberSplitOnPath(Type root, string columnPath)
     {
         if (!_interfaceMemberSplitsOnPath.TryGetValue((root, columnPath), out var found))
@@ -2815,27 +2897,94 @@ internal static class TypeMetadataCache
             if (_interfaceMemberSplitsOnPath.Count < MaxRememberedReadTargets)
                 _interfaceMemberSplitsOnPath.TryAdd((root, columnPath), found);
         }
-        if (found is { } misuse)
-            throw new InvalidOperationException(InterfaceMemberSplitMisuse(misuse.Owner, misuse.Contract, misuse.Marked));
+        if (found.Misuse is { } misuse)
+            throw new InvalidOperationException(InterfaceMemberSplitMisuse(misuse.Owner, misuse.Contract, misuse.Marked, misuse.NullableHolder));
+        if (found.Large)
+            throw new NotSupportedException(TableEntitySerializer.PartialUpdateRefusal(columnPath));
     }
 
     // The first declared type along the path (root first) that is or implements an interface with a member
-    // marked [TableValueSplit], with that member; null when there is none. Every member of each segment's name
-    // is followed (DeclaredPath, as the R11 walk), so the outcome does not depend on the order in which an
-    // interface lists the interfaces it inherits; a type the check cannot read ends only its own branch.
-    private static (Type Owner, Type Contract, PropertyInfo Marked)? InterfaceMemberSplitOnPath(Type root, string columnPath)
+    // marked [TableValueSplit], with that member and the property declared S? that holds it when the type is that struct S
+    // (null when there is none); and, when there is none, whether a member along the path or at its end is a large-value
+    // member. Every member of each segment's name is followed (DeclaredPath, as the R11 walk), so the outcome does not
+    // depend on the order in which an interface lists the interfaces it inherits; a type the check cannot read ends only
+    // its own branch.
+    private static ((Type Owner, Type Contract, PropertyInfo Marked, PropertyInfo? NullableHolder)? Misuse, bool Large) InterfaceMemberSplitOnPath(Type root, string columnPath)
     {
         if (InterfaceMemberSplit(root) is { } atRoot)
-            return (root, atRoot.Contract, atRoot.Marked);
-        foreach (var step in DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: true))
+            return ((root, atRoot.Contract, atRoot.Marked, null), false);
+        var steps = DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: true).ToList();
+        // A legacy name of a property of the root, in any form a read maps onto that property (the whole column, its
+        // __Json and __GZip cells, its split cells and its blob reference).
+        foreach (var legacy in ReadMappedLegacyColumns(columnPath))
+        {
+            foreach (var renamed in LegacyNameTargets(root, legacy))
+                steps.AddRange(DeclaredPath(root, [renamed], forMisuse: true));
+        }
+        foreach (var step in steps)
         {
             foreach (var (_, property) in step)
             {
-                if (InterfaceMemberSplit(property.PropertyType) is { } found)
-                    return (property.PropertyType, found.Contract, found.Marked);
+                // A property declared S? holds an S: S is the implementing type, as for a property declared S.
+                var declared = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+                if (InterfaceMemberSplit(declared) is { } found)
+                    return ((declared, found.Contract, found.Marked, declared == property.PropertyType ? null : property), false);
             }
         }
-        return null;
+        // A class-level attribute does not cover a nullable struct the serializer flattens into columns (its value is an
+        // S, stored as columns; the walk goes on into the members of S).
+        return (null, steps.Exists(step => step.Exists(m =>
+            Nullable.GetUnderlyingType(m.Member.PropertyType) is { } underlying && FlattensIntoColumns(underlying)
+                ? SplitFor(m.Owner, m.Member, classLevel: null, validate: false) is not null
+                : IsLargeValueMember(m.Owner, m.Member))));
+    }
+
+    // The legacy column a builder update's column is a read-mapped form of: the column itself, and the column without the
+    // suffix of one cell (__Json, __GZip) or of a split-cell or blob-reference cell (SplitCodec.TryParseLargeValueColumn),
+    // the forms in which a read maps a legacy column onto its property (ApplyColumnAliases).
+    private static List<string> ReadMappedLegacyColumns(string column)
+    {
+        var columns = new List<string> { column };
+        foreach (var suffix in new[] { "__Json", "__GZip" })
+        {
+            if (column.Length > suffix.Length && column.EndsWith(suffix, StringComparison.Ordinal))
+                columns.Add(column[..^suffix.Length]);
+        }
+        if (SplitCodec.TryParseLargeValueColumn(column, out var baseColumn, out _, out _) && !columns.Contains(baseColumn))
+            columns.Add(baseColumn);
+        return columns;
+    }
+
+    /// <summary>
+    /// The names of the properties of <paramref name="root"/> that <paramref name="column"/> is a legacy name of: a
+    /// property-level <see cref="ColumnAliasAttribute"/> of that name on a property of <paramref name="root"/>, or a
+    /// class-level one on <paramref name="root"/> or a base class (a read maps the whole column onto that property when
+    /// the row has no cell of the property's own name). Reflection alone (the attribute is sealed: no user code runs);
+    /// none for a type whose members or attributes cannot be read.
+    /// </summary>
+    internal static List<string> LegacyNameTargets(Type root, string column)
+    {
+        var names = new List<string>();
+#pragma warning disable CA1031 // a type whose attributes cannot be read names no legacy column, as the walk skips it
+        try
+        {
+            foreach (var property in DeclaredProperties(root))
+            {
+                if (property.GetCustomAttributes<ColumnAliasAttribute>(inherit: true).Any(a => a.PropertyName is null && a.LegacyColumnName == column))
+                    names.Add(property.Name);
+            }
+            foreach (var alias in root.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+            {
+                if (alias.PropertyName is { } target && alias.LegacyColumnName == column && !names.Contains(target))
+                    names.Add(target);
+            }
+        }
+        catch (Exception)
+        {
+            // The members or attributes of the root cannot be read.
+        }
+#pragma warning restore CA1031
+        return names;
     }
 
     // The first member marked [TableValueSplit] of an interface that t implements (or, t an interface, of t
@@ -2864,8 +3013,10 @@ internal static class TypeMetadataCache
             return null;
         });
 
-    // The misuse of ruling R11 for t, a class that implements contract, or an interface that is or inherits it.
-    private static string InterfaceMemberSplitMisuse(Type t, Type contract, PropertyInfo marked) => t.IsInterface
+    // The misuse of ruling R11 for t, a class or struct that implements contract, or an interface that is or inherits it.
+    // A struct takes no class-level attribute (CS0592); nullableHolder, a property declared t? that holds the struct on a
+    // builder update's path, must be declared t for a marked member of t to be stored (a nullable struct's is refused).
+    private static string InterfaceMemberSplitMisuse(Type t, Type contract, PropertyInfo marked, PropertyInfo? nullableHolder = null) => t.IsInterface
         ? $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface" +
           (t == contract ? "" : $" that {t.Name} inherits") + ": .NET does not pass the attributes of an interface member to the " +
           "implementing class, so the attribute cannot be honoured (the value would be stored as an ordinary cell, and could be " +
@@ -2875,8 +3026,10 @@ internal static class TypeMetadataCache
         : $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface that {t.Name} implements: " +
           ".NET does not pass the attributes of an interface member to the implementing class, so the attribute cannot be " +
           $"honoured (the value would be stored as an ordinary cell, and could be trimmed). Put [TableValueSplit] on " +
-          $"{t.Name}.{marked.Name} (the property of the implementing class), or on the class {t.Name}, and remove it from " +
-          $"{contract.Name}. Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
+          $"{t.Name}.{marked.Name} (the property of the implementing class)" + (t.IsValueType ? " and" : $", or on the class {t.Name}, and") +
+          $" remove it from {contract.Name}" +
+          (nullableHolder is null ? "" : $", and declare {nullableHolder.DeclaringType?.Name}.{nullableHolder.Name} as {t.Name}") +
+          $". Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
           "mark the entity class with [TableValueSplit] as well, so that the entity is large-value aware.";
 
     // The class-level [TableValueSplit] that applies to t: the nearest one, on t itself or on a base
@@ -2939,7 +3092,7 @@ internal static class TypeMetadataCache
     // inherits it through reflection; a property that hides (new) a base property of the same name and
     // type does not, so the hidden declarations are looked up (by name first: a property that
     // re-declares nothing resolves no type).
-    private static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
+    internal static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
     {
         if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
             return own;
