@@ -342,9 +342,9 @@ public static class TableEntitySerializer
     /// The message for the value of <paramref name="column"/>, a <paramref name="runtimeType"/> that the serializer
     /// flattens into columns, held by <paramref name="property"/>, which is marked <see cref="TableValueSplitAttribute"/>:
     /// the attribute applies to one value stored in the property's own cells, never to an object stored as columns. It
-    /// names "store an instance of the declared type" only when an instance of it is read back whole
-    /// through its whole JSON graph (<see cref="ReadsBackWholeAsJson"/>), never for a nullable struct (named <c>S?</c>), whose every value is an
-    /// <c>S</c>; declaring the property as the runtime type with the attribute on its members is always named.
+    /// names "store an instance of the declared type" only when an instance of it is read back whole through its whole
+    /// JSON graph (<see cref="ReadsBackWholeAsJson"/>), never for a nullable struct (named <c>S?</c>), whose every value
+    /// is an <c>S</c>; declaring the property as the runtime type with the attribute on its members is always named.
     /// </summary>
     internal static string MarkedValueStoredAsColumns(string column, PropertyInfo property, Type runtimeType)
     {
