@@ -355,6 +355,7 @@ internal sealed class FidelityScript
     private readonly string suffix = Guid.NewGuid().ToString("N")[..12];
     private readonly Dictionary<Type, object> memory = [];
     private readonly List<string> transcript = [];
+    private readonly HashSet<string> usedTables = new(StringComparer.Ordinal);
     private readonly TableServiceClient? tables;
     private readonly BlobServiceClient? blobs;
     private readonly string container;
@@ -382,7 +383,13 @@ internal sealed class FidelityScript
 
     public SplitTextEntity Split(string rk, string body) => new() { Id = Id(rk), Body = body, Title = "t-" + rk };
 
-    private string TableOf<T>() => typeof(T).Name.Replace("Entity", "", StringComparison.Ordinal) + suffix;
+    // Every table a scenario names is noted, so the clean-up drops the tables of any entity type it used.
+    private string TableOf<T>()
+    {
+        var name = typeof(T).Name.Replace("Entity", "", StringComparison.Ordinal) + suffix;
+        usedTables.Add(name);
+        return name;
+    }
 
     private UnifiedTableStorageOptions Options<T>() => new()
     {
@@ -401,6 +408,21 @@ internal sealed class FidelityScript
         }
         return new TableStorage<T>(tables!, new MemoryCache(new MemoryCacheOptions()), NullLogger<TableStorage<T>>.Instance,
             null, Options<T>(), blobs);
+    }
+
+    private readonly Dictionary<Type, object> cached = [];
+
+    /// <summary>
+    /// The store of <typeparamref name="T"/> that keeps its read cache across calls: on Azurite one
+    /// <see cref="TableStorage{T}"/> for the whole scenario, so a read after a write can be answered by the cache.
+    /// </summary>
+    public IStorage<T> CachedStore<T>() where T : class, IEntity, new()
+    {
+        if (!azure)
+            return Store<T>();
+        if (!cached.TryGetValue(typeof(T), out var store))
+            cached[typeof(T)] = store = Store<T>();
+        return (IStorage<T>)store;
     }
 
     private InMemoryPolymorphicStorage<TestMessage>? polymorphic;
@@ -491,11 +513,14 @@ internal sealed class FidelityScript
     {
         if (!azure)
             return;
-        foreach (var type in new[] { "TestEntity", "SplitTextEntity", "NestedEntity", "PolyEntity" })
+        var names = new[] { "TestEntity", "SplitTextEntity", "NestedEntity", "PolyEntity" }
+            .Select(type => type.Replace("Entity", "", StringComparison.Ordinal) + suffix)
+            .Union(usedTables, StringComparer.Ordinal);
+        foreach (var name in names)
         {
             try
             {
-                await tables!.DeleteTableAsync(type.Replace("Entity", "", StringComparison.Ordinal) + suffix, CancellationToken.None);
+                await tables!.DeleteTableAsync(name, CancellationToken.None);
             }
             catch (RequestFailedException)
             {

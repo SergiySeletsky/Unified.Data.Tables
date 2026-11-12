@@ -184,8 +184,9 @@ internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
     // settable ones. The members and their JSON names come from System.Text.Json's own contract for
     // the type, so [JsonIgnore], [JsonPropertyName], [JsonInclude], init-only setters and the naming
     // policy mean here exactly what they mean to it; a member it would not set (getter-only, a private
-    // setter without [JsonInclude], a computed property) is not set. A member the JSON does not name
-    // keeps the value the constructor and its initialiser gave it.
+    // setter without [JsonInclude], a computed property) is not set. A member the JSON does not name,
+    // and a member whose JSON does not deserialize to its type, keeps the value the constructor and its
+    // initialiser gave it.
     private static void AssignRemainingMembers(
         object result, JsonElement root, HashSet<string> consumed, JsonSerializerOptions options)
     {
@@ -205,7 +206,23 @@ internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
             if (member is null)
                 continue;
 
-            member.Set!(result, property.Value.Deserialize(member.PropertyType, MemberOptions(member, options)));
+            // A member whose stored JSON cannot be read into its current type keeps the constructor's and
+            // its initialiser's value, as 0.8.x (which assigned none of these members) read the row: a member
+            // typed as an interface or an abstract class without polymorphism metadata (NotSupportedException),
+            // a member whose type changed since the row was written, a null stored for a non-nullable value
+            // type (JsonException), a member converter that refuses the value (InvalidOperationException).
+            // The row stays readable and every other member is still assigned.
+            object? value;
+            try
+            {
+                value = property.Value.Deserialize(member.PropertyType, MemberOptions(member, options));
+            }
+            catch (Exception ex) when (ex is JsonException or NotSupportedException or InvalidOperationException)
+            {
+                continue;
+            }
+
+            member.Set!(result, value);
         }
     }
 
