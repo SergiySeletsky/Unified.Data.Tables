@@ -86,7 +86,10 @@ public sealed class PartitionDeleteLiveEntityTests : AzuriteCleanupTestBase
         Assert.Equal(TwoParts, (await store.OneAsync(Id("r"), Ct))!.Body, StringComparer.Ordinal);
     }
 
-    /// <summary>The whole chain with calls of the split-aware store only: two deletes, each overlapping one write of one entity.</summary>
+    /// <summary>
+    /// Two deletes, each overlapping one write of one entity. The first leaves no leftover (the grown
+    /// entity is deleted whole); the second meets one seeded by hand.
+    /// </summary>
     [Fact]
     public async Task Azurite_TwoPartitionDeletesThatEachOverlapAWriteOfOneEntity_LeaveThatEntityWholeOrGone()
     {
@@ -96,13 +99,16 @@ public sealed class PartitionDeleteLiveEntityTests : AzuriteCleanupTestBase
         Assert.Equal(["r", "r~0001"], await RowKeysAsync());
 
         // First delete: it listed r and r~0001; an upsert grows r to two continuation rows before its
-        // transaction. What it listed goes; r~0002 stays behind as a leftover.
+        // transaction. The entity is deleted whole, the row the listing did not see included.
         var first = new RowRequestInterleaving.BeforeTransaction(1,
             () => writer.UpsertAsync(new SplitTextEntity { Id = Id("r"), Body = TwoParts }, CancellationToken.None));
         var firstDeleter = SplitOnlyStore<SplitTextEntity>(TableServiceWith(first));
         await firstDeleter.EnsureCreatedAsync(Ct);
         Assert.Equal(1, await firstDeleter.DeletePartitionAsync(Pk, Ct));
-        Assert.Equal(["r~0002"], await RowKeysAsync());
+        Assert.Empty(await RowKeysAsync());
+
+        // A leftover that a writer unaware of continuation rows (or an older version) left behind.
+        await SeedSecondPartLeftoverAsync();
 
         // Second delete: it listed the leftover; the entity is created again before the leftover's delete.
         var second = new RowRequestInterleaving.BeforeTransaction(1,
@@ -322,7 +328,7 @@ public sealed class PartitionDeleteLiveEntityTests : AzuriteCleanupTestBase
 /// the listing; the rows deleted in a transaction of their own, each on condition of the version it was
 /// listed at; a version that no longer matches, or a row that is gone, leaves the rows alone without
 /// failing the delete. A listing in which every continuation row comes with its main row costs what it
-/// cost before: no point read, no condition.
+/// cost before: no point read, and only each main row on condition of the version it was listed at.
 /// </summary>
 public class PartitionDeleteListedLeftoverCallTests
 {
@@ -371,7 +377,7 @@ public class PartitionDeleteListedLeftoverCallTests
     }
 
     [Fact]
-    public async Task EveryContinuationRowListedWithItsMainRow_NoPointRead_AndNoCondition()
+    public async Task EveryContinuationRowListedWithItsMainRow_NoPointRead_AndOnlyTheMainRowsOnConditionOfTheirListedVersions()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         Lists(h, Primary("a"), Part("a", 1), Primary("b"));
@@ -379,7 +385,7 @@ public class PartitionDeleteListedLeftoverCallTests
 
         Assert.Equal(2, await h.Store.DeletePartitionAsync(Pk, Ct));
 
-        Assert.Equal([["Delete a", "Delete a~0001", "Delete b"]], submitted);
+        Assert.Equal([["Delete a If-Match W/\"m-a\"", "Delete a~0001", "Delete b If-Match W/\"m-b\""]], submitted);
         await h.Table.DidNotReceiveWithAnyArgs().GetEntityIfExistsAsync<TableEntity>(default!, default!, default, default);
         await h.Table.DidNotReceiveWithAnyArgs().DeleteEntityAsync(default!, default!, default, default);
     }
@@ -394,7 +400,7 @@ public class PartitionDeleteListedLeftoverCallTests
 
         Assert.Equal(1, await h.Store.DeletePartitionAsync(Pk, Ct));
 
-        Assert.Equal([["Delete a"], ["Delete r~0001 If-Match W/\"p-r-1\"", "Delete r~0002 If-Match W/\"p-r-2\""]], submitted);
+        Assert.Equal([["Delete a If-Match W/\"m-a\""], ["Delete r~0001 If-Match W/\"p-r-1\"", "Delete r~0002 If-Match W/\"p-r-2\""]], submitted);
         await h.Table.Received(1).GetEntityIfExistsAsync<TableEntity>(Pk, "r", Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
         await h.Table.ReceivedWithAnyArgs(1).GetEntityIfExistsAsync<TableEntity>(default!, default!, default, default);
     }
@@ -409,7 +415,7 @@ public class PartitionDeleteListedLeftoverCallTests
 
         Assert.Equal(1, await h.Store.DeletePartitionAsync(Pk, Ct));
 
-        Assert.Equal([["Delete a"]], submitted);
+        Assert.Equal([["Delete a If-Match W/\"m-a\""]], submitted);
     }
 
     [Fact]
@@ -448,7 +454,7 @@ public class PartitionDeleteListedLeftoverCallTests
         Assert.Equal(1, await h.Store.DeletePartitionAsync(Pk, Ct));
 
         Assert.Equal(
-            [["Delete a"], ["Delete r~0001 If-Match W/\"p-r-1\"", "Delete r~0002 If-Match W/\"p-r-2\""], ["Delete s~0001 If-Match W/\"p-s-1\""]],
+            [["Delete a If-Match W/\"m-a\""], ["Delete r~0001 If-Match W/\"p-r-1\"", "Delete r~0002 If-Match W/\"p-r-2\""], ["Delete s~0001 If-Match W/\"p-s-1\""]],
             submitted);
         // Each row of the failed transaction is then deleted on its own condition: r~0002 goes, r~0001 stays.
         Assert.Equal(["r~0001 If-Match W/\"p-r-1\"", "r~0002 If-Match W/\"p-r-2\""], singles);

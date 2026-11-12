@@ -509,7 +509,9 @@ public sealed partial class InMemoryStorage<T>
     /// transactions (<see cref="LargeValueTable.PlanPartitionDelete"/>: a primary and its continuation
     /// rows always together, at most 100 rows each), each applied atomically under the gate. A token
     /// cancelled between two transactions stops the delete there, with whole entities left; a row
-    /// written after the listing survives. Continuation rows listed without their primary go last, and
+    /// written after the listing survives; a transaction one of whose entities was written after the
+    /// listing deletes nothing and its entities are deleted one by one, as they are then, so no
+    /// continuation row is left without its primary. Continuation rows listed without their primary go last, and
     /// only when no primary exists for them by then, each only while it is still the version listed, so
     /// an entity written meanwhile is left whole. Then the blobs no remaining row references are deleted.
     /// </summary>
@@ -536,11 +538,28 @@ public sealed partial class InMemoryStorage<T>
         {
             // A cancelled token fails a transaction before it is sent, as the SDK does.
             ct.ThrowIfCancellationRequested();
+            bool committed;
             lock (gate)
             {
                 BatchTransactions++;
-                foreach (var row in transaction)
-                    rows.Remove((row.PartitionKey, row.RowKey));
+                // As on the service: each primary goes on condition of the version listed (412) and every
+                // listed row must still be there (404); otherwise the transaction deletes nothing.
+                committed = transaction.All(row =>
+                    rows.TryGetValue((row.PartitionKey, row.RowKey), out var current)
+                    && (LargeValueTable.IsPartRow(row) || current.Version == listedVersions[row.RowKey]));
+                if (committed)
+                {
+                    foreach (var row in transaction)
+                        rows.Remove((row.PartitionKey, row.RowKey));
+                }
+            }
+            if (!committed)
+            {
+                // An entity was written after the listing: each entity of the transaction is deleted on
+                // its own, as it is now (its primary and the continuation rows that name it), as TableStorage does.
+                foreach (var key in transaction.Select(UnitKeyOf).Distinct(StringComparer.Ordinal))
+                    await DeleteLargeAsync((partition, key), ct);
+                continue;
             }
             AfterLargeCommit?.Invoke();
         }
@@ -569,6 +588,10 @@ public sealed partial class InMemoryStorage<T>
         await large.DeletePartitionBlobsAsync(partition, typeof(T), (_, _) => PartitionRowsAsync(partition), onListFailure: null, onFailure: null, ct);
         return logical;
     }
+
+    // The row key of the entity a listed row belongs to: its own, or the primary's its _SplitOf cell names.
+    private static string UnitKeyOf(TableEntity row) =>
+        row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is string primary ? primary : row.RowKey;
 
     // ── Orphan sweep (any T: blobs under the partition may come from any type sharing the table) ──
 

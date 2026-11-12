@@ -771,6 +771,37 @@ public partial class TableStorage<T>
     /// condition and a row that changed or is gone is left alone; the partition delete goes on. A row
     /// whose version is unknown is never deleted here (the service always sends one).
     /// </summary>
+    /// <summary>
+    /// Deletes one transaction of a split-aware partition delete (<see cref="LargeValueTable.PlanPartitionDelete"/>):
+    /// each primary on condition of the version it was listed at, its continuation rows with it. A write
+    /// of one of those entities that committed after the listing changed its primary's version (a write
+    /// that grows an entity adds continuation rows the listing did not see; one that shrinks it deletes
+    /// rows the listing did), so the transaction fails with 412 or 404 and deletes nothing. Each entity
+    /// of the transaction is then deleted on its own as it is now (<see cref="DeleteLargeAsync"/>: its
+    /// primary and every continuation row that names it), so no continuation row is left without its
+    /// primary and the partition delete still completes.
+    /// </summary>
+    private async Task DeletePartitionUnitsAsync(string pk, IReadOnlyList<TableEntity> batch, CancellationToken ct)
+    {
+        var actions = batch.Select(row => new TableTransactionAction(
+            TableTransactionActionType.Delete, row, SplitRowLayout.IsPartRow(row) || !IsVersion(row.ETag) ? ETag.All : row.ETag));
+        try
+        {
+            await client.SubmitTransactionAsync(actions, ct);
+        }
+        catch (RequestFailedException ex) when (ex.Status is 412 or 404)
+        {
+            logger.LogDebug(ex, "{Type} partition {Partition}: an entity changed after the listing; its transaction's entities are deleted one by one",
+                typeName, pk);
+            foreach (var rk in batch.Select(UnitKeyOf).Distinct(StringComparer.Ordinal))
+                await DeleteLargeAsync(pk, rk, ct);
+        }
+    }
+
+    // The row key of the entity a listed row belongs to: its own, or the primary's its _SplitOf cell names.
+    private static string UnitKeyOf(TableEntity row) =>
+        row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is string primary ? primary : row.RowKey ?? string.Empty;
+
     private async Task DeleteListedLeftoversAsync(string pk, string primaryRowKey, IReadOnlyList<TableEntity> rows, CancellationToken ct)
     {
         var primary = await client.GetEntityIfExistsAsync<TableEntity>(pk, primaryRowKey, PartKeys, ct);
