@@ -657,6 +657,31 @@ constructed or resolved from DI: `InvalidOperationException` on a native scalar,
 flattens into columns and on a `TableBlobContent`; `NotSupportedException` on an interface or abstract
 type, which may flatten at runtime. The message names the member.
 
+The value the property holds at run time must be one value too. A property declared as a type stored as
+one JSON value by its constructors (a class that is not sealed whose public constructors all take
+parameters, a record) can hold a subclass with a public parameterless constructor, which the serializer
+stores as columns, one per member. A property declared as a nullable struct (`S?`) whose struct has a
+public parameterless constructor holds an `S`, which is stored as columns too. A write of such a value is
+refused with `NotSupportedException` before anything is uploaded or stored, at every size and under every
+`OversizedCellPolicy`, on every write path of both stores (`CreateAsync`, `UpsertAsync`, `UpdateAsync`,
+both batches, and `ToTableEntity`). The message names the column, the property with its declared type
+(a nullable struct as `S?`) and the type of the object. It says that the attribute applies to one value stored in the property's own cells, not to an object stored
+as columns, and names one remedy: declare the property as the runtime type and move `[TableValueSplit]`
+from it to the members of that type that can hold a large value. For a property declared as `S?`, that
+is: declare it as `S` and put the attribute on the members of `S`. For example:
+
+```text
+'Doc' holds a DocImpl, and Order.Doc (declared as DocBase) is marked [TableValueSplit]. The serializer
+stores a DocImpl as columns, one for each of its members, not as one value, and [TableValueSplit] on a
+property applies to one value stored in the property's own cells (a string, a byte[] or an object stored
+as one JSON value), not to an object stored as columns: its members would be stored as DocImpl declares
+them, and a trimming OversizedCellPolicy could trim them. Declare Order.Doc as DocImpl and move
+[TableValueSplit] from it to the members of DocImpl that can hold a large value. Nothing was stored.
+```
+
+A row written before, whose members of such an object are ordinary cells, still reads back; writing the
+entity back is refused the same way.
+
 The attribute on a property declared on an interface is a misuse too (`InvalidOperationException`): .NET
 does not pass the attributes of an interface member to the class that implements it, so the library
 cannot honour it. It makes no type large-value aware and lists no large-value column. It is reported
@@ -667,24 +692,36 @@ is stored. An instance held in a JSON-stored property (a collection, or a type s
 is not checked: it is written as JSON like every other value of that cell, and a trimming
 `OversizedCellPolicy` can trim that cell. The message names the interface member (`INote.Notes`), the
 implementing class and the remedy: put `[TableValueSplit]` on the property of the implementing class (or
-on that class) and remove it from the interface; where an entity holds the implementation in a property
-declared as the interface (or as another type), also mark the entity class `[TableValueSplit]` so that
-the entity is large-value aware. A value that needs split cells or a blob is then stored only when a read
-returns it into a large-value member: give that property an instance of the implementing class on a new
-entity (the refused writes below list the other declarations that work). On a read below the entity
-itself, the misuse arrives as the inner exception of a `SerializationException` ("Failed to set ..."), as
-for every misused attribute of a nested type. An attribute on an abstract property, or on a base-class
-property that a derived class overrides or hides, is honoured (below).
+on that class) and remove it from the interface. When the implementing class or struct is stored as one
+JSON value (it has no public parameterless constructor), an attribute on its members has no effect: put
+`[TableValueSplit]` on the property that holds it instead. For a struct that implements the interface,
+the message names putting the attribute on the struct's property and removing it from the interface; it
+does not name a class-level attribute, which C# does not allow on a struct. Where an entity holds the
+implementation in a property declared as the interface (or as another type), also mark the entity class
+`[TableValueSplit]` so that the entity is large-value aware. A value that needs split cells or a blob is
+then stored only when a read returns it into a large-value member: give that property an instance of the
+implementing class on a new entity (the refused writes below list the other declarations that work). On
+a read below the entity itself, the misuse arrives as the inner exception of a `SerializationException`
+("Failed to set ..."), as for every misused attribute of a nested type. An attribute on an abstract
+property, or on a base-class property that a derived class overrides or hides, is honoured (below).
 
 A builder partial update (`UpdateAsync(id, builder)`, on `TableStorage<T>` and `InMemoryStorage<T>`) meets
 the misuse through the declared types: when the entity type, or the declared type of a property along the
 updated path, is or implements an interface that declares a member marked `[TableValueSplit]`, the update is
 refused with the same `InvalidOperationException` before anything is written, under every
 `OversizedCellPolicy` and at every size, also for a path to another member of that type; the message names
-the interface member and the remedy. `InMemoryStorage<T>` looks at the row first: when the row does not
-exist it throws `RequestFailedException` (404), and when `WithETag` names another version
-`ConcurrencyConflictException`, as for every builder update; `TableStorage<T>` reports the misuse in both
-cases.
+the interface member and the remedy. The same holds when the path passes, at any depth, through a
+property declared as a nullable struct `S?` where `S` implements such an interface: under the
+serializer's column name (`Extra_Notes`, with no `Value` segment) and under the lambda's
+(`x => x.Extra!.Value.Notes`, column `Extra_Value_Notes`), whether the property holds a value or not. The
+message then also names declaring that property as `S`, because a member marked `[TableValueSplit]` of a
+nullable struct is refused in turn ("Declare Order.Extra as S, not nullable ..."). `InMemoryStorage<T>`
+looks at the row first: when the row does not exist it throws `RequestFailedException` (404), and when
+`WithETag` names another version `ConcurrencyConflictException`, as for every builder update;
+`TableStorage<T>` reports the misuse in both cases. The misuse is reported first; a path the declared
+types lead to a correctly marked member or a `TableBlobContent` is then refused with
+`NotSupportedException` ("partial updates cannot write it — replace the entity instead"), for every entity
+type (see [Limitations](#limitations)).
 
 This check reads declared types and attributes by reflection only, so for a plain entity type it does not
 see a property declared as a base class or `object` whose value at run time is such a class: a path
@@ -699,13 +736,20 @@ empty on a new entity is still not seen. Declare the property with the implement
 entity class and initialise the property with such an instance, and fix the attribute as the message says.
 
 On a class the attribute covers every `string`, `byte[]` and JSON-stored property of the class, whether
-the class declares the property or inherits it, except the entity `Id`, which stays an ordinary key
-column that can be filtered. A derived class inherits the attribute of its base class; when it declares
-its own, that one applies to all its properties. An attribute on a property wins over the one on its
-class (encoding and `Offload`), and a property that a derived class overrides or hides (`new`) keeps the
-attribute of the property it re-declares. Every covered property is a large property, which cannot be
-used in a LINQ filter or in a builder partial update (see [Limitations](#limitations)): to keep a
-`string` property filterable, put the attribute on the properties that need it instead of on the class.
+the class declares the property or inherits it, except the entity `Id`, which stays an ordinary key column
+that can be filtered. It covers a value stored as one value only: a property it covers by its declared
+type that holds an object stored as columns (a subclass with a public parameterless constructor) is not
+covered, and that object's members are stored as its own type declares them, as for a property declared as
+an interface or an abstract class. That is how an entity opted in at class level stores the marked members
+of a runtime subtype held in a property declared as a record or another base class. A class-level
+attribute does not cover a property declared as a nullable struct that is stored as columns either: the
+members of the struct are stored as the struct declares them, and a builder update of one that is not
+marked is written as before. A derived class inherits the attribute of its base class; when it declares
+its own, that one applies to all its properties. An attribute on a property wins over the one on its class
+(encoding and `Offload`), and a property that a derived class overrides or hides (`new`) keeps the
+attribute of the property it re-declares. Every covered property is a large property, which cannot be used
+in a LINQ filter or in a builder partial update (see [Limitations](#limitations)): to keep a `string`
+property filterable, put the attribute on the properties that need it instead of on the class.
 
 An entity type is large-value aware when it, or a type it flattens into columns (a nested object
 property), has a `[TableValueSplit]` property, a `TableBlobContent` property or a class-level
@@ -754,7 +798,11 @@ Such a constructor should have no side effects.
 A member of a runtime subtype can be a large value too. When a property is declared as an interface, an
 abstract class or a base class, its `[TableValueSplit]` and `TableBlobContent` members are those of the
 object it holds. The declared types do not show such a member, so it does not make the entity aware: opt
-the entity in with a class-level `[TableValueSplit]`. A read does not know the held object's type either:
+the entity in with a class-level `[TableValueSplit]`. Until it is opted in, the entity is a plain type, and
+a builder update that names such a member's column by name (a key of `UpdateBuilder.Updates`; no lambda
+can name a member the declared types do not have) writes it as an ordinary cell, as 0.8.3 does: under
+`TrimSilently` or `TrimWithMarker` a value too large for one cell is stored trimmed. A whole-entity write
+of such a value is refused, as below. A read does not know the held object's type either:
 it keeps the instance the entity's constructor puts in the property, and creates the declared type where
 there is none. So initialise such a property with an instance of the type that has the members (without
 one, a value of such a member that needs split cells or a blob is refused, see the refused writes below):
@@ -795,7 +843,14 @@ store of a plain type stores no large-value form at all. These writes are refuse
   is, so such a model fails on its first write of the member, not on its first large value. A member that
   holds null is not refused. A builder update that sets such a value
   (`SetProperty(x => x.Shape, new Circle { Notes = "..." })`) is refused the same way. The message names
-  the member, where it sits and the remedies above.
+  the member, where it sits and the remedies above. Where the declared types already give the property
+  that owns the member the type that carries it, and a property on the way is the reason the entity is
+  not aware (one declared as an abstract or base class whose member of that name the class does not
+  store, an `[IgnoreDataMember]` or get-only member that the object's class overrides or re-declares with
+  a setter, or a class stored as one JSON value by its constructors whose object is stored as columns),
+  the message names those properties with the types of the objects they hold
+  (`declare Order.Doc as DocImpl`), beside the class-level attribute, and not the declaration that is in
+  place.
 - Below an object whose type a read would not recreate, a value that needs split cells or a blob (every
   `TableBlobContent` does). A read keeps the instance the constructor puts in the property and creates the
   declared type where there is none, and the value is stored only when that object carries it as a
@@ -830,7 +885,12 @@ store of a plain type stores no large-value form at all. These writes are refuse
 - A `TableBlobContent` in a property declared as `object` (the only other type that can hold one, since
   `TableBlobContent` is sealed), on every store, aware or not; marking the class `[TableValueSplit]` does
   not change that. The message says to declare the property as `TableBlobContent`, the only type through
-  which a content is stored. For a subclass written through a store of its base type it names the
+  which a content is stored. A builder update of a plain type that puts a `TableBlobContent` in such a
+  property is refused too: the message names the declaration of the member the declared types reach
+  (`Declare Owner.File as TableBlobContent`), also when the update names the property by a legacy
+  `[ColumnAlias]` name; for a member only a runtime subtype declares, the update is refused as every
+  partial update of a large value is ("replace the entity instead"), and the whole-entity write names the
+  declarations. For a subclass written through a store of its base type it names the
   declaring class: when the base declares the property, declaring it there is enough; when only the
   subclass declares it, store the subclass through an `IStorage` of its own type as well. When the
   refusal concerns a `TableBlobContent` below an object held in a property declared as `object` (or
@@ -858,7 +918,14 @@ have had its source read first (see [Files](#files-tableblobcontent)).
 `TableBlobContent` property, or the class-level `[ColumnAlias("Property", "Old")]`, reads a value stored
 under the old column in every form: one cell, `Old__Json` or `Old__GZip` (written by a type that had not
 opted in), split cells, continuation rows, or a blob reference `Old__blob`. A projection that names the
-renamed property returns it. A read moves nothing. The next save through the new type stores the value
+renamed property returns it. A read moves nothing. A builder update of the legacy name of such a
+property, in any of these forms (`Old`, `Old__Json`, `Old__GZip`, `Old__c0`, `Old__chunks`, `Old__blob`
+and the other split cells), is refused with `NotSupportedException` before anything is sent, at every
+size, as one of the property's own name is ("'Old__Json' is a large value; partial updates cannot write
+it — replace the entity instead."). The same forms of a legacy name of an ordinary property are written
+as before (`Updates["Old__Json"]` of an ordinary string property is stored as that cell and read back
+into the property). A cell below a legacy name (`Old_Member`) is not a legacy name: no read maps it, and
+a builder update writes it as on 0.8.3. The next save through the new type stores the value
 under the new column and drops the old cells and continuation rows with the replaced row; an offloaded
 value is uploaded again under the new column's blob name (a `TableBlobContent` is copied from the old
 blob), and the old blob is deleted after the new row has committed, subject to `CleanupGrace`.
@@ -1428,8 +1495,24 @@ so a scaled-out app may register it in one instance only.
 - No LINQ filter and no partial update (`UpdateAsync(id, builder)`) on a large property (both throw
   `NotSupportedException`); not supported by `IPolymorphicStorage`. That includes every property a
   class-level attribute covers. One filter is not refused: on a member that an interface or base class
-  declares without the attribute and the runtime type opts in. It translates, and does not match rows whose
-  value is stored split or offloaded.
+  declares without the attribute and the runtime type opts in. It translates, and does not match rows
+  whose value is stored split or offloaded. A builder update is refused with `NotSupportedException`
+  before anything is sent, on both stores and for every entity type (also one that is not large-value
+  aware), when its column path, followed through the declared types, reaches a member marked
+  `[TableValueSplit]` (on the property, or covered by a class-level attribute) or a `TableBlobContent`
+  member, at the end of the path or on the way. Every member of each segment's name counts, whatever its
+  accessors and attributes: a get-only property, one marked `[IgnoreDataMember]` (an override in the class
+  the property holds at run time does not inherit that attribute), one re-declared with `new` or
+  overridden, inherited at any depth, of an interface or of a class. It makes no difference whether the
+  path is a lambda, a built expression or a key of `UpdateBuilder.Updates`. The path is followed through a
+  property declared as a nullable struct `S?`, at any depth, into the members of `S`: under the
+  serializer's column name (`Extra_Notes`) and under the lambda's (`x => x.Extra!.Value.Notes`, column
+  `Extra_Value_Notes`); an ordinary member of the same struct (`Extra_Name`) is still written. A legacy
+  `[ColumnAlias]` name of a large property, in any form a read maps onto it, is refused as the property's
+  own name is (see [Large values](#large-values-split-and-blob-offload)). The check reads declared types
+  and attributes by reflection only and constructs nothing; it is remembered per type and path. On a plain
+  type, a member only a runtime subtype declares is not seen: a key of `UpdateBuilder.Updates` that names
+  it writes an ordinary cell, as on 0.8.3. Replace the entity instead (a whole-entity write).
 - Batch writes of these types keep the batch contract: per partition, each entity's rows (main row,
   continuation rows, deletes of stale ones) are one unit, units are packed in order into entity-group
   transactions (at most 100 actions and the same byte and 4&nbsp;MiB wire budgets as a single write), and

@@ -86,7 +86,12 @@ Lossless storage of large values, opt-in per property.
     `NotSupportedException` naming the column or property before anything is uploaded or stored: through a
     store of a plain type, any value in a `[TableValueSplit]` member or a `TableBlobContent` below a
     runtime subtype, whatever its size (a plain store stores no large-value form; a null member is not
-    refused), also through a builder update; a value that needs split cells or a blob below an object whose
+    refused), also through a builder update that sets an object holding it; a property marked
+    `[TableValueSplit]` holding an object the serializer stores as columns (a subclass of its declared type
+    with a public parameterless constructor, or, in a property declared as a nullable struct, a struct
+    with a public parameterless constructor), at every size (the runtime form of the misuse on a property
+    whose declared type flattens; the message names one remedy: declare the property as the runtime type
+    and mark that type's members); a value that needs split cells or a blob below an object whose
     type a read would not recreate, when the object a read creates or keeps there (the declared type of a
     property that is empty on a new entity, or the default instance) has no member of that name or one that
     is not a large-value member (`public MemoBase? Doc { get; set; }` written holding a `MemoMarked` that
@@ -104,6 +109,14 @@ Lossless storage of large values, opt-in per property.
     `TableBlobContent` below an object whose runtime type a read does not recreate) may have read the
     file's source first; a content created from a non-seekable stream must then be created again from its
     source.
+  - A builder update is refused with `NotSupportedException` before anything is sent, for every entity
+    type, when the declared types lead its column path to a marked member or a `TableBlobContent` through
+    any member of each name (get-only, `[IgnoreDataMember]`, `new`, overridden, inherited), also through a
+    property declared as a nullable struct, and also under a legacy `[ColumnAlias]` name of such a property
+    in any form a read maps (`Old`, `Old__Json`, `Old__GZip`, split cells, `Old__blob`). An ordinary member
+    of a nullable struct, and the legacy name of an ordinary property, are written as before. On a plain
+    type, an `UpdateBuilder.Updates` key that names a member only a runtime subtype declares writes an
+    ordinary cell, as on 0.8.3 (a trimming `OversizedCellPolicy` can trim it).
   - The refusal messages name only remedies that work for the shape: a builder update that would write a
     large value says that a partial update cannot write one on any store and to replace the entity; a
     `TableBlobContent` in an `object` property (refused on every store, aware or not) names the
@@ -114,7 +127,11 @@ Lossless storage of large values, opt-in per property.
     and the declarations that work (the property initialised with an instance of the runtime type in the
     constructor of its owner, the property declared as the runtime type, or `[TableValueSplit]` on the
     member of the declared type; for a subclass written through a store of its base type, an `IStorage` of
-    the subclass, or the attribute on the base type's member).
+    the subclass, or the attribute on the base type's member). No refusal names a declaration that is
+    already in place: where the declared types already give the member's owner its type, the message of a
+    plain store names the properties on the way that hold an object of another type
+    (`declare Order.Doc as DocImpl`), and a plain type's builder update of a `TableBlobContent` names the
+    declaration of the member the declared types reach.
   - When many opted-in values that each fit one cell exceed one entity together, the largest are stored
     in split form so that their chunks can go to continuation rows (never a value a read would not return
     into a large-value member); a row that fits one entity is stored as before, every value in its own
@@ -462,11 +479,16 @@ Lossless storage of large values, opt-in per property.
   and every write or read that flattens a class implementing the interface into columns (the entity, or a
   property that flattens) throws `InvalidOperationException` naming the interface member, the
   implementing class and the remedy (put the attribute on the property of the implementing class, or on
-  that class), before anything is stored; such a value is never trimmed. A builder partial update, on both
+  that class; for a struct, only the property of the struct, since C# allows no class-level attribute on
+  a struct), before anything is stored; such a value is never trimmed. For an implementing class or
+  struct stored as one JSON value (no public parameterless constructor), an attribute on its members has
+  no effect: put `[TableValueSplit]` on the property that holds it. A builder partial update, on both
   stores, is refused with the same exception before anything is written when the entity type, or the
-  declared type of a property along the updated path, is or implements such an interface, at every size
-  and under every policy (`InMemoryStorage<T>` looks at the row first and throws the 404 of a missing row,
-  or the conflict of a `WithETag` that names another version, as for every builder update;
+  declared type of a property along the updated path, is or implements such an interface, also through a
+  property declared as a nullable struct (the message then also names declaring that property as the
+  struct), at every size and under every policy (`InMemoryStorage<T>` looks at the row first and throws
+  the 404 of a missing row, or the conflict of a `WithETag` that names another version, as for every
+  builder update;
   `TableStorage<T>` reports the misuse in both cases). Two cases are not checked: an instance held in a
   JSON-stored property (a collection, or a type stored as one JSON cell) is written as JSON like every
   other value of that cell, and a trimming `OversizedCellPolicy` can trim that cell; and a builder update
@@ -551,8 +573,9 @@ Lossless storage of large values, opt-in per property.
   declared as an interface, an abstract class or a base class and holds an object of a type that has such
   a member, a value too large for one cell was written as split cells (or a blob) and came back as `null`
   with no exception; the next save then dropped it. A read maps a large value the way it sets an ordinary
-  cell: through the object that is already in the property. A builder partial update of such a member is
-  refused with `NotSupportedException`.
+  cell: through the object that is already in the property. A builder partial update that sets an object
+  holding such a member is refused with `NotSupportedException`, and so is one that names the member's
+  column on a large-value aware type whose new entity holds such an object in that property.
 - `[ColumnAlias]` on an opted-in property, and on a renamed `TableBlobContent` property, reads the value
   stored under the old column in every form. Only a value of one cell was read; a larger one loaded as
   `null`, and the next save dropped it and its blob.
