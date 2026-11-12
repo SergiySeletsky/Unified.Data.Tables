@@ -341,18 +341,49 @@ public static class TableEntitySerializer
     /// <summary>
     /// The message for the value of <paramref name="column"/>, a <paramref name="runtimeType"/> that the serializer
     /// flattens into columns, held by <paramref name="property"/>, which is marked <see cref="TableValueSplitAttribute"/>:
-    /// the attribute applies to one value stored in the property's own cells, never to an object stored as columns.
+    /// the attribute applies to one value stored in the property's own cells, never to an object stored as columns. It
+    /// names "store an instance of the declared type" only when an instance of it is read back whole
+    /// (<see cref="ReadsBackWholeAsJson"/>), never for a nullable struct (named <c>S?</c>), whose every value is an
+    /// <c>S</c>; declaring the property as the runtime type with the attribute on its members is always named.
     /// </summary>
     internal static string MarkedValueStoredAsColumns(string column, PropertyInfo property, Type runtimeType)
     {
         var name = $"{property.DeclaringType?.Name}.{property.Name}";
-        return $"'{column}' holds a {runtimeType.Name}, and {name} (declared as {property.PropertyType.Name}) is marked [TableValueSplit]. The " +
+        var declared = Nullable.GetUnderlyingType(property.PropertyType) is { } underlying ? underlying.Name + "?" : property.PropertyType.Name;
+        var moved = $"declare {name} as {runtimeType.Name} and move [TableValueSplit] from it to the members of {runtimeType.Name} that " +
+                    "can hold a large value.";
+        return $"'{column}' holds a {runtimeType.Name}, and {name} (declared as {declared}) is marked [TableValueSplit]. The " +
                $"serializer stores a {runtimeType.Name} as columns, one for each of its members, not as one value, and [TableValueSplit] on a " +
                "property applies to one value stored in the property's own cells (a string, a byte[] or an object stored as one JSON value), " +
                $"not to an object stored as columns: its members would be stored as {runtimeType.Name} declares them, and a trimming " +
-               $"OversizedCellPolicy could trim them. Store an instance of {property.PropertyType.Name} in {name} (it is stored as one JSON " +
-               $"value), or declare {name} as {runtimeType.Name} and move [TableValueSplit] from it to the members of {runtimeType.Name} that " +
-               "can hold a large value. Nothing was stored.";
+               "OversizedCellPolicy could trim them. " +
+               (Nullable.GetUnderlyingType(property.PropertyType) is null && ReadsBackWholeAsJson(property.PropertyType)
+                   ? $"Store an instance of {declared} in {name} (it is stored as one JSON value), or {moved}"
+                   : char.ToUpperInvariant(moved[0]) + moved[1..]) +
+               " Nothing was stored.";
+    }
+
+    // Whether an instance of type, stored as one JSON value, is read back whole: the library's JSON reader constructs
+    // such a type through one constructor (ParameterizedConstructorConverterFactory) and sets nothing else, so every
+    // member its JSON stores (a property with a public getter, or one marked [JsonInclude]; a field marked [JsonInclude])
+    // must be a parameter of that constructor. False when the reader is not that constructor (a type System.Text.Json
+    // constructs itself): the remedy is then not named, as one that may not work. Reflection alone.
+    private static bool ReadsBackWholeAsJson(Type type)
+    {
+        if (ParameterizedConstructorConverterFactory.FindConstructor(type) is not { } constructor)
+            return false;
+        var parameters = constructor.GetParameters();
+        bool Bound(MemberInfo member)
+        {
+            var stored = member.GetCustomAttribute<JsonPropertyNameAttribute>()?.Name ?? member.Name;
+            return Array.Exists(parameters, p => string.Equals(p.Name, stored, StringComparison.OrdinalIgnoreCase));
+        }
+        static bool Ignored(MemberInfo member) => member.GetCustomAttribute<JsonIgnoreAttribute>() is { Condition: JsonIgnoreCondition.Always };
+        const BindingFlags Members = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        return type.GetProperties(Members)
+                   .Where(p => p.GetIndexParameters().Length == 0 && (p.GetMethod is { IsPublic: true } || p.IsDefined(typeof(JsonIncludeAttribute))) && !Ignored(p))
+                   .All(Bound)
+               && type.GetFields(Members).Where(f => f.IsDefined(typeof(JsonIncludeAttribute)) && !Ignored(f)).All(Bound);
     }
 
     /// <summary>
