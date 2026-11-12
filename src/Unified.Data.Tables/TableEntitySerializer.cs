@@ -931,7 +931,8 @@ public static class TableEntitySerializer
     /// (<c>"Inner_Body"</c>): refuses a path that reaches a large-value member, which the untyped
     /// overload cannot see. For every type, the path is walked through the declared types by reflection alone,
     /// with every member of each segment's name whatever its accessors and attributes (inherited, hidden with
-    /// <c>new</c>, overridden): a path that meets a member marked <see cref="TableValueSplitAttribute"/> (on the
+    /// <c>new</c>, overridden; through a nullable struct into the members of the struct; a legacy column name of a
+    /// property as that property): a path that meets a member marked <see cref="TableValueSplitAttribute"/> (on the
     /// property, or by a class-level attribute that covers it) or a <see cref="TableBlobContent"/> member, at its
     /// end or on the way, is refused. For a large-value aware type the path is also resolved as a read resolves it
     /// (a default instance may hold a runtime subtype that opts the member in); when that resolution throws (its
@@ -2906,7 +2907,10 @@ internal static class TypeMetadataCache
     /// and an override) and whatever the order in which an interface lists the interfaces it inherits. Declared
     /// types and attributes are read by reflection alone (nothing is constructed, no getter is called, no metadata
     /// is built); what the walk finds is remembered per type and column path (up to
-    /// <see cref="MaxRememberedReadTargets"/>). A member only a runtime subtype declares is not seen.
+    /// <see cref="MaxRememberedReadTargets"/>). A property declared as a nullable struct <c>S?</c> is followed into the
+    /// members of <c>S</c> (as the serializer names them, and through <c>Value</c>), and a column that is a legacy name
+    /// (<see cref="ColumnAliasAttribute"/>) of a property of <paramref name="root"/> is walked as that property too (a read
+    /// maps it there). A member only a runtime subtype declares is not seen.
     /// </summary>
     /// <exception cref="InvalidOperationException">The misuse, naming the interface member and the remedy.</exception>
     /// <exception cref="NotSupportedException">The path names a large-value member.</exception>
