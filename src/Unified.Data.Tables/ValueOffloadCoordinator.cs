@@ -21,6 +21,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     private const int CopyBufferBytes = 81_920;
 
+    // The first buffer a download of an offloaded split value reads into; it doubles up to the claimed length.
+    private const int InitialDownloadBytes = 1 << 20;
+
     private static readonly IReadOnlyDictionary<string, object> NothingResolved = new Dictionary<string, object>(StringComparer.Ordinal);
 
     /// <summary>
@@ -912,10 +915,15 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         if (reference.Length > Array.MaxLength)
             throw new TableValueIntegrityException(column, $"the blob is {reference.Length:N0} B, too large to read into memory.");
         await using var stream = await store.OpenReadAsync(column, reference.Path, ct);
-        var bytes = new byte[reference.Length];
+        // The buffer grows with what the blob delivers, up to the claimed length: a row that claims far
+        // more than its blob holds (a damaged or hostile row) fails below without that length being allocated.
+        var expected = (int)reference.Length;
+        var bytes = new byte[Math.Min(expected, InitialDownloadBytes)];
         var read = 0;
-        while (read < bytes.Length)
+        while (read < expected)
         {
+            if (read == bytes.Length)
+                Array.Resize(ref bytes, (int)Math.Min(expected, 2L * bytes.Length));
             var n = await stream.ReadAsync(bytes.AsMemory(read), ct);
             if (n == 0)
                 throw new TableValueIntegrityException(column, $"the blob holds {read} bytes, expected {reference.Length}.");
