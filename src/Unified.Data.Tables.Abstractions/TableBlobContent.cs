@@ -184,7 +184,8 @@ public sealed class TableBlobContent
     /// <para>
     /// Once an attempt has uploaded the content's blob, the content streams that blob and no longer reads
     /// the stream (seekable or not): a retry with the same content, for example after the row write
-    /// failed, reuses that blob. So the retry has
+    /// failed, after the upload of another value of the same write failed, or after the write was
+    /// cancelled once this blob was uploaded, reuses that blob. So the retry has
     /// to come before the blob is collected (by an orphan sweep whose age has passed, or a partition
     /// delete's cleanup); after that the write throws <see cref="TableValueIntegrityException"/> saying
     /// that the blob this content was uploaded to is gone, nothing is written, and the content must be
