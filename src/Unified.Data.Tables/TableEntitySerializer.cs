@@ -336,6 +336,23 @@ public static class TableEntitySerializer
         $"'{name}' is a large value; partial updates cannot write it — replace the entity instead.";
 
     /// <summary>
+    /// The message for the value of <paramref name="column"/>, a <paramref name="runtimeType"/> that the serializer
+    /// flattens into columns, held by <paramref name="property"/>, which is marked <see cref="TableValueSplitAttribute"/>:
+    /// the attribute applies to one value stored in the property's own cells, never to an object stored as columns.
+    /// </summary>
+    internal static string MarkedValueStoredAsColumns(string column, PropertyInfo property, Type runtimeType)
+    {
+        var name = $"{property.DeclaringType?.Name}.{property.Name}";
+        return $"'{column}' holds a {runtimeType.Name}, and {name} (declared as {property.PropertyType.Name}) is marked [TableValueSplit]. The " +
+               $"serializer stores a {runtimeType.Name} as columns, one for each of its members, not as one value, and [TableValueSplit] on a " +
+               "property applies to one value stored in the property's own cells (a string, a byte[] or an object stored as one JSON value), " +
+               $"not to an object stored as columns: its members would be stored as {runtimeType.Name} declares them, and a trimming " +
+               $"OversizedCellPolicy could trim them. Store an instance of {property.PropertyType.Name} in {name} (it is stored as one JSON " +
+               $"value), or declare {name} as {runtimeType.Name} and move [TableValueSplit] from it to the members of {runtimeType.Name} that " +
+               "can hold a large value. Nothing was stored.";
+    }
+
+    /// <summary>
     /// The message for a partial update of <paramref name="column"/> of an aware <paramref name="root"/> whose
     /// read-side resolution threw <paramref name="failure"/>: whether the column is a large value is not known.
     /// </summary>
@@ -1551,6 +1568,12 @@ internal sealed class TableEntityValue
             case not null when IsPrimitive(Value.GetType()) || Value.GetType().IsEnum:
                 return false;
             case not null when Path.IsEmpty || CanSerializeWithoutJson(Value):
+                // An object the serializer flattens into columns. [TableValueSplit] on the property that holds it applies
+                // to one value in the property's own cells, never to columns: refused (a clone copies what a read made).
+                // A class-level attribute covers only values stored as one value: the object is not one, and its members
+                // are stored as its type declares them.
+                if (HeldBy is { } held && state is not { Ctx.IsClone: true } && TypeMetadataCache.PropertyLevelSplit(held) is not null)
+                    throw new NotSupportedException(TableEntitySerializer.MarkedValueStoredAsColumns(columnName, held, Type!));
                 return false;
             default:
                 payload = JsonSerializer.Serialize(Value, JsonOptions);
@@ -2982,7 +3005,7 @@ internal static class TypeMetadataCache
     // inherits it through reflection; a property that hides (new) a base property of the same name and
     // type does not, so the hidden declarations are looked up (by name first: a property that
     // re-declares nothing resolves no type).
-    private static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
+    internal static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
     {
         if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)
             return own;
