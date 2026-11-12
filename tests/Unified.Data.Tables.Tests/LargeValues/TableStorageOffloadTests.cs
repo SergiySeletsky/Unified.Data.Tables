@@ -610,7 +610,7 @@ public class TableStorageOffloadTests
         await rig.Store.CreateAsync(new PlainEntity { Id = Id, Body = new string('x', 10_000) }, Ct);
         await rig.Store.UpsertAsync(new PlainEntity { Id = Id, Body = "b" }, Ct);
         await rig.Store.UpdateAsync(new PlainEntity { Id = Id, Body = "c", ETag = "W/\"v1\"" }, Ct);
-        rig.H.Cache.Remove($"{typeof(PlainEntity).FullName}:entity:{Id}");
+        ((Microsoft.Extensions.Caching.Memory.MemoryCache)rig.H.Cache).Compact(1.0); // forget the cached entity, so the next read goes to the table
         Assert.Equal("b", (await rig.Store.OneAsync(Id, Ct))!.Body);
         await rig.Store.DeleteAsync(Id, Ct);
         await rig.Store.DeletePartitionAsync(Pk, Ct);
