@@ -30,11 +30,16 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # The tag and the dispatch input reach the script through env, never expanded into its text, so a
+      # value holding shell syntax is data, not a command.
       - name: Determine version
         id: version
         shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          INPUT: ${{ inputs.version }}
         run: |
-          VERSION="${{ github.event.release.tag_name || inputs.version }}"
+          VERSION="${TAG:-$INPUT}"
           VERSION="${VERSION#v}"   # strip a leading 'v' (v1.2.3 -> 1.2.3)
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version: ${VERSION:-<.csproj default>}"
@@ -88,9 +93,11 @@ jobs:
 
       - name: Pack
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
-          if [ -n "${{ steps.version.outputs.value }}" ]; then
-            dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts -p:Version=${{ steps.version.outputs.value }}
+          if [ -n "$VERSION" ]; then
+            dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts "-p:Version=$VERSION"
           else
             dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts
           fi
