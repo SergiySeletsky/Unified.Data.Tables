@@ -146,6 +146,15 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         }
     }
 
+    /// <summary>Removes a raw row as is (for tests that damage a stored entity); false when there was none.</summary>
+    internal bool RemovePhysicalRow(string partitionKey, string rowKey)
+    {
+        lock (gate)
+        {
+            return rows.Remove((partitionKey, rowKey));
+        }
+    }
+
     // Mode-aware id normalization — identical to TableStorage's, preserving fake/Azure parity.
     private string NormalizeId(string id) =>
         idNormalization == IdNormalization.Normalized ? EntityId.Normalize(id) : id;
@@ -206,6 +215,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             throw new ArgumentNullException(nameof(entity));
         }
         RefuseReservedRowKey(entity.Id);
+        // An already-cancelled token fails the call before anything is stamped or written, as the SDK
+        // call TableStorage<T> makes first does.
+        ct.ThrowIfCancellationRequested();
 
         entity.CreatedAt = DateTimeOffset.UtcNow;
         // An insert is a write — keep audit stamps consistent, mirroring TableStorage. (Entity's
@@ -218,11 +230,11 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         if (LargeValueAware)
             return WriteLargeAsync(entity, LargeWriteKind.Create, ifMatch: null, ct);
 
+        ServiceErrors.ThrowIfRefusedKey(keys);
         lock (gate)
         {
             if (rows.ContainsKey(keys))
-                throw new DuplicateKeyException(typeof(T).Name, entity.Id,
-                    new RequestFailedException(409, $"The specified entity already exists. Id: {entity.Id}"));
+                throw new DuplicateKeyException(typeof(T).Name, entity.Id, ServiceErrors.AlreadyExists(entity.Id));
             entity.ETag = Store(keys, entity).ETagString();
         }
 
@@ -246,7 +258,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
         entity.Id = NormalizeId(entity.Id);
+        ct.ThrowIfCancellationRequested();
         var keys = EntityId.Split(entity.Id);
+        ServiceErrors.ThrowIfRefusedKey(keys);
 
         lock (gate)
         {
@@ -287,12 +301,14 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
         entity.Id = NormalizeId(entity.Id);
+        ct.ThrowIfCancellationRequested();
         var keys = EntityId.Split(entity.Id);
+        ServiceErrors.ThrowIfRefusedKey(keys);
 
         lock (gate)
         {
             if (!rows.TryGetValue(keys, out var existing))
-                throw new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}");
+                throw ServiceErrors.NotFound(entity.Id);
 
             // Strict — and Auto with a caller-round-tripped ETag — enforce the row version; a
             // mismatch surfaces as a conflict with no retry, exactly like TableStorage<T>. Auto
@@ -301,8 +317,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             if (mode != ConcurrencyMode.LastWriterWins && callerSuppliedETag
                 && !string.Equals(existing.ETagString(), suppliedETag, StringComparison.Ordinal))
             {
-                throw new ConcurrencyConflictException(typeof(T).Name, entity.Id,
-                    new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer."));
+                throw new ConcurrencyConflictException(typeof(T).Name, entity.Id, ServiceErrors.ConditionNotSatisfied());
             }
 
             entity.ETag = Store(keys, entity).ETagString();
@@ -330,18 +345,19 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         var keys = EntityId.Split(NormalizeId(id));
         // A continuation row is not an entity: merging cells into one would surface them on the primary.
         RefuseReservedRowKey(id);
+        ct.ThrowIfCancellationRequested();
+        ServiceErrors.ThrowIfRefusedKey(keys);
 
         lock (gate)
         {
             if (!rows.TryGetValue(keys, out var existing))
-                throw new RequestFailedException(404, $"The specified resource does not exist. Id: {id}");
+                throw ServiceErrors.NotFound(id);
 
             // Conditional merge (WithETag): the merge only applies to the version that was read.
             if (builder.ETag is not null
                 && !string.Equals(existing.ETagString(), builder.ETag, StringComparison.Ordinal))
             {
-                throw new ConcurrencyConflictException(typeof(T).Name, id,
-                    new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer."));
+                throw new ConcurrencyConflictException(typeof(T).Name, id, ServiceErrors.ConditionNotSatisfied());
             }
 
             // Server-side Merge: only the declared (flattened) columns change; the rest survive.
@@ -377,7 +393,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
 
         lock (gate)
         {
-            return Task.FromResult(rows.TryGetValue(keys, out var row) ? Materialize(row) : null);
+            // As TableStorage<T> reads for every T: a row with a _SplitOf cell (a continuation row of a
+            // large-value aware type) is not an entity.
+            return Task.FromResult(rows.TryGetValue(keys, out var row) && !LargeValueTable.IsPartRow(row.Data) ? Materialize(row) : null);
         }
     }
 
@@ -394,7 +412,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         lock (gate)
         {
             // A continuation row is not an entity: addressing one by id finds nothing.
-            return Task.FromResult(rows.TryGetValue(keys, out var row) && !(LargeValueAware && LargeValueTable.IsPartRow(row.Data)));
+            // For every T, as TableStorage<T> answers it.
+            return Task.FromResult(rows.TryGetValue(keys, out var row) && !LargeValueTable.IsPartRow(row.Data));
         }
     }
 
@@ -406,7 +425,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             return QueryLargeAsync(scope, ct);
         lock (gate)
         {
-            var matches = OrderedRows()
+            var matches = LogicalRows()
                 .Where(kv => scope is null || kv.Key.PartitionKey == scope)
                 .Select(kv => Materialize(kv.Value))
                 .ToList();
@@ -421,9 +440,10 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         if (LargeValueAware)
             return BoundedLargeAsync(options, ct);
 
+        var select = ProjectedRows.SelectedColumns<T>(options);
         lock (gate)
         {
-            return Task.FromResult<IReadOnlyList<T>>(Bounded(options).Select(kv => Materialize(kv.Value)).ToList());
+            return Task.FromResult<IReadOnlyList<T>>(Bounded(options).Select(kv => Materialize(kv.Value, select)).ToList());
         }
     }
 
@@ -448,7 +468,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
 
         lock (gate)
         {
-            IEnumerable<T> query = OrderedRows()
+            IEnumerable<T> query = LogicalRows()
                 .Where(kv => scope is null || kv.Key.PartitionKey == scope)
                 .Select(kv => Materialize(kv.Value))
                 .Where(matches);
@@ -469,9 +489,10 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         }
         else
         {
+            var select = ProjectedRows.SelectedColumns<T>(options);
             lock (gate)
             {
-                snapshot = Bounded(options ?? new QueryOptions()).Select(kv => Materialize(kv.Value)).ToList();
+                snapshot = Bounded(options ?? new QueryOptions()).Select(kv => Materialize(kv.Value, select)).ToList();
             }
         }
 
@@ -524,8 +545,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             after = (inner.Substring(0, sep), inner.Substring(sep + 1));
         }
 
+        var select = ProjectedRows.SelectedColumns<T>(options);
         if (LargeValueAware)
-            return PageLargeAsync(partition, rowKeyPrefix, pageSize, fingerprint, after, ct);
+            return PageLargeAsync(partition, rowKeyPrefix, pageSize, fingerprint, after, select, ct);
 
         lock (gate)
         {
@@ -538,7 +560,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             var candidate = rowsQuery.Take(pageSize + 1).ToList();
             var hasMore = candidate.Count > pageSize;
             var pageRows = hasMore ? candidate.Take(pageSize).ToList() : candidate;
-            var items = pageRows.Select(kv => Materialize(kv.Value)).ToList();
+            // A row with a _SplitOf cell takes its place in the page and is then skipped, as TableStorage<T>
+            // pages for every T.
+            var items = pageRows.Where(kv => !LargeValueTable.IsPartRow(kv.Value.Data)).Select(kv => Materialize(kv.Value, select)).ToList();
 
             string? next = null;
             if (hasMore)
@@ -628,6 +652,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         }
 
         var keys = EntityId.Split(NormalizeId(id));
+        ct.ThrowIfCancellationRequested();
         if (LargeValueAware)
             return DeleteLargeAsync(keys, ct);
 
@@ -647,6 +672,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             throw new ArgumentNullException(nameof(partition));
 
         partition = NormalizeId(partition); // match stored (normalized) PartitionKeys
+        ct.ThrowIfCancellationRequested();
         if (LargeValueAware)
             return DeletePartitionLargeAsync(partition, ct);
         lock (gate)
@@ -665,6 +691,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         ArgumentNullException.ThrowIfNull(entities);
         if (entities.Count == 0)
             return Task.FromResult(0);
+        ct.ThrowIfCancellationRequested();
 
         // Refuse a reserved row key before the first entity is stamped or written, not halfway through.
         if (LargeValueAware)
@@ -694,7 +721,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             entity.Id = NormalizeId(entity.Id);
             var keys = EntityId.Split(entity.Id);
 
-            if (!upsert && !withinBatch.Add(keys))
+            // A large-value aware create batch refuses a repeated key up front, as TableStorage<T> does; a
+            // plain batch finds it in its transaction, as the service does (see WritePlainBatch).
+            if (LargeValueAware && !upsert && !withinBatch.Add(keys))
                 throw new DuplicateKeyException(typeof(T).Name, entity.Id,
                     new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}"));
             prepared.Add((keys, entity));
@@ -706,24 +735,53 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         // Every entity is serialized before the first is stored, as TableStorage<T> serializes the whole
         // batch before it sends it: an entity the serializer refuses fails the batch with nothing written.
         var serialized = prepared.ConvertAll(p => Serialize(p.Keys, p.Entity));
-        lock (gate)
-        {
-            if (!upsert)
-            {
-                // Validate before applying — a duplicate fails the batch without partial writes
-                // (the fake treats the whole call as one transaction; close enough to the real
-                // per-partition 100-row transactions for test purposes).
-                var duplicate = prepared.FirstOrDefault(p => rows.ContainsKey(p.Keys));
-                if (duplicate.Entity is not null)
-                    throw new DuplicateKeyException(typeof(T).Name, duplicate.Entity.Id,
-                        new RequestFailedException(409, $"The specified entity already exists. Id: {duplicate.Entity.Id}"));
-            }
-
-            for (var i = 0; i < prepared.Count; i++)
-                Store(prepared[i].Keys, serialized[i]);
-        }
-
+        WritePlainBatch(prepared, serialized, upsert, ct);
         return Task.FromResult(prepared.Count);
+    }
+
+    /// <summary>
+    /// The plain batch as TableStorage&lt;T&gt; sends it: per partition (in the order the partitions first
+    /// appear), the rows packed into the same entity-group transactions (<see cref="BatchPlanner"/>, at most
+    /// 100 rows and the payload budget each), each applied atomically under the gate. A transaction that
+    /// fails applies nothing, and the ones before it stay committed. It fails as the service fails it: a
+    /// key the service refuses with a raw 400 <c>InvalidInput</c>, a row named twice with 400
+    /// <c>InvalidDuplicateRow</c> (a <see cref="DuplicateKeyException"/> for a create, as TableStorage&lt;T&gt;
+    /// translates it; raw for an upsert), a stored key of a create with a
+    /// <see cref="DuplicateKeyException"/> over 409 <c>EntityAlreadyExists</c>, each wrapped in the
+    /// <see cref="TableTransactionFailedException"/> the SDK raises.
+    /// </summary>
+    private void WritePlainBatch(List<((string, string) Keys, T Entity)> prepared, List<TableEntity> serialized, bool upsert, CancellationToken ct)
+    {
+        foreach (var group in Enumerable.Range(0, prepared.Count).GroupBy(i => prepared[i].Keys.Item1, StringComparer.Ordinal))
+        {
+            var members = group.ToArray();
+            var plan = BatchPlanner.Plan([.. members.Select(i => TableRequestSize.EstimateEntityBytes(serialized[i]))]);
+            foreach (var range in plan)
+            {
+                // A cancelled token fails a transaction before it is sent, as the SDK does.
+                ct.ThrowIfCancellationRequested();
+                lock (gate)
+                {
+                    var inTransaction = new HashSet<(string, string)>();
+                    for (var j = range.Start; j < range.Start + range.Count; j++)
+                    {
+                        var (keys, entity) = prepared[members[j]];
+                        if (ServiceErrors.RefusedKey(keys.Item1, keys.Item2) is { } refused)
+                            throw ServiceErrors.InTransaction(refused);
+                        if (!inTransaction.Add(keys))
+                        {
+                            var repeated = ServiceErrors.InTransaction(ServiceErrors.DuplicateRow(entity.Id));
+                            throw upsert ? repeated : new DuplicateKeyException(typeof(T).Name, entity.Id, repeated);
+                        }
+                        if (!upsert && rows.ContainsKey(keys))
+                            throw new DuplicateKeyException(typeof(T).Name, entity.Id,
+                                ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(entity.Id)));
+                    }
+                    for (var j = range.Start; j < range.Start + range.Count; j++)
+                        Store(prepared[members[j]].Keys, serialized[members[j]]);
+                }
+            }
+        }
     }
 
     private IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> Bounded(QueryOptions options)
@@ -742,7 +800,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
                 "ContinuationToken is only honored by QueryPageAsync — use QueryPageAsync to resume paging.",
                 nameof(options));
 
-        var matches = (LargeValueAware ? LogicalRows() : OrderedRows())
+        // A row with a _SplitOf cell is skipped for every T, as TableStorage<T> reads it.
+        var matches = LogicalRows()
             .Where(kv => partition is null || kv.Key.PartitionKey == partition)
             .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal));
 
@@ -767,6 +826,18 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     // The plain path, as TableStorage<T> serializes it: the row a read of a T comes from.
     private static TableEntity Serialize((string PartitionKey, string RowKey) keys, T entity) =>
         LargeValueRows.ToPlainTableEntity(entity, keys.PartitionKey, keys.RowKey, typeof(T));
+
+    // A projected read (select not null) deserializes only the selected cells, as TableStorage<T> reads what
+    // the service returns for a $select; nothing outside the row is read.
+    private static T Materialize(StoredRow row, IReadOnlyList<string>? select)
+    {
+        if (select is null)
+            return Materialize(row);
+        var entity = ProjectedRows.Read<T>(CopyOf(row.Data), select);
+        entity.ETag = row.ETagString();
+        entity.Timestamp = row.Timestamp;
+        return entity;
+    }
 
     private static T Materialize(StoredRow row)
     {
