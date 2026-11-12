@@ -340,7 +340,9 @@ public class BlobNamingTests
 
         var ex = await Assert.ThrowsAsync<AggregateException>(() => h.Store.SweepOrphanBlobsAsync(TimeSpan.FromMinutes(5), Ct));
 
-        Assert.Same(failure, Assert.Single(ex.InnerExceptions));
+        // One inner exception per failed partition: its orphans that could not be deleted, together.
+        var partition = Assert.IsType<AggregateException>(Assert.Single(ex.InnerExceptions));
+        Assert.Same(failure, Assert.Single(partition.InnerExceptions));
         Assert.Contains("2", ex.Message, StringComparison.Ordinal); // the blobs deleted before giving up
         Assert.Equal([bad], blobs.Inner.Names);
     }
