@@ -2,6 +2,7 @@
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace Unified.Data.Tables;
 
@@ -37,6 +38,12 @@ namespace Unified.Data.Tables;
 /// </list>
 /// Without this converter those rows are readable only by the serializer that wrote them, which
 /// makes the format-compatibility guarantee false for exactly the types most likely to rely on it.
+/// <para>
+/// After the constructor runs, every JSON property no parameter took is assigned to the settable or
+/// init-only member it names, as both System.Text.Json and Newtonsoft assign the members beside a
+/// constructor; which members those are, and under which JSON names, is System.Text.Json's own
+/// contract for the type. A positional record's extra members are therefore kept, not dropped.
+/// </para>
 /// <para>
 /// A type that System.Text.Json can already construct without a constructor decision is never
 /// touched: <see cref="CanConvert"/> declines it, and the default behaviour (including
@@ -109,6 +116,8 @@ internal sealed class ParameterizedConstructorConverterFactory : JsonConverterFa
 internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
 {
     private static readonly ConcurrentDictionary<JsonSerializerOptions, JsonSerializerOptions> Delegating = new();
+    private static readonly ConcurrentDictionary<JsonSerializerOptions, IReadOnlyList<JsonPropertyInfo>> SettableMembers = new();
+    private static readonly ConcurrentDictionary<(JsonSerializerOptions Options, JsonPropertyInfo Member), JsonSerializerOptions> MemberConverterOptions = new();
 
     private readonly ConstructorInfo constructor;
     private readonly ParameterInfo[] parameters;
@@ -142,6 +151,7 @@ internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
         }
 
         var args = new object?[parameters.Length];
+        var consumed = new HashSet<string>(StringComparer.Ordinal);
         for (var i = 0; i < parameters.Length; i++)
         {
             var parameter = parameters[i];
@@ -151,12 +161,130 @@ internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
             // binding, and what a camelCase-on-write / case-insensitive-on-read policy requires.
             // Each argument deserializes to the PARAMETER's declared type, so a parameter typed
             // IEnumerable<T> accepts JSON that was written from an ImmutableList<T> property.
-            args[i] = TryGetProperty(root, parameter.Name!, options, out var value)
-                ? value.Deserialize(parameter.ParameterType, options)
-                : DefaultOf(parameter);
+            if (TryGetProperty(root, parameter.Name!, options, out var value, out var matched))
+            {
+                args[i] = value.Deserialize(parameter.ParameterType, options);
+                consumed.Add(matched);
+            }
+            else
+            {
+                args[i] = DefaultOf(parameter);
+            }
         }
 
-        return (T)constructor.Invoke(args);
+        // Boxed until the members are set, so a struct is set itself rather than a copy of it.
+        var result = constructor.Invoke(args);
+        AssignRemainingMembers(result, root, consumed, options);
+        return (T)result;
+    }
+
+    // After the constructor, every JSON property no parameter took is assigned to the member it names,
+    // as System.Text.Json assigns the members beside a constructor it binds itself and as Newtonsoft
+    // assigned them: a positional record's init-only and settable members, a constructor-only class's
+    // settable ones. The members and their JSON names come from System.Text.Json's own contract for
+    // the type, so [JsonIgnore], [JsonPropertyName], [JsonInclude], init-only setters and the naming
+    // policy mean here exactly what they mean to it; a member it would not set (getter-only, a private
+    // setter without [JsonInclude], a computed property) is not set. A member the JSON does not name,
+    // and a member whose JSON does not deserialize to its type, keeps the value the constructor and its
+    // initialiser gave it.
+    private static void AssignRemainingMembers(
+        object result, JsonElement root, HashSet<string> consumed, JsonSerializerOptions options)
+    {
+        var members = Members(options);
+        if (members.Count == 0)
+            return;
+
+        var comparison = options.PropertyNameCaseInsensitive
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        foreach (var property in root.EnumerateObject())
+        {
+            if (consumed.Contains(property.Name))
+                continue;
+
+            var member = FindMember(members, property.Name, comparison);
+            if (member is null)
+                continue;
+
+            // A member whose stored JSON cannot be read into its current type keeps the constructor's and
+            // its initialiser's value, as 0.8.x (which assigned none of these members) read the row: a member
+            // typed as an interface or an abstract class without polymorphism metadata (NotSupportedException),
+            // a member whose type changed since the row was written, a null stored for a non-nullable value
+            // type (JsonException), a member converter that refuses the value (InvalidOperationException).
+            // The row stays readable and every other member is still assigned.
+            object? value;
+            try
+            {
+                value = property.Value.Deserialize(member.PropertyType, MemberOptions(member, options));
+            }
+            catch (Exception ex) when (ex is JsonException or NotSupportedException or InvalidOperationException)
+            {
+                continue;
+            }
+
+            member.Set!(result, value);
+        }
+    }
+
+    private static JsonPropertyInfo? FindMember(
+        IReadOnlyList<JsonPropertyInfo> members, string name, StringComparison comparison)
+    {
+        // An exact match wins over a case-insensitive one, as it does for System.Text.Json.
+        foreach (var member in members)
+        {
+            if (string.Equals(member.Name, name, StringComparison.Ordinal))
+                return member;
+        }
+
+        if (comparison == StringComparison.Ordinal)
+            return null;
+
+        foreach (var member in members)
+        {
+            if (string.Equals(member.Name, name, comparison))
+                return member;
+        }
+
+        return null;
+    }
+
+    // The settable members of T in System.Text.Json's contract, read through the options without this
+    // factory (the factory changes only how T is constructed, never which members T has).
+    private static IReadOnlyList<JsonPropertyInfo> Members(JsonSerializerOptions options) =>
+        SettableMembers.GetOrAdd(options, static o =>
+        {
+            JsonTypeInfo info;
+            try
+            {
+                info = WithoutFactory(o).GetTypeInfo(typeof(T));
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
+            {
+                // A type System.Text.Json cannot describe at all (two members under one JSON name, say)
+                // could still be read through its constructor before this pass existed; it still is.
+                return [];
+            }
+
+            if (info.Kind != JsonTypeInfoKind.Object)
+                return [];
+
+            return info.Properties
+                .Where(p => p.Set is not null && !p.IsExtensionData)
+                .ToArray();
+        });
+
+    // A member with its own [JsonConverter] reads through it, as System.Text.Json would.
+    private static JsonSerializerOptions MemberOptions(JsonPropertyInfo member, JsonSerializerOptions options)
+    {
+        if (member.CustomConverter is null)
+            return options;
+
+        return MemberConverterOptions.GetOrAdd((options, member), static key =>
+        {
+            var copy = new JsonSerializerOptions(key.Options);
+            copy.Converters.Insert(0, key.Member.CustomConverter!);
+            return copy;
+        });
     }
 
     /// <inheritdoc />
@@ -169,8 +297,9 @@ internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
     }
 
     private static bool TryGetProperty(
-        JsonElement root, string name, JsonSerializerOptions options, out JsonElement value)
+        JsonElement root, string name, JsonSerializerOptions options, out JsonElement value, out string matched)
     {
+        matched = string.Empty;
         if (root.ValueKind != JsonValueKind.Object)
         {
             value = default;
@@ -184,6 +313,7 @@ internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
                 if (string.Equals(property.Name, candidate, StringComparison.OrdinalIgnoreCase))
                 {
                     value = property.Value;
+                    matched = property.Name;
                     return true;
                 }
             }

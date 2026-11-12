@@ -306,9 +306,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     {
         ValidateKey(write.Key);
 
+        // A TableBlobContent needs a blob upload this store does not perform: refuse it before serializing.
+        if (write.Item is not null && TableEntitySerializer.CarriesBlobContent(write.Item))
+            throw new NotSupportedException(TableEntitySerializer.PolymorphicWriteRefusal(write.Item.GetType()));
+
         var row = write.Item is null
             ? new TableEntity(write.Key.PartitionKey, write.Key.RowKey)
             : write.Item.ToTableEntity(write.Key.PartitionKey, write.Key.RowKey);
+
+        // A split value spans cells (and, through IStorage<T>, continuation rows and blobs) that this
+        // store neither writes atomically nor reassembles on read, so refuse it rather than store half.
+        if (write.Item is not null && TableEntitySerializer.HasLargeValueCells(row))
+            throw new NotSupportedException(TableEntitySerializer.PolymorphicWriteRefusal(write.Item.GetType()));
 
         if (write.Item is not null)
             row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(write.Item.GetType());

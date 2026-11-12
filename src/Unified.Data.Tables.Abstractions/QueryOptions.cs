@@ -51,8 +51,10 @@ public sealed record QueryOptions
     /// crossed the wire, so the transfer cost is already paid.
     ///
     /// The implementation always adds back the columns deserialization cannot work without
-    /// (<c>PartitionKey</c>, <c>RowKey</c>, <c>Timestamp</c>, <c>odata.etag</c> and the type
-    /// discriminator), so a caller cannot accidentally project a row into garbage.
+    /// (<c>PartitionKey</c>, <c>RowKey</c>, <c>Timestamp</c> and the type discriminator), so a caller
+    /// cannot accidentally project a row into garbage. The row's version needs no selecting: the
+    /// service returns it with every entity, so a projected entity still carries its <c>ETag</c>.
+    /// Do not name <c>odata.etag</c> here: it is not a column, and it is dropped from the projection.
     /// </summary>
     public IReadOnlyList<string>? Select { get; init; }
 }

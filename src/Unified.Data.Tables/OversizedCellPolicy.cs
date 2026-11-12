@@ -10,7 +10,7 @@ namespace Unified.Data.Tables;
 public enum OversizedCellPolicy
 {
     /// <summary>
-    /// Default. Trim the payload to fit (largest list prefix / capped string; a non-list payload is
+    /// Trim the payload to fit (largest list prefix / capped string; a non-list payload is
     /// dropped) and record what happened in a sibling <c>{Column}__Truncated</c> marker cell
     /// (e.g. <c>"kept 125 of 2000 items"</c>), so the loss is visible in the data itself.
     /// </summary>
@@ -18,7 +18,7 @@ public enum OversizedCellPolicy
 
     /// <summary>
     /// Fail the write with <see cref="System.Runtime.Serialization.SerializationException"/> —
-    /// for data where silent loss is never acceptable and the caller wants to remodel instead
+    /// The default (<see cref="UnifiedTableStorageOptions.OversizedCells"/>). For data where silent loss is never acceptable and the caller wants to remodel instead
     /// (e.g. row-per-item).
     /// </summary>
     Throw,

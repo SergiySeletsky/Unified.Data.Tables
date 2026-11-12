@@ -1,0 +1,77 @@
+namespace Unified.Data.Tables;
+
+/// <summary>
+/// Opts a property (or the properties of a class) into lossless storage of values of
+/// any size: the value is kept inline when it fits one cell and the entity fits one row, otherwise split
+/// across cells and rows, and finally offloaded to blob storage. Nothing is ever trimmed.
+/// </summary>
+/// <remarks>
+/// On a class the attribute covers every <c>string</c>, <c>byte[]</c> and JSON-stored property of the
+/// class, declared or inherited, except the entity id (<see cref="IEntity.Id"/>), which stays an
+/// ordinary key column. A derived class inherits the attribute of its base class and may declare its
+/// own. An attribute on a property wins over the one on its class, and a property that a derived class
+/// overrides or hides (<c>new</c>) keeps the attribute of the property it re-declares.
+/// <para>
+/// On a property declared on an interface the attribute is a misuse: .NET does not pass the attributes of
+/// an interface member to the class that implements it, so it cannot be honoured. It makes no type
+/// large-value aware and lists no large-value column. Every write or read that flattens a class
+/// implementing the interface into columns (the entity, or a property that flattens into columns) throws
+/// <see cref="System.InvalidOperationException"/> before anything is stored (a value of such a class is
+/// never trimmed), naming the interface member and the remedy: put the attribute on the property of the
+/// implementing class, or on that class (and, where an entity holds the implementation in a property
+/// declared as the interface, on the entity class too). A builder partial update is refused with the same
+/// exception before anything is written when the entity type, or the declared type of a property along
+/// the updated path, is or implements such an interface (<c>InMemoryStorage&lt;T&gt;</c> looks at the row
+/// first: for a missing row, or a <c>WithETag</c> that names another version, it throws the 404 or the
+/// conflict, as for every builder update). An instance held in a JSON-stored property (a collection, or a
+/// type stored as one JSON cell) is not checked: it is written as JSON like every other value of that
+/// cell, and a trimming <c>OversizedCellPolicy</c> can trim that cell.
+/// </para>
+/// <para>
+/// A store treats its entity type as large-value aware (it plans split cells, continuation rows and blobs)
+/// only when the declared types say so, read by reflection alone: the attribute on a property of the entity
+/// or of a type the entity flattens into columns, a <see cref="TableBlobContent"/> property there, or the
+/// attribute on the entity class itself. The last also applies when it covers none of the entity's own
+/// properties: it is how an entity opts in whose large values are members of an object whose type is known
+/// only at run time (an interface-, abstract- or base-class-typed property that holds a subtype with
+/// <c>[TableValueSplit]</c> or <see cref="TableBlobContent"/> members). The entity's constructor must then
+/// put an instance of that subtype in the property: a read keeps that instance and creates the declared
+/// type where there is none, and below an object of the declared type such a value that needs split cells
+/// or a blob is refused (below). The attribute still covers the entity's own string, <c>byte[]</c> and
+/// JSON-stored properties as above. The store of such an entity constructs it when it first needs the
+/// columns of the objects its constructor puts in those properties, once for each column a builder update
+/// names before it was resolved, and once for each column of a <see cref="TableBlobContent"/>, or of a
+/// <c>[TableValueSplit]</c> value below a nested object (or of a subclass written through a store of its
+/// base type), that a write meets before it was resolved; it never constructs a type that is not
+/// large-value aware. While that construction throws (the constructor or a getter fails), such a builder
+/// update is refused with <see cref="System.NotSupportedException"/>, and so is such a write of a value
+/// below a nested object, or of such a subclass, that needs split cells or a blob; a value of one cell, and
+/// a top-level value of an entity of the store's own type, are written. A type that is not large-value
+/// aware refuses to store a value in such a member below a runtime subtype, whatever its size, with
+/// <see cref="System.NotSupportedException"/>.
+/// </para>
+/// <para>
+/// A value too large for one cell is stored only where a read returns it into a large-value member of the
+/// object the read creates or keeps there. Below an object a read cannot create (a struct held in a
+/// nullable property, an interface- or abstract-typed property with no instance), and below one whose type
+/// has no member of the value's name, or has one that is not a large-value member (a property declared as
+/// a base class and empty on a new entity, written holding a subclass that marks the member while the base
+/// class does not), the write is refused with <see cref="System.NotSupportedException"/> naming the column,
+/// before anything is stored or uploaded; a value that fits one cell there stays an ordinary cell, and is
+/// never moved to split form to make a crowded row fit. A split value keeps four cells on the entity's main
+/// row besides its chunks, and a row with split values its part count, within the 252 properties one entity
+/// holds besides its keys and timestamp: an entity with no other properties than those of
+/// <see cref="Entity"/> holds 62 split values, a wider one fewer. Beyond that the write throws
+/// <see cref="OversizedValueException"/>, which names the value and the properties its cells need.
+/// </para>
+/// </remarks>
+/// <param name="encoding">How the value is encoded once it has to be split.</param>
+[AttributeUsage(AttributeTargets.Property | AttributeTargets.Class, Inherited = true)]
+public sealed class TableValueSplitAttribute(SplitEncoding encoding) : Attribute
+{
+    /// <summary>How the value is encoded once it has to be split.</summary>
+    public SplitEncoding Encoding { get; } = encoding;
+
+    /// <summary>Whether the value may be offloaded to blob storage. Defaults to <see cref="BlobOffload.AboveThreshold"/>.</summary>
+    public BlobOffload Offload { get; set; }
+}

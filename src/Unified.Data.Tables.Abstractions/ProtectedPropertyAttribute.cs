@@ -8,6 +8,15 @@ namespace Unified.Data.Tables;
 ///   <item><description>builder-based <see cref="IStorage{T}.UpdateAsync(string, System.Action{UpdateBuilder{T}}, System.Threading.CancellationToken)"/> rejects the property — at any depth of the set path (<c>x =&gt; x.Payroll.Salary</c>) — unless <see cref="UpdateBuilder{T}.AllowProtected"/> was called.</description></item>
 /// </list>
 /// </summary>
+/// <remarks>
+/// A whole-entity write counts the property as changed when the new value does not equal the stored one
+/// (<see cref="object.Equals(object, object)"/>), and its refusal quotes both values. A property that is a
+/// large value (a <see cref="TableBlobContent"/>, or a value opted in with
+/// <see cref="TableValueSplitAttribute"/>) is compared by content instead: a file is unchanged when it is the
+/// same blob (same SHA-256, length and content type), a <c>byte[]</c> when it has the same bytes. A content
+/// whose hash is not known yet (made from a stream that has not been written) counts as changed. The
+/// refusal of such a change gives the kind and length of both values, never the values.
+/// </remarks>
 [AttributeUsage(AttributeTargets.Property, AllowMultiple = false)]
 public sealed class ProtectedPropertyAttribute : Attribute
 {

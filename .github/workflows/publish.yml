@@ -21,6 +21,7 @@ jobs:
     name: Build & publish to NuGet.org
     runs-on: ubuntu-latest
     environment: production   # must match the 'Environment' in the nuget.org trusted-publishing policy
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -29,26 +30,113 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # The tag and the dispatch input reach the script through env, never expanded into its text, so a
+      # value holding shell syntax is data, not a command.
       - name: Determine version
         id: version
         shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          INPUT: ${{ inputs.version }}
         run: |
-          VERSION="${{ github.event.release.tag_name || inputs.version }}"
+          VERSION="${TAG:-$INPUT}"
           VERSION="${VERSION#v}"   # strip a leading 'v' (v1.2.3 -> 1.2.3)
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing version: ${VERSION:-<.csproj default>}"
 
+      # A NuGet version cannot be deleted: refuse a release tag (or an explicit workflow_dispatch version)
+      # that differs from the <Version> the repository declares in Directory.Build.props.
+      - name: Check the version matches Directory.Build.props
+        shell: bash
+        env:
+          REQUESTED: ${{ steps.version.outputs.value }}
+        run: |
+          DECLARED="$(sed -n 's:.*<Version>\([^<]*\)</Version>.*:\1:p' Directory.Build.props | head -n 1)"
+          if [ -z "$DECLARED" ]; then
+            echo "::error::Directory.Build.props declares no <Version>"
+            exit 1
+          fi
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "$DECLARED" ]; then
+            echo "::error::Requested version $REQUESTED differs from Directory.Build.props <Version>$DECLARED</Version>"
+            exit 1
+          fi
+          echo "Version $DECLARED matches Directory.Build.props"
+
+      # The Azurite integration tests must run, not skip, before anything is published: start the
+      # emulator (pinned, same flags as local development) and make an unreachable one a test failure.
+      - name: Start Azurite
+        shell: bash
+        run: |
+          docker run -d --name azurite -p 10000:10000 -p 10002:10002 \
+            mcr.microsoft.com/azure-storage/azurite:3.35.0 \
+            azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --loose --skipApiVersionCheck
+          # Docker's port forwarder accepts a TCP connection as soon as the container exists, whether or
+          # not Azurite listens yet: wait for an HTTP answer (any status code) on the blob (10000) and
+          # the table (10002) endpoint, for at most 60 s in all.
+          deadline=$((SECONDS + 60))
+          for port in 10000 10002; do
+            until curl -s -o /dev/null -m 2 "http://127.0.0.1:$port/"; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::Azurite did not answer an HTTP request on port $port within 60 s"
+                docker logs azurite
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "Azurite answers HTTP on port $port"
+          done
+
       - name: Test
+        env:
+          UNIFIED_TABLES_REQUIRE_AZURITE: "1"
         run: dotnet test Unified.Data.Tables.slnx -c Release
 
       - name: Pack
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
-          if [ -n "${{ steps.version.outputs.value }}" ]; then
-            dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts -p:Version=${{ steps.version.outputs.value }}
+          if [ -n "$VERSION" ]; then
+            dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts "-p:Version=$VERSION"
           else
             dotnet pack Unified.Data.Tables.slnx -c Release -o artifacts
           fi
+
+      # Unified.Data.Tables binds to the abstractions' internals and Unified.Data.Tables.InMemory to the
+      # main package's provider SPI, so each must depend on EXACTLY the version packed beside it:
+      # [1.2.3], not NuGet's default >= 1.2.3. The pins come from a target in Directory.Build.targets
+      # that hooks a private NuGet target; if an SDK update renames that target they vanish without a
+      # warning. Read them back from the packages about to be pushed and stop the publish without them.
+      - name: Verify exact sibling-package versions
+        shell: bash
+        run: |
+          nuspec() {  # nuspec <package id>: prints the nuspec of the one packed <package id>.<version>.nupkg
+            local id="$1" packages
+            packages=(artifacts/"$id".[0-9]*.nupkg)
+            [ -f "${packages[0]}" ] || packages=()  # a pattern that matches nothing stays as written
+            if [ "${#packages[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one packed $id in artifacts/, found: ${packages[*]:-none}" >&2
+              return 1
+            fi
+            unzip -p "${packages[0]}" "$id.nuspec"
+          }
+          require_exact() {  # require_exact <package id> <dependency id>
+            local package="$1" dependency="$2" spec sibling version pins
+            spec="$(nuspec "$package")" || exit 1
+            sibling="$(nuspec "$dependency")" || exit 1
+            # The version the dependency was packed as, without build metadata (a range never has it).
+            version="$(sed -n 's:.*<version>\([^<+]*\).*:\1:p' <<<"$sibling" | sort -u | paste -sd ' ' -)"
+            # The version attribute of every <dependency id="$dependency"> element, whatever the layout.
+            pins="$(tr '>' '\n' <<<"$spec" | grep -F '<dependency ' | grep -F " id=\"$dependency\"" \
+              | sed -n 's:.* version="\([^"]*\)".*:\1:p' | LC_ALL=C sort -u | paste -sd ' ' - || true)"
+            if [ -z "$version" ] || [ "$pins" != "[$version]" ]; then
+              echo "::error::$package must depend on $dependency [${version:-version not found}] (exactly the version packed beside it), but its nuspec says: ${pins:-no such dependency}"
+              exit 1
+            fi
+            echo "$package depends on $dependency [$version]"
+          }
+          require_exact Unified.Data.Tables Unified.Data.Tables.Abstractions
+          require_exact Unified.Data.Tables.InMemory Unified.Data.Tables
 
       - name: NuGet login (OIDC trusted publishing)
         id: login

@@ -62,13 +62,15 @@ public class InMemoryStorageTests
     public async Task OneAsync_RoundTripsThroughRealSerializer()
     {
         var store = new InMemoryStorage<EntityWithDecimal>();
-        await store.CreateAsync(new EntityWithDecimal { Id = "p|r", Amount = 10.123456789012345678m });
+        var amount = 10.123456789012345678m;
+        await store.CreateAsync(new EntityWithDecimal { Id = "p|r", Amount = amount });
 
         var loaded = await store.OneAsync("p|r");
 
         // decimal is stored as double by the production serializer — the fake must exhibit the
-        // same precision behaviour instead of hiding it.
-        Assert.Equal((decimal)(double)10.123456789012345678m, loaded!.Amount);
+        // same precision behaviour instead of hiding it. The expected value is converted at run time:
+        // a constant expression is folded by the compiler, whose own runtime may round differently.
+        Assert.Equal((decimal)(double)amount, loaded!.Amount);
     }
 
     [Fact]

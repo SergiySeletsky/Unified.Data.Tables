@@ -42,12 +42,52 @@ jobs:
         run: |
           New-Item -Path ${{ runner.temp }}\scanner -ItemType Directory
           dotnet tool update dotnet-sonarscanner --tool-path ${{ runner.temp }}\scanner
-      - name: Build and analyze
+      # The Azurite integration tests must run, not skip: Windows runners cannot run the Linux
+      # emulator container, so the same pinned Azurite release is installed from npm (Node is
+      # preinstalled) and an unreachable emulator is made a test failure.
+      - name: Start Azurite
+        shell: powershell
+        run: |
+          npm install -g azurite@3.35.0
+          $data = Join-Path $env:RUNNER_TEMP 'azurite'
+          New-Item -ItemType Directory -Force -Path $data | Out-Null
+          $azurite = (Get-Command azurite.cmd).Source
+          Start-Process -FilePath $azurite -WindowStyle Hidden -ArgumentList @(
+            '--blobHost', '127.0.0.1', '--tableHost', '127.0.0.1', '--loose', '--skipApiVersionCheck', '--location', $data)
+          foreach ($port in 10000, 10002) {
+            $deadline = (Get-Date).AddSeconds(60)
+            while ($true) {
+              $client = New-Object System.Net.Sockets.TcpClient
+              try { $client.Connect('127.0.0.1', $port); break } catch { } finally { $client.Dispose() }
+              if ((Get-Date) -gt $deadline) { throw "Azurite did not open port $port" }
+              Start-Sleep -Seconds 1
+            }
+          }
+      # One command per step. A PowerShell step takes its result from the exit code of the LAST program
+      # it runs, so when these four shared one step a failed build or test was hidden whenever the
+      # scanner's `end` succeeded. Now each command decides its own step, and a failure skips the steps
+      # after it. That includes `end`: the scanner is not told the test results (only coverage is
+      # imported), so it would report a quality gate for a commit whose tests failed. ci.yml gates on
+      # the tests and needs no SONAR_TOKEN.
+      - name: Begin analysis
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         shell: powershell
         run: |
           ${{ runner.temp }}\scanner\dotnet-sonarscanner begin /k:"testasm_unified-data-tables" /o:"testasm" /d:sonar.token="${{ secrets.SONAR_TOKEN }}" /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml"
+      - name: Build
+        shell: powershell
+        run: |
           dotnet build
+      - name: Test
+        env:
+          UNIFIED_TABLES_REQUIRE_AZURITE: "1"
+        shell: powershell
+        run: |
           dotnet test --no-build --collect:"XPlat Code Coverage" --settings coverage.runsettings
+      - name: End analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        shell: powershell
+        run: |
           ${{ runner.temp }}\scanner\dotnet-sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"

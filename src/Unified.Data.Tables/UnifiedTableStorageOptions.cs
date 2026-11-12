@@ -18,8 +18,9 @@ public sealed class UnifiedTableStorageOptions
 
     /// <summary>
     /// What happens when a serialized payload exceeds the 64 KB cell cap even compressed —
-    /// see <see cref="OversizedCellPolicy"/>. Default: trim and leave a <c>__Truncated</c> marker.
-    /// Applied to the (static) serializer at registration time.
+    /// see <see cref="OversizedCellPolicy"/>. Default: <see cref="OversizedCellPolicy.Throw"/>.
+    /// For lossless storage of large values, opt a property in with <see cref="TableValueSplitAttribute"/>
+    /// and configure <see cref="BlobOffload"/>; nothing is trimmed. Applied to the (static) serializer at registration time.
     /// </summary>
     public OversizedCellPolicy OversizedCells { get; set; } = OversizedCellPolicy.Throw;
 
@@ -40,6 +41,13 @@ public sealed class UnifiedTableStorageOptions
     /// <see cref="ConcurrencyMode.LastWriterWins"/> and leaving this off.
     /// </summary>
     public bool ImplicitLastWriterWins { get; set; }
+
+    /// <summary>
+    /// Blob offload for large values (<see cref="TableValueSplitAttribute"/> values too large for table
+    /// rows, and every <see cref="TableBlobContent"/>). <c>null</c> (the default) disables it: such a
+    /// value throws <see cref="OversizedValueException"/> instead. Types with neither are unaffected.
+    /// </summary>
+    public BlobOffloadOptions? BlobOffload { get; set; }
 
     /// <summary>
     /// Overrides the table name, which otherwise defaults to <c>typeof(T).Name</c>.

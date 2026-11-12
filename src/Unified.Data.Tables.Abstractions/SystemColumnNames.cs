@@ -9,14 +9,13 @@ namespace Unified.Data.Tables;
 /// the in-memory fake need the predicate, and because a consumer writing sentinel columns has to be
 /// able to ask the question too.
 /// <para>
-/// <b>The rule is enforced on READ only, and that asymmetry is deliberate.</b> The serializer's
-/// flatten pass names columns after <c>PropertyInfo.Name</c> verbatim, so a public settable property
-/// literally named <c>_Foo</c> still writes a column called <c>_Foo</c>; nothing rejects or renames
-/// it. Closing the gap on the write path would mean throwing on (or silently renaming) data that has
-/// serialized cleanly in every release, which is a larger break than the read-path fix it would be
-/// tidying up after. The consequence to know: such a column is now skipped on read instead of being
-/// parsed as property path <c>["Foo"]</c>, so a type declaring both <c>_Foo</c> and <c>Foo</c> no
-/// longer cross-loads one into the other. Keep <see cref="Prefix"/> out of your property names.
+/// <b>A property cannot write a system column.</b> <c>'_'</c> is also the column-path delimiter, so
+/// the serializer refuses to write any property whose name contains it, a leading one included: a
+/// property named <c>_Foo</c> or <c>Foo_Bar</c> fails the write with a
+/// <see cref="System.Runtime.Serialization.SerializationException"/> that names the property (since
+/// 0.8.1). On read, a column that starts with <see cref="Prefix"/> is skipped instead of being parsed
+/// as the property path <c>["Foo"]</c>, so a system column written through a raw column bag never
+/// reaches a property named <c>Foo</c>. Keep <see cref="Prefix"/> out of your property names.
 /// </para>
 /// </remarks>
 public static class SystemColumnNames
@@ -26,6 +25,15 @@ public static class SystemColumnNames
 
     /// <summary>Column holding the stored type discriminator.</summary>
     public const string TypeName = "_TypeName";
+
+    /// <summary>Column on a continuation row naming the row key of the head row it continues.</summary>
+    public const string SplitOf = "_SplitOf";
+
+    /// <summary>Column on a continuation row holding its 1-based position among the continuation rows.</summary>
+    public const string SplitIndex = "_SplitIndex";
+
+    /// <summary>Column on a head row holding the number of continuation rows that belong to it.</summary>
+    public const string SplitParts = "_SplitParts";
 
     /// <summary>
     /// True when <paramref name="columnName"/> is a system column. Used on every read path to keep

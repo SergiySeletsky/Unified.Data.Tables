@@ -3,6 +3,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using Azure;
 using Azure.Data.Tables;
+using Unified.Data.Tables.Providers;
 
 namespace Unified.Data.Tables.InMemory;
 
@@ -18,7 +19,7 @@ namespace Unified.Data.Tables.InMemory;
 /// (PartitionKey, RowKey) result ordering.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, new()
+public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
 {
     private static readonly List<(PropertyInfo Prop, ProtectedPropertyAttribute Attr)> ProtectedProps =
         typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)
@@ -29,14 +30,27 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
 
     private sealed record StoredRow(TableEntity Data, long Version, DateTimeOffset Timestamp)
     {
-        public string ETagString() => $"W/\"{Version.ToString(CultureInfo.InvariantCulture)}\"";
+        public string ETagString() => ETagOf(Version);
     }
+
+    private static string ETagOf(long version) => $"W/\"{version.ToString(CultureInfo.InvariantCulture)}\"";
+
+    // True when T has a member that may be stored as split cells, continuation rows or a blob. Every
+    // large-value branch below is reached only for such a T; any other T behaves exactly as before.
+    private static readonly bool LargeValueAware = LargeValueTable.IsLargeValueAware(typeof(T));
+
+    /// <summary>How many times in all a write that keeps losing its condition to concurrent writers is attempted (the number TableStorage uses).</summary>
+    private const int MaxLargeWriteAttempts = LargeValueTable.MaxWriteAttempts;
 
     private readonly Dictionary<(string PartitionKey, string RowKey), StoredRow> rows = [];
     private readonly object gate = new();
     private readonly IProtectedPropertyAuthorizer? authorizer;
     private readonly IdNormalization idNormalization;
     private readonly bool implicitLastWriterWins;
+    private readonly LargeValueTable large;
+
+    // Whether the store has a blob container for offloaded values (the hosted sweep skips it otherwise).
+    private readonly bool hasBlobOffload;
     private long versionCounter;
 
     /// <summary>Creates a store without protected-property enforcement.</summary>
@@ -67,16 +81,19 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         var opts = options ?? new UnifiedTableStorageOptions();
         idNormalization = opts.IdNormalization;
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
+        // Blob offload gets this store's own in-memory container (no BlobServiceClient), named under the
+        // table name TableStorage<T> would resolve, so blob names match the real store's.
+        var tableName = opts.TableNameResolver?.Invoke(typeof(T));
+        hasBlobOffload = opts.BlobOffload is not null;
+        large = new LargeValueTable(string.IsNullOrWhiteSpace(tableName) ? typeof(T).Name : tableName,
+            opts.BlobOffload, hasBlobOffload ? Blobs : null, typeof(T));
     }
 
-    // Mode-aware id normalization — identical to TableStorage's, preserving fake/Azure parity.
-    private string NormalizeId(string id) =>
-        idNormalization == IdNormalization.Normalized ? EntityId.Normalize(id) : id;
+    /// <summary>The offloaded-value blobs of this store (for tests); empty when blob offload is not configured.</summary>
+    internal InMemoryOffloadBlobStore Blobs { get; } = new();
 
-    // ── Test conveniences (not part of IStorage) ────────────────────────────
-
-    /// <summary>Number of rows currently stored.</summary>
-    public int Count
+    /// <summary>Stored rows including continuation rows (for tests); <see cref="Count"/> counts entities.</summary>
+    internal int PhysicalRowCount
     {
         get
         {
@@ -86,6 +103,83 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             }
         }
     }
+
+    /// <summary>The row keys stored in <paramref name="partitionKey"/>, continuation rows included, in order (for tests).</summary>
+    internal IReadOnlyList<string> PhysicalRowKeys(string partitionKey)
+    {
+        lock (gate)
+        {
+            return rows.Keys.Where(k => k.PartitionKey == partitionKey).Select(k => k.RowKey)
+                .OrderBy(k => k, StringComparer.Ordinal).ToList();
+        }
+    }
+
+    /// <summary>
+    /// How many entity-group transactions the batch writes and the partition deletes of a
+    /// large-value-aware type have attempted, committed or not (for tests; TableStorage sends one
+    /// <c>$batch</c> request each).
+    /// </summary>
+    internal int BatchTransactions { get; set; }
+
+    /// <summary>
+    /// Runs after each large-value write or delete has committed, before its blob cleanup (for tests);
+    /// a batch write and a partition delete run it after each of their transactions.
+    /// </summary>
+    internal Action? AfterLargeCommit { get; set; }
+
+    /// <summary>A copy of the stored row at these keys, continuation rows included (for tests); null when absent.</summary>
+    internal TableEntity? PhysicalRow(string partitionKey, string rowKey)
+    {
+        lock (gate)
+        {
+            return rows.TryGetValue((partitionKey, rowKey), out var row) ? CopyOf(row.Data) : null;
+        }
+    }
+
+    /// <summary>Stores a raw row as is (for tests that stage damaged or foreign rows).</summary>
+    internal void SeedPhysicalRow(TableEntity row)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        lock (gate)
+        {
+            rows[(row.PartitionKey, row.RowKey)] = new StoredRow(CopyOf(row), ++versionCounter, DateTimeOffset.UtcNow);
+        }
+    }
+
+    /// <summary>Removes a raw row as is (for tests that damage a stored entity); false when there was none.</summary>
+    internal bool RemovePhysicalRow(string partitionKey, string rowKey)
+    {
+        lock (gate)
+        {
+            return rows.Remove((partitionKey, rowKey));
+        }
+    }
+
+    // Mode-aware id normalization — identical to TableStorage's, preserving fake/Azure parity.
+    private string NormalizeId(string id) =>
+        idNormalization == IdNormalization.Normalized ? EntityId.Normalize(id) : id;
+
+    // ── Test conveniences (not part of IStorage) ────────────────────────────
+
+    /// <summary>Number of entities currently stored (continuation rows of split values are not counted).</summary>
+    public int Count
+    {
+        get
+        {
+            lock (gate)
+            {
+                return LargeValueAware ? LogicalRows().Count() : rows.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Names of the blobs that currently hold offloaded values (ordinal order), for assertions; empty
+    /// when blob offload is not configured. A blob a replace or delete released stays listed until its
+    /// cleanup grace (<see cref="BlobOffloadOptions.CleanupGrace"/>) has passed.
+    /// </summary>
+    public IReadOnlyList<string> OffloadedBlobNames() =>
+        Blobs.Names.OrderBy(n => n, StringComparer.Ordinal).ToList();
 
     /// <summary>Removes all rows.</summary>
     public void Clear()
@@ -99,6 +193,12 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
     /// <summary>Deserialized copies of every stored row (lexical key order), for assertions.</summary>
     public IReadOnlyList<T> Snapshot()
     {
+        if (LargeValueAware)
+        {
+            // The in-memory blob store completes synchronously, so this never blocks on I/O.
+            return MaterializeAllAsync(LogicalSnapshot(LogicalRows), CancellationToken.None).GetAwaiter().GetResult();
+        }
+
         lock (gate)
         {
             return OrderedRows().Select(kv => Materialize(kv.Value)).ToList();
@@ -114,6 +214,10 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        RefuseReservedRowKey(entity.Id);
+        // An already-cancelled token fails the call before anything is stamped or written, as the SDK
+        // call TableStorage<T> makes first does.
+        ct.ThrowIfCancellationRequested();
 
         entity.CreatedAt = DateTimeOffset.UtcNow;
         // An insert is a write — keep audit stamps consistent, mirroring TableStorage. (Entity's
@@ -123,12 +227,14 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         entity.Timestamp = null;
         entity.Id = NormalizeId(entity.Id);
         var keys = EntityId.Split(entity.Id);
+        if (LargeValueAware)
+            return WriteLargeAsync(entity, LargeWriteKind.Create, ifMatch: null, ct);
 
+        ServiceErrors.ThrowIfRefusedKey(keys);
         lock (gate)
         {
             if (rows.ContainsKey(keys))
-                throw new DuplicateKeyException(typeof(T).Name, entity.Id,
-                    new RequestFailedException(409, $"The specified entity already exists. Id: {entity.Id}"));
+                throw new DuplicateKeyException(typeof(T).Name, entity.Id, ServiceErrors.AlreadyExists(entity.Id));
             entity.ETag = Store(keys, entity).ETagString();
         }
 
@@ -142,6 +248,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        if (LargeValueAware)
+            return UpsertLargeAsync(entity, ct);
 
         EnforceProtectedProperties(entity);
 
@@ -150,7 +258,9 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
         entity.Id = NormalizeId(entity.Id);
+        ct.ThrowIfCancellationRequested();
         var keys = EntityId.Split(entity.Id);
+        ServiceErrors.ThrowIfRefusedKey(keys);
 
         lock (gate)
         {
@@ -171,6 +281,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        if (LargeValueAware)
+            return UpdateLargeAsync(entity, mode, ct);
 
         EnforceProtectedProperties(entity);
 
@@ -189,12 +301,14 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         entity.UpdatedAt = DateTimeOffset.UtcNow;
         entity.Timestamp = null;
         entity.Id = NormalizeId(entity.Id);
+        ct.ThrowIfCancellationRequested();
         var keys = EntityId.Split(entity.Id);
+        ServiceErrors.ThrowIfRefusedKey(keys);
 
         lock (gate)
         {
             if (!rows.TryGetValue(keys, out var existing))
-                throw new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}");
+                throw ServiceErrors.NotFound(entity.Id);
 
             // Strict — and Auto with a caller-round-tripped ETag — enforce the row version; a
             // mismatch surfaces as a conflict with no retry, exactly like TableStorage<T>. Auto
@@ -203,8 +317,7 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             if (mode != ConcurrencyMode.LastWriterWins && callerSuppliedETag
                 && !string.Equals(existing.ETagString(), suppliedETag, StringComparison.Ordinal))
             {
-                throw new ConcurrencyConflictException(typeof(T).Name, entity.Id,
-                    new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer."));
+                throw new ConcurrencyConflictException(typeof(T).Name, entity.Id, ServiceErrors.ConditionNotSatisfied());
             }
 
             entity.ETag = Store(keys, entity).ETagString();
@@ -230,30 +343,36 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         }
 
         var keys = EntityId.Split(NormalizeId(id));
+        // A continuation row is not an entity: merging cells into one would surface them on the primary.
+        RefuseReservedRowKey(id);
+        ct.ThrowIfCancellationRequested();
+        ServiceErrors.ThrowIfRefusedKey(keys);
 
         lock (gate)
         {
             if (!rows.TryGetValue(keys, out var existing))
-                throw new RequestFailedException(404, $"The specified resource does not exist. Id: {id}");
+                throw ServiceErrors.NotFound(id);
 
             // Conditional merge (WithETag): the merge only applies to the version that was read.
             if (builder.ETag is not null
                 && !string.Equals(existing.ETagString(), builder.ETag, StringComparison.Ordinal))
             {
-                throw new ConcurrencyConflictException(typeof(T).Name, id,
-                    new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer."));
+                throw new ConcurrencyConflictException(typeof(T).Name, id, ServiceErrors.ConditionNotSatisfied());
             }
 
             // Server-side Merge: only the declared (flattened) columns change; the rest survive.
             var merged = CopyOf(existing.Data);
             foreach (var (name, value) in builder.Updates)
             {
-                foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(name, value))
+                // The typed flatten refuses a [TableValueSplit] member exactly as TableStorage<T> does: a
+                // merged plain cell beside the old split cells would read back the OLD value.
+                foreach (var (col, cell) in LargeValueRows.FlattenPropertyForUpdate(typeof(T), name, value))
                 {
-                    merged[col] = cell;
+                    merged[col] = Detached(cell);
                 }
             }
             merged[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
+            ServiceErrors.ThrowIfOversizedProperty(merged);
 
             var stored = new StoredRow(merged, ++versionCounter, DateTimeOffset.UtcNow);
             rows[keys] = stored;
@@ -270,10 +389,14 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         }
 
         var keys = EntityId.Split(NormalizeId(id));
+        if (LargeValueAware)
+            return OneLargeAsync(keys, ct);
 
         lock (gate)
         {
-            return Task.FromResult(rows.TryGetValue(keys, out var row) ? Materialize(row) : null);
+            // As TableStorage<T> reads for every T: a row with a _SplitOf cell (a continuation row of a
+            // large-value aware type) is not an entity.
+            return Task.FromResult(rows.TryGetValue(keys, out var row) && !LargeValueTable.IsPartRow(row.Data) ? Materialize(row) : null);
         }
     }
 
@@ -289,7 +412,9 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
 
         lock (gate)
         {
-            return Task.FromResult(rows.ContainsKey(keys));
+            // A continuation row is not an entity: addressing one by id finds nothing.
+            // For every T, as TableStorage<T> answers it.
+            return Task.FromResult(rows.TryGetValue(keys, out var row) && !LargeValueTable.IsPartRow(row.Data));
         }
     }
 
@@ -297,9 +422,11 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
     public Task<IEnumerable<T>> QueryAsync(string? partition = null, CancellationToken ct = default)
     {
         var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
+        if (LargeValueAware)
+            return QueryLargeAsync(scope, ct);
         lock (gate)
         {
-            var matches = OrderedRows()
+            var matches = LogicalRows()
                 .Where(kv => scope is null || kv.Key.PartitionKey == scope)
                 .Select(kv => Materialize(kv.Value))
                 .ToList();
@@ -311,10 +438,13 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
     public Task<IReadOnlyList<T>> QueryAsync(QueryOptions options, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(options);
+        if (LargeValueAware)
+            return BoundedLargeAsync(options, ct);
 
+        var select = ProjectedRows.SelectedColumns<T>(options);
         lock (gate)
         {
-            return Task.FromResult<IReadOnlyList<T>>(Bounded(options).ToList());
+            return Task.FromResult<IReadOnlyList<T>>(Bounded(options).Select(kv => Materialize(kv.Value, select)).ToList());
         }
     }
 
@@ -334,10 +464,12 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         var canonical = (Expression<Func<T, bool>>)new IdEqualityCanonicalizer(predicate.Parameters[0]).Visit(predicate);
         var matches = canonical.Compile();
         var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
+        if (LargeValueAware)
+            return QueryLargeAsync(matches, scope, take, ct);
 
         lock (gate)
         {
-            IEnumerable<T> query = OrderedRows()
+            IEnumerable<T> query = LogicalRows()
                 .Where(kv => scope is null || kv.Key.PartitionKey == scope)
                 .Select(kv => Materialize(kv.Value))
                 .Where(matches);
@@ -352,9 +484,17 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         List<T> snapshot;
-        lock (gate)
+        if (LargeValueAware)
         {
-            snapshot = Bounded(options ?? new QueryOptions()).ToList();
+            snapshot = [.. await BoundedLargeAsync(options ?? new QueryOptions(), ct)];
+        }
+        else
+        {
+            var select = ProjectedRows.SelectedColumns<T>(options);
+            lock (gate)
+            {
+                snapshot = Bounded(options ?? new QueryOptions()).Select(kv => Materialize(kv.Value, select)).ToList();
+            }
         }
 
         foreach (var entity in snapshot)
@@ -362,8 +502,6 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             ct.ThrowIfCancellationRequested();
             yield return entity;
         }
-
-        await Task.CompletedTask;
     }
 
     /// <inheritdoc />
@@ -408,6 +546,10 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             after = (inner.Substring(0, sep), inner.Substring(sep + 1));
         }
 
+        var select = ProjectedRows.SelectedColumns<T>(options);
+        if (LargeValueAware)
+            return PageLargeAsync(partition, rowKeyPrefix, pageSize, fingerprint, after, select, ct);
+
         lock (gate)
         {
             IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> rowsQuery = OrderedRows()
@@ -419,7 +561,9 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             var candidate = rowsQuery.Take(pageSize + 1).ToList();
             var hasMore = candidate.Count > pageSize;
             var pageRows = hasMore ? candidate.Take(pageSize).ToList() : candidate;
-            var items = pageRows.Select(kv => Materialize(kv.Value)).ToList();
+            // A row with a _SplitOf cell takes its place in the page and is then skipped, as TableStorage<T>
+            // pages for every T.
+            var items = pageRows.Where(kv => !LargeValueTable.IsPartRow(kv.Value.Data)).Select(kv => Materialize(kv.Value, select)).ToList();
 
             string? next = null;
             if (hasMore)
@@ -479,11 +623,11 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
 
     /// <inheritdoc />
     public Task<int> CreateBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
-        => WriteBatch(entities, upsert: false);
+        => WriteBatch(entities, upsert: false, ct);
 
     /// <inheritdoc />
     public Task<int> UpsertBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
-        => WriteBatch(entities, upsert: true);
+        => WriteBatch(entities, upsert: true, ct);
 
     /// <inheritdoc />
     public Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
@@ -491,6 +635,8 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         lock (gate)
         {
             var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
+            if (LargeValueAware)
+                return Task.FromResult(LogicalRows().Count(kv => scope is null || kv.Key.PartitionKey == scope));
             var count = scope is null
                 ? rows.Count
                 : rows.Keys.Count(k => k.PartitionKey == scope);
@@ -507,6 +653,9 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         }
 
         var keys = EntityId.Split(NormalizeId(id));
+        ct.ThrowIfCancellationRequested();
+        if (LargeValueAware)
+            return DeleteLargeAsync(keys, ct);
 
         lock (gate)
         {
@@ -524,6 +673,9 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             throw new ArgumentNullException(nameof(partition));
 
         partition = NormalizeId(partition); // match stored (normalized) PartitionKeys
+        ct.ThrowIfCancellationRequested();
+        if (LargeValueAware)
+            return DeletePartitionLargeAsync(partition, ct);
         lock (gate)
         {
             var doomed = rows.Keys.Where(k => k.PartitionKey == partition).ToList();
@@ -535,11 +687,22 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
 
     // ── Internals ───────────────────────────────────────────────────────────
 
-    private Task<int> WriteBatch(IReadOnlyCollection<T> entities, bool upsert)
+    private Task<int> WriteBatch(IReadOnlyCollection<T> entities, bool upsert, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entities);
         if (entities.Count == 0)
             return Task.FromResult(0);
+        ct.ThrowIfCancellationRequested();
+
+        // Refuse a reserved row key before the first entity is stamped or written, not halfway through.
+        if (LargeValueAware)
+        {
+            foreach (var entity in entities)
+            {
+                if (entity is not null && !string.IsNullOrWhiteSpace(entity.Id))
+                    RefuseReservedRowKey(entity.Id);
+            }
+        }
 
         var now = DateTimeOffset.UtcNow;
         var prepared = new List<((string, string) Keys, T Entity)>(entities.Count);
@@ -559,33 +722,72 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
             entity.Id = NormalizeId(entity.Id);
             var keys = EntityId.Split(entity.Id);
 
-            if (!upsert && !withinBatch.Add(keys))
+            // A large-value aware create batch refuses a repeated key up front, as TableStorage<T> does; a
+            // plain batch finds it in its transaction, as the service does (see WritePlainBatch).
+            if (LargeValueAware && !upsert && !withinBatch.Add(keys))
                 throw new DuplicateKeyException(typeof(T).Name, entity.Id,
                     new RequestFailedException(400, $"InvalidDuplicateRow: duplicate key within the batch. Id: {entity.Id}"));
             prepared.Add((keys, entity));
         }
 
-        lock (gate)
-        {
-            if (!upsert)
-            {
-                // Validate before applying — a duplicate fails the batch without partial writes
-                // (the fake treats the whole call as one transaction; close enough to the real
-                // per-partition 100-row transactions for test purposes).
-                var duplicate = prepared.FirstOrDefault(p => rows.ContainsKey(p.Keys));
-                if (duplicate.Entity is not null)
-                    throw new DuplicateKeyException(typeof(T).Name, duplicate.Entity.Id,
-                        new RequestFailedException(409, $"The specified entity already exists. Id: {duplicate.Entity.Id}"));
-            }
+        if (LargeValueAware)
+            return WriteBatchLargeAsync(prepared, upsert, ct);
 
-            foreach (var (keys, entity) in prepared)
-                Store(keys, entity);
-        }
-
+        // Every entity is serialized before the first is stored, as TableStorage<T> serializes the whole
+        // batch before it sends it: an entity the serializer refuses fails the batch with nothing written.
+        var serialized = prepared.ConvertAll(p => Serialize(p.Keys, p.Entity));
+        WritePlainBatch(prepared, serialized, upsert, ct);
         return Task.FromResult(prepared.Count);
     }
 
-    private IEnumerable<T> Bounded(QueryOptions options)
+    /// <summary>
+    /// The plain batch as TableStorage&lt;T&gt; sends it: per partition (in the order the partitions first
+    /// appear), the rows packed into the same entity-group transactions (<see cref="BatchPlanner"/>, at most
+    /// 100 rows and the payload budget each), each applied atomically under the gate. A transaction that
+    /// fails applies nothing, and the ones before it stay committed. It fails as the service fails it: a
+    /// key the service refuses with a raw 400 <c>InvalidInput</c>, a row named twice with 400
+    /// <c>InvalidDuplicateRow</c> (a <see cref="DuplicateKeyException"/> for a create, as TableStorage&lt;T&gt;
+    /// translates it; raw for an upsert), a stored key of a create with a
+    /// <see cref="DuplicateKeyException"/> over 409 <c>EntityAlreadyExists</c>, each wrapped in the
+    /// <see cref="TableTransactionFailedException"/> the SDK raises.
+    /// </summary>
+    private void WritePlainBatch(List<((string, string) Keys, T Entity)> prepared, List<TableEntity> serialized, bool upsert, CancellationToken ct)
+    {
+        foreach (var group in Enumerable.Range(0, prepared.Count).GroupBy(i => prepared[i].Keys.Item1, StringComparer.Ordinal))
+        {
+            var members = group.ToArray();
+            var plan = BatchPlanner.Plan([.. members.Select(i => TableRequestSize.EstimateEntityBytes(serialized[i]))]);
+            foreach (var range in plan)
+            {
+                // A cancelled token fails a transaction before it is sent, as the SDK does.
+                ct.ThrowIfCancellationRequested();
+                lock (gate)
+                {
+                    var inTransaction = new HashSet<(string, string)>();
+                    for (var j = range.Start; j < range.Start + range.Count; j++)
+                    {
+                        var (keys, entity) = prepared[members[j]];
+                        if (ServiceErrors.RefusedKey(keys.Item1, keys.Item2) is { } refused)
+                            throw ServiceErrors.InTransaction(refused);
+                        if (ServiceErrors.OversizedProperty(serialized[members[j]]) is { } oversized)
+                            throw ServiceErrors.InTransaction(oversized);
+                        if (!inTransaction.Add(keys))
+                        {
+                            var repeated = ServiceErrors.InTransaction(ServiceErrors.DuplicateRow(entity.Id));
+                            throw upsert ? repeated : new DuplicateKeyException(typeof(T).Name, entity.Id, repeated);
+                        }
+                        if (!upsert && rows.ContainsKey(keys))
+                            throw new DuplicateKeyException(typeof(T).Name, entity.Id,
+                                ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(entity.Id)));
+                    }
+                    for (var j = range.Start; j < range.Start + range.Count; j++)
+                        Store(prepared[members[j]].Keys, serialized[members[j]]);
+                }
+            }
+        }
+    }
+
+    private IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> Bounded(QueryOptions options)
     {
         var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition); // match stored (normalized) PartitionKeys
         var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : NormalizeId(options.RowKeyPrefix); // stored RowKeys are normalized too
@@ -601,10 +803,10 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
                 "ContinuationToken is only honored by QueryPageAsync — use QueryPageAsync to resume paging.",
                 nameof(options));
 
-        var matches = OrderedRows()
+        // A row with a _SplitOf cell is skipped for every T, as TableStorage<T> reads it.
+        var matches = LogicalRows()
             .Where(kv => partition is null || kv.Key.PartitionKey == partition)
-            .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal))
-            .Select(kv => Materialize(kv.Value));
+            .Where(kv => rowKeyPrefix is null || kv.Key.RowKey.StartsWith(rowKeyPrefix, StringComparison.Ordinal));
 
         return options.Take is int take ? matches.Take(take) : matches;
     }
@@ -613,14 +815,33 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         rows.OrderBy(kv => kv.Key.PartitionKey, StringComparer.Ordinal)
             .ThenBy(kv => kv.Key.RowKey, StringComparer.Ordinal);
 
-    private StoredRow Store((string PartitionKey, string RowKey) keys, T entity)
+    private StoredRow Store((string PartitionKey, string RowKey) keys, T entity) =>
+        Store(keys, Serialize(keys, entity));
+
+    private StoredRow Store((string PartitionKey, string RowKey) keys, TableEntity serialized)
     {
-        var row = new StoredRow(
-            entity.ToTableEntity(keys.PartitionKey, keys.RowKey),
-            ++versionCounter,
-            DateTimeOffset.UtcNow);
+        // The service refuses a cell above 64 KiB (a plain byte[] reaches it uncompressed).
+        ServiceErrors.ThrowIfOversizedProperty(serialized);
+        // A copy: the serialized cells may be arrays the writer still holds.
+        var row = new StoredRow(CopyOf(serialized), ++versionCounter, DateTimeOffset.UtcNow);
         rows[keys] = row;
         return row;
+    }
+
+    // The plain path, as TableStorage<T> serializes it: the row a read of a T comes from.
+    private static TableEntity Serialize((string PartitionKey, string RowKey) keys, T entity) =>
+        LargeValueRows.ToPlainTableEntity(entity, keys.PartitionKey, keys.RowKey, typeof(T));
+
+    // A projected read (select not null) deserializes only the selected cells, as TableStorage<T> reads what
+    // the service returns for a $select; nothing outside the row is read.
+    private static T Materialize(StoredRow row, IReadOnlyList<string>? select)
+    {
+        if (select is null)
+            return Materialize(row);
+        var entity = ProjectedRows.Read<T>(CopyOf(row.Data), select);
+        entity.ETag = row.ETagString();
+        entity.Timestamp = row.Timestamp;
+        return entity;
     }
 
     private static T Materialize(StoredRow row)
@@ -631,18 +852,30 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         return entity;
     }
 
-    // Isolate stored state from caller mutations (the serializer round-trip already deep-copies
-    // values on materialize; this guards the stored TableEntity itself).
+    // Isolate stored state from caller mutations: every row goes in and comes out through a copy. The
+    // serializer passes a byte[] cell through by reference both ways (every other cell value is
+    // immutable), so each array is copied too: a stored row never holds an array a caller passed in or
+    // received.
     private static TableEntity CopyOf(TableEntity source)
     {
         var copy = new TableEntity(source.PartitionKey, source.RowKey);
         foreach (var kv in source)
         {
             if (kv.Key is not ("PartitionKey" or "RowKey" or "odata.etag" or "Timestamp"))
-                copy[kv.Key] = kv.Value;
+                copy[kv.Key] = Detached(kv.Value);
         }
         return copy;
     }
+
+    // A cell value that shares nothing mutable with the given one. A DateTimeOffset is kept as the instant
+    // in UTC, as the service stores an Edm.DateTime and returns it (offset zero) whatever offset it was
+    // written with.
+    private static object Detached(object value) => value switch
+    {
+        byte[] bytes => bytes.Clone(),
+        DateTimeOffset at => at.ToUniversalTime(),
+        _ => value,
+    };
 
     private void EnforceProtectedProperties(T entity)
     {
@@ -655,6 +888,12 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         {
             stored = rows.TryGetValue(keys, out var row) ? Materialize(row) : null;
         }
+        CheckProtectedProperties(stored, entity);
+    }
+
+    // Shared by the plain and the large-value paths: a changed protected property needs an authorised caller.
+    private void CheckProtectedProperties(T? stored, T entity)
+    {
         if (stored is null)
             return;
 
@@ -662,11 +901,18 @@ public sealed class InMemoryStorage<T> : IStorage<T> where T : class, IEntity, n
         {
             var oldVal = prop.GetValue(stored);
             var newVal = prop.GetValue(entity);
-            if (!Equals(oldVal, newVal) && !(authorizer?.IsAllowed(attr.Roles) ?? false))
+            // As TableStorage: a large value is compared by content and never quoted, a byte[] is compared by
+            // content (a read never hands back the stored array), and any other property keeps the comparison
+            // of 0.8.3; every value that is not large keeps its message.
+            var large = ProtectedLargeValues.IsLargeValue(typeof(T), prop);
+            if (!(large || oldVal is byte[] ? ProtectedLargeValues.IsUnchanged(oldVal, newVal) : Equals(oldVal, newVal))
+                && !(authorizer?.IsAllowed(attr.Roles) ?? false))
             {
                 throw new UnauthorizedAccessException(
                     $"Property '{prop.Name}' on {typeof(T).Name} is protected (requires roles: {attr.Roles}). " +
-                    $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'.");
+                    (large || ProtectedLargeValues.HoldsLargeValue(typeof(T), oldVal, newVal)
+                        ? ProtectedLargeValues.DescribeRefusedChange(oldVal, newVal)
+                        : $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'."));
             }
         }
     }

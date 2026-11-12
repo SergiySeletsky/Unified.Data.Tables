@@ -4,8 +4,11 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
 using Azure;
 using Azure.Data.Tables;
+using Azure.Storage.Blobs;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Unified.Data.Tables.Providers;
 
 namespace Unified.Data.Tables;
 
@@ -20,7 +23,7 @@ namespace Unified.Data.Tables;
 /// <see cref="ServiceCollectionExtensions.AddUnifiedTableStorage(Microsoft.Extensions.DependencyInjection.IServiceCollection, Action{UnifiedTableStorageOptions})"/>.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
+public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
 {
     private const char Separator = '|';
 
@@ -42,12 +45,28 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     private readonly bool implicitLastWriterWins;
     private readonly string typeName = typeof(T).Name;
 
-    // Cache keys use the fully-qualified type name so two entity types with the same simple name in
-    // different namespaces never collide in a shared IMemoryCache. (The Azure table name still uses the
+    // Cache keys name the fully-qualified type and the table (its account endpoint and its name), so two
+    // entity types with the same simple name in different namespaces, and two stores of one type over two
+    // tables or two accounts, never collide in a shared IMemoryCache; two stores of the same table share
+    // their entries. Set in the constructor (see CacheKeyPrefix). (The Azure table name still uses the
     // simple name for back-compat — changing that would rename the table and need a data migration.)
-    private readonly string cacheKeyPrefix = typeof(T).FullName ?? typeof(T).Name;
+    private readonly string cacheKeyPrefix;
 
     private readonly TableInitializer tableInitializer;
+
+    // The resolved table name (also the first segment of every offloaded blob name).
+    private readonly string tableName;
+
+    // The large-value rules of this table (split rows, blob offload, cleanup), shared with other
+    // providers through the storage-provider SPI so they run the same code.
+    private readonly LargeValueTable large;
+
+    /// <summary>The client clock blob cleanup falls back to when no service time is known (for tests).</summary>
+    internal TimeProvider LargeValueClock
+    {
+        get => large.Clock;
+        set => large.Clock = value;
+    }
 
     /// <summary>Creates a store without protected-property enforcement.</summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger)
@@ -68,11 +87,41 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     /// <summary>
     /// Creates a store with an <see cref="UnifiedTableStorageOptions"/> (cache policy etc.) and an
     /// optional <see cref="IProtectedPropertyAuthorizer"/>. Null options fall back to the defaults
-    /// (sliding 1&#160;hour cache — the 0.2.x behaviour). The trailing defaults let the DI
-    /// container select this constructor even when neither optional service is registered.
+    /// (sliding 1&#160;hour cache — the 0.2.x behaviour). Blob offload needs a
+    /// <see cref="BlobServiceClient"/> for a type with large-value members: set <see cref="BlobOffloadOptions.ServiceClient"/> or use the constructor that takes one.
     /// </summary>
     public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
-        IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
+        IProtectedPropertyAuthorizer? authorizer, UnifiedTableStorageOptions? options)
+        : this(serviceClient, cache, logger, authorizer, options, blobServiceClient: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a store with an <see cref="UnifiedTableStorageOptions"/>, an optional
+    /// <see cref="IProtectedPropertyAuthorizer"/> and an optional <see cref="BlobServiceClient"/> for
+    /// blob offload (<see cref="UnifiedTableStorageOptions.BlobOffload"/>). The trailing defaults let the
+    /// DI container select this constructor whichever of the optional services are registered; in DI the
+    /// blob client is the library's own keyed registration (see <c>AddUnifiedTableStorage</c>), never the
+    /// host's unkeyed <see cref="BlobServiceClient"/>. <see cref="BlobOffloadOptions.ServiceClient"/> is used
+    /// when <paramref name="blobServiceClient"/> is null. No call is made to either service here; the table
+    /// and the blob container are created on first use.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set, <typeparamref name="T"/> has a
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> member, and no blob client is
+    /// supplied (neither <paramref name="blobServiceClient"/> nor <see cref="BlobOffloadOptions.ServiceClient"/>).
+    /// Any other <typeparamref name="T"/> needs none.
+    /// </exception>
+    public TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
+        IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null,
+        [FromKeyedServices(ServiceCollectionExtensions.OffloadBlobServiceClientKey)] BlobServiceClient? blobServiceClient = null)
+        : this(serviceClient, cache, logger, authorizer, options, OffloadStore(options, blobServiceClient))
+    {
+    }
+
+    /// <summary>Creates a store over an explicit offload blob store (tests and other providers).</summary>
+    internal TableStorage(TableServiceClient serviceClient, IMemoryCache cache, ILogger<TableStorage<T>> logger,
+        IProtectedPropertyAuthorizer? authorizer, UnifiedTableStorageOptions? options, IOffloadBlobStore? blobs)
     {
         ArgumentNullException.ThrowIfNull(serviceClient);
         this.cache = cache;
@@ -82,10 +131,65 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         cachePolicy = opts.ResolveCachePolicy(typeof(T));
         idNormalization = opts.IdNormalization;
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
-        client = serviceClient.GetTableClient(ResolveTableName(opts));
+        tableName = ResolveTableName(opts);
+        client = serviceClient.GetTableClient(tableName);
+        cacheKeyPrefix = CacheKeyPrefix(serviceClient, tableName);
         tableInitializer = new TableInitializer(client);
+        large = new LargeValueTable(tableName, opts.BlobOffload, blobs, typeof(T));
+        large.OnBlobMissing(ForgetRowWithMissingBlob);
     }
 
+    // The prefix of every cache key of this store: the entity type, then the table it reads, named by the
+    // account endpoint (without its query, which may hold a SAS) and the table name. Both are compared
+    // ignoring case, as the service compares them, so two stores of one table share their entries however
+    // they spell its name. A service client that reports no endpoint (a test double) names the table alone.
+    private static string CacheKeyPrefix(TableServiceClient serviceClient, string tableName)
+    {
+        string? endpoint;
+#pragma warning disable CA1031 // a client that cannot report its endpoint names the table alone
+        try
+        {
+            endpoint = serviceClient.Uri?.GetLeftPart(UriPartial.Path).TrimEnd('/');
+        }
+        catch (Exception)
+        {
+            endpoint = null;
+        }
+#pragma warning restore CA1031
+        var table = (endpoint is { Length: > 0 } ? endpoint + "/" : string.Empty) + tableName;
+        return (typeof(T).FullName ?? typeof(T).Name) + "@" + table.ToUpperInvariant();
+    }
+
+    // The Azure blob container for this store's offloaded values. Built only for a type that can carry
+    // them (no client call either way); a plain type never touches the blob service and needs no client,
+    // so a host with offload configured but no blob client still resolves every plain store.
+    private static AzureOffloadBlobStore? OffloadStore(UnifiedTableStorageOptions? options, BlobServiceClient? blobServiceClient)
+    {
+        if (!LargeValueAware || options?.BlobOffload is not { } offload)
+            return null;
+        var client = blobServiceClient ?? offload.ServiceClient
+            ?? throw new InvalidOperationException(MissingOffloadClientMessage(offload));
+        return new AzureOffloadBlobStore(client.GetBlobContainerClient(offload.ContainerName));
+    }
+
+    // True for every way the client can be missing: a store constructed without one, options that ask for
+    // the host's client when none reaches the store, and registrations that offer none (a connection
+    // string whose blob endpoint is missing or malformed, options registered through a factory or a type).
+    private static string MissingOffloadClientMessage(BlobOffloadOptions offload)
+    {
+        var useRegistered = $"{nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.UseRegisteredServiceClient)}";
+        var why = offload.UseRegisteredServiceClient
+            ? $"{useRegistered} is set, but no {nameof(BlobServiceClient)} reached this store: register one in the container. Beside options " +
+              "registered through a factory or a type, the host's client is used only after a call of AddUnifiedTableStorage that offers a " +
+              "client of its own (see the remarks on AddUnifiedTableStorage). "
+            : string.Empty;
+        return $"UnifiedTableStorageOptions.BlobOffload is set and {typeof(T).Name} has large-value members, but no {nameof(BlobServiceClient)} was supplied. " +
+               why +
+               $"A store gets one from {nameof(BlobOffloadOptions)}.{nameof(BlobOffloadOptions.ServiceClient)}; from the {nameof(BlobServiceClient)} " +
+               $"registered in DI when {useRegistered} is set; from a connection-string or credential overload of AddUnifiedTableStorage only when " +
+               "its connection string or endpoint has a blob endpoint (a string whose blob endpoint is missing or malformed derives none, and the " +
+               "registered options must leave the client to the calls); or, constructed directly, pass one to the constructor.";
+    }
 
     /// <summary>
     /// The table this store reads and writes. Defaults to <c>typeof(T).Name</c>; see
@@ -114,6 +218,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        RefuseReservedRowKey(entity.Id);
 
         await EnsureTableAsync(ct);
 
@@ -123,7 +228,16 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         entity.Id = NormalizeId(entity.Id);
 
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-        var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
+        // Taken before the first storage call: the entity is cached only if no other write or delete of
+        // it was noted in between (see WriteGenerations).
+        var mark = BeginWrite(entity.Id);
+        if (LargeValueAware)
+        {
+            CommitLargeWrite(entity, partitionKey, await WriteLargeOrEvictAsync(entity, LargeWriteKind.Create, ETag.All, partitionKey, ct), mark);
+            return entity;
+        }
+
+        var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
         Response addResponse;
         try
         {
@@ -133,7 +247,14 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         {
             // An existing key is an EXPECTED outcome of concurrent creates — surface it
             // provider-agnostically (GetOrCreateAsync/MutateOrCreateAsync absorb it entirely).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
             throw new DuplicateKeyException(typeName, entity.Id, ex);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
         }
 
         // Read ETag from the response headers. Relying on dataEntity.ETag being mutated by the SDK
@@ -151,7 +272,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         }
         var insertedETag = responseETag ?? dataEntity.ETag;
         entity.ETag = insertedETag.ToString();
-        CacheEntity(entity.Id, entity, insertedETag);
+        CacheEntity(entity.Id, entity, insertedETag, mark);
         InvalidateQueryCache(partitionKey);
 
         return entity;
@@ -165,11 +286,24 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             throw new ArgumentNullException(nameof(id));
         }
         id = NormalizeId(id);
-
+        // Any key is deletable (a row written before the type opted in may have any shape); a
+        // continuation row addressed by id is not an entity, so the split-aware delete finds nothing.
         await EnsureTableAsync(ct);
 
         var (partitionKey, rowKey) = GetEntityKeys(id);
-        await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
+        try
+        {
+            if (LargeValueAware)
+                await DeleteLargeAsync(partitionKey, rowKey, ct);
+            else
+                await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(id, partitionKey);
+            throw;
+        }
 
         cache.Remove(EntityCacheKey(id));
         InvalidateQueryCache(partitionKey);
@@ -187,31 +321,68 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         var entities = new List<TableEntity>();
         await foreach (var entity in client.QueryAsync<TableEntity>(
             e => e.PartitionKey == partition,
-            select: ["PartitionKey", "RowKey"],
+            select: LargeValueAware ? ["PartitionKey", "RowKey", SystemColumnNames.SplitOf] : ["PartitionKey", "RowKey"],
             cancellationToken: ct))
         {
             entities.Add(entity);
         }
 
-        if (entities.Count == 0) return 0;
-
-        // Azure Table batch: max 100 entities per transaction, same partition
-        foreach (var batch in entities.Chunk(100))
+        if (entities.Count == 0)
         {
-            var actions = batch.Select(e =>
-                new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
-            await client.SubmitTransactionAsync(actions, ct);
+            await DeletePartitionBlobsAsync(partition, ct);
+            return 0;
+        }
+        // Every row goes, continuation rows included; only logical entities are counted.
+        var logicalCount = LargeValueAware ? entities.Count(e => !SplitRowLayout.IsPartRow(e)) : entities.Count;
+
+        // Azure Table batch: max 100 entities per transaction, same partition. For a split-aware type a
+        // primary and its continuation rows are one unit that is never divided between two transactions,
+        // so a failure or a cancellation between transactions leaves no continuation row without its
+        // primary (rows nothing could read, and that would block the key). Continuation rows listed
+        // without their primary may belong to an entity that is live by now: they go last, each group
+        // only once no primary exists for it, and each row on condition of the version it was listed at.
+        // Each primary is deleted on condition of the version it was listed at, so a write of the entity
+        // that committed after the listing (it may have added or deleted continuation rows) fails the
+        // transaction instead of leaving rows behind; its entities are then deleted one by one, as they are now.
+        IReadOnlyList<TableEntity> whole = entities;
+        IReadOnlyList<(string PrimaryRowKey, IReadOnlyList<TableEntity> Rows)> leftovers = [];
+        if (LargeValueAware)
+            (whole, leftovers) = LargeValueTable.SeparateListedLeftovers(entities);
+        IEnumerable<IReadOnlyList<TableEntity>> transactions =
+            LargeValueAware ? LargeValueTable.PlanPartitionDelete(whole) : entities.Chunk(100);
+        try
+        {
+            foreach (var batch in transactions)
+            {
+                if (LargeValueAware)
+                {
+                    await DeletePartitionUnitsAsync(partition, batch, ct);
+                    continue;
+                }
+                var actions = batch.Select(e =>
+                    new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
+                await client.SubmitTransactionAsync(actions, ct);
+            }
+            foreach (var (primaryRowKey, rows) in leftovers)
+                await DeleteListedLeftoversAsync(partition, primaryRowKey, rows, ct);
+        }
+        finally
+        {
+            // Invalidate caches, also when a transaction failed or was cancelled: the earlier ones stay
+            // committed, and a row they deleted must not be answered from the cache.
+            InvalidateQueryCache(partition);
+            foreach (var e in entities)
+                cache.Remove(EntityCacheKey($"{e.PartitionKey}{Separator}{e.RowKey}"));
         }
 
-        // Invalidate caches
-        foreach (var e in entities)
-            cache.Remove(EntityCacheKey($"{e.PartitionKey}{Separator}{e.RowKey}"));
-        InvalidateQueryCache(partition);
-
         logger.LogInformation("Batch-deleted {Count} {Type} entities from partition {Partition}",
-            entities.Count, typeName, partition);
+            logicalCount, typeName, partition);
 
-        return entities.Count;
+        // The rows are gone: so are the blobs stored under the partition that no row references now (a
+        // row another writer created meanwhile keeps its blob). Best effort; a cancelled token only
+        // bounds how long that may take, the rest is left to the orphan sweep.
+        await DeletePartitionBlobsAsync(partition, ct);
+        return logicalCount;
     }
 
     /// <inheritdoc />
@@ -223,26 +394,41 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         }
         id = NormalizeId(id);
 
-        var cacheKey = EntityCacheKey(id);
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(cacheKey, out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.OneAsync id={Id}", typeName, id);
             return Clone(cached.Entity);
         }
 
         logger.LogDebug("[Cache MISS] {Type}.OneAsync id={Id} — fetching from Table Storage", typeName, id);
+        // Taken before the first storage call: what this read finds is cached only if no write or delete
+        // of the entity has completed in between (see WriteGenerations).
+        var mark = BeginRead(id);
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
 
-        if (!response.HasValue)
+        if (!response.HasValue || SplitRowLayout.IsPartRow(response.Value!))
             return null;
 
-        var entity = response.Value!.FromTableEntity<T>();
-        entity.ETag = response.Value!.ETag.ToString();
-        entity.Timestamp = response.Value!.Timestamp;
-        CacheEntity(id, entity, response.Value!.ETag);
-        // `entity` is now caller-private (CacheEntity snapshotted its own copy), so hand it back as-is.
+        TableEntity row;
+        T entity;
+        if (LargeValueAware)
+        {
+            // Deleted while its parts or blobs were read: absent.
+            if (await ReadLargeAsync(response.Value!, ct) is not { } read)
+                return null;
+            (row, entity) = read;
+        }
+        else
+        {
+            row = response.Value!;
+            entity = row.FromTableEntity<T>();
+        }
+        entity.ETag = row.ETag.ToString();
+        entity.Timestamp = row.Timestamp;
+        CacheRead(id, entity, row.ETag, mark);
+        // `entity` is now caller-private (CacheRead snapshotted its own copy), so hand it back as-is.
         return entity;
     }
 
@@ -255,23 +441,44 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         }
         id = NormalizeId(id);
 
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null)
+        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityKey(id), out var cached) && cached is not null)
         {
             logger.LogDebug("[Cache HIT] {Type}.ExistsAsync id={Id}", typeName, id);
             return true;
         }
 
         logger.LogDebug("[Cache MISS] {Type}.ExistsAsync id={Id} — fetching from Table Storage", typeName, id);
+        var mark = BeginRead(id); // before the first storage call, as in OneAsync
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
 
-        if (response.HasValue)
+        if (response.HasValue && SplitRowLayout.IsPartRow(response.Value!))
+            return false;
+
+        // A split or offloaded value is not assembled or downloaded just to answer "does it exist" - it
+        // is simply not cached. Nor is a row whose part count cannot be read, or whose value stored in the
+        // row's own cells fails its integrity check (a damaged row): it exists, and DeleteAsync can delete
+        // it, but its value cannot be read.
+        // A plain type over a row another type wrote with large-value cells is not cached either: its
+        // read would throw for an offloaded value, and existence needs no value. A column that only has
+        // the name of such a cell is read as 0.8.3 read it, and the row is cached as 0.8.3 cached it.
+        if (response.HasValue && (LargeValueAware
+            ? DeclaresNoParts(response.Value!) && !HasBlobReference(response.Value!)
+            : !TableEntitySerializer.HasGenuineLargeValueCells(response.Value!)))
         {
-            var entity = response.Value!.FromTableEntity<T>();
+            T entity;
+            try
+            {
+                entity = response.Value!.FromTableEntity<T>();
+            }
+            catch (TableValueIntegrityException) when (LargeValueAware)
+            {
+                return true;
+            }
             entity.ETag = response.Value!.ETag.ToString();
             entity.Timestamp = response.Value!.Timestamp;
-            CacheEntity(id, entity, response.Value!.ETag);
+            CacheRead(id, entity, response.Value!.ETag, mark);
         }
 
         return response.HasValue;
@@ -294,27 +501,46 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         }
 
         logger.LogDebug("[Cache MISS] {Type}.QueryAsync partition={Partition} — fetching from Table Storage", typeName, partition ?? "*");
+        // Taken before the first storage call: the list, and each entity it warms, is cached only if no
+        // write or delete it could have missed has completed in between (see WriteGenerations).
+        var mark = BeginScan();
         await EnsureTableAsync(ct);
         var results = new List<T>();
         var query = string.IsNullOrWhiteSpace(partition)
             ? client.QueryAsync<TableEntity>(cancellationToken: ct)
             : client.QueryAsync<TableEntity>(x => x.PartitionKey == partition, cancellationToken: ct);
 
-        await foreach (var tableEntity in query.WithCancellation(ct))
+        await foreach (var queried in query.WithCancellation(ct))
         {
-            var entity = tableEntity.FromTableEntity<T>();
+            if (SplitRowLayout.IsPartRow(queried))
+                continue;
+            TableEntity tableEntity;
+            T entity;
+            if (LargeValueAware)
+            {
+                // Deleted while its parts or blobs were read: no longer part of the result.
+                if (await ReadLargeAsync(queried, ct) is not { } read)
+                    continue;
+                (tableEntity, entity) = read;
+            }
+            else
+            {
+                tableEntity = queried;
+                entity = queried.FromTableEntity<T>();
+            }
             entity.ETag = tableEntity.ETag.ToString();
             entity.Timestamp = tableEntity.Timestamp;
             results.Add(entity);
 
             // Warm the individual entity cache with fresh ETags
-            CacheEntity(entity.Id, entity, tableEntity.ETag);
+            CacheRead(entity.Id, entity, tableEntity.ETag, mark);
         }
 
         if (cachePolicy.Enabled)
             // Sized by row count so a SizeLimit-bounded cache actually accounts for a large (or
-            // whole-table) result list instead of counting it as one unit.
-            cache.Set(cacheKey, (IEnumerable<T>)results, CacheEntryOptions(Math.Max(1, results.Count)));
+            // whole-table) result list instead of counting it as one unit. Not cached when a write to
+            // the partition (to any partition, for the whole table) completed while it was read.
+            Generations.PutListIfUnchanged(mark, partition, cache, cacheKey, (IEnumerable<T>)results, CacheEntryOptions(Math.Max(1, results.Count)));
 
         // Hand back isolated copies so a caller mutating a result never corrupts the cached instances.
         return results.Select(Clone).ToList();
@@ -366,7 +592,9 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         // A bounded query is the "never cached" read path — it does not warm the per-entity cache.
         // A PROJECTED row must never warm it either: a partial entity in the cache would be served
         // to a later caller that asked for every column.
-        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, BuildSelect(options));
+        // A projection that omits every large value is not assembled (its cells were not fetched).
+        var select = BuildSelect(options);
+        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, select, assemble: LargeValueAware && select is null);
     }
 
     /// <inheritdoc />
@@ -383,7 +611,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             ? predicateFilter
             : $"{TableClient.CreateQueryFilter($"PartitionKey eq {partition}")} and ({predicateFilter})";
 
-        return StreamAsync(filter, take, warmCache: true, ct);
+        return StreamAsync(filter, take, warmCache: true, ct, assemble: LargeValueAware);
     }
 
 
@@ -392,39 +620,74 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     /// work without, and returns <c>null</c> (meaning every column) when no projection was asked for.
     ///
     /// The trap this closes: a projection of <c>["Content"]</c> is a perfectly valid Tables query
-    /// that comes back with no PartitionKey, no RowKey, no ETag and no type discriminator, and
+    /// that comes back with no PartitionKey, no RowKey, no Timestamp and no type discriminator, and
     /// deserializes into a silently wrong entity. Projection is a transfer optimisation, never a
     /// change to what an entity IS, so the system columns are not the caller's to omit.
+    ///
+    /// The row's version is not one of them: <c>odata.etag</c> is not a column. The service returns it
+    /// with every entity, selected or not, and a <c>$select</c> that names it may be refused (other Azure
+    /// SDKs strip the token), so it is never sent, and one a caller named is dropped.
     /// </summary>
     internal static IEnumerable<string>? BuildSelect(QueryOptions? options)
     {
         if (options?.Select is not { Count: > 0 } requested) return null;
+        // A large value spans cells and continuation rows: naming it fetches (and assembles) the whole row.
+        if (LargeValueAware && SelectsLargeValue(requested)) return null;
 
-        var columns = new List<string>(requested.Count + SystemColumns.Length);
+        var columns = new List<string>(requested.Count + SystemColumns.Length + SplitSystemColumns.Length);
         columns.AddRange(SystemColumns);
+        if (LargeValueAware) columns.AddRange(SplitSystemColumns);
         foreach (var column in requested)
-            if (!columns.Contains(column, StringComparer.Ordinal)) columns.Add(column);
+        {
+            if (!string.Equals(column, ETagToken, StringComparison.Ordinal) && !columns.Contains(column, StringComparer.Ordinal))
+                columns.Add(column);
+        }
 
         return columns;
     }
 
     /// <summary>Columns every projection carries whether the caller asked for them or not.</summary>
-    private static readonly string[] SystemColumns = ["PartitionKey", "RowKey", "Timestamp", "odata.etag", "_TypeName"];
+    private static readonly string[] SystemColumns = ["PartitionKey", "RowKey", "Timestamp", "_TypeName"];
+
+    /// <summary>The name under which the service returns a row's version; never part of a <c>$select</c>.</summary>
+    private const string ETagToken = "odata.etag";
 
     // Shared server-side streaming iterator. Validation lives in the public methods so it throws
     // eagerly rather than being deferred to the first MoveNext of the returned sequence.
     private async IAsyncEnumerable<T> StreamAsync(string? filter, int? take, bool warmCache,
-        [EnumeratorCancellation] CancellationToken ct, IEnumerable<string>? select = null)
+        [EnumeratorCancellation] CancellationToken ct, IEnumerable<string>? select = null, bool assemble = false)
     {
+        // Taken before the first storage call, once for the whole stream: an entity it yields is cached
+        // only if no write or delete of that entity has completed since the stream began (see
+        // WriteGenerations), however long the caller takes to consume it.
+        var mark = warmCache ? BeginScan() : default;
         await EnsureTableAsync(ct);
 
         var maxPerPage = take is int t ? Math.Min(t, 1000) : (int?)null;
         var pageable = client.QueryAsync<TableEntity>(filter, maxPerPage, select, ct);
 
+        var projection = ProjectionContext(select);
         var yielded = 0;
-        await foreach (var row in pageable.WithCancellation(ct))
+        await foreach (var queried in pageable.WithCancellation(ct))
         {
-            yield return warmCache ? Materialize(row) : Deserialize(row);
+            // Continuation rows are not entities: they never count toward take, nor reach the cache.
+            if (SplitRowLayout.IsPartRow(queried))
+                continue;
+            if (assemble)
+            {
+                // The whole row: its split values reassembled and its offloaded values resolved (a row
+                // deleted while that was read is skipped).
+                if (await ReadLargeAsync(queried, ct) is not { } read)
+                    continue;
+                var entity = Stamp(read.Entity, read.Row);
+                if (warmCache) CacheRead(entity.Id, entity, read.Row.ETag, mark);
+                yield return entity;
+            }
+            else
+            {
+                // A projection that omits every large value: nothing outside the row is read.
+                yield return warmCache ? Materialize(queried, mark) : Deserialize(queried, projection);
+            }
 
             if (take is int max && ++yielded >= max)
                 yield break;
@@ -452,10 +715,15 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         var fingerprint = PageCursor.Fingerprint(partition, rowKeyPrefix, pageSize);
         var innerToken = options.ContinuationToken is null ? null : PageCursor.Decode(options.ContinuationToken, fingerprint);
 
+        var select = BuildSelect(options);
+        // Taken before the first storage call (a projected page caches nothing): an entity of the page
+        // is cached only if no write or delete of it has completed in between (see WriteGenerations).
+        var mark = select is null ? BeginScan() : default;
         await EnsureTableAsync(ct);
 
         var filter = BuildFilter(partition, rowKeyPrefix);
-        var pageable = client.QueryAsync<TableEntity>(filter, pageSize, BuildSelect(options), ct);
+        var assemble = LargeValueAware && select is null;
+        var pageable = client.QueryAsync<TableEntity>(filter, pageSize, select, ct);
 
         // Take the first server page from the cursor position (one page per call).
         await using var pages = pageable.AsPages(innerToken, pageSize).GetAsyncEnumerator(ct);
@@ -463,7 +731,26 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             return new EntityPage<T>([], null);
 
         var page = pages.Current;
-        var items = page.Values.Select(Materialize).ToList();
+        var items = new List<T>(page.Values.Count);
+        var projection = ProjectionContext(select);
+        foreach (var queried in page.Values)
+        {
+            if (SplitRowLayout.IsPartRow(queried))
+                continue;
+            // A projected row is a partial entity: it must never warm the per-entity cache.
+            if (select is not null)
+                items.Add(Deserialize(queried, projection));
+            else if (assemble)
+            {
+                if (await ReadLargeAsync(queried, ct) is not { } read)
+                    continue;
+                var entity = Stamp(read.Entity, read.Row);
+                CacheRead(entity.Id, entity, read.Row.ETag, mark);
+                items.Add(entity);
+            }
+            else
+                items.Add(Materialize(queried, mark));
+        }
         var next = page.ContinuationToken is null ? null : PageCursor.Encode(fingerprint, page.ContinuationToken);
         return new EntityPage<T>(items, next);
     }
@@ -475,30 +762,54 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         return await enumerator.MoveNextAsync();
     }
 
-    // Deserialize a queried row and stamp its ETag/Timestamp (no caching).
-    private static T Deserialize(TableEntity row)
+    // Deserialize a queried row and stamp its ETag/Timestamp (no caching). A projected row
+    // (ProjectionContext): an offloaded value the projection omits keeps its default instead of throwing.
+    private static T Deserialize(TableEntity row, ValueReadContext? projection = null) =>
+        Stamp(TableEntitySerializer.FromTableEntity<T>(row, projection ?? ValueReadContext.None), row);
+
+    // The read context of a query, built once per query rather than per row: none for a whole-entity
+    // read, the projected columns otherwise.
+    private static ValueReadContext ProjectionContext(IEnumerable<string>? select) =>
+        select is null ? ValueReadContext.None : new ValueReadContext(NothingResolved, null, [.. select]);
+
+    private static readonly Dictionary<string, object> NothingResolved = new(StringComparer.Ordinal);
+
+    // Stamp the row's version and service write time on the entity it holds.
+    private static T Stamp(T entity, TableEntity row)
     {
-        var entity = row.FromTableEntity<T>();
         entity.ETag = row.ETag.ToString();
         entity.Timestamp = row.Timestamp;
         return entity;
     }
 
-    // Deserialize and warm the per-entity cache with the fresh ETag.
-    private T Materialize(TableEntity row)
+    // Deserialize and warm the per-entity cache with the fresh ETag (a read's put: see CacheRead).
+    private T Materialize(TableEntity row, ReadMark mark)
     {
         var entity = Deserialize(row);
-        CacheEntity(entity.Id, entity, row.ETag);
+        CacheRead(entity.Id, entity, row.ETag, mark);
         return entity;
     }
 
     // A cache-isolated deep copy of an entity (serializer round-trip, like the in-memory fake), so a
-    // caller mutating a returned entity never corrupts the shared cached instance. ETag/Timestamp are
-    // not serialized as columns, so they are restored explicitly.
+    // caller mutating a returned entity never corrupts the shared cached instance. The serializer passes a
+    // byte[] cell through by reference both ways, so each one is copied: no array of the copy (at any
+    // depth) is an array of the entity. ETag/Timestamp are not serialized as columns, so they are
+    // restored explicitly.
     private static T Clone(T entity)
     {
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-        var copy = entity.ToTableEntity(partitionKey, rowKey).FromTableEntity<T>();
+        // The clone context keeps a cached split value a plain in-process bag, never re-encoded for storage.
+        var row = TableEntitySerializer.ToTableEntity(entity, partitionKey, rowKey, ValueWriteContext.ForClone, pending: null);
+        foreach (var column in row.Keys.ToList())
+        {
+            // A DateTimeOffset cell is cached as the service returns it, in UTC (offset zero), so a cache hit
+            // returns what a read of the table returns.
+            if (row[column] is byte[] bytes)
+                row[column] = bytes.Clone();
+            else if (row[column] is DateTimeOffset at)
+                row[column] = at.ToUniversalTime();
+        }
+        var copy = row.FromTableEntity<T>();
         copy.ETag = entity.ETag;
         copy.Timestamp = entity.Timestamp;
         return copy;
@@ -506,13 +817,21 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
     /// <inheritdoc />
     /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
-    /// the point of a batch) — treat them as trusted server-side paths.</remarks>
+    /// the point of a batch) — treat them as trusted server-side paths. For a type with a
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> member each entity's rows
+    /// (primary, continuation rows, stale-part deletes) are one indivisible unit packed into the
+    /// partition's transactions, so the batch stays atomic per transaction and an entity's rows never
+    /// straddle two.</remarks>
     public Task<int> CreateBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
         => WriteBatchAsync(entities, TableTransactionActionType.Add, ct);
 
     /// <inheritdoc />
     /// <remarks>Batch writes bypass [ProtectedProperty] enforcement (per-row reads would defeat
-    /// the point of a batch) — treat them as trusted server-side paths.</remarks>
+    /// the point of a batch) — treat them as trusted server-side paths. For a type with a
+    /// <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> member each entity's rows
+    /// (primary, continuation rows, stale-part deletes) are one indivisible unit packed into the
+    /// partition's transactions, so the batch stays atomic per transaction and an entity's rows never
+    /// straddle two.</remarks>
     public Task<int> UpsertBatchAsync(IReadOnlyCollection<T> entities, CancellationToken ct = default)
         => WriteBatchAsync(entities, TableTransactionActionType.UpsertReplace, ct);
 
@@ -529,11 +848,14 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             : TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
 
         // Keys-only projection keeps each page tiny; Azure Tables has no server-side count.
+        // A split-aware table also selects _SplitOf so continuation rows are not counted as entities.
         var count = 0;
-        await foreach (var _ in client.QueryAsync<TableEntity>(filter, select: ["PartitionKey"], cancellationToken: ct)
+        await foreach (var row in client.QueryAsync<TableEntity>(
+                               filter, select: LargeValueAware ? ["PartitionKey", SystemColumnNames.SplitOf] : ["PartitionKey"], cancellationToken: ct)
                            .WithCancellation(ct))
         {
-            count++;
+            if (!SplitRowLayout.IsPartRow(row))
+                count++;
         }
         return count;
     }
@@ -547,6 +869,20 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             return 0;
 
         await EnsureTableAsync(ct);
+
+        // A type with large values refuses a reserved or unsplittable key before any entity is stamped
+        // (as InMemoryStorage does), so a refused batch leaves the caller's entities as they were.
+        if (LargeValueAware)
+        {
+            foreach (var entity in entities)
+            {
+                if (entity is not null && !string.IsNullOrWhiteSpace(entity.Id))
+                {
+                    var (pk, rk) = GetEntityKeys(NormalizeId(entity.Id));
+                    SplitRowLayout.ValidateKeys(pk, rk);
+                }
+            }
+        }
 
         var now = DateTimeOffset.UtcNow;
         var rows = new List<(string Partition, string Id, TableEntity Row)>(entities.Count);
@@ -566,44 +902,16 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             entity.Id = NormalizeId(entity.Id);
 
             var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-            rows.Add((partitionKey, entity.Id, entity.ToTableEntity(partitionKey, rowKey)));
+            // A split-aware entity is serialized by its own per-entity write below.
+            rows.Add((partitionKey, entity.Id, LargeValueAware ? null! : TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T))));
         }
 
         try
         {
-            foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
-            {
-                // Azure Table transactions cap on BOTH entity count and payload size, and a
-                // count-only chunker sends a legal-looking 100-entity batch that the service
-                // rejects with 413 once the rows carry binary columns — after earlier chunks
-                // have already committed. BatchPlanner caps on both axes and refuses an
-                // unsendable entity up front. See BatchPlanner for the measured budget.
-                var groupRows = group.ToArray();
-                var plan = BatchPlanner.Plan([.. groupRows.Select(r => TableRowSize.Estimate(r.Row))]);
-                foreach (var range in plan)
-                {
-                    var chunk = new (string Partition, string Id, TableEntity Row)[range.Count];
-                    Array.Copy(groupRows, range.Start, chunk, 0, range.Count);
-
-                    var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
-                    try
-                    {
-                        await client.SubmitTransactionAsync(actions, ct);
-                    }
-                    catch (TableTransactionFailedException ex)
-                        when (actionType == TableTransactionActionType.Add
-                            && (ex.Status == 409 || ex.ErrorCode == "InvalidDuplicateRow"))
-                    {
-                        // 409 = a row already exists in the table; 400 InvalidDuplicateRow = the
-                        // same key twice WITHIN this transaction. Both are duplicate keys — and
-                        // InMemoryStorage translates both, so production must match the fake.
-                        var duplicateId = ex.FailedTransactionActionIndex is int i && i >= 0 && i < chunk.Length
-                            ? chunk[i].Id
-                            : chunk[0].Partition + Separator + "?";
-                        throw new DuplicateKeyException(typeName, duplicateId, ex);
-                    }
-                }
-            }
+            if (LargeValueAware)
+                await WriteBatchLargeAsync(entities, actionType, ct);
+            else
+                await SubmitBatchRowsAsync(rows, actionType, ct);
         }
         finally
         {
@@ -619,6 +927,44 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             actionType, rows.Count, typeName, rows.Select(r => r.Partition).Distinct(StringComparer.Ordinal).Count());
 
         return rows.Count;
+    }
+
+    private async Task SubmitBatchRowsAsync(
+        List<(string Partition, string Id, TableEntity Row)> rows, TableTransactionActionType actionType, CancellationToken ct)
+    {
+        foreach (var group in rows.GroupBy(r => r.Partition, StringComparer.Ordinal))
+        {
+            // Azure Table transactions cap on BOTH entity count and payload size, and a
+            // count-only chunker sends a legal-looking 100-entity batch that the service
+            // rejects with 413 once the rows carry binary columns — after earlier chunks
+            // have already committed. BatchPlanner caps on both axes and refuses an
+            // unsendable entity up front. See BatchPlanner for the measured budget.
+            var groupRows = group.ToArray();
+            var plan = BatchPlanner.Plan([.. groupRows.Select(r => TableRowSize.Estimate(r.Row))]);
+            foreach (var range in plan)
+            {
+                var chunk = new (string Partition, string Id, TableEntity Row)[range.Count];
+                Array.Copy(groupRows, range.Start, chunk, 0, range.Count);
+
+                var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
+                try
+                {
+                    await client.SubmitTransactionAsync(actions, ct);
+                }
+                catch (TableTransactionFailedException ex)
+                    when (actionType == TableTransactionActionType.Add
+                        && (ex.Status == 409 || ex.ErrorCode == "InvalidDuplicateRow"))
+                {
+                    // 409 = a row already exists in the table; 400 InvalidDuplicateRow = the
+                    // same key twice WITHIN this transaction. Both are duplicate keys — and
+                    // InMemoryStorage translates both, so production must match the fake.
+                    var duplicateId = ex.FailedTransactionActionIndex is int i && i >= 0 && i < chunk.Length
+                        ? chunk[i].Id
+                        : chunk[0].Partition + Separator + "?";
+                    throw new DuplicateKeyException(typeName, duplicateId, ex);
+                }
+            }
+        }
     }
 
     private static string? BuildFilter(string? partition, string? rowKeyPrefix)
@@ -674,21 +1020,31 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         }
 
         id = NormalizeId(id);
+        // A continuation row is not an entity: merging cells into one would surface them on the primary.
+        RefuseReservedRowKey(id);
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
 
+        // The entry cached when the merge is sent: the only one the update may keep warm (see below).
+        var cached = CachedBeforeTheMerge(id);
         var partial = new TableEntity(partitionKey, rowKey);
         foreach (var (name, value) in builder.Updates)
         {
-            foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(name, value))
+            // The typed overload refuses a [TableValueSplit] member: its cells must be replaced together.
+            var cells = TableEntitySerializer.FlattenProperty(typeof(T), name, value);
+            if (cached is not null && !IsWholeScalarInItsOwnCell(name, value, cells))
+                cached = null;
+            foreach (var (col, cell) in cells)
             {
-                partial[col] = cell;
+                // A byte[] is sent as a copy: the request never holds an array the caller may change.
+                partial[col] = cell is byte[] bytes ? bytes.Clone() : cell;
             }
         }
         // Always bump UpdatedAt — set last so it wins over any caller-supplied value.
         partial[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
 
         var condition = builder.ETag is null ? ETag.All : new ETag(builder.ETag);
+        var mark = BeginWrite(id); // before the storage call (see WriteGenerations)
         Response resp;
         try
         {
@@ -698,21 +1054,59 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         {
             // Conditional merge lost the race. The 412 proves a foreign writer touched the row,
             // so the cached entity AND any cached query results for its partition are stale.
-            cache.Remove(EntityCacheKey(id));
-            InvalidateQueryCache(partitionKey);
+            EvictAfterFailedWrite(id, partitionKey);
             throw new ConcurrencyConflictException(typeName, id, ex);
         }
-
-        // Keep the cache coherent: if the entity is cached and every declared path maps onto a
-        // top-level property, patch it in place with the new ETag so reads stay warm. Nested-path
-        // updates (or unknown names) evict instead — the next OneAsync re-reads fresh.
-        var newETag = ReadETagHeader(resp);
-        if (cachePolicy.Enabled && cache.TryGetValue<CachedEntity>(EntityCacheKey(id), out var cached) && cached is not null
-            && TryApplyUpdates(cached.Entity, builder.Updates))
+        catch (Exception)
         {
-            cached.Entity.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
-            cached.Entity.Timestamp = null; // the row changed server-side; stale until re-read
-            CacheEntity(id, cached.Entity, newETag ?? cached.ETag);
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(id, partitionKey);
+            throw;
+        }
+
+        // Keep the cache warm, as 0.8.3 did, only where the patch is known to give the row's content: the
+        // entry the merge was sent over is still the entry in the cache (no read and no other write has
+        // put another since: one put during the flight may hold a later change of another writer), and
+        // every value is a non-null scalar the merge wrote whole in its own top-level column. Then one copy
+        // of that entry (one construction, as on 0.8.3) gets the values and is put (a write's put: it
+        // gives way to another write or delete of the entity noted since the mark). The copy carries the
+        // merge's new ETag only when the merge was conditional on exactly the cached entity's version, the
+        // one case in which the row it was applied to is the row the entry holds; otherwise (an
+        // unconditional merge, a condition on another version, a response without a version) it keeps the
+        // cached entity's own ETag, never newer than its content, so an optimistic write with it meets
+        // 412, evicts and reads the row. In every other case the entry is evicted and the next read asks
+        // the table. Whatever throws while the copy is made or put (the entity's constructor, a getter or
+        // setter, the cache) evicts the entry before the exception leaves: the version from before the
+        // merge is never left cached.
+        var newETag = ReadETagHeader(resp);
+        if (cached is not null
+            && cache.TryGetValue<CachedEntity>(EntityKey(id), out var current) && ReferenceEquals(current, cached))
+        {
+            try
+            {
+                if (Snapshot(id, cached.Entity) is { } copy)
+                {
+                    var properties = TypeMetadataCache.GetMetadata(typeof(T)).PropertyMap;
+                    // A DateTimeOffset is kept in UTC, as the service returns the cell the merge wrote.
+                    foreach (var (name, value) in builder.Updates)
+                        properties[name].SetValue(copy, value is DateTimeOffset at ? at.ToUniversalTime() : value);
+                    copy.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
+                    copy.Timestamp = null; // the row changed server-side; stale until re-read
+                    var onCachedVersion = newETag is not null && builder.ETag is not null
+                        && string.Equals(builder.ETag, cached.Entity.ETag, StringComparison.Ordinal);
+                    copy.ETag = onCachedVersion ? newETag!.Value.ToString() : cached.Entity.ETag;
+                    PutWrite(id, new CachedEntity(copy, onCachedVersion ? newETag!.Value : cached.ETag), mark);
+                }
+                else
+                {
+                    cache.Remove(EntityCacheKey(id));
+                }
+            }
+            catch (Exception)
+            {
+                EvictAfterFailedWrite(id, partitionKey);
+                throw;
+            }
         }
         else
         {
@@ -721,6 +1115,26 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
         InvalidateQueryCache(partitionKey);
         return newETag?.ToString() ?? string.Empty;
+    }
+
+    // The entity's entry in the cache when a builder update is about to send its merge; null when there
+    // is none or caching is off. A cache whose lookup throws (disposed, or failing in any other way)
+    // answers none here: the merge is sent as on 0.8.3, which asked the cache only after it, and the
+    // entry is then evicted, so the cache's exception, if it fails again, comes from that eviction.
+    private CachedEntity? CachedBeforeTheMerge(string id)
+    {
+        if (!cachePolicy.Enabled)
+            return null;
+#pragma warning disable CA1031 // a failing lookup means "no entry": the update evicts after the merge
+        try
+        {
+            return cache.TryGetValue<CachedEntity>(EntityKey(id), out var entry) ? entry : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+#pragma warning restore CA1031
     }
 
     private static ETag? ReadETagHeader(Response response)
@@ -738,24 +1152,51 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         }
     }
 
-    private static bool TryApplyUpdates(T entity, Dictionary<string, object> updates)
+    // Whether a builder value may be applied to the cached entity (ruling R10, points 2 and 3), decided
+    // from the cells the merge sends: the path names a top-level property, the value is a non-null scalar
+    // of the property's own type, and it is the one cell the merge writes for it, under the property's
+    // own column, that a read converts back to a value equal to the one set. These are the scalars the
+    // serializer stores in a cell of their own (as 0.8.3 kept warm): a string no policy trimmed or
+    // compressed, a bool, int, uint, long, ulong (stored as a long, read back unchanged over its whole
+    // range), byte (a one-byte binary cell), double, Guid, TimeSpan (its invariant text), an enum (its
+    // name), a decimal whose double cell converts back to an equal decimal, and a date other than the
+    // 1601-01-01 sentinel instant (which a read returns as the default value; the default value itself is
+    // written as the sentinel and reads back equal) and not local (stored as its UTC instant). A null (the
+    // merge writes no cell and the row keeps its value), an object the serializer flattens, a collection
+    // or other JSON-stored value (a float, short, char, sbyte, ushort among them), a byte[] (mutable) and
+    // a large value do not qualify.
+    private static bool IsWholeScalarInItsOwnCell(string name, object? value, Dictionary<string, object> cells)
     {
-        // Validate every path BEFORE mutating: the cached instance is shared with prior readers,
-        // so a partial patch followed by eviction would leave them a half-updated object.
-        var meta = TypeMetadataCache.GetMetadata(typeof(T));
-        foreach (var name in updates.Keys)
+        if (value is null || cells.Count != 1 || !cells.TryGetValue(name, out var cell)
+            || !TypeMetadataCache.GetMetadata(typeof(T)).PropertyMap.TryGetValue(name, out var property)
+            || value.GetType() != (Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType))
+            return false;
+        return value switch
         {
-            if (!meta.PropertyMap.ContainsKey(name))
-            {
-                return false; // nested/unknown path — caller evicts the cache entry instead
-            }
-        }
+            string s => cell is string written && string.Equals(s, written, StringComparison.Ordinal),
+            bool or int or uint or long or ulong or byte or double or Guid or TimeSpan or Enum => true,
+            decimal m => cell is double written && DecimalReadBack(written) == m,
+            DateTimeOffset d => d != DateSentinel,
+            DateTime d => d.Kind != DateTimeKind.Local && d != DateSentinel.UtcDateTime,
+            _ => false,
+        };
+    }
 
-        foreach (var (name, value) in updates)
+    // The date a cell cannot hold as a genuine value: the serializer writes an unset date as this instant
+    // and a read returns it as the default value.
+    private static readonly DateTimeOffset DateSentinel = new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    // What a read makes of a decimal's double cell (the invariant conversion), or null where it fails.
+    private static decimal? DecimalReadBack(double cell)
+    {
+        try
         {
-            meta.PropertyMap[name].SetValue(entity, value);
+            return Convert.ToDecimal(cell, System.Globalization.CultureInfo.InvariantCulture);
         }
-        return true;
+        catch (OverflowException)
+        {
+            return null;
+        }
     }
 
     /// <inheritdoc />
@@ -769,6 +1210,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        RefuseReservedRowKey(entity.Id);
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
@@ -808,7 +1250,14 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-        var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
+        var mark = BeginWrite(entity.Id); // before the first storage call (see WriteGenerations)
+        if (LargeValueAware)
+        {
+            CommitLargeWrite(entity, partitionKey, await WriteLargeOrEvictAsync(entity, LargeWriteKind.Replace, etag, partitionKey, ct), mark);
+            return entity;
+        }
+
+        var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
 
         try
         {
@@ -816,7 +1265,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             var newETag = updateResponse.Headers.ETag ?? etag;
             entity.ETag = newETag.ToString();
 
-            CacheEntity(entity.Id, entity, newETag);
+            CacheEntity(entity.Id, entity, newETag, mark);
             InvalidateQueryCache(partitionKey);
         }
         catch (RequestFailedException ex) when (ex.Status == 412)
@@ -825,9 +1274,14 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             // read. Surface the provider-agnostic conflict; the 412 also proves the cached entity
             // and the partition's cached query results are stale, so drop both — a follow-up read
             // (e.g. MutateAsync's retry) must see the fresh row.
-            cache.Remove(EntityCacheKey(entity.Id));
-            InvalidateQueryCache(partitionKey);
+            EvictAfterFailedWrite(entity.Id, partitionKey);
             throw new ConcurrencyConflictException(typeName, entity.Id, ex);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
         }
 
         return entity;
@@ -840,6 +1294,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        RefuseReservedRowKey(entity.Id);
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
@@ -853,8 +1308,25 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(entity.Id);
-        var dataEntity = entity.ToTableEntity(partitionKey, rowKey);
-        var upsertResponse = await client.UpsertEntityAsync(dataEntity, TableUpdateMode.Replace, ct);
+        var mark = BeginWrite(entity.Id); // before the first storage call (see WriteGenerations)
+        if (LargeValueAware)
+        {
+            CommitLargeWrite(entity, partitionKey, await WriteLargeOrEvictAsync(entity, LargeWriteKind.Upsert, ETag.All, partitionKey, ct), mark);
+            return entity;
+        }
+
+        var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
+        Response upsertResponse;
+        try
+        {
+            upsertResponse = await client.UpsertEntityAsync(dataEntity, TableUpdateMode.Replace, ct);
+        }
+        catch (Exception)
+        {
+            // It may have committed (a timeout, a cancellation after the request was sent).
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
+        }
 
         // Same header-first ETag read as CreateAsync — the SDK does not mutate dataEntity.ETag.
         ETag? responseETag = null;
@@ -868,7 +1340,7 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         }
         var newETag = responseETag ?? dataEntity.ETag;
         entity.ETag = newETag.ToString();
-        CacheEntity(entity.Id, entity, newETag);
+        CacheEntity(entity.Id, entity, newETag, mark);
         InvalidateQueryCache(partitionKey);
 
         return entity;
@@ -893,11 +1365,19 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
         {
             var oldVal = prop.GetValue(stored);
             var newVal = prop.GetValue(entity);
-            if (!Equals(oldVal, newVal) && !(authorizer?.IsAllowed(attr.Roles) ?? false))
+            // A large value (a file, an opted-in value) is compared by content and never quoted. A byte[] is
+            // compared by content too (a read never hands back the stored array, so a comparison by
+            // reference would see a change in every write); any other property keeps the comparison of 0.8.3,
+            // and every value that is not large keeps its message.
+            var large = ProtectedLargeValues.IsLargeValue(typeof(T), prop);
+            if (!(large || oldVal is byte[] ? ProtectedLargeValues.IsUnchanged(oldVal, newVal) : Equals(oldVal, newVal))
+                && !(authorizer?.IsAllowed(attr.Roles) ?? false))
             {
                 throw new UnauthorizedAccessException(
                     $"Property '{prop.Name}' on {typeName} is protected (requires roles: {attr.Roles}). " +
-                    $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'.");
+                    (large || ProtectedLargeValues.HoldsLargeValue(typeof(T), oldVal, newVal)
+                        ? ProtectedLargeValues.DescribeRefusedChange(oldVal, newVal)
+                        : $"The current caller is not authorised to change it from '{oldVal}' to '{newVal}'."));
             }
         }
     }
@@ -911,22 +1391,119 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     // (e.g. "vision|execution|agent" → partition "vision", row "execution|agent").
     private static (string PartitionKey, string RowKey) GetEntityKeys(string id) => EntityId.Split(id);
 
-    private string EntityCacheKey(string id) => $"{cacheKeyPrefix}:entity:{id}";
+    // The cache key of an entity, for a read: a lookup, or the read's own put (CacheRead). One entry per
+    // ROW, however its id is spelled ("a" and "a|a" are the same row): a write or delete evicts the entry
+    // a read cached under the other spelling, and a partition delete, which names every row by both
+    // keys, evicts an entity whose id has one segment.
+    private string EntityKey(string id) => $"{cacheKeyPrefix}:entity:{EntityId.Canonicalize(id)}";
+
+    // The cache key of an entity, for a MUTATION: every caller has just committed (or lost) a write or
+    // delete of the entity and is about to evict or patch its entry. The write is noted here, before the
+    // entry is touched: that order is what keeps a read that raced the write from leaving the older
+    // version behind (see WriteGenerations). Reads use EntityKey.
+    private string EntityCacheKey(string id)
+    {
+        Generations.NoteWrite(id);
+        return EntityKey(id);
+    }
+
     private string QueryCacheKey(string? partition) => $"{cacheKeyPrefix}:query:{partition ?? "*"}";
 
-    private void CacheEntity(string id, T entity, ETag etag)
+    // A WRITE's put: the entity a create, update or upsert has just committed, under the version the
+    // service returned for it. The write notes itself and puts only if no other write or delete of the
+    // entity was noted since its mark (BeginWrite); otherwise it evicts the entry (see WriteGenerations).
+    // (An entity that cannot be copied for the cache is not put, and the entry of the version it replaced
+    // is left as it always was: evicting it would turn the next read into a failed one, because a row
+    // that cannot be copied cannot be read back either.)
+    private void CacheEntity(string id, T entity, ETag etag, ReadMark mark)
     {
-        if (!cachePolicy.Enabled)
-            return;
+        if (cachePolicy.Enabled && Snapshot(id, entity) is { } snapshot)
+            PutWrite(id, new CachedEntity(snapshot, etag), mark);
+        else
+            Generations.NoteWrite(id);
+    }
 
-        // Store a private snapshot, never the caller-visible instance. Every read path (OneAsync,
-        // QueryAsync, the Materialize-based predicate/stream/page paths) and every write path
-        // (Create/Update/Upsert) hands its entity to the caller too; caching a clone here is the one
-        // choke point that keeps a caller mutating a returned/written entity from corrupting the cache.
-        T snapshot;
+    // A write's put of an entry it has already copied. Noting the write and comparing with the write's
+    // mark are one critical section; the put follows, and is undone when another write or delete of the
+    // entity was noted meanwhile. (The cache itself is called outside the gate, as every write called it
+    // before: an IMemoryCache whose Set runs code that reads through this store must not wait for a gate
+    // its caller holds.) A write that was not alone evicts instead of putting.
+    private void PutWrite(string id, CachedEntity value, ReadMark mark)
+    {
+        var key = EntityKey(id);
+        if (Generations.NoteWriteAlone(mark, id, out var noted))
+        {
+            cache.Set(key, value, CacheEntryOptions());
+            if (Generations.IsLatest(id, noted))
+                return;
+        }
+        cache.Remove(key);
+    }
+
+    // A write or delete whose storage call threw may or may not have committed (a timeout, a cancellation,
+    // a connection dropped after the commit). The entity's entry and its partition's cached lists go
+    // (noted first), so the next read asks the table. It runs while the write's exception is leaving, and
+    // never replaces it: a cache that throws (a disposed MemoryCache during shutdown) is logged.
+    private void EvictAfterFailedWrite(string id, string partitionKey)
+    {
         try
         {
-            snapshot = Clone(entity);
+            cache.Remove(EntityCacheKey(id));
+        }
+#pragma warning disable CA1031 // the caller gets the storage call's exception; the eviction's failure is logged
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "{Type} id={Id}: the cached entity could not be evicted after a failed write", typeName, id);
+        }
+        try
+        {
+            InvalidateQueryCache(partitionKey);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "{Type} partition={Partition}: the cached lists could not be evicted after a failed write", typeName, partitionKey);
+        }
+#pragma warning restore CA1031
+    }
+
+    // The large-value write of a create, update or upsert; when it throws, the entry and the partition's
+    // lists go before the exception leaves (EvictAfterFailedWrite). A key the row layout refuses
+    // (ArgumentException) is refused before any storage call: nothing was written, nothing is evicted.
+    private async Task<LargeWriteResult> WriteLargeOrEvictAsync(T entity, LargeWriteKind kind, ETag ifMatch, string partitionKey, CancellationToken ct)
+    {
+        try
+        {
+            return await WriteLargeAsync(entity, kind, ifMatch, ct);
+        }
+        catch (Exception ex) when (ex is not ArgumentException)
+        {
+            EvictAfterFailedWrite(entity.Id, partitionKey);
+            throw;
+        }
+    }
+
+    // A READ's put: the entity a point read, a query, a page or a stream found. It is cached only while
+    // no write or delete of it has been noted since the read took its mark, which it did before its
+    // first storage call; otherwise what it found may already be the older version.
+    private void CacheRead(string id, T entity, ETag etag, ReadMark mark)
+    {
+        // Asked before the snapshot too: an entity that will not be cached is not copied.
+        if (!cachePolicy.Enabled || !Generations.Unchanged(mark, id))
+            return;
+        if (Snapshot(id, entity) is { } snapshot)
+            Generations.PutEntityIfUnchanged(mark, id, cache, EntityKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
+    }
+
+    // A private snapshot for the cache, never the caller-visible instance. Every read path (OneAsync,
+    // QueryAsync, the Materialize-based predicate/stream/page paths) and every write path
+    // (Create/Update/Upsert) hands its entity to the caller too; caching a clone here is the one
+    // choke point that keeps a caller mutating a returned/written entity from corrupting the cache.
+    // Null when the entity cannot be cloned.
+    private T? Snapshot(string id, T entity)
+    {
+        try
+        {
+            return Clone(entity);
         }
         catch (Exception ex) when (ex is SerializationException or InvalidOperationException or NotSupportedException)
         {
@@ -935,10 +1512,8 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
             // cell), skip the cache rather than failing an already-successful write — such an entity is
             // not cacheable anyway, and a later read goes to the backend (its own concern).
             logger.LogDebug(ex, "[Cache SKIP] {Type} id={Id} — entity is not round-trippable for caching", typeName, id);
-            return;
+            return null;
         }
-
-        cache.Set(EntityCacheKey(id), new CachedEntity(snapshot, etag), CacheEntryOptions());
     }
 
     // Size makes every entry countable so the store works with a SizeLimit-bounded IMemoryCache
@@ -950,6 +1525,9 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
 
     private void InvalidateQueryCache(string partitionKey)
     {
+        // The write is noted before its lists are evicted (see WriteGenerations), so a query that read
+        // the partition before the write committed cannot put its list back afterwards.
+        Generations.NotePartitionWrite(partitionKey);
         // A write to one partition can only affect that partition's cached query and the whole-table
         // ("all") query — never another partition's filtered results — so evict exactly those two.
         // (This replaces the old "evict every tracked partition" sweep and its unbounded tracked set.)
@@ -958,4 +1536,251 @@ public class TableStorage<T> : IStorage<T> where T : class, IEntity, new()
     }
 
     private sealed record CachedEntity(T Entity, ETag ETag);
+
+    // ── Read-cache coherence ────────────────────────────────────────────────
+    //
+    // A read puts what it read into the cache some time after it read it: the response is in flight, and
+    // a split-aware read still queries the continuation rows and downloads the blobs. A write puts what it
+    // wrote some time after its row committed: its response is in flight, and a split-aware write first
+    // deletes the blobs of the version it replaced. A write or delete of the same entity that commits in
+    // between must not be followed by that put of the older version: later reads would be served it from
+    // memory, a read-then-upsert caller would write it back, and a deleted entity would stay readable. So:
+    //
+    //   - a mutation, once it has committed (or once its storage call threw: it may have committed),
+    //     NOTES itself (advances a write generation) before it evicts or overwrites a cache entry: the
+    //     entity's generation in EntityCacheKey and PutWrite, before the entity's entry goes or is
+    //     replaced; the partition's in InvalidateQueryCache, before the cached lists go. Every mutating
+    //     path goes through those helpers;
+    //   - a read takes a ReadMark (the generations it depends on) before its first storage call and puts
+    //     its result only while they are unchanged. Comparing and putting are one critical section with
+    //     the advance;
+    //   - a write's put gives way: a write takes a mark of the entity's generation (BeginWrite) before its
+    //     first storage call. When it has committed it notes itself and, in the same critical section,
+    //     asks whether any other write or delete of the entity was noted since its mark. If one was, it
+    //     evicts the entry instead of putting. If none was, it puts, and then evicts again if another
+    //     write or delete was noted after its own note. (The order in which the service applied two
+    //     overlapping unconditional writes cannot be known from the order of their responses, so neither
+    //     of two overlapping writes keeps its entity cached.)
+    //
+    // Why the read rule is enough: take a read that fetched an older version than a write committed. It
+    // took its mark before that commit, hence before the write's advance. Either the advance came before
+    // the read's compare-and-put, and the read puts nothing; or it came after, and then the write evicts
+    // or overwrites what the read put, because it touches the entry only after advancing. So once the
+    // write has returned, nothing older than it is in the cache, or was ever visible there after that
+    // moment.
+    //
+    // Why the write rule is enough: take a write A whose entity is still cached once A and every other
+    // mutation of the entity have returned. No mutation was noted between A's mark and A's check after its
+    // put (A would have evicted), and none after that check (it would have evicted or overwritten A's
+    // entry, since each touches the entry only after noting). So every other mutation was noted before
+    // A's mark: it committed before A began, and A's version is the one the table holds. Two entities that
+    // share a counter only make a write evict where it could have cached.
+    //
+    // An entry's ETag is never newer than its content: it is the version of the row whose content the
+    // entry holds, or an older one. The one put of an older one is a builder update's patched copy (see
+    // UpdateAsync(id, builder)). It is made only from the entry that was cached when the merge was sent
+    // and is still the entry once the merge returned (an entry a read put during the flight may hold a
+    // later change of another writer, and is evicted instead), and only when every value is a non-null
+    // scalar the merge wrote whole in its own column, so the patch changes exactly what the merge changed.
+    // Its merge was applied to the row the table holds, its patch to the row the entry holds, so the copy
+    // takes the merge's ETag only when the merge was conditional on exactly the cached version; otherwise
+    // it keeps the cached entity's own, older ETag. An optimistic write of an entry with an older ETag
+    // meets 412 and evicts; it never overwrites a change the entry has not seen.
+    // Every put and every hit goes through Clone, which copies each byte[] cell: an entry never holds a
+    // byte[] a caller passed to the store or received from it. The array of a TableBlobContent.FromBytes
+    // content is the exception: the clone keeps the content object (shared by design), and that content
+    // keeps reading the caller's array.
+    // Writes by other processes are not seen, as before (see CachePolicy).
+
+    private static readonly ConditionalWeakTable<IMemoryCache, WriteGenerations> GenerationsByCache = new();
+
+    private WriteGenerations? generations;
+
+    // One per cache: two stores of T over one table and one IMemoryCache share its entries, so they
+    // share the generations that guard them (stores of other tables or types sharing them only makes a
+    // read that raced one of their writes skip its put). (A store built without a cache has nothing to guard.)
+    private WriteGenerations Generations => generations ??= cache is null
+        ? new WriteGenerations()
+        : GenerationsByCache.GetValue(cache, static _ => new WriteGenerations());
+
+    /// <summary>The mark of a read of one entity; taken before the read's first storage call.</summary>
+    private ReadMark BeginRead(string id) => cachePolicy.Enabled ? Generations.MarkEntity(id) : default;
+
+    /// <summary>The mark of a read of many entities; taken before the read's first storage call.</summary>
+    private ReadMark BeginScan() => cachePolicy.Enabled ? Generations.MarkAll() : default;
+
+    /// <summary>
+    /// The mark of a write of one entity; taken before the write's first storage call. A write puts its
+    /// entity only while no other write or delete of the entity was noted since (see CacheEntity).
+    /// </summary>
+    private ReadMark BeginWrite(string id) => cachePolicy.Enabled ? Generations.MarkEntity(id) : default;
+
+    /// <summary>
+    /// What a read noted before its first storage call: the write generation of the one entity it reads
+    /// (<see cref="Stripe"/>, <see cref="Generation"/>), or every generation (<see cref="All"/>) for a
+    /// read of many entities. The default value marks nothing: a read that carries it caches nothing.
+    /// </summary>
+    private readonly struct ReadMark(int stripe, long generation, long[]? all)
+    {
+        public bool Taken { get; } = true;
+
+        public int Stripe { get; } = stripe;
+
+        public long Generation { get; } = generation;
+
+        public long[]? All { get; } = all;
+    }
+
+    /// <summary>
+    /// The write generations of one cache: counters that a mutation advances and a read compares. An
+    /// entity and a partition each map onto one of a fixed number of counters, so memory stays bounded
+    /// however many keys are written; two keys that share a counter only make a read that raced a write
+    /// of the OTHER key skip its put.
+    /// </summary>
+    private sealed class WriteGenerations
+    {
+        private const int Stripes = 256;
+        private const uint HashSeed = 2166136261;
+
+        private readonly Lock gate = new();
+        private readonly long[] counters = new long[Stripes];
+
+        /// <summary>Notes a committed write or delete of the entity <paramref name="id"/>, before its entry is touched.</summary>
+        public void NoteWrite(ReadOnlySpan<char> id)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                counters[stripe]++;
+            }
+        }
+
+        /// <summary>Notes a committed write or delete somewhere in the partition, before its lists are evicted.</summary>
+        public void NotePartitionWrite(ReadOnlySpan<char> partitionKey)
+        {
+            var stripe = PartitionStripe(partitionKey);
+            lock (gate)
+            {
+                counters[stripe]++;
+            }
+        }
+
+        /// <summary>The mark of a read of the entity <paramref name="id"/> alone.</summary>
+        public ReadMark MarkEntity(ReadOnlySpan<char> id)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                return new ReadMark(stripe, counters[stripe], null);
+            }
+        }
+
+        /// <summary>The mark of a read of many entities (a partition, a page, a predicate, the table).</summary>
+        public ReadMark MarkAll()
+        {
+            lock (gate)
+            {
+                return new ReadMark(-1, 0, (long[])counters.Clone());
+            }
+        }
+
+        /// <summary>True while no write or delete of the entity <paramref name="id"/> was noted since <paramref name="mark"/>.</summary>
+        public bool Unchanged(ReadMark mark, ReadOnlySpan<char> id)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                return EntityUnchanged(mark, stripe);
+            }
+        }
+
+        /// <summary>
+        /// Caches what a read found for the entity <paramref name="id"/>, unless a write or delete of it
+        /// was noted since <paramref name="mark"/>. One critical section with <see cref="NoteWrite"/>.
+        /// </summary>
+        public bool PutEntityIfUnchanged<TItem>(
+            ReadMark mark, ReadOnlySpan<char> id, IMemoryCache cache, string key, TItem value, MemoryCacheEntryOptions options)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                if (!EntityUnchanged(mark, stripe))
+                    return false;
+                cache.Set(key, value, options);
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Notes a committed write of the entity <paramref name="id"/>, like <see cref="NoteWrite"/>, and
+        /// tells, in the same critical section, whether no other write or delete of it was noted since the
+        /// write's own <paramref name="mark"/>. <paramref name="noted"/> is the generation this note gave.
+        /// </summary>
+        public bool NoteWriteAlone(ReadMark mark, ReadOnlySpan<char> id, out long noted)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                var alone = mark.Taken && mark.All is null && mark.Stripe == stripe && counters[stripe] == mark.Generation;
+                noted = ++counters[stripe];
+                return alone;
+            }
+        }
+
+        /// <summary>True while no write or delete of the entity <paramref name="id"/> was noted after the note that gave <paramref name="noted"/>.</summary>
+        public bool IsLatest(ReadOnlySpan<char> id, long noted)
+        {
+            var stripe = EntityStripe(id);
+            lock (gate)
+            {
+                return counters[stripe] == noted;
+            }
+        }
+
+        /// <summary>
+        /// Caches the list a query read for <paramref name="partitionKey"/> (null: the whole table),
+        /// unless a write or delete in that partition (anywhere, for the whole table) was noted since
+        /// <paramref name="mark"/>. One critical section with the two Note methods.
+        /// </summary>
+        public bool PutListIfUnchanged<TItem>(
+            ReadMark mark, string? partitionKey, IMemoryCache cache, string key, TItem value, MemoryCacheEntryOptions options)
+        {
+            // Only a read of many entities (MarkAll) caches a list.
+            if (mark.All is not { } all)
+                return false;
+            var stripe = partitionKey is null ? -1 : PartitionStripe(partitionKey);
+            lock (gate)
+            {
+                // Every mutation advances at least one counter, so "no counter moved" is "no write at all".
+                var unchanged = stripe < 0 ? counters.AsSpan().SequenceEqual(all) : counters[stripe] == all[stripe];
+                if (!unchanged)
+                    return false;
+                cache.Set(key, value, options);
+                return true;
+            }
+        }
+
+        // Called under the gate.
+        private bool EntityUnchanged(ReadMark mark, int stripe) => mark.All is { } all
+            ? counters[stripe] == all[stripe]
+            : mark.Taken && mark.Stripe == stripe && counters[stripe] == mark.Generation;
+
+        // The counter of an entity, by its keys however the id spells them ("a" and "a|a" are one row).
+        private static int EntityStripe(ReadOnlySpan<char> id) => Stripe(id.Contains(Separator)
+            ? Hash(HashSeed, id)
+            : Hash(Hash(Hash(HashSeed, id), [Separator]), id));
+
+        // The counter of a partition's cached list.
+        private static int PartitionStripe(ReadOnlySpan<char> partitionKey) => Stripe(Hash(HashSeed, partitionKey));
+
+        // FNV-1a over the UTF-16 code units: the same on every run, and nothing is allocated.
+        private static uint Hash(uint hash, ReadOnlySpan<char> text)
+        {
+            foreach (var c in text)
+                hash = (hash ^ c) * 16777619;
+            return hash;
+        }
+
+        private static int Stripe(uint hash) => (int)((hash ^ (hash >> 16)) % Stripes);
+    }
 }

@@ -5,16 +5,23 @@
     <PackageId>Unified.Data.Tables.InMemory</PackageId>
     <RootNamespace>Unified.Data.Tables.InMemory</RootNamespace>
     <AssemblyName>Unified.Data.Tables.InMemory</AssemblyName>
-    <Description>Faithful in-memory IStorage&lt;T&gt; for Unified.Data.Tables: rows round-trip through the real TableEntitySerializer (so tests exercise production serialization behavior — decimal-as-double, enum-as-string, nested flattening, 64KB cell handling), with 409-on-duplicate-create, ETag simulation with 412 conflicts, and identical id normalization and key splitting. For unit tests, dev mode, and offline runtime.</Description>
+    <Description>Faithful in-memory IStorage&lt;T&gt; for Unified.Data.Tables: rows round-trip through the real TableEntitySerializer (so tests exercise production serialization behavior — decimal-as-double, enum-as-string, nested flattening, oversized cells, lossless [TableValueSplit] large values with an in-memory blob store for offload), with the service's status and error codes (409 on duplicate create, 412 on ETag conflicts), per-transaction batches, QueryOptions.Select projection, and identical id normalization and key splitting. For unit tests, dev mode, and offline runtime.</Description>
     <PackageTags>azure;table-storage;repository;in-memory;testing;fake;storage;nosql</PackageTags>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
+    <!-- Binds to the main package's hidden provider SPI (Unified.Data.Tables.Providers) and the abstractions' internals, which may change in any minor version: depend on exactly the same version. See Directory.Build.targets. -->
+    <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Unified.Data.Tables\Unified.Data.Tables.csproj" />
+  </ItemGroup>
+
+  <!-- InMemoryOffloadBlobStore's Seed/Tamper/Remove/Names let the tests stage blob states directly. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
   </ItemGroup>
 
   <ItemGroup>

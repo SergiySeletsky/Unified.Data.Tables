@@ -5,8 +5,19 @@ namespace Unified.Data.Tables;
 /// writer between the read that produced the caller's <see cref="Entity.ETag"/> and the write.
 /// Raised by <see cref="ConcurrencyMode.Strict"/> updates, <see cref="ConcurrencyMode.Auto"/>
 /// updates with a caller-supplied ETag, and ETag-conditional partial updates
-/// (<see cref="UpdateBuilder{T}.WithETag"/>). Provider-agnostic — the storage backend's own
-/// exception (e.g. an Azure 412) is preserved as <see cref="Exception.InnerException"/>.
+/// (<see cref="UpdateBuilder{T}.WithETag"/>). Provider-agnostic: the storage backend's own exception
+/// (e.g. an Azure 412) is preserved as <see cref="Exception.InnerException"/> when the backend refused
+/// the write; a conflict the store finds in its own read of the row has none.
+/// For a large-value aware type (one whose declared types have a <see cref="TableValueSplitAttribute"/>
+/// or <see cref="TableBlobContent"/> member) it is also thrown by <c>UpsertAsync</c>, a
+/// <see cref="ConcurrencyMode.LastWriterWins"/> update, <c>DeleteAsync</c> and <c>UpsertBatchAsync</c>
+/// that lost their condition to concurrent writers five times; by <c>CreateAsync</c> and
+/// <c>CreateBatchAsync</c> only while they take back leftover continuation rows that keep changing or
+/// vanishing; and by a read (a point read, a query, a stream or a page) whose row another writer
+/// replaced during each of its five attempts, so that its continuation rows or blobs belonged to
+/// another version every time. Nothing stored is damaged then and the read can be repeated; its
+/// <see cref="Exception.InnerException"/> is the <see cref="TableValueIntegrityException"/> of the
+/// last attempt, and <see cref="EntityType"/> and <see cref="Id"/> are null.
 /// </summary>
 /// <remarks>
 /// The canonical recovery is re-read → re-apply → retry, which
