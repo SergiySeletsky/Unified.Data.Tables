@@ -529,6 +529,184 @@ public class InterfaceInheritedMemberMatrixTests
         }
     }
 
+    // ── Family B below a nullable struct (fix wave 10, RV9 SERIALIZER-1) ───────────────────────────────
+    // The holder Doc is declared S? (at the root, and below another owner W), initialised or empty on a new entity; S is a
+    // struct that implements the marked interface (directly, or through an interface that inherits it), or one whose
+    // member's type does. Both spellings of the column: the serializer's (a nullable struct flattens with no Value segment)
+    // and the lambda's (through Value), by a key of UpdateBuilder.Updates and, for the lambda's, by the lambda too.
+
+    public struct MarkedStruct : IMarked
+    {
+        public MarkedStruct()
+        {
+        }
+
+        public string? Notes { get; set; }
+    }
+
+    public struct MarkedDerStruct : IMarkedDer
+    {
+        public MarkedDerStruct()
+        {
+        }
+
+        public string? Notes { get; set; }
+    }
+
+    public struct OuterStruct : IO2<MarkedImpl>
+    {
+        public OuterStruct()
+        {
+        }
+
+        public MarkedImpl Inner { get; set; } = new();
+    }
+
+    public sealed class NTopInit<TS> : Entity where TS : struct
+    {
+        public TS? Doc { get; set; } = new TS();
+        public string? Title { get; set; }
+    }
+
+    public sealed class NTopEmpty<TS> : Entity where TS : struct
+    {
+        public TS? Doc { get; set; }
+        public string? Title { get; set; }
+    }
+
+    public sealed class NWrapInit<TS> where TS : struct
+    {
+        public TS? Doc { get; set; } = new TS();
+    }
+
+    public sealed class NWrapEmpty<TS> where TS : struct
+    {
+        public TS? Doc { get; set; }
+    }
+
+    public sealed class NNestedInit<TS> : Entity where TS : struct
+    {
+        public NWrapInit<TS> W { get; set; } = new();
+        public string? Title { get; set; }
+    }
+
+    public sealed class NNestedEmpty<TS> : Entity where TS : struct
+    {
+        public NWrapEmpty<TS> W { get; set; } = new();
+        public string? Title { get; set; }
+    }
+
+    private static IEnumerable<(string Name, Type Entity, string Column, bool Lambda)> NullableMisuseCatalogue()
+    {
+        var structs = new (string Name, Type Struct, string Path)[]
+        {
+            ("a struct that implements the marked interface", typeof(MarkedStruct), "Notes"),
+            ("a struct that implements an interface inheriting the marked one", typeof(MarkedDerStruct), "Notes"),
+            ("a struct whose inherited interface member's type implements the marked interface", typeof(OuterStruct), "Inner_Notes"),
+        };
+        var holders = new (string Name, Type Generic, string Prefix)[]
+        {
+            ("top-level, initialised", typeof(NTopInit<>), "Doc"), ("top-level, empty", typeof(NTopEmpty<>), "Doc"),
+            ("nested, initialised", typeof(NNestedInit<>), "W_Doc"), ("nested, empty", typeof(NNestedEmpty<>), "W_Doc"),
+        };
+        foreach (var s in structs)
+        {
+            foreach (var h in holders)
+            {
+                var entity = h.Generic.MakeGenericType(s.Struct);
+                yield return ($"{s.Name}, declared S?, {h.Name}, the serializer's column", entity, $"{h.Prefix}_{s.Path}", false);
+                yield return ($"{s.Name}, declared S?, {h.Name}, the lambda's column by a key", entity, $"{h.Prefix}_Value_{s.Path}", false);
+                yield return ($"{s.Name}, declared S?, {h.Name}, the lambda's column by the lambda", entity, $"{h.Prefix}_Value_{s.Path}", true);
+            }
+        }
+    }
+
+    public static readonly (string Name, Type Entity, string Column, bool Lambda)[] NullableMisuseCases = [.. NullableMisuseCatalogue()];
+
+    public static TheoryData<string, string, OversizedCellPolicy> NullableMisuseCasesStoresPolicies()
+    {
+        var d = new TheoryData<string, string, OversizedCellPolicy>();
+        foreach (var c in NullableMisuseCases)
+            foreach (var k in new[] { LargeValueStores.Memory, LargeValueStores.Azurite })
+                foreach (var p in Policies)
+                    d.Add(c.Name, k, p);
+        return d;
+    }
+
+    // A builder update never writes a cell for the member: refused with the misuse before any request, as below S.
+    [Theory]
+    [MemberData(nameof(NullableMisuseCasesStoresPolicies))]
+    public Task MemberMarkedOnAnInterface_BelowANullableStruct_IsRefusedOnABuilderUpdate(string name, string kind, OversizedCellPolicy policy)
+    {
+        var (_, entity, column, lambda) = NullableMisuseCases.Single(c => c.Name == name);
+        return Invoke(nameof(NullableMisuseRefusedAsync), entity, name, column, lambda, kind, policy);
+    }
+
+    private static async Task NullableMisuseRefusedAsync<T>(string name, string column, bool lambda, string kind, OversizedCellPolicy policy) where T : class, IEntity, new()
+    {
+        await using var stores = await LargeValueStores.OpenAsync(kind);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        var id = stores.Id("n");
+        await stores.Store<RowWriter>(Table).CreateAsync(new RowWriter { Id = id, Title = "t" }, Ct);
+        await stores.ShareTableAsync<RowWriter, T>(Table);
+        var store = stores.Store<T>(Table);
+        var before = TableEntitySerializer.OversizedCellPolicy;
+        TableEntitySerializer.OversizedCellPolicy = policy;
+        try
+        {
+            foreach (var length in new[] { 10, Large })
+            {
+                var notes = BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(length, 5);
+                Exception? thrown = null;
+                var writes = await stores.StorageWritesAsync(store, async () =>
+                    thrown = await Record.ExceptionAsync(() => store.UpdateAsync(id,
+                        b => { if (lambda) b.SetProperty(PathOf<T>(column), notes); else b.Updates[column] = notes; }, Ct)));
+                var row = (await stores.RawRowsAsync<T>(Table)).Single();
+                Assert.True(thrown is InvalidOperationException && writes.Count == 0 && !row.Keys.Any(k => k.Contains("Notes", StringComparison.Ordinal)),
+                    BuilderUpdateThroughAnInheritedInterfaceMemberTests.Describe(name, policy, length, thrown, writes, row));
+                Assert.Contains("[TableValueSplit] on IMarked.Notes", thrown!.Message, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            TableEntitySerializer.OversizedCellPolicy = before;
+        }
+    }
+
+    // The whole-entity write of the same shapes with a value in the member reports the misuse, as the builder update does.
+    [Theory]
+    [MemberData(nameof(NullableMisuseCaseNames))]
+    public void MemberMarkedOnAnInterface_BelowANullableStruct_OptsNothingIn_AndAWholeEntityWriteReportsIt(string name)
+    {
+        var (_, entity, column, _) = NullableMisuseCases.Single(c => c.Name == name);
+        Assert.False(TypeMetadataCache.IsLargeValueAware(entity), $"{name}: large-value aware");
+        var written = (IEntity)Activator.CreateInstance(entity)!;
+        written.Id = "a|b";
+        SetLeafThroughNullable(written, column.Replace("_Value", "", StringComparison.Ordinal), "x");
+        var whole = Record.Exception(() => TableEntitySerializer.ToTableEntity(written, "a", "b"));
+        Assert.True(whole is InvalidOperationException && whole.Message.Contains("[TableValueSplit] on IMarked.Notes", StringComparison.Ordinal),
+            $"{name}: {whole?.GetType().Name}: {whole?.Message}");
+    }
+
+    public static TheoryData<string> NullableMisuseCaseNames() => [.. NullableMisuseCases.Where(c => !c.Lambda && !c.Column.Contains("_Value_", StringComparison.Ordinal)).Select(c => c.Name)];
+
+    // Sets the leaf below a nullable struct: the struct is copied out (a new one where the property is empty), changed and
+    // stored back.
+    private static void SetLeafThroughNullable(object owner, string column, object value)
+    {
+        var segments = column.Split('_');
+        var property = owner.GetType().GetProperty(segments[0])!;
+        if (segments.Length == 1)
+        {
+            property.SetValue(owner, value);
+            return;
+        }
+        var underlying = Nullable.GetUnderlyingType(property.PropertyType);
+        var child = property.GetValue(owner) ?? (underlying is not null ? Activator.CreateInstance(underlying)! : throw new InvalidOperationException(column));
+        SetLeafThroughNullable(child, string.Join('_', segments[1..]), value);
+        property.SetValue(owner, child);
+    }
+
     // ── L1 of the review (the verifier's tests), on both stores ───────────────────────────────────────
 
     public static TheoryData<string> Stores() => [LargeValueStores.Memory, LargeValueStores.Azurite];

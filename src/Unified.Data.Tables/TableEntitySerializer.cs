@@ -2908,7 +2908,8 @@ internal static class TypeMetadataCache
     /// types and attributes are read by reflection alone (nothing is constructed, no getter is called, no metadata
     /// is built); what the walk finds is remembered per type and column path (up to
     /// <see cref="MaxRememberedReadTargets"/>). A property declared as a nullable struct <c>S?</c> is followed into the
-    /// members of <c>S</c> (as the serializer names them, and through <c>Value</c>), and a column that is a legacy name
+    /// members of <c>S</c> (as the serializer names them, and through <c>Value</c>), and <c>S</c> is its declared type for
+    /// the misuse, as for a property declared <c>S</c>; and a column that is a legacy name
     /// (<see cref="ColumnAliasAttribute"/>) of a property of <paramref name="root"/> is walked as that property too (a read
     /// maps it there). A member only a runtime subtype declares is not seen.
     /// </summary>
@@ -2945,8 +2946,10 @@ internal static class TypeMetadataCache
         {
             foreach (var (_, property) in step)
             {
-                if (InterfaceMemberSplit(property.PropertyType) is { } found)
-                    return ((property.PropertyType, found.Contract, found.Marked), false);
+                // A property declared S? holds an S: S is the implementing type, as for a property declared S.
+                var declared = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+                if (InterfaceMemberSplit(declared) is { } found)
+                    return ((declared, found.Contract, found.Marked), false);
             }
         }
         // A class-level attribute does not cover a nullable struct the serializer flattens into columns (its value is an
