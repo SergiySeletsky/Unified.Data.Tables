@@ -9,7 +9,10 @@ namespace Unified.Data.Tables;
 // Large values (TableValueSplit): writes put a split value's primary row and its continuation rows
 // ({RowKey}~0001...) in ONE entity-group transaction, and reads hide continuation rows and reassemble
 // the value before deserializing. Every branch here is reached only for a split-aware T (one with a
-// [TableValueSplit] member), except the IsPartRow skip on reads, which is a no-op for any other type.
+// [TableValueSplit] member), except the IsPartRow skip on reads: OneAsync, ExistsAsync and the queries
+// that fetch whole rows skip a row that carries a _SplitOf cell for every type (a plain type never
+// writes one, but it can share a table with a split-aware type). CountAsync and a projected query of a
+// plain type do not select _SplitOf, so they still count or return such rows, as 0.8.3 does.
 //
 // Whose row is it? A continuation row is the entity's own when the stored primary declares it, or when
 // its _SplitOf cell names the entity (a leftover: the primary was deleted or replaced by a writer that
