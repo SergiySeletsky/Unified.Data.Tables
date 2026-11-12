@@ -33,6 +33,17 @@ public static class StorageExtensions
     /// <see cref="ConcurrencyConflictException"/> (a read of a large value whose row kept changing) is a
     /// lost race too: it counts as an attempt and is retried the same way.
     /// </summary>
+    /// <remarks>
+    /// A mutation can be applied twice under a transport fault. When the service applies the strict
+    /// update but its response is lost (a timeout, a dropped connection), the Azure SDK retries the same
+    /// request, which now fails its version condition (412) because the first attempt changed the row.
+    /// That conflict cannot be told from another writer's, so the row, which already holds the mutation,
+    /// is read again and <paramref name="mutate"/> is applied to it once more. A mutation that is not
+    /// idempotent (a counter, an append) must guard itself, for example by recording an operation id on
+    /// the entity and skipping one it already holds, or the table client must be built with
+    /// <c>TableClientOptions.Retry.MaxRetries = 0</c>, so that a lost response surfaces as an error instead.
+    /// The same holds for <see cref="TryMutateAsync{T}"/> and <see cref="MutateOrCreateAsync{T}"/>.
+    /// </remarks>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
     /// <param name="id">Composite document identifier (<c>"{PartitionKey}|{RowKey}"</c>).</param>
