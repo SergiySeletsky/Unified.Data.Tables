@@ -5,7 +5,7 @@
     <PackageId>Unified.Data.Tables.InMemory</PackageId>
     <RootNamespace>Unified.Data.Tables.InMemory</RootNamespace>
     <AssemblyName>Unified.Data.Tables.InMemory</AssemblyName>
-    <Description>Faithful in-memory IStorage&lt;T&gt; for Unified.Data.Tables: rows round-trip through the real TableEntitySerializer (so tests exercise production serialization behavior — decimal-as-double, enum-as-string, nested flattening, 64KB cell handling), with 409-on-duplicate-create, ETag simulation with 412 conflicts, and identical id normalization and key splitting. For unit tests, dev mode, and offline runtime.</Description>
+    <Description>Faithful in-memory IStorage&lt;T&gt; for Unified.Data.Tables: rows round-trip through the real TableEntitySerializer (so tests exercise production serialization behavior — decimal-as-double, enum-as-string, nested flattening, oversized cells, lossless [TableValueSplit] large values with an in-memory blob store for offload), with the service's status and error codes (409 on duplicate create, 412 on ETag conflicts), per-transaction batches, QueryOptions.Select projection, and identical id normalization and key splitting. For unit tests, dev mode, and offline runtime.</Description>
     <PackageTags>azure;table-storage;repository;in-memory;testing;fake;storage;nosql</PackageTags>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>

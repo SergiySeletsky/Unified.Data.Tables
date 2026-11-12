@@ -5,7 +5,7 @@
     <PackageId>Unified.Data.Tables</PackageId>
     <RootNamespace>Unified.Data.Tables</RootNamespace>
     <AssemblyName>Unified.Data.Tables</AssemblyName>
-    <Description>Azure Table Storage implementation for Unified.Data.Tables: TableStorage&lt;T&gt; (IStorage&lt;T&gt;) with in-memory caching, ETag optimistic concurrency, builder-driven partial (Merge) updates, role-gated protected properties, and a reflection-based object-graph serializer (nested types, JSON/GZip fallback, 64KB cell handling). Builds on Unified.Data.Tables.Abstractions.</Description>
+    <Description>Azure Table Storage implementation for Unified.Data.Tables: TableStorage&lt;T&gt; (IStorage&lt;T&gt;) with in-memory caching, ETag optimistic concurrency, builder-driven partial (Merge) updates, role-gated protected properties, and a reflection-based object-graph serializer (nested types, JSON/GZip fallback, an oversized-cell policy), and lossless large values: a [TableValueSplit] string, byte[] or JSON-stored property larger than one 64 KB cell is stored across cells and continuation rows with integrity checks, or offloaded to Azure Blob Storage, and TableBlobContent streams blob-backed content. Builds on Unified.Data.Tables.Abstractions.</Description>
     <PackageTags>azure;azure-table-storage;table-storage;repository;storage;serialization;nosql;cache</PackageTags>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
