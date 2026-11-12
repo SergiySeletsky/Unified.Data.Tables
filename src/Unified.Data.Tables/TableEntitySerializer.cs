@@ -1286,6 +1286,79 @@ internal sealed class TableEntityValue
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };
 
+    // JsonOptions for a value a [TableValueSplit] member stores as JSON: the same bytes, except that a
+    // string (or char, or string dictionary key) with an unpaired surrogate is refused rather than written
+    // as U+FFFD, which would read back altered with no error. A type that opts into nothing never uses it.
+    private static readonly JsonSerializerOptions WellFormedJsonOptions = WellFormed(JsonOptions);
+
+    private static JsonSerializerOptions WellFormed(JsonSerializerOptions options)
+    {
+        var copy = new JsonSerializerOptions(options);
+        copy.Converters.Insert(0, new WellFormedStringConverter());
+        copy.Converters.Insert(1, new WellFormedCharConverter());
+        return copy;
+    }
+
+    // A marked value stored as JSON: refused when it holds text JSON cannot carry (see WellFormedJsonOptions).
+    private static string SerializeMarkedJson(object? value, string column)
+    {
+        try
+        {
+            return JsonSerializer.Serialize(value, WellFormedJsonOptions);
+        }
+        catch (IllFormedTextException)
+        {
+            throw new NotSupportedException(
+                $"'{column}' is a [TableValueSplit] value stored as JSON, and it holds a string with an unpaired surrogate "
+                + "(ill-formed UTF-16). JSON cannot carry one: it would be stored as U+FFFD and read back altered. "
+                + "Store such text in a string or byte[] member marked [TableValueSplit], which keeps it exactly, "
+                + "or remove the unpaired surrogate.");
+        }
+    }
+
+    private sealed class IllFormedTextException : Exception;
+
+    private sealed class WellFormedStringConverter : JsonConverter<string>
+    {
+        public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.GetString();
+
+        public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options) =>
+            writer.WriteStringValue(Checked(value));
+
+        public override string ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.GetString()!;
+
+        public override void WriteAsPropertyName(Utf8JsonWriter writer, string value, JsonSerializerOptions options) =>
+            writer.WritePropertyName(Checked(value));
+
+        private static string Checked(string value) =>
+            SplitCodec.IsWellFormedUtf16(value) ? value : throw new IllFormedTextException();
+    }
+
+    private sealed class WellFormedCharConverter : JsonConverter<char>
+    {
+        public override char Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.GetString() is [var c] ? c : throw new JsonException("Expected a one-character string.");
+
+        public override void Write(Utf8JsonWriter writer, char value, JsonSerializerOptions options)
+        {
+            if (char.IsSurrogate(value))
+                throw new IllFormedTextException();
+            writer.WriteStringValue(value.ToString());
+        }
+
+        public override char ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            Read(ref reader, typeToConvert, options);
+
+        public override void WriteAsPropertyName(Utf8JsonWriter writer, char value, JsonSerializerOptions options)
+        {
+            if (char.IsSurrogate(value))
+                throw new IllFormedTextException();
+            writer.WritePropertyName(value.ToString());
+        }
+    }
+
     private static readonly Dictionary<Type, Func<object, object?>> Primitives = new()
     {
         { typeof(string), v => (string)v },
@@ -1587,7 +1660,7 @@ internal sealed class TableEntityValue
                     throw new NotSupportedException(TableEntitySerializer.MarkedValueStoredAsColumns(columnName, held, Type!));
                 return false;
             default:
-                payload = JsonSerializer.Serialize(Value, JsonOptions);
+                payload = SerializeMarkedJson(Value, columnName);
                 isJson = true;
                 break;
         }
