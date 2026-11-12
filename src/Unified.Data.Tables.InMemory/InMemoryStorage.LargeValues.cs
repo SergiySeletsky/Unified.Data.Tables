@@ -159,6 +159,8 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
                 // The service refuses the key when the row is written (the blobs are uploaded by then).
                 if (ServiceErrors.RefusedKey(keys.PartitionKey, keys.RowKey) is { } refused)
                     throw Sent(refused);
+                if (plan.Parts.Prepend(plan.Primary).Select(ServiceErrors.OversizedProperty).FirstOrDefault(e => e is not null) is { } oversized)
+                    throw Sent(oversized);
                 if (kind == LargeWriteKind.Create)
                 {
                     if (rows.ContainsKey(keys))
@@ -400,6 +402,8 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
                 {
                     if (ServiceErrors.RefusedKey(unit.Keys.PartitionKey, unit.Keys.RowKey) is { } refused)
                         throw ServiceErrors.InTransaction(refused);
+                    if (unit.Plan.Parts.Prepend(unit.Plan.Primary).Select(ServiceErrors.OversizedProperty).FirstOrDefault(e => e is not null) is { } oversized)
+                        throw ServiceErrors.InTransaction(oversized);
                     if (kind == LargeWriteKind.Create)
                     {
                         if (rows.ContainsKey(unit.Keys))

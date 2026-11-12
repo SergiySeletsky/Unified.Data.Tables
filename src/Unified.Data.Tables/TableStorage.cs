@@ -802,8 +802,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var row = TableEntitySerializer.ToTableEntity(entity, partitionKey, rowKey, ValueWriteContext.ForClone, pending: null);
         foreach (var column in row.Keys.ToList())
         {
+            // A DateTimeOffset cell is cached as the service returns it, in UTC (offset zero), so a cache hit
+            // returns what a read of the table returns.
             if (row[column] is byte[] bytes)
                 row[column] = bytes.Clone();
+            else if (row[column] is DateTimeOffset at)
+                row[column] = at.ToUniversalTime();
         }
         var copy = row.FromTableEntity<T>();
         copy.ETag = entity.ETag;
@@ -1083,8 +1087,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 if (Snapshot(id, cached.Entity) is { } copy)
                 {
                     var properties = TypeMetadataCache.GetMetadata(typeof(T)).PropertyMap;
+                    // A DateTimeOffset is kept in UTC, as the service returns the cell the merge wrote.
                     foreach (var (name, value) in builder.Updates)
-                        properties[name].SetValue(copy, value);
+                        properties[name].SetValue(copy, value is DateTimeOffset at ? at.ToUniversalTime() : value);
                     copy.UpdatedAt = (DateTimeOffset)partial[nameof(Entity.UpdatedAt)];
                     copy.Timestamp = null; // the row changed server-side; stale until re-read
                     var onCachedVersion = newETag is not null && builder.ETag is not null

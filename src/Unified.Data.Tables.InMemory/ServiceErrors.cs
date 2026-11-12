@@ -55,6 +55,42 @@ internal static class ServiceErrors
             throw refused;
     }
 
+    /// <summary>The largest property value the service accepts: 64 KiB (a string is UTF-16, so 32 K characters).</summary>
+    internal const int MaxPropertyBytes = 64 * 1024;
+
+    /// <summary>
+    /// 400 <c>PropertyValueTooLarge</c> when a cell of <paramref name="row"/> holds a <c>byte[]</c> longer than
+    /// 64 KiB or a string longer than 32 K characters, as the service refuses the write; null when every cell
+    /// fits. (The serializer refuses, compresses or trims a string or JSON cell itself; a plain <c>byte[]</c>
+    /// cell reaches the service as it is.)
+    /// </summary>
+    internal static RequestFailedException? OversizedProperty(TableEntity row)
+    {
+        foreach (var cell in row)
+        {
+            var bytes = cell.Value switch
+            {
+                byte[] b => b.Length,
+                string text => text.Length * 2L,
+                _ => 0L,
+            };
+            if (bytes > MaxPropertyBytes)
+            {
+                return new RequestFailedException(400,
+                    "The property value exceeds the maximum allowed size (64KB). If the property value is a string, it is UTF-16 encoded and the maximum number of characters should be 32K or less.",
+                    "PropertyValueTooLarge", null);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Throws <see cref="OversizedProperty"/> for a single-entity write.</summary>
+    internal static void ThrowIfOversizedProperty(TableEntity row)
+    {
+        if (OversizedProperty(row) is { } refused)
+            throw refused;
+    }
+
     private static bool HasRefusedCharacter(string key)
     {
         foreach (var c in key)

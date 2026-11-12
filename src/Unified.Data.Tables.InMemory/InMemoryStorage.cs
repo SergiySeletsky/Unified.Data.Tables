@@ -372,6 +372,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
                 }
             }
             merged[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
+            ServiceErrors.ThrowIfOversizedProperty(merged);
 
             var stored = new StoredRow(merged, ++versionCounter, DateTimeOffset.UtcNow);
             rows[keys] = stored;
@@ -768,6 +769,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
                         var (keys, entity) = prepared[members[j]];
                         if (ServiceErrors.RefusedKey(keys.Item1, keys.Item2) is { } refused)
                             throw ServiceErrors.InTransaction(refused);
+                        if (ServiceErrors.OversizedProperty(serialized[members[j]]) is { } oversized)
+                            throw ServiceErrors.InTransaction(oversized);
                         if (!inTransaction.Add(keys))
                         {
                             var repeated = ServiceErrors.InTransaction(ServiceErrors.DuplicateRow(entity.Id));
@@ -817,6 +820,8 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
 
     private StoredRow Store((string PartitionKey, string RowKey) keys, TableEntity serialized)
     {
+        // The service refuses a cell above 64 KiB (a plain byte[] reaches it uncompressed).
+        ServiceErrors.ThrowIfOversizedProperty(serialized);
         // A copy: the serialized cells may be arrays the writer still holds.
         var row = new StoredRow(CopyOf(serialized), ++versionCounter, DateTimeOffset.UtcNow);
         rows[keys] = row;
@@ -862,8 +867,15 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         return copy;
     }
 
-    // A cell value that shares nothing mutable with the given one.
-    private static object Detached(object value) => value is byte[] bytes ? bytes.Clone() : value;
+    // A cell value that shares nothing mutable with the given one. A DateTimeOffset is kept as the instant
+    // in UTC, as the service stores an Edm.DateTime and returns it (offset zero) whatever offset it was
+    // written with.
+    private static object Detached(object value) => value switch
+    {
+        byte[] bytes => bytes.Clone(),
+        DateTimeOffset at => at.ToUniversalTime(),
+        _ => value,
+    };
 
     private void EnforceProtectedProperties(T entity)
     {
