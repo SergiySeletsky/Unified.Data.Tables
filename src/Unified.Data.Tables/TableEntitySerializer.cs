@@ -1289,6 +1289,79 @@ internal sealed class TableEntityValue
     /// <summary>The JSON text a value stored as JSON is written as (what a protected-property check compares).</summary>
     internal static string StoredJson(object value) => JsonSerializer.Serialize(value, JsonOptions);
 
+    // JsonOptions for a value a [TableValueSplit] member stores as JSON: the same bytes, except that a
+    // string (or char, or string dictionary key) with an unpaired surrogate is refused rather than written
+    // as U+FFFD, which would read back altered with no error. A type that opts into nothing never uses it.
+    private static readonly JsonSerializerOptions WellFormedJsonOptions = WellFormed(JsonOptions);
+
+    private static JsonSerializerOptions WellFormed(JsonSerializerOptions options)
+    {
+        var copy = new JsonSerializerOptions(options);
+        copy.Converters.Insert(0, new WellFormedStringConverter());
+        copy.Converters.Insert(1, new WellFormedCharConverter());
+        return copy;
+    }
+
+    // A marked value stored as JSON: refused when it holds text JSON cannot carry (see WellFormedJsonOptions).
+    private static string SerializeMarkedJson(object? value, string column)
+    {
+        try
+        {
+            return JsonSerializer.Serialize(value, WellFormedJsonOptions);
+        }
+        catch (IllFormedTextException)
+        {
+            throw new NotSupportedException(
+                $"'{column}' is a [TableValueSplit] value stored as JSON, and it holds a string with an unpaired surrogate "
+                + "(ill-formed UTF-16). JSON cannot carry one: it would be stored as U+FFFD and read back altered. "
+                + "Store such text in a string or byte[] member marked [TableValueSplit], which keeps it exactly, "
+                + "or remove the unpaired surrogate.");
+        }
+    }
+
+    private sealed class IllFormedTextException : Exception;
+
+    private sealed class WellFormedStringConverter : JsonConverter<string>
+    {
+        public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.GetString();
+
+        public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options) =>
+            writer.WriteStringValue(Checked(value));
+
+        public override string ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.GetString()!;
+
+        public override void WriteAsPropertyName(Utf8JsonWriter writer, string value, JsonSerializerOptions options) =>
+            writer.WritePropertyName(Checked(value));
+
+        private static string Checked(string value) =>
+            SplitCodec.IsWellFormedUtf16(value) ? value : throw new IllFormedTextException();
+    }
+
+    private sealed class WellFormedCharConverter : JsonConverter<char>
+    {
+        public override char Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.GetString() is [var c] ? c : throw new JsonException("Expected a one-character string.");
+
+        public override void Write(Utf8JsonWriter writer, char value, JsonSerializerOptions options)
+        {
+            if (char.IsSurrogate(value))
+                throw new IllFormedTextException();
+            writer.WriteStringValue(value.ToString());
+        }
+
+        public override char ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            Read(ref reader, typeToConvert, options);
+
+        public override void WriteAsPropertyName(Utf8JsonWriter writer, char value, JsonSerializerOptions options)
+        {
+            if (char.IsSurrogate(value))
+                throw new IllFormedTextException();
+            writer.WritePropertyName(value.ToString());
+        }
+    }
+
     private static readonly Dictionary<Type, Func<object, object?>> Primitives = new()
     {
         { typeof(string), v => (string)v },
@@ -1590,7 +1663,7 @@ internal sealed class TableEntityValue
                     throw new NotSupportedException(TableEntitySerializer.MarkedValueStoredAsColumns(columnName, held, Type!));
                 return false;
             default:
-                payload = JsonSerializer.Serialize(Value, JsonOptions);
+                payload = SerializeMarkedJson(Value, columnName);
                 isJson = true;
                 break;
         }
@@ -3069,7 +3142,8 @@ internal static class TypeMetadataCache
         // The property's type is resolved only for a property an attribute may cover: the metadata of
         // a type that opts into nothing is built from property names and attributes alone, as on 0.8.3.
         if (PropertyLevelSplit(prop) is not { } own)
-            return classLevel is not null && IsOrdinaryColumn(t, prop) && IsSplittable(prop.PropertyType) ? classLevel : null;
+            return classLevel is not null && IsOrdinaryColumn(t, prop) && IsSplittable(prop.PropertyType)
+                   && !IsBoundedJsonScalar(prop.PropertyType) ? classLevel : null;
 
         var type = prop.PropertyType;
         if (type == typeof(TableBlobContent))
@@ -3124,6 +3198,18 @@ internal static class TypeMetadataCache
         && !(prop.Name == nameof(IEntity.Id) && typeof(IEntity).IsAssignableFrom(t));
 
     // string, byte[], or a type the serializer stores as one JSON cell.
+    // A scalar the serializer stores as JSON only because it has no native cell for it (float, short,
+    // char, DateOnly, TimeOnly, Half, Int128, ...; nullable or not). Its JSON is a few characters, so it
+    // can never need splitting: a class-level attribute does not cover it, and it keeps the builder
+    // updates of a plain type. A property-level attribute on one is still honoured as written.
+    private static bool IsBoundedJsonScalar(Type type)
+    {
+        var underlying = Nullable.GetUnderlyingType(type) ?? type;
+        return underlying.IsPrimitive || underlying.IsEnum
+            || underlying == typeof(DateOnly) || underlying == typeof(TimeOnly) || underlying == typeof(Half)
+            || underlying == typeof(Int128) || underlying == typeof(UInt128);
+    }
+
     private static bool IsSplittable(Type type) =>
         type != typeof(TableBlobContent) && (type == typeof(string) || type == typeof(byte[]) || (!IsScalar(type) && !TableEntitySerializer.FlattensToColumns(type)));
 
