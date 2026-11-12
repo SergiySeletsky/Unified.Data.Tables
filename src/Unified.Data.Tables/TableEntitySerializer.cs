@@ -3137,7 +3137,8 @@ internal static class TypeMetadataCache
         // The property's type is resolved only for a property an attribute may cover: the metadata of
         // a type that opts into nothing is built from property names and attributes alone, as on 0.8.3.
         if (PropertyLevelSplit(prop) is not { } own)
-            return classLevel is not null && IsOrdinaryColumn(t, prop) && IsSplittable(prop.PropertyType) ? classLevel : null;
+            return classLevel is not null && IsOrdinaryColumn(t, prop) && IsSplittable(prop.PropertyType)
+                   && !IsBoundedJsonScalar(prop.PropertyType) ? classLevel : null;
 
         var type = prop.PropertyType;
         if (type == typeof(TableBlobContent))
@@ -3192,6 +3193,18 @@ internal static class TypeMetadataCache
         && !(prop.Name == nameof(IEntity.Id) && typeof(IEntity).IsAssignableFrom(t));
 
     // string, byte[], or a type the serializer stores as one JSON cell.
+    // A scalar the serializer stores as JSON only because it has no native cell for it (float, short,
+    // char, DateOnly, TimeOnly, Half, Int128, ...; nullable or not). Its JSON is a few characters, so it
+    // can never need splitting: a class-level attribute does not cover it, and it keeps the builder
+    // updates of a plain type. A property-level attribute on one is still honoured as written.
+    private static bool IsBoundedJsonScalar(Type type)
+    {
+        var underlying = Nullable.GetUnderlyingType(type) ?? type;
+        return underlying.IsPrimitive || underlying.IsEnum
+            || underlying == typeof(DateOnly) || underlying == typeof(TimeOnly) || underlying == typeof(Half)
+            || underlying == typeof(Int128) || underlying == typeof(UInt128);
+    }
+
     private static bool IsSplittable(Type type) =>
         type != typeof(TableBlobContent) && (type == typeof(string) || type == typeof(byte[]) || (!IsScalar(type) && !TableEntitySerializer.FlattensToColumns(type)));
 
