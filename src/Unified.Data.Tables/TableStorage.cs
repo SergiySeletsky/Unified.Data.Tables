@@ -45,10 +45,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     private readonly bool implicitLastWriterWins;
     private readonly string typeName = typeof(T).Name;
 
-    // Cache keys use the fully-qualified type name so two entity types with the same simple name in
-    // different namespaces never collide in a shared IMemoryCache. (The Azure table name still uses the
+    // Cache keys name the fully-qualified type and the table (its account endpoint and its name), so two
+    // entity types with the same simple name in different namespaces, and two stores of one type over two
+    // tables or two accounts, never collide in a shared IMemoryCache; two stores of the same table share
+    // their entries. Set in the constructor (see CacheKeyPrefix). (The Azure table name still uses the
     // simple name for back-compat — changing that would rename the table and need a data migration.)
-    private readonly string cacheKeyPrefix = typeof(T).FullName ?? typeof(T).Name;
+    private readonly string cacheKeyPrefix;
 
     private readonly TableInitializer tableInitializer;
 
@@ -131,9 +133,31 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
         tableName = ResolveTableName(opts);
         client = serviceClient.GetTableClient(tableName);
+        cacheKeyPrefix = CacheKeyPrefix(serviceClient, tableName);
         tableInitializer = new TableInitializer(client);
         large = new LargeValueTable(tableName, opts.BlobOffload, blobs, typeof(T));
         large.OnBlobMissing(ForgetRowWithMissingBlob);
+    }
+
+    // The prefix of every cache key of this store: the entity type, then the table it reads, named by the
+    // account endpoint (without its query, which may hold a SAS) and the table name. Both are compared
+    // ignoring case, as the service compares them, so two stores of one table share their entries however
+    // they spell its name. A service client that reports no endpoint (a test double) names the table alone.
+    private static string CacheKeyPrefix(TableServiceClient serviceClient, string tableName)
+    {
+        string? endpoint;
+#pragma warning disable CA1031 // a client that cannot report its endpoint names the table alone
+        try
+        {
+            endpoint = serviceClient.Uri?.GetLeftPart(UriPartial.Path).TrimEnd('/');
+        }
+        catch (Exception)
+        {
+            endpoint = null;
+        }
+#pragma warning restore CA1031
+        var table = (endpoint is { Length: > 0 } ? endpoint + "/" : string.Empty) + tableName;
+        return (typeof(T).FullName ?? typeof(T).Name) + "@" + table.ToUpperInvariant();
     }
 
     // The Azure blob container for this store's offloaded values. Built only for a type that can carry
@@ -1559,8 +1583,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     private WriteGenerations? generations;
 
-    // One per cache and entity type: two stores of T over one IMemoryCache share its entries, so they
-    // share the generations that guard them. (A store built without a cache has nothing to guard.)
+    // One per cache: two stores of T over one table and one IMemoryCache share its entries, so they
+    // share the generations that guard them (stores of other tables or types sharing them only makes a
+    // read that raced one of their writes skip its put). (A store built without a cache has nothing to guard.)
     private WriteGenerations Generations => generations ??= cache is null
         ? new WriteGenerations()
         : GenerationsByCache.GetValue(cache, static _ => new WriteGenerations());
