@@ -343,7 +343,7 @@ public static class TableEntitySerializer
     /// flattens into columns, held by <paramref name="property"/>, which is marked <see cref="TableValueSplitAttribute"/>:
     /// the attribute applies to one value stored in the property's own cells, never to an object stored as columns. It
     /// names "store an instance of the declared type" only when an instance of it is read back whole
-    /// (<see cref="ReadsBackWholeAsJson"/>), never for a nullable struct (named <c>S?</c>), whose every value is an
+    /// through its whole JSON graph (<see cref="ReadsBackWholeAsJson"/>), never for a nullable struct (named <c>S?</c>), whose every value is an
     /// <c>S</c>; declaring the property as the runtime type with the attribute on its members is always named.
     /// </summary>
     internal static string MarkedValueStoredAsColumns(string column, PropertyInfo property, Type runtimeType)
@@ -363,28 +363,73 @@ public static class TableEntitySerializer
                " Nothing was stored.";
     }
 
-    // Whether an instance of type, stored as one JSON value, is read back whole: the library's JSON reader constructs
-    // such a type through one constructor (ParameterizedConstructorConverterFactory) and sets nothing else, so every
-    // member its JSON stores (a property with a public getter, or one marked [JsonInclude]; a field marked [JsonInclude])
-    // must be a parameter of that constructor. False when the reader is not that constructor (a type System.Text.Json
-    // constructs itself): the remedy is then not named, as one that may not work. Reflection alone.
-    private static bool ReadsBackWholeAsJson(Type type)
+    // Whether an instance of type, stored as one JSON value, is read back whole through its whole JSON graph. The library's
+    // JSON reader constructs such a type through one constructor (ParameterizedConstructorConverterFactory) and sets nothing
+    // else, so every member its JSON stores must be a parameter of that constructor; and so must every member of every
+    // type below it that the reader constructs the same way (at every depth of the declared types of what it reads, the
+    // element types of collections and dictionaries included); a type below it that System.Text.Json constructs itself
+    // must be able to set every member it stores. A member declared as object, an interface or an abstract type (stored
+    // by its runtime type, read as something else), a collection that is not a framework collection, or anything else the
+    // check does not know is read back whole makes it false: the remedy is then not named, as one that may not work. False
+    // too when the reader of type itself is not that constructor. Reflection alone; a type is checked once (cycles).
+    private static bool ReadsBackWholeAsJson(Type type) =>
+        ParameterizedConstructorConverterFactory.FindConstructor(type) is not null && JsonReadsBackWhole(type, []);
+
+    private static bool JsonReadsBackWhole(Type type, HashSet<Type> seen)
     {
-        if (ParameterizedConstructorConverterFactory.FindConstructor(type) is not { } constructor)
-            return false;
-        var parameters = constructor.GetParameters();
-        bool Bound(MemberInfo member)
+        type = Nullable.GetUnderlyingType(type) ?? type;
+        if ((type.IsPrimitive && type != typeof(IntPtr) && type != typeof(UIntPtr)) || type.IsEnum || JsonScalars.Contains(type) || !seen.Add(type))
+            return true;
+#pragma warning disable CA1031 // a type whose members cannot be read is not known to read back whole
+        try
         {
-            var stored = member.GetCustomAttribute<JsonPropertyNameAttribute>()?.Name ?? member.Name;
-            return Array.Exists(parameters, p => string.Equals(p.Name, stored, StringComparison.OrdinalIgnoreCase));
+            if (type == typeof(object) || type == typeof(TableBlobContent) || type.IsPointer || type.IsByRef)
+                return false;
+            if (type.IsArray)
+                return type.GetArrayRank() == 1 && JsonReadsBackWhole(type.GetElementType()!, seen);
+            if (typeof(IEnumerable).IsAssignableFrom(type))
+                return type.IsGenericType && type.Namespace is "System.Collections.Generic" or "System.Collections.Immutable" or "System.Collections.ObjectModel"
+                       && type.GetGenericArguments().All(a => JsonReadsBackWhole(a, seen));
+            if (type.IsInterface || type.IsAbstract || type.ContainsGenericParameters)
+                return false;
+            const BindingFlags Members = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            static bool Ignored(MemberInfo member) => member.GetCustomAttribute<JsonIgnoreAttribute>() is { Condition: JsonIgnoreCondition.Always };
+            var properties = type.GetProperties(Members)
+                .Where(p => p.GetIndexParameters().Length == 0 && (p.GetMethod is { IsPublic: true } || p.IsDefined(typeof(JsonIncludeAttribute))) && !Ignored(p))
+                .ToList();
+            var fields = type.GetFields(Members).Where(f => f.IsDefined(typeof(JsonIncludeAttribute)) && !Ignored(f)).ToList();
+            if (ParameterizedConstructorConverterFactory.FindConstructor(type) is { } constructor)
+            {
+                // Read through the constructor: every stored member is one of its parameters, each read as the parameter's type.
+                var parameters = constructor.GetParameters();
+                bool Bound(MemberInfo member)
+                {
+                    var stored = member.GetCustomAttribute<JsonPropertyNameAttribute>()?.Name ?? member.Name;
+                    return Array.Exists(parameters, p => string.Equals(p.Name, stored, StringComparison.OrdinalIgnoreCase));
+                }
+                return properties.All(Bound) && fields.All(Bound) && parameters.All(p => JsonReadsBackWhole(p.ParameterType, seen));
+            }
+            // Constructed by System.Text.Json itself: through a public parameterless constructor (a struct has one), never
+            // a [JsonConstructor] (not checked here), and every stored member set by a setter it can call.
+            if ((!type.IsValueType && type.GetConstructor(Type.EmptyTypes) is null)
+                || type.GetConstructors(Members).Any(c => c.IsDefined(typeof(JsonConstructorAttribute))))
+                return false;
+            return properties.All(p => p.SetMethod is { } set && (set.IsPublic || p.IsDefined(typeof(JsonIncludeAttribute))) && JsonReadsBackWhole(p.PropertyType, seen))
+                   && fields.All(f => !f.IsInitOnly && JsonReadsBackWhole(f.FieldType, seen));
         }
-        static bool Ignored(MemberInfo member) => member.GetCustomAttribute<JsonIgnoreAttribute>() is { Condition: JsonIgnoreCondition.Always };
-        const BindingFlags Members = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-        return type.GetProperties(Members)
-                   .Where(p => p.GetIndexParameters().Length == 0 && (p.GetMethod is { IsPublic: true } || p.IsDefined(typeof(JsonIncludeAttribute))) && !Ignored(p))
-                   .All(Bound)
-               && type.GetFields(Members).Where(f => f.IsDefined(typeof(JsonIncludeAttribute)) && !Ignored(f)).All(Bound);
+        catch (Exception)
+        {
+            return false;
+        }
+#pragma warning restore CA1031
     }
+
+    // The types System.Text.Json reads as one JSON value (string, number) whole, besides primitives and enums.
+    private static readonly HashSet<Type> JsonScalars =
+    [
+        typeof(string), typeof(decimal), typeof(DateTime), typeof(DateTimeOffset), typeof(TimeSpan), typeof(Guid), typeof(Uri),
+        typeof(Version), typeof(DateOnly), typeof(TimeOnly), typeof(Half), typeof(Int128), typeof(UInt128), typeof(byte[]),
+    ];
 
     /// <summary>
     /// The message for a partial update of <paramref name="column"/> of an aware <paramref name="root"/> whose
