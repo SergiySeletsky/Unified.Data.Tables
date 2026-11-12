@@ -25,6 +25,9 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     /// <summary>Awaited before each read opens a blob (for tests that change the store mid-read).</summary>
     internal Func<string, CancellationToken, Task>? BeforeOpenRead { get; set; }
 
+    /// <summary>Awaited before each delete removes anything (for tests that fail or delay a delete).</summary>
+    internal Func<string, CancellationToken, Task>? BeforeDelete { get; set; }
+
     /// <summary>The names of the stored blobs (for tests).</summary>
     internal IReadOnlyCollection<string> Names => blobs.Keys.ToArray();
 
@@ -96,15 +99,17 @@ internal sealed class InMemoryOffloadBlobStore : IOffloadBlobStore
     }
 
     /// <inheritdoc />
-    public Task<bool> DeleteIfUnmodifiedAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct)
+    public async Task<bool> DeleteIfUnmodifiedAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct)
     {
         OffloadBlobNames.ThrowIfNotAddressable(name);
         ct.ThrowIfCancellationRequested();
+        if (BeforeDelete is { } hook)
+            await hook(name, ct);
         if (!blobs.TryGetValue(name, out var blob))
-            return Task.FromResult(false);
+            return false;
         if (unmodifiedSince is { } since && blob.LastModified > since)
-            return Task.FromResult(false);
-        return Task.FromResult(blobs.TryRemove(KeyValuePair.Create(name, blob)));
+            return false;
+        return blobs.TryRemove(KeyValuePair.Create(name, blob));
     }
 
     /// <inheritdoc />

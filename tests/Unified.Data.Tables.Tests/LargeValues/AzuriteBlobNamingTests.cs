@@ -138,8 +138,7 @@ public sealed class AzuriteBlobNamingTests : IAsyncLifetime
         Assert.Contains(names, n => n.StartsWith($"{tableName}/p/{segment}/Body/", StringComparison.Ordinal));
 
         await PastTheServiceSecondAsync();
-        if (!string.IsNullOrWhiteSpace(key))
-            Assert.Equal(0, await store.SweepOrphanBlobsAsync(key, TimeSpan.Zero, Ct));
+        Assert.Equal(0, await store.SweepOrphanBlobsAsync(key, TimeSpan.Zero, Ct));
         Assert.Equal(0, await store.SweepOrphanBlobsAsync("p", TimeSpan.Zero, Ct));
         Assert.Equal(0, await store.SweepOrphanBlobsAsync(TimeSpan.Zero, Ct));
         Assert.Equal(names, (await AllBlobsAsync()).Select(b => b.Name).Order(StringComparer.Ordinal));

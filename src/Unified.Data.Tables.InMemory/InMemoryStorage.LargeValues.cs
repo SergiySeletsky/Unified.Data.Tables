@@ -17,7 +17,7 @@ namespace Unified.Data.Tables.InMemory;
 // of its own at the key of a new continuation row is planned again over the entity's own rows (it
 // replaces the ones it needs and deletes the others); any other row at such a key is foreign and is
 // never overwritten. A delete of an entity that has no primary row removes its leftovers.
-public sealed partial class InMemoryStorage<T>
+public sealed partial class InMemoryStorage<T> : IBlobOffloadState
 {
     private enum LargeWriteKind
     {
@@ -579,6 +579,8 @@ public sealed partial class InMemoryStorage<T>
         var partition = NormalizeId(partitionKey); // match stored (normalized) PartitionKeys, as DeletePartitionAsync
         return large.SweepOrphanBlobsAsync(partition, olderThan, typeof(T), (_, _) => PartitionRowsAsync(partition), ct);
     }
+
+    bool IBlobOffloadState.HasBlobOffload => hasBlobOffload;
 
     /// <inheritdoc />
     public Task<int> SweepOrphanBlobsAsync(TimeSpan olderThan, CancellationToken ct = default) =>

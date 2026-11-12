@@ -894,8 +894,12 @@ public sealed class LargeValueTable
     /// </param>
     /// <param name="ct">Cancels the listing, the read and the deletes.</param>
     /// <returns>The number of blobs deleted; 0 when blob offload is not configured.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null or whitespace.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="olderThan"/> is negative.</exception>
+    /// <exception cref="AggregateException">
+    /// One or more orphans could not be deleted (one inner exception each). The other orphans were
+    /// still tried, and the message says how many blobs were deleted.
+    /// </exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public Task<int> SweepOrphanBlobsAsync(
         string partitionKey, TimeSpan olderThan, Type entityType,
@@ -915,8 +919,16 @@ public sealed class LargeValueTable
         Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
     {
         var cutoff = await SweepCutoffAsync(olderThan, ct);
-        return await coordinator.SweepAsync(partitionKey, cutoff, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, ct);
+        var (deleted, failures) = await coordinator.SweepAsync(partitionKey, cutoff, TypeMetadataCache.LargeValueColumns(entityType), partitionRows, ct);
+        if (failures is not null)
+            throw PartitionSweepFailed(deleted, failures);
+        return deleted;
     }
+
+    // The orphans of one partition that could not be deleted, after every other orphan was tried.
+    private AggregateException PartitionSweepFailed(int deleted, List<Exception> failures) =>
+        new($"The orphan sweep of a partition of table '{tableName}' deleted {deleted} blob(s), but {failures.Count} orphan blob(s) could not be deleted.",
+            failures);
 
     // Ages are measured on the service clock, read before the listing (so never later than it).
     private async Task<DateTimeOffset> SweepCutoffAsync(TimeSpan olderThan, CancellationToken ct) =>
@@ -993,7 +1005,10 @@ public sealed class LargeValueTable
         {
             try
             {
-                deleted += await coordinator.SweepAsync(partition, cutoff, columns, (select, c) => partitionRows(partition, select, c), ct);
+                var (swept, blobFailures) = await coordinator.SweepAsync(partition, cutoff, columns, (select, c) => partitionRows(partition, select, c), ct);
+                deleted += swept;
+                if (blobFailures is not null)
+                    (failures ??= []).Add(PartitionSweepFailed(swept, blobFailures));
             }
 #pragma warning disable CA1031 // one partition's failure must not stop the others; every failure is rethrown below
             catch (Exception ex) when (!(ex is OperationCanceledException && ct.IsCancellationRequested))
@@ -1015,19 +1030,28 @@ public sealed class LargeValueTable
     /// </summary>
     /// <param name="partitionKey">The partition argument.</param>
     /// <param name="olderThan">The age argument.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null or whitespace.</exception>
+    /// <remarks>
+    /// An empty or whitespace key is a partition like any other: a write stores one (an id such as
+    /// <c>"|r"</c>, or <c>"   |r"</c> under <see cref="IdNormalization.AsWritten"/>), and the store
+    /// normalizes the argument as it normalizes ids on write, so the sweep reaches that partition.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="olderThan"/> is negative.</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public static void ValidateSweep(string partitionKey, TimeSpan olderThan)
     {
-        if (string.IsNullOrWhiteSpace(partitionKey))
-            throw new ArgumentNullException(nameof(partitionKey));
+        ArgumentNullException.ThrowIfNull(partitionKey);
         ArgumentOutOfRangeException.ThrowIfLessThan(olderThan, TimeSpan.Zero);
     }
+
+    /// <summary>True when this table offloads values to a blob container (so a sweep has something to do).</summary>
+    internal bool HasBlobOffload => blobs is not null;
 
     // "Now" on the clock that stamps blob Last-Modified times: the blob store's service time or, when it
     // cannot tell, the client clock moved back by ClientClockMargin (it may run ahead of the service).
     // Blobs modified after (now - grace) may be about to be referenced by a concurrent write: kept.
+    // Only the caller's cancellation is thrown: a cancellation it did not cause (an SDK or network
+    // timeout) leaves the time unknown, so a cleanup after a committed change never reports it failed.
     private async Task<DateTimeOffset> ServiceNowAsync(CancellationToken ct)
     {
         try
@@ -1036,7 +1060,7 @@ public sealed class LargeValueTable
                 return serviceNow;
         }
 #pragma warning disable CA1031 // an unknown service time falls back to the (margined) client clock
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (!(ex is OperationCanceledException && ct.IsCancellationRequested))
 #pragma warning restore CA1031
         {
         }
