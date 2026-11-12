@@ -423,7 +423,7 @@ public sealed class AzuriteReusedSourceStreamTests(ITestOutputHelper output) : A
     private const int Size = 1_000_000;
 
     private static string ConnectionString =>
-        Environment.GetEnvironmentVariable("UNIFIED_TABLES_TEST_STORAGE") is { Length: > 0 } configured ? configured : "UseDevelopmentStorage=true";
+        TestSupport.AzuriteConnection.ConnectionString;
 
     [Theory]
     [InlineData(true)]

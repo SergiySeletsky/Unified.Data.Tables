@@ -129,7 +129,7 @@ public sealed class ExistsOfADamagedInRowValueParityTests
         if (store is InMemoryStorage<SplitTextEntity> memory)
             memory.SeedPhysicalRow(damaged);
         else
-            await new TableServiceClient("UseDevelopmentStorage=true").GetTableClient(nameof(SplitTextEntity)).UpsertEntityAsync(damaged, TableUpdateMode.Replace, Ct);
+            await new TableServiceClient(TestSupport.AzuriteConnection.ConnectionString).GetTableClient(nameof(SplitTextEntity)).UpsertEntityAsync(damaged, TableUpdateMode.Replace, Ct);
 
         var lines = new List<string>();
         async Task Step(string name, Func<Task<object?>> f)

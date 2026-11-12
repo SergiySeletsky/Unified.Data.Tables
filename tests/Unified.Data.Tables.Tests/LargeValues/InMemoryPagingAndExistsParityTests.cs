@@ -140,10 +140,7 @@ public sealed class InMemoryPagingAndExistsParityTests
 /// </summary>
 file sealed class ParityScript(LargeValueStores stores, List<string> transcript)
 {
-    private static readonly string ConnectionString =
-        Environment.GetEnvironmentVariable(AzuriteLargeValueIntegrationTests.ConnectionStringVariable) is { Length: > 0 } configured
-            ? configured
-            : "UseDevelopmentStorage=true";
+    private static readonly string ConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 

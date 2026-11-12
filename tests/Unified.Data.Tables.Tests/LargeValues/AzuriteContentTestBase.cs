@@ -20,15 +20,12 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 public abstract class AzuriteContentTestBase : IAsyncLifetime
 {
     /// <summary>Overrides the storage connection string the tests use (the same variable the other Azurite tests read).</summary>
-    private const string ConnectionStringVariable = "UNIFIED_TABLES_TEST_STORAGE";
 
-    private const string DevelopmentStorage = "UseDevelopmentStorage=true";
 
     /// <summary>Why a test did not run.</summary>
-    protected const string SkipReason = "Azurite (tables and blobs) is not reachable; set " + ConnectionStringVariable + " or start Azurite";
+    protected const string SkipReason = "Azurite (tables and blobs) is not reachable; set " + TestSupport.AzuriteConnection.Variable + " or start Azurite";
 
-    private static readonly string ConnectionString =
-        Environment.GetEnvironmentVariable(ConnectionStringVariable) is { Length: > 0 } configured ? configured : DevelopmentStorage;
+    private static readonly string ConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     // Once per test run: skips only when the emulator is not there at all (see AzuriteProbe).
     private static readonly Lazy<Task<bool>> Probe =

@@ -8,7 +8,7 @@ namespace Unified.Data.Tables.Tests;
 
 /// <summary>
 /// Integration tests that exercise the REAL <see cref="TableStorage{T}"/> + serializer against a
-/// LOCAL Azurite emulator (connection string <c>UseDevelopmentStorage=true</c>). Unlike the mocked
+/// LOCAL Azurite emulator (connection string <c>UseDevelopmentStorage=true</c> unless <c>UNIFIED_TABLES_TEST_STORAGE</c> names another). Unlike the mocked
 /// unit tests, these go through the actual Azure.Data.Tables SDK, so they catch serializer /
 /// persisted-type mismatches that in-memory mocks cannot.
 ///
@@ -24,7 +24,7 @@ namespace Unified.Data.Tables.Tests;
 /// </summary>
 public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
 {
-    private const string AzuriteConnectionString = "UseDevelopmentStorage=true";
+    private static readonly string AzuriteConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     private TableServiceClient _service = default!;
     private bool _available;
@@ -73,7 +73,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task Entity_RoundTrips_ThroughRealAzurite()
     {
-        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+        Assert.SkipUnless(_available, "Azurite is not running (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true)");
 
         var store = Store<TestEntity>();
         var entity = new TestEntity { Id = $"{Partition("integration")}|alice", Name = "Alice", Value = 42 };
@@ -91,7 +91,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task OneAsync_RawDateTimeCell_DeserializesIntoDateTimeOffsetTarget()
     {
-        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+        Assert.SkipUnless(_available, "Azurite is not running (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true)");
 
         // Bypass the write serializer and insert a row whose date is a plain DateTime — exactly the
         // representation older rows surface as through the SDK. Reading it back into a DateTimeOffset
@@ -117,7 +117,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task PartialUpdate_ThroughRealAzurite_TouchesOnlyDeclaredColumns()
     {
-        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+        Assert.SkipUnless(_available, "Azurite is not running (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true)");
 
         var store = Store<TestEntity>();
         var entity = new TestEntity { Id = $"{Partition("integration")}|patch", Name = "before", Value = 5 };
@@ -136,7 +136,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task DeletePartitionAsync_RemovesAllRowsInPartition()
     {
-        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+        Assert.SkipUnless(_available, "Azurite is not running (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true)");
 
         var store = Store<TestEntity>();
         var p = Partition("delpart");
@@ -154,7 +154,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task QueryAsync_ServerSidePredicate_RoundTripsThroughRealAzurite()
     {
-        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+        Assert.SkipUnless(_available, "Azurite is not running (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true)");
 
         var store = Store<TestEntity>();
         var p = Partition("linqfilter");
@@ -174,7 +174,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task QueryPageAsync_PagesThroughRealAzurite_WithContinuationTokens()
     {
-        Assert.SkipUnless(_available, "Azurite is not running on UseDevelopmentStorage=true");
+        Assert.SkipUnless(_available, "Azurite is not running (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true)");
 
         var store = Store<TestEntity>();
         var p = Partition("paging");
@@ -209,7 +209,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     {
         // Assert.Skip, not `if (!_available) return;` — a silent early return reports PASS for a
         // test that never ran, which is indistinguishable from the fix working.
-        Assert.SkipUnless(_available, "Azurite is not reachable on UseDevelopmentStorage=true.");
+        Assert.SkipUnless(_available, "Azurite is not reachable (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true).");
 
         // The regression this closes. Azure caps a transaction at 100 entities AND 4 MB, and the
         // REST layer base64-expands binary 1.333x. Chunking on count alone sends a legal-looking
@@ -239,7 +239,7 @@ public sealed class AzuriteTableStorageIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task Query_WithProjection_OmitsTheUnselectedColumn()
     {
-        Assert.SkipUnless(_available, "Azurite is not reachable on UseDevelopmentStorage=true.");
+        Assert.SkipUnless(_available, "Azurite is not reachable (" + TestSupport.AzuriteConnection.Variable + " overrides UseDevelopmentStorage=true).");
 
         // Projection is the difference between reading a scalar and dragging every large payload
         // in the partition across the wire with it.

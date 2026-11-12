@@ -168,9 +168,7 @@ public sealed class SweepPastAnUndeletableOrphanAzuriteTests : AzuriteCleanupTes
         var options = new BlobClientOptions();
         options.AddPolicy(new FailDeletesOf("/" + Pk + "/a/Body/"), HttpPipelinePosition.PerCall);
         var blobService = new BlobServiceClient(
-            Environment.GetEnvironmentVariable(AzuriteLargeValueIntegrationTests.ConnectionStringVariable) is { Length: > 0 } configured
-                ? configured
-                : "UseDevelopmentStorage=true",
+            TestSupport.AzuriteConnection.ConnectionString,
             options);
         Table(nameof(SplitTextEntity)); // this test's rows in it are deleted at the end
         return new TableStorage<SplitTextEntity>(TableService, new MemoryCache(new MemoryCacheOptions()),

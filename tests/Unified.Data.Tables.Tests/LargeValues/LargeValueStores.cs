@@ -30,14 +30,10 @@ internal abstract class LargeValueStores : IAsyncDisposable
     internal const string Azurite = "azurite";
 
     internal const string SkipReason = "Azurite (tables and blobs) is not reachable; set "
-        + AzuriteLargeValueIntegrationTests.ConnectionStringVariable + " or start Azurite";
+        + TestSupport.AzuriteConnection.Variable + " or start Azurite";
 
-    private const string DevelopmentStorage = "UseDevelopmentStorage=true";
 
-    private static readonly string ConnectionString =
-        Environment.GetEnvironmentVariable(AzuriteLargeValueIntegrationTests.ConnectionStringVariable) is { Length: > 0 } configured
-            ? configured
-            : DevelopmentStorage;
+    private static readonly string ConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     // Once per test run: skips only when the emulator is not there at all (see AzuriteProbe).
     private static readonly Lazy<Task<bool>> Probe =

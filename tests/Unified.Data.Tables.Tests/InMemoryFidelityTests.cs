@@ -344,10 +344,7 @@ public sealed class InMemoryFidelityTests
 /// </summary>
 internal sealed class FidelityScript
 {
-    private static readonly string ConnectionString =
-        Environment.GetEnvironmentVariable(AzuriteLargeValueIntegrationTests.ConnectionStringVariable) is { Length: > 0 } configured
-            ? configured
-            : "UseDevelopmentStorage=true";
+    private static readonly string ConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     private static readonly Lazy<Task<bool>> Probe =
         new(() => AzuriteProbe.ProbeAsync(ConnectionString, blobs: true, AzuriteProbe.Required));

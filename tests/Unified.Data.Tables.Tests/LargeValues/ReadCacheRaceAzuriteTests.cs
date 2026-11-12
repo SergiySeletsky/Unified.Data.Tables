@@ -19,13 +19,11 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// </summary>
 public sealed class ReadCacheRaceAzuriteTests : IAsyncLifetime
 {
-    private const string ConnectionStringVariable = "UNIFIED_TABLES_TEST_STORAGE";
-    private const string SkipReason = "Azurite (tables and blobs) is not reachable; set " + ConnectionStringVariable + " or start Azurite";
+    private const string SkipReason = "Azurite (tables and blobs) is not reachable; set " + TestSupport.AzuriteConnection.Variable + " or start Azurite";
 
     private static readonly TimeSpan Patience = TimeSpan.FromSeconds(60);
 
-    private static readonly string ConnectionString =
-        Environment.GetEnvironmentVariable(ConnectionStringVariable) is { Length: > 0 } configured ? configured : "UseDevelopmentStorage=true";
+    private static readonly string ConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     private static readonly Lazy<Task<bool>> Probe =
         new(() => AzuriteProbe.ProbeAsync(ConnectionString, blobs: true, AzuriteProbe.Required));

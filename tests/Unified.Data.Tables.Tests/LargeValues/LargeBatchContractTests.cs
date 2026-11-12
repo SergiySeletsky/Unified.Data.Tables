@@ -1026,12 +1026,9 @@ public sealed class InMemoryLargeBatchContractTests : LargeBatchContract
 public sealed class AzuriteLargeBatchContractTests : LargeBatchContract
 {
     private const string SkipReason = "Azurite (tables and blobs) is not reachable; set "
-        + AzuriteLargeValueIntegrationTests.ConnectionStringVariable + " or start Azurite";
+        + TestSupport.AzuriteConnection.Variable + " or start Azurite";
 
-    private static readonly string ConnectionString =
-        Environment.GetEnvironmentVariable(AzuriteLargeValueIntegrationTests.ConnectionStringVariable) is { Length: > 0 } configured
-            ? configured
-            : "UseDevelopmentStorage=true";
+    private static readonly string ConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     private static readonly Lazy<Task<bool>> Probe =
         new(() => TestSupport.AzuriteProbe.ProbeAsync(ConnectionString, blobs: true, TestSupport.AzuriteProbe.Required));

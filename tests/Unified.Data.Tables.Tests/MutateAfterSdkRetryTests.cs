@@ -52,7 +52,7 @@ public sealed class MutateAfterSdkRetryTests : AzuriteCleanupTestBase
         options.Retry.MaxRetries = maxRetries;
         options.AddPolicy(policy, HttpPipelinePosition.PerRetry);
         Table(nameof(SimpleEntity));
-        return new TableStorage<SimpleEntity>(new TableServiceClient("UseDevelopmentStorage=true", options),
+        return new TableStorage<SimpleEntity>(new TableServiceClient(TestSupport.AzuriteConnection.ConnectionString, options),
             new MemoryCache(new MemoryCacheOptions()), NullLogger<TableStorage<SimpleEntity>>.Instance,
             authorizer: null, new UnifiedTableStorageOptions { Cache = CachePolicy.Disabled });
     }

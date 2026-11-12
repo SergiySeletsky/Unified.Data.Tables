@@ -23,7 +23,7 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// </summary>
 public sealed class OverlappingWriteCacheAzuriteTests : IAsyncLifetime
 {
-    private const string ConnectionString = "UseDevelopmentStorage=true";
+    private static readonly string ConnectionString = TestSupport.AzuriteConnection.ConnectionString;
 
     private static readonly TimeSpan Patience = TimeSpan.FromSeconds(60);
 

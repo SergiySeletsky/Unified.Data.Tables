@@ -134,9 +134,7 @@ public sealed class ServiceTimeTimeoutAzuriteTests : AzuriteCleanupTestBase
         var options = new BlobClientOptions();
         options.AddPolicy(policy, HttpPipelinePosition.PerCall);
         var blobService = new BlobServiceClient(
-            Environment.GetEnvironmentVariable(AzuriteLargeValueIntegrationTests.ConnectionStringVariable) is { Length: > 0 } configured
-                ? configured
-                : "UseDevelopmentStorage=true",
+            TestSupport.AzuriteConnection.ConnectionString,
             options);
         using var cache = new MemoryCache(new MemoryCacheOptions());
         var store = new TableStorage<SplitTextEntity>(TableService, cache, NullLogger<TableStorage<SplitTextEntity>>.Instance, authorizer: null,

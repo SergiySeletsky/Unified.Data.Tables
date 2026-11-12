@@ -54,8 +54,7 @@ public sealed class DuplicateCreateCacheTests : AzuriteCleanupTestBase
         var options = new TableClientOptions();
         options.Retry.Delay = TimeSpan.FromMilliseconds(10);
         options.AddPolicy(new LoseTheFirstInsertResponse(), HttpPipelinePosition.PerRetry);
-        var service = new TableServiceClient(Environment.GetEnvironmentVariable(AzuriteLargeValueIntegrationTests.ConnectionStringVariable)
-            is { Length: > 0 } configured ? configured : "UseDevelopmentStorage=true", options);
+        var service = new TableServiceClient(TestSupport.AzuriteConnection.ConnectionString, options);
         try
         {
             await service.CreateTableIfNotExistsAsync(tableName, Ct);
