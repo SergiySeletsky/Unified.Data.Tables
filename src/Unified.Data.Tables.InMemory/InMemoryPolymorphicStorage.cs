@@ -106,12 +106,13 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         // row building — so a buffered fake that never looked at it would let a cancelled operation
         // succeed here and fail in production.
         ct.ThrowIfCancellationRequested();
+        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey));
 
         lock (gate)
         {
             var key = (write.Key.PartitionKey, write.Key.RowKey);
             if (rows.ContainsKey(key))
-                throw Duplicate(write.Key);
+                throw Duplicate(write.Key, ServiceErrors.AlreadyExists(write.Key.ToId()));
 
             rows[key] = Store(row);
             return Task.FromResult(ToEntry(rows[key], timestampKnown: false));
@@ -125,6 +126,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         Guard.NotNull(write, nameof(write));
         var row = ToRow(write);
         ct.ThrowIfCancellationRequested();
+        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey));
 
         lock (gate)
         {
@@ -142,42 +144,44 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         if (writes.Count == 0)
             return Task.FromResult(0);
 
-        // Build every row before taking the lock, so validation failures cost nothing.
+        // Build every row before the first transaction, so a validation failure costs nothing.
         var built = new List<(TableKey Key, TableEntity Row)>(writes.Count);
-        var withinBatch = new HashSet<(string, string)>();
         foreach (var write in writes)
-        {
-            var row = ToRow(write);
-
-            // The same key TWICE in one batch. Azure rejects the whole transaction with 400
-            // InvalidDuplicateRow; without this check the dictionary would quietly collapse the pair
-            // into one row and report the full count, so the fake would return 2 for a batch Azure
-            // stores none of. Checked before the existing-row scan because it needs no lock.
-            if (!withinBatch.Add((write.Key.PartitionKey, write.Key.RowKey)))
-            {
-                throw new DuplicateKeyException(
-                    tableName,
-                    write.Key.ToId(),
-                    new RequestFailedException(
-                        400,
-                        $"InvalidDuplicateRow: duplicate key within the batch. Id: {write.Key.ToId()}"));
-            }
-
-            built.Add((write.Key, row));
-        }
+            built.Add((write.Key, ToRow(write)));
 
         ct.ThrowIfCancellationRequested();
 
-        lock (gate)
+        // As PolymorphicTableStorage sends it: per partition (in the order the partitions first appear),
+        // the rows packed into the same entity-group transactions (BatchPlanner), each applied atomically
+        // under the gate; a transaction that fails applies nothing, and the ones before it stay committed.
+        // The same key twice in one transaction is the service's 400 InvalidDuplicateRow, a stored key its
+        // 409 EntityAlreadyExists, both surfaced as DuplicateKeyException over the transaction failure; a
+        // key the service refuses is its raw 400 InvalidInput.
+        foreach (var group in built.GroupBy(b => b.Key.PartitionKey, StringComparer.Ordinal))
         {
-            foreach (var (key, _) in built)
+            var groupRows = group.ToList();
+            var plan = BatchPlanner.Plan([.. groupRows.Select(b => TableRequestSize.EstimateEntityBytes(b.Row))]);
+            foreach (var range in plan)
             {
-                if (rows.ContainsKey((key.PartitionKey, key.RowKey)))
-                    throw Duplicate(key);
-            }
+                ct.ThrowIfCancellationRequested();
+                lock (gate)
+                {
+                    var inTransaction = new HashSet<(string, string)>();
+                    for (var i = range.Start; i < range.Start + range.Count; i++)
+                    {
+                        var key = groupRows[i].Key;
+                        if (ServiceErrors.RefusedKey(key.PartitionKey, key.RowKey) is { } refused)
+                            throw ServiceErrors.InTransaction(refused);
+                        if (!inTransaction.Add((key.PartitionKey, key.RowKey)))
+                            throw Duplicate(key, ServiceErrors.InTransaction(ServiceErrors.DuplicateRow(key.ToId())));
+                        if (rows.ContainsKey((key.PartitionKey, key.RowKey)))
+                            throw Duplicate(key, ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(key.ToId())));
+                    }
 
-            foreach (var (key, row) in built)
-                rows[(key.PartitionKey, key.RowKey)] = Store(row);
+                    for (var i = range.Start; i < range.Start + range.Count; i++)
+                        rows[(groupRows[i].Key.PartitionKey, groupRows[i].Key.RowKey)] = Store(groupRows[i].Row);
+                }
+            }
         }
 
         return Task.FromResult(built.Count);
@@ -200,11 +204,12 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
             ValidateSystemColumn(column.Key);
 
         ct.ThrowIfCancellationRequested();
+        ServiceErrors.ThrowIfRefusedKey((key.PartitionKey, key.RowKey));
 
         lock (gate)
         {
             if (!rows.TryGetValue((key.PartitionKey, key.RowKey), out var existing))
-                throw new RequestFailedException(404, "The specified resource does not exist.");
+                throw new RequestFailedException(404, "The specified resource does not exist.", "ResourceNotFound", null);
 
             // Server-side Merge overlays the supplied cells onto a copy and leaves the rest alone.
             var merged = CopyOf(existing.Data);
@@ -372,10 +377,9 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     // Duplicate-key errors name the TABLE, exactly as PolymorphicTableStorage does — the fake used
     // typeof(TBase).Name, which can never coincide with a real polymorphic table name, so every
     // DuplicateKeyException.Message and .EntityType diverged between the two implementations.
-    private DuplicateKeyException Duplicate(TableKey key) =>
-        new(tableName,
-            key.ToId(),
-            new RequestFailedException(409, "The specified entity already exists."));
+    // The inner failure is the service's, with its status and error code (see ServiceErrors).
+    private DuplicateKeyException Duplicate(TableKey key, RequestFailedException failure) =>
+        new(tableName, key.ToId(), failure);
 
     // timestampKnown: false on the WRITE paths. A write response carries no service timestamp, so
     // PolymorphicTableStorage returns a null one; a fake that filled it in would green-light a test

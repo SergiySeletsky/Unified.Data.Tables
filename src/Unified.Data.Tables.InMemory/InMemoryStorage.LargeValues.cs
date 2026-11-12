@@ -125,8 +125,9 @@ public sealed partial class InMemoryStorage<T>
             {
                 if (prior is null)
                     throw new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}");
+                // As TableStorage: the version it read is not the caller's, so nothing is sent (no inner failure).
                 if (strict && !string.Equals(ETagOf(prior.Version), ifMatch, StringComparison.Ordinal))
-                    throw Conflict(entity.Id);
+                    throw new ConcurrencyConflictException(typeof(T).Name, entity.Id, null);
             }
 
             var plan = own is not null
@@ -142,16 +143,26 @@ public sealed partial class InMemoryStorage<T>
                     }, ct);
             // Every blob exists (uploaded, or touched when already there) before the row that references it.
             await large.UploadAsync(plan, ct);
+            // A cancelled token fails the row write before it is sent, as the SDK does.
+            ct.ThrowIfCancellationRequested();
             BeforeLargeCommit?.Invoke();
+
+            // TableStorage writes a row with continuation rows to write or delete as one entity-group
+            // transaction, and the SDK reports a failure of it as a TableTransactionFailedException.
+            var transactional = plan.Parts.Count > 0 || plan.StalePartRowKeys.Count > 0;
+            RequestFailedException Sent(RequestFailedException failure) =>
+                transactional ? ServiceErrors.InTransaction(failure) : failure;
 
             long version;
             lock (gate)
             {
+                // The service refuses the key when the row is written (the blobs are uploaded by then).
+                if (ServiceErrors.RefusedKey(keys.PartitionKey, keys.RowKey) is { } refused)
+                    throw Sent(refused);
                 if (kind == LargeWriteKind.Create)
                 {
                     if (rows.ContainsKey(keys))
-                        throw new DuplicateKeyException(typeof(T).Name, entity.Id,
-                            new RequestFailedException(409, $"The specified entity already exists. Id: {entity.Id}"));
+                        throw new DuplicateKeyException(typeof(T).Name, entity.Id, Sent(ServiceErrors.AlreadyExists(entity.Id)));
                 }
                 else if (ReadPrior(keys) is var current && current?.Version != prior?.Version)
                 {
@@ -159,10 +170,12 @@ public sealed partial class InMemoryStorage<T>
                     if (strict)
                     {
                         throw current is null
-                            ? new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}")
-                            : Conflict(entity.Id);
+                            ? Sent(ServiceErrors.NotFound(entity.Id))
+                            : new ConcurrencyConflictException(typeof(T).Name, entity.Id, Sent(ServiceErrors.ConditionNotSatisfied()));
                     }
-                    lost = new RequestFailedException(current is null ? 404 : 412, "The entity was modified by another writer.");
+                    lost = Sent(current is null
+                        ? ServiceErrors.NotFound(entity.Id)
+                        : ServiceErrors.ConditionNotSatisfied("The entity was modified by another writer."));
                     lostRace = true;
                     continue;
                 }
@@ -172,7 +185,7 @@ public sealed partial class InMemoryStorage<T>
                 // now, the write is planned again.
                 if (own is not null && !SameParts(own, OwnParts(keys)))
                 {
-                    lost = PartsChanged();
+                    lost = Sent(PartsChanged());
                     lostRace = true;
                     continue;
                 }
@@ -183,9 +196,9 @@ public sealed partial class InMemoryStorage<T>
                     // entity is its own, left behind: the write is planned again over the entity's own
                     // rows. Any other row is foreign: the write is refused and that row is left as it is.
                     if (!IsOwnPart(keys, taken))
-                        throw LargeValueTable.ContinuationKeyTaken(keys.PartitionKey, keys.RowKey, taken, Taken(taken));
+                        throw LargeValueTable.ContinuationKeyTaken(keys.PartitionKey, keys.RowKey, taken, Sent(Taken(taken)));
                     takeBack = true;
-                    lost = Taken(taken);
+                    lost = Sent(Taken(taken));
                     continue;
                 }
                 version = Commit(keys, plan);
@@ -385,11 +398,13 @@ public sealed partial class InMemoryStorage<T>
                 // The first action the service would fail fails the whole transaction; nothing is applied.
                 foreach (var unit in chunk)
                 {
+                    if (ServiceErrors.RefusedKey(unit.Keys.PartitionKey, unit.Keys.RowKey) is { } refused)
+                        throw ServiceErrors.InTransaction(refused);
                     if (kind == LargeWriteKind.Create)
                     {
                         if (rows.ContainsKey(unit.Keys))
                             throw new DuplicateKeyException(typeof(T).Name, unit.Entity.Id,
-                                new RequestFailedException(409, $"The specified entity already exists. Id: {unit.Entity.Id}"));
+                                ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(unit.Entity.Id)));
                     }
                     else if (ReadPrior(unit.Keys)?.Version != unit.Prior?.Version)
                     {
@@ -407,7 +422,7 @@ public sealed partial class InMemoryStorage<T>
                         // A foreign row is never overwritten; the entity's own leftover is taken back
                         // by planning the transaction again with that entity over its own rows.
                         if (!IsOwnPart(unit.Keys, taken))
-                            throw LargeValueTable.ContinuationKeyTaken(unit.Keys.PartitionKey, unit.Keys.RowKey, taken, Taken(taken));
+                            throw LargeValueTable.ContinuationKeyTaken(unit.Keys.PartitionKey, unit.Keys.RowKey, taken, ServiceErrors.InTransaction(Taken(taken)));
                         lost = unit;
                         lostRace = false;
                         // As TableStorage: every entity of the transaction that inserts a continuation
@@ -432,7 +447,7 @@ public sealed partial class InMemoryStorage<T>
             {
                 if (attempt >= MaxLargeWriteAttempts)
                     throw new ConcurrencyConflictException(typeof(T).Name, lost.Entity.Id,
-                        new RequestFailedException(412, "The entity was modified by another writer."));
+                        ServiceErrors.InTransaction(ServiceErrors.ConditionNotSatisfied("The entity was modified by another writer.")));
                 // After a lost race: the same pause as TableStorage (none when an own leftover is taken back).
                 if (lostRace)
                     await large.WaitBeforeRetryAsync(attempt + 1, ct);
@@ -617,31 +632,75 @@ public sealed partial class InMemoryStorage<T>
     private async Task<IEnumerable<T>> QueryLargeAsync(string? scope, CancellationToken ct) =>
         await MaterializeAllAsync(LogicalSnapshot(() => LogicalRows().Where(kv => scope is null || kv.Key.PartitionKey == scope)), ct);
 
+    // As the service filters for TableStorage: the predicate is evaluated on the stored primary row (a
+    // filter cannot name a large value), and only a row it matches is assembled and has its blobs read, so a
+    // row whose large value cannot be read fails the query only when it matches.
     private async Task<IReadOnlyList<T>> QueryLargeAsync(Func<T, bool> matches, string? scope, int? take, CancellationToken ct)
     {
-        var candidates = LogicalSnapshot(() => LogicalRows().Where(kv => scope is null || kv.Key.PartitionKey == scope));
+        List<StoredRow> candidates;
+        lock (gate)
+        {
+            candidates = [];
+            foreach (var (_, stored) in LogicalRows().Where(kv => scope is null || kv.Key.PartitionKey == scope))
+            {
+                if (MatchesStoredRow(stored, matches))
+                    candidates.Add(Assembled(stored));
+            }
+        }
         var results = new List<T>();
         foreach (var row in candidates)
         {
             if (take is int t && results.Count >= t)
                 break;
-            if (await MaterializeAsync(row, ct) is { } entity && matches(entity))
+            // Deleted while its blobs were read: not part of the result, and it does not count toward take.
+            if (await MaterializeAsync(row, ct) is { } entity)
                 results.Add(entity);
         }
         return results;
     }
 
-    private async Task<IReadOnlyList<T>> BoundedLargeAsync(QueryOptions options, CancellationToken ct) =>
-        await MaterializeAllAsync(LogicalSnapshot(() => Bounded(options)), ct);
+    // Under the gate: whether the predicate holds for the primary row as a server-side filter sees it.
+    private static bool MatchesStoredRow(StoredRow stored, Func<T, bool> matches)
+    {
+        T view;
+        try
+        {
+            view = ProjectedRows.FilterView<T>(CopyOf(stored.Data));
+        }
+        catch (TableValueIntegrityException)
+        {
+            // The row's own cells cannot be read even without its large values: it is assembled, and its
+            // read reports the failure, as before.
+            return true;
+        }
+        view.ETag = stored.ETagString();
+        view.Timestamp = stored.Timestamp;
+        return matches(view);
+    }
+
+    private async Task<IReadOnlyList<T>> BoundedLargeAsync(QueryOptions options, CancellationToken ct)
+    {
+        // A projection that names no large value reads the selected cells of each row and nothing else
+        // (nothing assembled, no blob read), as TableStorage does.
+        if (ProjectedRows.SelectedColumns<T>(options) is { } select)
+        {
+            lock (gate)
+            {
+                return Bounded(options).Select(kv => Materialize(kv.Value, select)).ToList();
+            }
+        }
+        return await MaterializeAllAsync(LogicalSnapshot(() => Bounded(options)), ct);
+    }
 
     // Pages over the stored rows, as the service does for TableStorage: a continuation row (declared or
     // leftover) takes a place in the page and is then skipped, so a page can hold fewer entities than its
     // size, or none, and still carry a cursor; the cursor resumes after the last row of the page.
     private async Task<EntityPage<T>> PageLargeAsync(
         string? partition, string? rowKeyPrefix, int pageSize, string fingerprint,
-        (string PartitionKey, string RowKey)? after, CancellationToken ct)
+        (string PartitionKey, string RowKey)? after, IReadOnlyList<string>? select, CancellationToken ct)
     {
         List<StoredRow> pageRows;
+        List<T>? projected = null;
         string? next = null;
         lock (gate)
         {
@@ -659,10 +718,20 @@ public sealed partial class InMemoryStorage<T>
                 var last = page[page.Count - 1].Key;
                 next = PageCursor.Encode(fingerprint, last.PartitionKey + "\0" + last.RowKey);
             }
-            pageRows = page.Where(kv => !LargeValueTable.IsPartRow(kv.Value.Data)).Select(kv => Assembled(kv.Value)).ToList();
+            var entities = page.Where(kv => !LargeValueTable.IsPartRow(kv.Value.Data));
+            if (select is not null)
+            {
+                // A projection that names no large value reads only the selected cells (see BoundedLargeAsync).
+                projected = entities.Select(kv => Materialize(kv.Value, select)).ToList();
+                pageRows = [];
+            }
+            else
+            {
+                pageRows = entities.Select(kv => Assembled(kv.Value)).ToList();
+            }
         }
 
-        return new EntityPage<T>(await MaterializeAllAsync(pageRows, ct), next);
+        return new EntityPage<T>(projected ?? await MaterializeAllAsync(pageRows, ct), next);
     }
 
     // ── Helpers (callers marked "under the gate" must hold it) ───────────────
@@ -792,9 +861,6 @@ public sealed partial class InMemoryStorage<T>
         var keys = EntityId.Split(NormalizeId(id));
         LargeValueTable.ValidateKeys(keys.PartitionKey, keys.RowKey);
     }
-
-    private static ConcurrencyConflictException Conflict(string id) =>
-        new(typeof(T).Name, id, new RequestFailedException(412, "Precondition Failed: the entity was modified by another writer."));
 
     private async Task EnforceProtectedPropertiesLargeAsync(T entity, CancellationToken ct)
     {
