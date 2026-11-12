@@ -23,8 +23,9 @@ copy-pasted into each one.
   created lazily on first use (`EnsureCreatedAsync()` for fail-fast hosts).
 - **Reflection-based serializer** — flattens nested objects into `Parent_Child` columns, stores enums as
   strings and money-style `decimal`s as doubles, and falls back to JSON (then GZip) for collections and
-  complex graphs. Oversized cells are compressed, and an oversized payload throws rather than being
-  trimmed. Opt a property into `[TableValueSplit]` to store arbitrarily large values losslessly.
+  complex graphs. Oversized string and JSON cells are compressed, and an oversized payload throws rather
+  than being trimmed (a plain `byte[]` cell is never compressed: one above 64&nbsp;KB is refused by the
+  service with a 400 `PropertyValueTooLarge`, not `OversizedCellException`). Opt a property into `[TableValueSplit]` to store arbitrarily large values losslessly.
 - **Large values & blob offload** — `[TableValueSplit]` stores strings and byte arrays far beyond the
   64&nbsp;KB cell limit as split cells, continuation rows or an Azure Blob, SHA-256 verified on read;
   `TableBlobContent` stores files as blobs with a lazy stream; an optional hosted sweep removes orphan

@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.0] — 2026-11-10
+## [0.9.0] — Unreleased
 
 Lossless storage of large values, opt-in per property.
 
@@ -56,6 +56,13 @@ Lossless storage of large values, opt-in per property.
   same backoff; when the attempts run out, `TryMutateAsync` and `TryTransitionAsync` return
   `MutationStatus.Conflicted` and the other two throw `ConcurrencyConflictException`. `GetOrCreateAsync`
   has no attempt budget, and a `ConcurrencyConflictException` from its read leaves it.
+- A type read through its constructor (a positional record, a class whose only public constructor takes
+  arguments) now reads its other settable and `init` members from the JSON its rows already store, plain
+  types included (see the constructor entry under Fixed). Code that relied on such a member coming back
+  at its initialiser sees the stored value instead. A member whose stored JSON does not deserialize to its
+  current type (a member typed as an interface or abstract class, a type changed since the row was
+  written, a null for a non-nullable value type) keeps its initialiser, as on 0.8.3, and every row 0.8.3
+  read stays readable.
 - Beside `UnifiedTableStorageOptions` that the host registered through a factory or a type, a
   connection-string or credential `AddUnifiedTableStorage` call registers a keyed `BlobServiceClient` even
   when those options use no blob offload. On Lamar the host's own unkeyed `BlobServiceClient` then
@@ -480,8 +487,11 @@ Lossless storage of large values, opt-in per property.
   `[JsonIgnore]`, `[JsonPropertyName]`, `[JsonInclude]` and a member's `[JsonConverter]` mean what they
   mean to System.Text.Json, and a member the JSON does not name keeps its initialiser. Writing is
   unchanged, so rows written by 0.8.x already carry these members and now read them. The change affects
-  reads of plain types too: a stored member whose JSON no longer deserializes to the member's current
-  type now fails the read, where 0.8.x ignored it. Up to 0.9.0 the converter matched Newtonsoft only in
+  reads of plain types too, and never makes a row unreadable that 0.8.x read: a member whose stored JSON
+  does not deserialize to its current type (an interface or abstract member without polymorphism
+  metadata, a type changed since the row was written, a null for a non-nullable value type) keeps the
+  value the constructor and its initialiser gave it, and the other members are still assigned
+  (`ConstructorMemberToleranceTests`, on both stores). Up to 0.9.0 the converter matched Newtonsoft only in
   how it bound constructor parameters (the 0.8.2 entry's "the historical behaviour"). Newtonsoft also
   assigned the remaining members, which the converter did not do until now.
 - Two stores of one entity type that share an `IMemoryCache` no longer serve each other's rows.
@@ -539,6 +549,14 @@ fake's old behaviour can see these changes:
   `RequestFailedException` had no `ErrorCode` and batch failures were not wrapped. (The large-value
   create batch's own up-front repeated-key check keeps an inner `RequestFailedException` 400 with no
   `ErrorCode`, as `TableStorage<T>` raises it.)
+- `InMemoryStorage<T>` returns a `DateTimeOffset` cell in UTC (offset zero), as the service does, whatever
+  offset it was written with; the instant is unchanged. On 0.8.3 the fake returned the written offset, so
+  `Offset`, `ToString()` and JSON output differed from Azure. A `DateTimeOffset` inside a JSON-stored value
+  keeps its offset on both stores. (`TableStorage<T>`'s read cache now does the same, see Fixed.)
+- A cell above the service's 64 KiB property limit (in practice a plain `byte[]`, which the serializer
+  sends uncompressed) is refused by `InMemoryStorage<T>` with `RequestFailedException` 400
+  `PropertyValueTooLarge`, wrapped in `TableTransactionFailedException` inside a batch, and nothing is
+  stored, as the service refuses it. On 0.8.3 the fake stored it.
 - Reads of a plain type on `InMemoryStorage<T>` (`OneAsync`, `ExistsAsync`, queries, streams, pages) skip
   rows that carry a `_SplitOf` cell for every `T`, and `CountAsync` counts them, as `TableStorage<T>`
   does. Before, the fake hid such rows only for large-value aware types and also left them out of the
@@ -821,8 +839,12 @@ fake's old behaviour can see these changes:
   reading the blob; the buffer grows with what the blob delivers (integrity checks unchanged).
 - A read-cache hit copies large values in process, without the split codec (no gzip, hash or chunking).
   Before, each hit of a multi-megabyte Gzip value compressed and decompressed it, which made a hit slower
-  than an uncached read (an 8M-char Gzip hit took 500-780 ms; it now takes under 1 ms). Entity cache
+  than an uncached read. A hit no longer runs the codec, so it is no slower than an uncached read. Entity cache
   entries still count as size 1 whatever their byte size.
+- A read that `TableStorage<T>`'s cache answers after a create, a replace, an upsert or a builder update
+  returns a `DateTimeOffset` property in UTC (offset zero), as a read of the table does. Before (in 0.8.3
+  too) the cached copy kept the offset the value was written with, so a cache hit and a cache miss of the
+  same row returned different `Offset`s. The columns written and the SDK calls are unchanged.
 - A whole-entity `UpdateAsync`/`UpsertAsync` that carries a protected `[TableValueSplit]` value stored as
   JSON (a list, a dictionary, an object stored as one value) unchanged from the read is no longer
   refused. Such values are compared by the JSON they store. A changed value is still refused without the
