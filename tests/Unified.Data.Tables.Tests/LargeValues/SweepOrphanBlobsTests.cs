@@ -368,16 +368,30 @@ public class SweepOrphanBlobsTests
         Assert.Empty(rig.Log);
     }
 
-    [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData("   ")]
-    public async Task Sweep_BlankPartition_Throws(string? partition)
+    [Fact]
+    public async Task Sweep_NullPartition_Throws()
     {
         using var rig = new Rig();
 
-        await Assert.ThrowsAsync<ArgumentNullException>(() => rig.Store.SweepOrphanBlobsAsync(partition!, TimeSpan.Zero, Ct));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => rig.Store.SweepOrphanBlobsAsync(null!, TimeSpan.Zero, Ct));
         Assert.Empty(rig.Log);
+    }
+
+    // A blank key is a partition like any other (BlankPartitionSweepTests): "   " normalizes to "".
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Sweep_BlankPartition_SweepsTheEmptyPartition(string partition)
+    {
+        using var rig = new Rig();
+        var orphan = Seed(rig.Inner, Name("SplitTextEntity", "", Rk, "Body", "aa"), TimeSpan.FromMinutes(10));
+        rig.Rows();
+
+        Assert.Equal(1, await rig.Store.SweepOrphanBlobsAsync(partition, TimeSpan.FromMinutes(5), Ct));
+
+        Assert.DoesNotContain(orphan, rig.Inner.Names);
+        Assert.Contains("PartitionKey eq ''", Assert.Single(rig.Filters), StringComparison.Ordinal);
+        rig.AssertNoRowWrites();
     }
 
     [Fact]
@@ -467,7 +481,7 @@ public class SweepOrphanBlobsTests
         var store = Memory();
 
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => store.SweepOrphanBlobsAsync(Pk, TimeSpan.FromTicks(-1), Ct));
-        await Assert.ThrowsAsync<ArgumentNullException>(() => store.SweepOrphanBlobsAsync(" ", TimeSpan.Zero, Ct));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => store.SweepOrphanBlobsAsync(null!, TimeSpan.Zero, Ct));
     }
 
     // ── an IStorage<T> that is not an IOrphanBlobSweeper ──────────────────

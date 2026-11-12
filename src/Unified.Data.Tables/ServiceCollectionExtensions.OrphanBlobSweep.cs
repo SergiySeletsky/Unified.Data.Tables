@@ -12,8 +12,10 @@ public static partial class ServiceCollectionExtensions
     /// type registered with <see cref="AddUnifiedOrphanBlobSweep{T}(IServiceCollection)"/>, one type after
     /// another, first after <see cref="OrphanBlobSweepOptions.InitialDelay"/> and then every
     /// <see cref="OrphanBlobSweepOptions.Interval"/>. A type that fails is logged and retried next round;
-    /// shutdown cancels the round in progress. When <see cref="UnifiedTableStorageOptions.BlobOffload"/> is
-    /// not configured the service logs that and does nothing. The first call's options win, as with
+    /// shutdown cancels the round in progress. Each type's store is the one its <see cref="IStorage{T}"/>
+    /// resolves to, whatever <see cref="UnifiedTableStorageOptions"/> are registered: a store built with
+    /// options (and a blob client) of its own is swept, and a store without blob offload is skipped (logged
+    /// once at Information). The first call's options win, as with
     /// <c>AddUnifiedTableStorage</c>. Every host instance that registers it sweeps; that is safe (each
     /// delete is conditional) but redundant, so a scaled-out app may register it in one instance only.
     /// </summary>

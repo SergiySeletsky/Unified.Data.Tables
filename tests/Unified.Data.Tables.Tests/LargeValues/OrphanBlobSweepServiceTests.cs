@@ -267,20 +267,78 @@ public class OrphanBlobSweepServiceTests
     // ── not configured ────────────────────────────────────────────────────
 
     [Fact]
-    public async Task NoBlobOffload_NeverSweeps_AndTheServiceEnds()
+    public async Task NoBlobOffload_TheStoreIsSkipped_AndLoggedOnce()
+    {
+        await using var rig = new Rig(s => s
+            .AddUnifiedOrphanBlobSweep(o => o.InitialDelay = TimeSpan.Zero)
+            .AddUnifiedOrphanBlobSweep<SplitTextEntity>(), offload: null);
+
+        await rig.StartAsync();
+        await rig.Steps.StepAsync();
+        await rig.Steps.StepAsync();
+        await rig.Steps.WaitingAsync();
+
+        var entries = rig.Logger.Snapshot();
+        Assert.Single(entries, e => e.Level == LogLevel.Information
+            && e.Message.Contains(nameof(SplitTextEntity), StringComparison.Ordinal)
+            && e.Message.Contains("no blob offload", StringComparison.Ordinal));
+        Assert.DoesNotContain(entries, e => e.Level >= LogLevel.Warning);
+        Assert.False(rig.Service.ExecuteTask!.IsCompleted);
+    }
+
+    // The hosted sweep follows the store it resolves, never the registered options: a store built with
+    // options (and a blob client) of its own is swept, and one without offload is skipped.
+    [Fact]
+    public async Task StoreWithItsOwnOffload_IsSwept_ThoughTheRegisteredOptionsHaveNone()
+    {
+        var own = new InMemoryStorage<SplitTextEntity>(null, new UnifiedTableStorageOptions { BlobOffload = Offload() });
+        await using var rig = new Rig(s => s
+            .AddSingleton<IStorage<SplitTextEntity>>(own)
+            .AddUnifiedOrphanBlobSweep(o => o.OlderThan = TimeSpan.FromMinutes(30))
+            .AddUnifiedOrphanBlobSweep<SplitTextEntity>(), offload: null);
+        var orphan = Orphan(own.Blobs, "SplitTextEntity", "p", "gone", TimeSpan.FromHours(2));
+
+        await rig.StartAsync();
+        await rig.Steps.StepAsync();
+        await rig.Steps.WaitingAsync();
+
+        Assert.DoesNotContain(orphan, own.Blobs.Names);
+        Assert.Contains(rig.Logger.Snapshot(), e => e.Level == LogLevel.Information && e.Message.Contains("deleted 1 ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task StoreWithoutOffload_IsSkipped_ThoughTheRegisteredOptionsHaveOne()
+    {
+        var own = new InMemoryStorage<SplitTextEntity>(null, new UnifiedTableStorageOptions());
+        await using var rig = new Rig(s => s
+            .AddSingleton<IStorage<SplitTextEntity>>(own)
+            .AddUnifiedOrphanBlobSweep<SplitTextEntity>(), Offload());
+
+        await rig.StartAsync();
+        await rig.Steps.StepAsync();
+        await rig.Steps.StepAsync();
+        await rig.Steps.WaitingAsync();
+
+        var entries = rig.Logger.Snapshot();
+        Assert.Single(entries, e => e.Level == LogLevel.Information
+            && e.Message.Contains(nameof(SplitTextEntity), StringComparison.Ordinal)
+            && e.Message.Contains("no blob offload", StringComparison.Ordinal));
+        Assert.DoesNotContain(entries, e => e.Level >= LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task OtherSweeper_IsCalled_WhateverTheRegisteredOptions()
     {
         var sweeper = Substitute.For<IStorage<PlainEntity>, IOrphanBlobSweeper>();
         await using var rig = new Rig(s => s
             .AddSingleton(sweeper)
-            .AddUnifiedOrphanBlobSweep(o => o.InitialDelay = TimeSpan.Zero)
             .AddUnifiedOrphanBlobSweep<PlainEntity>(), offload: null);
 
         await rig.StartAsync();
-        await rig.Service.ExecuteTask!.WaitAsync(Wait, Ct);
+        await rig.Steps.StepAsync();
+        await rig.Steps.WaitingAsync();
 
-        Assert.Empty(rig.Steps.Requested);
-        await ((IOrphanBlobSweeper)sweeper).DidNotReceiveWithAnyArgs().SweepOrphanBlobsAsync(default(TimeSpan), default);
-        Assert.Contains(rig.Logger.Snapshot(), e => e.Level == LogLevel.Information && e.Message.Contains("BlobOffload", StringComparison.Ordinal));
+        await ((IOrphanBlobSweeper)sweeper).Received(1).SweepOrphanBlobsAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]

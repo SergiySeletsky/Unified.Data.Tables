@@ -48,6 +48,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     private readonly IdNormalization idNormalization;
     private readonly bool implicitLastWriterWins;
     private readonly LargeValueTable large;
+
+    // Whether the store has a blob container for offloaded values (the hosted sweep skips it otherwise).
+    private readonly bool hasBlobOffload;
     private long versionCounter;
 
     /// <summary>Creates a store without protected-property enforcement.</summary>
@@ -81,8 +84,9 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         // Blob offload gets this store's own in-memory container (no BlobServiceClient), named under the
         // table name TableStorage<T> would resolve, so blob names match the real store's.
         var tableName = opts.TableNameResolver?.Invoke(typeof(T));
+        hasBlobOffload = opts.BlobOffload is not null;
         large = new LargeValueTable(string.IsNullOrWhiteSpace(tableName) ? typeof(T).Name : tableName,
-            opts.BlobOffload, opts.BlobOffload is null ? null : Blobs, typeof(T));
+            opts.BlobOffload, hasBlobOffload ? Blobs : null, typeof(T));
     }
 
     /// <summary>The offloaded-value blobs of this store (for tests); empty when blob offload is not configured.</summary>

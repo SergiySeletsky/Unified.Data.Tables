@@ -21,12 +21,20 @@ public interface IOrphanBlobSweeper
     /// Deletes the blobs offloaded under <c>{table}/{partitionKey}/</c> that no row of the partition
     /// references and whose Last-Modified is older than <paramref name="olderThan"/>.
     /// </summary>
-    /// <param name="partitionKey">The partition whose blobs to sweep (normalized like <c>DeletePartitionAsync</c>).</param>
+    /// <remarks>
+    /// An orphan whose delete fails does not stop the others. Once every orphan was tried, the failures
+    /// are thrown together as an <see cref="AggregateException"/> (one inner exception per blob) whose
+    /// message says how many blobs were deleted; the next sweep retries the rest. An empty or whitespace
+    /// key is a partition like any other (a write of <c>"|r"</c>, or of <c>"   |r"</c> under
+    /// <c>IdNormalization.AsWritten</c>, stores one) and is normalized as ids are on write.
+    /// </remarks>
+    /// <param name="partitionKey">The partition whose blobs to sweep (normalized as ids are on write).</param>
     /// <param name="olderThan">Only blobs last modified longer ago than this are deleted; must not be negative.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The number of blobs deleted; 0 when blob offload is not configured.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null, empty or whitespace.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="olderThan"/> is negative.</exception>
+    /// <exception cref="AggregateException">One or more orphans could not be deleted.</exception>
     Task<int> SweepOrphanBlobsAsync(string partitionKey, TimeSpan olderThan, CancellationToken ct = default);
 
     /// <summary>
@@ -36,9 +44,11 @@ public interface IOrphanBlobSweeper
     /// read from the service clock before the listing, applies to all of them.
     /// </summary>
     /// <remarks>
-    /// A partition that fails does not stop the others. Once every partition was tried, the failures are
-    /// thrown together as an <see cref="AggregateException"/> (one inner exception per failed partition)
-    /// whose message says how many blobs were deleted; blobs deleted before that stay deleted, and the
+    /// A partition that fails does not stop the others, nor does an orphan that cannot be deleted stop the
+    /// rest of its partition. Once every partition was tried, the failures are thrown together as an
+    /// <see cref="AggregateException"/> (one inner exception per failed partition; a partition whose
+    /// listing succeeded but some deletes failed contributes an <see cref="AggregateException"/> of those)
+    /// whose message says how many blobs were deleted, in every partition; blobs deleted before that stay deleted, and the
     /// next sweep retries the rest. Cancellation ends the sweep with an <see cref="OperationCanceledException"/>.
     /// </remarks>
     /// <param name="olderThan">Only blobs last modified longer ago than this are deleted; must not be negative.</param>
@@ -94,4 +104,14 @@ public static class OrphanBlobSweeperExtensions
         return storage as IOrphanBlobSweeper
             ?? throw new NotSupportedException($"{storage.GetType().FullName} does not implement {nameof(IOrphanBlobSweeper)}.");
     }
+}
+
+/// <summary>
+/// Whether a store that implements <see cref="IOrphanBlobSweeper"/> offloads to blob storage at all, so
+/// the hosted sweep can skip one that has nothing to sweep (internal: the library's own stores only).
+/// </summary>
+internal interface IBlobOffloadState
+{
+    /// <summary>True when the store offloads values to (and so may leave orphans in) a blob container.</summary>
+    bool HasBlobOffload { get; }
 }

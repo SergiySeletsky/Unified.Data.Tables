@@ -19,7 +19,7 @@ namespace Unified.Data.Tables;
 // does not know continuation rows, a partition delete stopped halfway, or a delete raced a write). A
 // write replaces its own rows and deletes the ones it no longer needs; any other row at a continuation
 // key is foreign and is never overwritten. Leftovers are looked for only when one is in the way.
-public partial class TableStorage<T>
+public partial class TableStorage<T> : IBlobOffloadState
 {
     /// <summary>True when <typeparamref name="T"/> has a member that may be stored as split cells.</summary>
     private static readonly bool LargeValueAware = TypeMetadataCache.IsLargeValueAware(typeof(T));
@@ -415,6 +415,9 @@ public partial class TableStorage<T>
         return large.SweepOrphanBlobsAsync(partition, olderThan, typeof(T),
             (select, c) => PartitionRowsAsync(partition, select, c), ct);
     }
+
+    // Only a type that can carry large values gets a blob container (see OffloadStore).
+    bool IBlobOffloadState.HasBlobOffload => large.HasBlobOffload;
 
     /// <inheritdoc />
     public Task<int> SweepOrphanBlobsAsync(TimeSpan olderThan, CancellationToken ct = default) =>

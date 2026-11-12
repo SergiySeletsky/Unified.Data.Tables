@@ -26,7 +26,9 @@ internal sealed class OrphanBlobSweepTarget<T> : IOrphanBlobSweepTarget where T 
 /// Runs the table-wide <see cref="IOrphanBlobSweeper.SweepOrphanBlobsAsync(TimeSpan, CancellationToken)"/> of
 /// every registered entity type: after <see cref="OrphanBlobSweepOptions.InitialDelay"/>, then every
 /// <see cref="OrphanBlobSweepOptions.Interval"/> after a round ends. One type's failure is logged and does
-/// not stop the others or the next round. Nothing runs when blob offload is not configured.
+/// not stop the others or the next round. Each round follows the store the type's <see cref="IStorage{T}"/>
+/// resolves to, whatever options are registered: a store built with options (and a blob client) of its
+/// own is swept, and one of the library's stores without blob offload is skipped (logged once).
 /// </summary>
 internal sealed class OrphanBlobSweepService : BackgroundService
 {
@@ -34,6 +36,9 @@ internal sealed class OrphanBlobSweepService : BackgroundService
     private readonly OrphanBlobSweepOptions options;
     private readonly IOrphanBlobSweepTarget[] targets;
     private readonly ILogger logger;
+
+    // The types already reported as skipped for having no blob offload (each is logged once at Information).
+    private readonly HashSet<Type> reportedWithoutOffload = [];
 
     public OrphanBlobSweepService(
         IServiceProvider services,
@@ -54,11 +59,6 @@ internal sealed class OrphanBlobSweepService : BackgroundService
     {
         // Never run a round inside the host's StartAsync, whatever the BackgroundService version does.
         await Task.Yield();
-        if (services.GetService<UnifiedTableStorageOptions>()?.BlobOffload is null)
-        {
-            logger.LogInformation("Orphan blob sweep is not running: UnifiedTableStorageOptions.BlobOffload is not configured.");
-            return;
-        }
         if (targets.Length == 0)
         {
             logger.LogInformation("Orphan blob sweep is not running: no entity type is registered with AddUnifiedOrphanBlobSweep<T>().");
@@ -98,6 +98,15 @@ internal sealed class OrphanBlobSweepService : BackgroundService
                 {
                     logger.LogWarning("Orphan blob sweep skips {EntityType}: its IStorage<T> does not implement {Capability}.",
                         target.EntityType.Name, nameof(IOrphanBlobSweeper));
+                    return true;
+                }
+                if (sweeper is IBlobOffloadState { HasBlobOffload: false })
+                {
+                    if (reportedWithoutOffload.Add(target.EntityType))
+                        logger.LogInformation("Orphan blob sweep skips {EntityType}: its store has no blob offload (BlobOffload is not set in the options it was built with, or the type has no large-value member).",
+                            target.EntityType.Name);
+                    else
+                        logger.LogDebug("Orphan blob sweep skips {EntityType}: its store has no blob offload.", target.EntityType.Name);
                     return true;
                 }
                 var deleted = await sweeper.SweepOrphanBlobsAsync(options.OlderThan, stoppingToken).ConfigureAwait(false);

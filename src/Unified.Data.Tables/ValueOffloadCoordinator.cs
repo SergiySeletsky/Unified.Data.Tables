@@ -707,7 +707,12 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// whole when the projection is null. Called at most once.
     /// </param>
     /// <param name="ct">Cancels the listing, the read and the deletes.</param>
-    internal async Task<int> SweepAsync(
+    /// <returns>
+    /// How many blobs were deleted, and the error of each orphan whose delete failed (null when none
+    /// did). One orphan that cannot be deleted does not stop the others; a listing or read failure, and
+    /// the caller's cancellation, are thrown.
+    /// </returns>
+    internal async Task<(int Deleted, List<Exception>? Failures)> SweepAsync(
         string pk, DateTimeOffset cutoff, IReadOnlyList<string> declaredColumns,
         Func<IReadOnlyList<string>?, CancellationToken, IAsyncEnumerable<TableEntity>> partitionRows, CancellationToken ct)
     {
@@ -715,16 +720,26 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         ArgumentNullException.ThrowIfNull(declaredColumns);
         ArgumentNullException.ThrowIfNull(partitionRows);
         if (blobs is null)
-            return 0;
+            return (0, null);
 
         // The orphans, each deleted only if it was not modified since it was listed.
         var deleted = 0;
+        List<Exception>? failures = null;
         foreach (var (name, lastModified) in await OrphansAsync(pk, cutoff, includeCutoff: false, declaredColumns, partitionRows, ct))
         {
-            if (await blobs.DeleteIfUnmodifiedAsync(name, lastModified, ct))
-                deleted++;
+            try
+            {
+                if (await blobs.DeleteIfUnmodifiedAsync(name, lastModified, ct))
+                    deleted++;
+            }
+#pragma warning disable CA1031 // one orphan that cannot be deleted must not keep the others; every failure is returned
+            catch (Exception ex) when (!(ex is OperationCanceledException && ct.IsCancellationRequested))
+#pragma warning restore CA1031
+            {
+                (failures ??= []).Add(ex);
+            }
         }
-        return deleted;
+        return (deleted, failures);
     }
 
     /// <summary>
