@@ -653,6 +653,73 @@ public class MarkedValueBelowAMemberOnlyTheRuntimeClassStoresTests
         return thrown;
     }
 
+    // ── Rule C: the builder-update wording of a TableBlobContent on a plain type ───────────────────────────
+
+    public sealed class ObjectFileDoc
+    {
+        public object? File { get; set; }
+    }
+
+    public sealed class ObjectFileHolder : Entity
+    {
+        public ObjectFileDoc Doc { get; set; } = new();
+    }
+
+    // The remedy the refusal names, followed.
+    public sealed class DeclaredFileDoc
+    {
+        public TableBlobContent? File { get; set; }
+    }
+
+    public sealed class DeclaredFileHolder : Entity
+    {
+        public DeclaredFileDoc Doc { get; set; } = new();
+    }
+
+    public interface IFileShape
+    {
+    }
+
+    public sealed class FileCircle : IFileShape
+    {
+        public TableBlobContent? File { get; set; }
+    }
+
+    public sealed class FileDrawing : Entity
+    {
+        public IFileShape Shape { get; set; } = new FileCircle();
+    }
+
+    // A file in a member the declared types give another type (object): the declaration named is that member's, not the
+    // column path ("Declare ObjectFileHolder.Doc_File as TableBlobContent"), and following it stores the file. A file in a
+    // member only a runtime subtype declares (FileCircle.File IS a TableBlobContent): no declaration is named, and the
+    // partial update is refused as every partial update of a large value is.
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public async Task ABuilderUpdateOfATableBlobContent_OnAPlainType_NamesTheDeclarationOfItsMember_OrNone(string kind)
+    {
+        await using var stores = await LargeValueStores.OpenAsync(kind);
+        Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
+        var id = stores.Id("o");
+        var plain = stores.Store<ObjectFileHolder>(Table);
+        await plain.CreateAsync(new ObjectFileHolder { Id = id }, Ct);
+        var inObject = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            plain.UpdateAsync(id, b => b.SetProperty(x => x.Doc.File, (object)TableBlobContent.FromBytes([1], "application/octet-stream")), Ct));
+        Assert.Contains($"Declare {nameof(ObjectFileDoc)}.File as TableBlobContent, so that {nameof(ObjectFileHolder)} is large-value aware", inObject.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Doc_File as", inObject.Message, StringComparison.Ordinal);
+
+        var declared = new DeclaredFileHolder { Id = stores.Id("d"), Doc = { File = TableBlobContent.FromBytes([1, 2, 3], "application/octet-stream") } };
+        await stores.Store<DeclaredFileHolder>(Table).CreateAsync(declared, Ct);
+        await using (var back = await (await stores.Store<DeclaredFileHolder>(Table).OneAsync(declared.Id, Ct))!.Doc.File!.OpenReadAsync(Ct))
+            Assert.Equal([1, 2, 3], await OffloadTestSupport.ReadAllAsync(back));
+
+        var drawing = stores.Store<FileDrawing>(Table);
+        await drawing.CreateAsync(new FileDrawing { Id = stores.Id("s") }, Ct);
+        var inSubtype = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            drawing.UpdateAsync(stores.Id("s"), b => b.Updates["Shape_File"] = TableBlobContent.FromBytes([1], "application/octet-stream"), Ct));
+        Assert.Equal(TableEntitySerializer.PartialUpdateRefusal("Shape_File"), inSubtype.Message);
+    }
+
     // ── Controls: the remedies that work ──────────────────────────────────────────────────────────────────
 
     // Declaring the property as the implementation makes the type aware: the value is stored and read back whole and
