@@ -8,7 +8,8 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// refused with the R11 <see cref="InvalidOperationException"/> before anything is sent or merged, exactly as through a
 /// property declared <c>S</c>: under the serializer's column name (<c>Extra_Notes</c>, <c>Doc_Extra_Notes</c>) and under
 /// the lambda's (<c>Extra_Value_Notes</c>), with the property empty or initialised, for plain and aware entity types, on
-/// both stores, under every policy and at every size. The misuse decision of the builder-update walk asked
+/// both stores, under every policy and at every size; the message of a path through <c>S?</c> also names declaring that
+/// property as <c>S</c> (SERIALIZER-4 of the review of fix wave 10). The misuse decision of the builder-update walk asked
 /// <c>Nullable&lt;S&gt;</c>, which implements nothing, so <c>Updates["Extra_Notes"]</c> of a plain type was accepted and
 /// stored trimmed (SERIALIZER-1 of the review of fix wave 9).
 /// </summary>
@@ -99,11 +100,23 @@ public class BuilderUpdateMisuseBelowANullableStructTests
         return thrown.Message;
     }
 
+    // The R11 message for a path through a property declared MisStruct?: the struct's, and declare that property as MisStruct
+    // (RV10 SERIALIZER-4).
+    private static string Expected(Type type)
+    {
+        var holder = type == typeof(PlainStruct) ? null
+            : type == typeof(PlainNullableNested) ? "NullableBelow.Extra"
+            : type.Name + ".Extra";
+        var structMisuse = StructMisuse();
+        Assert.Contains(" remove it from IMarkedNotes. Where ", structMisuse, StringComparison.Ordinal);
+        return holder is null ? structMisuse
+            : structMisuse.Replace(" remove it from IMarkedNotes. Where ", $" remove it from IMarkedNotes, and declare {holder} as MisStruct. Where ", StringComparison.Ordinal);
+    }
+
     // RV9 SERIALIZER-1, P2a: where the two stores meet (both call this before anything is sent or merged).
     [Fact]
     public void FlattenPropertyForUpdate_BelowANullableStruct_ReportsTheMisuseAsForTheStruct()
     {
-        var expected = StructMisuse();
         var lines = new List<string>();
         foreach (var policy in Policies)
         {
@@ -119,7 +132,7 @@ public class BuilderUpdateMisuseBelowANullableStructTests
                         var cells = TableEntitySerializer.FlattenProperty(type, column, value);
                         lines.Add($"{type.Name}.{column}, {policy}, {size}: accepted; cells [{string.Join(", ", cells.Select(kv => $"{kv.Key}({(kv.Value as string)?.Length})"))}]");
                     }
-                    catch (InvalidOperationException e) when (e.Message == expected)
+                    catch (InvalidOperationException e) when (e.Message == Expected(type))
                     {
                     }
                     catch (Exception e)
@@ -166,7 +179,7 @@ public class BuilderUpdateMisuseBelowANullableStructTests
 
     private static async Task RefusedAsync<T>(string kind, string column) where T : class, IEntity, new()
     {
-        var expected = StructMisuse();
+        var expected = Expected(typeof(T));
         await using var stores = await LargeValueStores.OpenAsync(kind);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
         // The row is written by another type: the whole-entity write of an initialised misused struct is itself refused.
@@ -210,7 +223,7 @@ public class BuilderUpdateMisuseBelowANullableStructTests
     [MemberData(nameof(Stores))]
     public async Task EmptyNullableStruct_CreatedThenUpdated_IsRefusedUnderEitherSpelling(string kind)
     {
-        var expected = StructMisuse();
+        var expected = Expected(typeof(PlainNullableEmpty));
         await using var stores = await LargeValueStores.OpenAsync(kind);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
         var store = stores.Store<PlainNullableEmpty>(Table);

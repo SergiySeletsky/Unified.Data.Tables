@@ -2017,7 +2017,7 @@ internal static class TypeMetadataCache
     private static readonly ConcurrentDictionary<(Type Type, string Column), PropertyInfo?> _readTargets = new();
     private static readonly ConcurrentDictionary<(Type Type, string Column), bool> _largeOnRead = new();
     private static readonly ConcurrentDictionary<Type, (Type Contract, PropertyInfo Marked)?> _interfaceMemberSplits = new();
-    private static readonly ConcurrentDictionary<(Type Type, string Column), ((Type Owner, Type Contract, PropertyInfo Marked)? Misuse, bool Large)> _interfaceMemberSplitsOnPath = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Column), ((Type Owner, Type Contract, PropertyInfo Marked, PropertyInfo? NullableHolder)? Misuse, bool Large)> _interfaceMemberSplitsOnPath = new();
     private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _declaredProperties = new();
     private static readonly ConditionalWeakTable<Exception, Exception> _misuses = new();
 
@@ -2882,8 +2882,8 @@ internal static class TypeMetadataCache
     /// is built); what the walk finds is remembered per type and column path (up to
     /// <see cref="MaxRememberedReadTargets"/>). A property declared as a nullable struct <c>S?</c> is followed into the
     /// members of <c>S</c> (as the serializer names them, and through <c>Value</c>), and <c>S</c> is its declared type for
-    /// the misuse, as for a property declared <c>S</c>; and a column that is a legacy name
-    /// (<see cref="ColumnAliasAttribute"/>) of a property of <paramref name="root"/>, in any form a read maps onto that
+    /// the misuse, as for a property declared <c>S</c> (its message also names declaring that property as <c>S</c>); and a
+    /// column that is a legacy name (<see cref="ColumnAliasAttribute"/>) of a property of <paramref name="root"/>, in any form a read maps onto that
     /// property (the whole column, its <c>__Json</c> and <c>__GZip</c> cells, its split cells and blob reference), is walked
     /// as that property too. A member only a runtime subtype declares is not seen.
     /// </summary>
@@ -2898,20 +2898,21 @@ internal static class TypeMetadataCache
                 _interfaceMemberSplitsOnPath.TryAdd((root, columnPath), found);
         }
         if (found.Misuse is { } misuse)
-            throw new InvalidOperationException(InterfaceMemberSplitMisuse(misuse.Owner, misuse.Contract, misuse.Marked));
+            throw new InvalidOperationException(InterfaceMemberSplitMisuse(misuse.Owner, misuse.Contract, misuse.Marked, misuse.NullableHolder));
         if (found.Large)
             throw new NotSupportedException(TableEntitySerializer.PartialUpdateRefusal(columnPath));
     }
 
     // The first declared type along the path (root first) that is or implements an interface with a member
-    // marked [TableValueSplit], with that member (null when there is none); and, when there is none, whether a
-    // member along the path or at its end is a large-value member. Every member of each segment's name is followed
-    // (DeclaredPath, as the R11 walk), so the outcome does not depend on the order in which an interface lists the
-    // interfaces it inherits; a type the check cannot read ends only its own branch.
-    private static ((Type Owner, Type Contract, PropertyInfo Marked)? Misuse, bool Large) InterfaceMemberSplitOnPath(Type root, string columnPath)
+    // marked [TableValueSplit], with that member and the property declared S? that holds it when the type is that struct S
+    // (null when there is none); and, when there is none, whether a member along the path or at its end is a large-value
+    // member. Every member of each segment's name is followed (DeclaredPath, as the R11 walk), so the outcome does not
+    // depend on the order in which an interface lists the interfaces it inherits; a type the check cannot read ends only
+    // its own branch.
+    private static ((Type Owner, Type Contract, PropertyInfo Marked, PropertyInfo? NullableHolder)? Misuse, bool Large) InterfaceMemberSplitOnPath(Type root, string columnPath)
     {
         if (InterfaceMemberSplit(root) is { } atRoot)
-            return ((root, atRoot.Contract, atRoot.Marked), false);
+            return ((root, atRoot.Contract, atRoot.Marked, null), false);
         var steps = DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: true).ToList();
         // A legacy name of a property of the root, in any form a read maps onto that property (the whole column, its
         // __Json and __GZip cells, its split cells and its blob reference).
@@ -2927,7 +2928,7 @@ internal static class TypeMetadataCache
                 // A property declared S? holds an S: S is the implementing type, as for a property declared S.
                 var declared = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
                 if (InterfaceMemberSplit(declared) is { } found)
-                    return ((declared, found.Contract, found.Marked), false);
+                    return ((declared, found.Contract, found.Marked, declared == property.PropertyType ? null : property), false);
             }
         }
         // A class-level attribute does not cover a nullable struct the serializer flattens into columns (its value is an
@@ -3012,8 +3013,10 @@ internal static class TypeMetadataCache
             return null;
         });
 
-    // The misuse of ruling R11 for t, a class that implements contract, or an interface that is or inherits it.
-    private static string InterfaceMemberSplitMisuse(Type t, Type contract, PropertyInfo marked) => t.IsInterface
+    // The misuse of ruling R11 for t, a class or struct that implements contract, or an interface that is or inherits it.
+    // A struct takes no class-level attribute (CS0592); nullableHolder, a property declared t? that holds the struct on a
+    // builder update's path, must be declared t for a marked member of t to be stored (a nullable struct's is refused).
+    private static string InterfaceMemberSplitMisuse(Type t, Type contract, PropertyInfo marked, PropertyInfo? nullableHolder = null) => t.IsInterface
         ? $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface" +
           (t == contract ? "" : $" that {t.Name} inherits") + ": .NET does not pass the attributes of an interface member to the " +
           "implementing class, so the attribute cannot be honoured (the value would be stored as an ordinary cell, and could be " +
@@ -3023,8 +3026,10 @@ internal static class TypeMetadataCache
         : $"[TableValueSplit] on {contract.Name}.{marked.Name}, a member declared on an interface that {t.Name} implements: " +
           ".NET does not pass the attributes of an interface member to the implementing class, so the attribute cannot be " +
           $"honoured (the value would be stored as an ordinary cell, and could be trimmed). Put [TableValueSplit] on " +
-          $"{t.Name}.{marked.Name} (the property of the implementing class), or on the class {t.Name}, and remove it from " +
-          $"{contract.Name}. Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
+          $"{t.Name}.{marked.Name} (the property of the implementing class)" + (t.IsValueType ? " and" : $", or on the class {t.Name}, and") +
+          $" remove it from {contract.Name}" +
+          (nullableHolder is null ? "" : $", and declare {nullableHolder.DeclaringType?.Name}.{nullableHolder.Name} as {t.Name}") +
+          $". Where an entity holds a {t.Name} in a property declared as {contract.Name} (or as another type), " +
           "mark the entity class with [TableValueSplit] as well, so that the entity is large-value aware.";
 
     // The class-level [TableValueSplit] that applies to t: the nearest one, on t itself or on a base
