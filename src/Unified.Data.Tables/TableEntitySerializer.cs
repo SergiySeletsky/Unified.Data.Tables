@@ -1286,6 +1286,9 @@ internal sealed class TableEntityValue
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };
 
+    /// <summary>The JSON text a value stored as JSON is written as (what a protected-property check compares).</summary>
+    internal static string StoredJson(object value) => JsonSerializer.Serialize(value, JsonOptions);
+
     private static readonly Dictionary<Type, Func<object, object?>> Primitives = new()
     {
         { typeof(string), v => (string)v },

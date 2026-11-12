@@ -100,7 +100,9 @@ public static class ProtectedLargeValues
     /// Storage-provider SPI, not for application code. True when the value <paramref name="written"/> to a
     /// large-value property, or to a <c>byte[]</c> property, leaves the <paramref name="stored"/> one as it is: the same instance; two
     /// <see cref="TableBlobContent"/> of the same blob (the same SHA-256, length and content type, both known);
-    /// two <c>byte[]</c> with the same bytes; otherwise <see cref="object.Equals(object, object)"/>. A content
+    /// two <c>byte[]</c> with the same bytes; two values a large-value property stores as JSON (a list, a dictionary,
+    /// an object stored as one value) of one runtime type whose JSON text is the same (a read never hands back the
+    /// stored instance); otherwise <see cref="object.Equals(object, object)"/>. A content
     /// whose hash is not known yet (a stream that was never prepared) counts as changed: nothing is downloaded
     /// and no caller's stream is read to compare.
     /// </summary>
@@ -119,8 +121,29 @@ public static class ProtectedLargeValues
                 && string.Equals(a.Sha256, b.Sha256, StringComparison.OrdinalIgnoreCase)
                 && string.Equals(a.ContentType, b.ContentType, StringComparison.Ordinal),
             (byte[] a, byte[] b) => a.AsSpan().SequenceEqual(b),
-            _ => Equals(stored, written),
+            _ => Equals(stored, written) || SameStoredJson(stored, written),
         };
+    }
+
+    // Two values of one runtime type that the serializer stores as JSON, compared by the JSON it would store.
+    // A value of a type the serializer does not store as JSON (a scalar, a string, a byte[], a content, an
+    // object it flattens into columns) is never one, and nor is a value whose JSON cannot be written.
+    private static bool SameStoredJson(object? stored, object? written)
+    {
+        if (stored is null || written is null || stored.GetType() != written.GetType()
+            || stored is string or byte[] or TableBlobContent || stored.GetType().IsEnum
+            || TableEntityValue.IsPrimitive(stored.GetType()) || TableEntityValue.CanSerializeWithoutJson(stored))
+            return false;
+#pragma warning disable CA1031 // a value whose JSON cannot be written counts as changed
+        try
+        {
+            return string.Equals(TableEntityValue.StoredJson(stored), TableEntityValue.StoredJson(written), StringComparison.Ordinal);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+#pragma warning restore CA1031
     }
 
     /// <summary>
