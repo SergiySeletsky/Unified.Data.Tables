@@ -144,8 +144,10 @@ All overloads register `IMemoryCache`, the configured options, and the open-gene
 Within one process the cache follows the writes made through it: once a write or delete this process
 made has returned, the cache does not answer with an older version, except for the moment described
 below while an earlier, overlapping write of the same entity is still running. This holds for every
-entity type, across all stores of one entity type that share an `IMemoryCache` (the DI registration
-shares one), and for the cached `QueryAsync(partition)` lists:
+entity type, across all stores of one entity type and table that share an `IMemoryCache` (the DI
+registration shares one), and for the cached `QueryAsync(partition)` lists. Entries are keyed by entity
+type and table (account endpoint plus table name). Stores of different tables can safely share one
+`IMemoryCache`, and stores of the same table share entries:
 
 - a read that is in flight while a write or delete of the same entity completes may still return the
   version it fetched, but it does not leave that version in the cache;
@@ -159,7 +161,9 @@ shares one), and for the cached `QueryAsync(partition)` lists:
   returned;
 - when a create, update, upsert, builder update or delete throws (a timeout or a cancelled token
   included), the store cannot know whether the row was written, so it drops the entity's entry and its
-  partition's cached lists. If the cache itself throws while it does (a disposed `MemoryCache` during host
+  partition's cached lists. A duplicate create (409, `DuplicateKeyException`) is one of them, so the next
+  read after it costs one point read: a 409 can be the SDK's retry meeting this call's own committed
+  insert. If the cache itself throws while it does (a disposed `MemoryCache` during host
   shutdown, say), that failure is logged as a warning, and the exception the call throws is still the one
   the storage call produced, or the library's translation of it (`DuplicateKeyException`,
   `ConcurrencyConflictException`). A call refused by its own checks before anything is sent (an argument,
@@ -271,11 +275,11 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `MutateOrCreateAsync(id, create, mutate)` | Extension: insert-or-mutate CAS — the delta applies uniformly on first insert and on updates. |
 | `TryMutateAsync(id, e => …)` | Extension: outcome-returning CAS — `Updated` / `NotFound` / `Conflicted`, nothing thrown for expected branches. |
 | `TryTransitionAsync(id, when, apply)` | Extension: exactly-once transition as a result — the race-loser gets `PreconditionFailed` with the winner's row. |
-| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction, atomic per transaction (`DuplicateKeyException` on an existing or repeated key). Types with large values too: an entity's continuation rows ride in its transaction. |
-| `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking; returns the number of entities passed (a row named twice counts twice and is written once). A type with large values reads each row first and replaces it conditionally; `ConcurrencyConflictException` after five lost races. |
+| `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction, atomic per transaction (`DuplicateKeyException` on an existing or repeated key). Types with large values too: an entity's continuation rows ride in its transaction. A failed transaction applies nothing; the partitions and transactions before it stay committed, on `InMemoryStorage<T>` as on Azure. |
+| `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking; returns the number of entities passed. A plain type sends the rows as they are: a key named twice in one transaction fails it with the service's 400 `InvalidDuplicateRow` (a `TableTransactionFailedException`), and transactions already sent stay committed. A type with large values writes the last occurrence of a repeated key (it counts twice and is written once), reads each row first and replaces it conditionally; `ConcurrencyConflictException` after five lost races. |
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
 | `DeleteAsync(id)` | Delete one row (idempotent). For a type with large values it reads the row first and deletes it, with its continuation rows and blobs, on condition of the version read; `ConcurrencyConflictException` after five lost races. |
-| `DeletePartitionAsync(partition)` | Batch-delete a whole partition in transactions of up to 100 rows; returns the number of entities deleted (continuation rows are not counted). Atomic per transaction only: call it again to finish one that failed. |
+| `DeletePartitionAsync(partition)` | Batch-delete a whole partition in transactions of up to 100 rows; returns the number of entities deleted (continuation rows are not counted). Atomic per transaction only: call it again to finish one that failed. A write that races the delete leaves its entity gone, never a continuation row without its main row. |
 | `SweepOrphanBlobsAsync(partition, olderThan)` | Extension (`IOrphanBlobSweeper`): delete offloaded blobs of the partition that no row references and that are older than `olderThan`; returns the count. See [Large values](#large-values-split-and-blob-offload). |
 | `SweepOrphanBlobsAsync(olderThan)` | Extension (`IOrphanBlobSweeper`): the same for every partition of the table. |
 
@@ -446,6 +450,22 @@ compare-and-swap loop — it re-reads and re-applies on conflict, so no incremen
 ```csharp
 await storage.MutateAsync(id, e => e.OccurrenceCount++);   // read → mutate → Strict write, ≤3 attempts with jittered backoff
 ```
+
+> **A lost response can apply a mutation twice.** `MutateAsync`, `TryMutateAsync` and
+> `MutateOrCreateAsync` can apply a mutation twice when the service applied the strict update but its
+> response was lost (a timeout or a dropped connection). The SDK retries the request and gets 412, and
+> the mutation is applied again to the re-read row. This is unchanged since 0.8.3. Make such mutations
+> idempotent, or set `TableClientOptions.Retry.MaxRetries = 0` so that the lost response surfaces as an
+> error. For example, record an operation id on the entity and skip it if already present:
+>
+> ```csharp
+> await storage.MutateAsync(id, e =>
+> {
+>     if (e.AppliedOps.Contains(opId)) return;   // already applied by an earlier attempt
+>     e.AppliedOps.Add(opId);
+>     e.OccurrenceCount++;
+> });
+> ```
 
 ### Outcome verbs — expected situations as return values
 
@@ -739,10 +759,20 @@ only when the entity's constructor puts an instance of the implementing class in
 empty on a new entity is still not seen. Declare the property with the implementing class, or mark the
 entity class and initialise the property with such an instance, and fix the attribute as the message says.
 
+`[TableValueSplit]` on a member has no effect when the object that owns the member is itself stored as
+one JSON cell. That happens for an element of a collection, a struct that declares no public
+parameterless constructor of its own, a constructor-only record or class, or a runtime subclass with no
+public parameterless constructor held in an opted-in entity. The whole object is one JSON value, so it is too large for a cell under `OversizedCellPolicy.Throw`
+(`OversizedCellException`) and trimmed as a whole under either Trim policy. Mark the property that holds
+the object instead.
+
 On a class the attribute covers every `string`, `byte[]` and JSON-stored property of the class, whether
 the class declares the property or inherits it, except the entity `Id`, which stays an ordinary key column
-that can be filtered. It covers a value stored as one value only: a property it covers by its declared
-type that holds an object stored as columns (a subclass with a public parameterless constructor) is not
+that can be filtered. It does not cover a scalar the serializer stores as JSON only because Azure Tables
+has no native cell for it (`float`, `short`, `ushort`, `sbyte`, `char`, `DateOnly`, `TimeOnly`, `Half`,
+`Int128`, `UInt128`, nullable or not). Such a value is a few characters, so it is stored, updated with a
+builder and refused by LINQ exactly as on a plain type. It covers a value stored as one value only: a
+property it covers by its declared type that holds an object stored as columns (a subclass with a public parameterless constructor) is not
 covered, and that object's members are stored as its own type declares them, as for a property declared as
 an interface or an abstract class. That is how an entity opted in at class level stores the marked members
 of a runtime subtype held in a property declared as a record or another base class. A class-level
@@ -1007,7 +1037,10 @@ offload is not configured, instead of failing with HTTP 413.
 gzips first and stores binary cells (a blob carries `Content-Encoding: gzip`), which suits compressible
 text. A string that is not well-formed UTF-16 (an unpaired surrogate) cannot survive UTF-8, so it ignores
 the requested encoding and is stored as `utf16le`, code unit for code unit. The SHA-256 is over the stored
-bytes; a split value and the same value offloaded have the same hash.
+bytes; a split value and the same value offloaded have the same hash. A value stored as JSON (a collection
+or an object stored as one JSON cell) cannot carry an unpaired surrogate, because JSON writes U+FFFD in its
+place. A `[TableValueSplit]` property holding one is refused with `NotSupportedException` naming the
+column. Store such text in a marked `string` or `byte[]` member instead.
 
 ### Registering blob offload
 
@@ -1221,7 +1254,8 @@ A write refused because a read could not map a file's column back to a property 
 below an object whose runtime type a read does not recreate) may have read the file's source first; a
 content created from a non-seekable stream must then be created again from its source.
 
-Once an attempt has uploaded the content's blob (the row write then failed, say), the content streams
+Once an attempt has uploaded the content's blob (the row write then failed, say, or the upload of another
+value of the same write failed, or the write was cancelled after this upload), the content streams
 that blob and no longer reads its stream: a retry with the same content reuses the blob. That retry has
 to come before the blob is collected (by an orphan sweep whose age has passed, or a partition delete's
 cleanup). After that the write throws `TableValueIntegrityException` ("the blob this content was uploaded
@@ -1280,12 +1314,16 @@ copies fail to open their file, and that failure evicts the source row's cache e
 - **Partition delete** - the rows first, in transactions of at most 100 deletes that never divide a main
   row from its continuation rows, so a failure or a cancelled token between two transactions leaves whole
   entities (the call throws; call it again to finish). The count returned is of entities, not rows. An
-  entity written while the delete runs is, after it, either whole or gone: continuation rows listed
+  entity written while the delete runs is, after it, either whole or gone: each main row is deleted on
+  condition of the version it was listed at; when a write committed in between (it grew or shrank the
+  entity), that transaction's entities are deleted one by one as they are then, so the call completes and
+  leaves no continuation row behind; continuation rows listed
   without their main row (a leftover, or the rows of an entity created between two listing pages) are
   deleted last, and only when no main row exists for them after the listing (one point read per such
   entity) and each row is still the version that was listed; a row that changed or is gone is left alone,
   and the call does not fail because of it. With no concurrent writer the partition is left empty. A
-  partition in which every continuation row is listed with its main row costs the same requests as before;
+  partition in which every continuation row is listed with its main row costs the same requests as before
+  (the main rows now carry If-Match);
   each entity whose continuation rows were listed alone costs one point read and one transaction more. Then
   the blobs under the partition that are older than `CleanupGrace` and that no row of the partition
   references at that moment: a row another writer created meanwhile keeps its blobs.
@@ -1379,8 +1417,14 @@ The sweep is the capability interface `IOrphanBlobSweeper`, implemented by `Tabl
 `InMemoryStorage<T>`; on an `IStorage<T>` the same calls are extension methods that throw
 `NotSupportedException` for a store without it. The table-wide overload lists the partitions from the
 container (`{table}/` with the delimiter `/`), takes one cutoff from the service clock, and sweeps each
-partition in turn. A failing partition does not stop the others: afterwards the failures are thrown
-together as an `AggregateException` whose message says how many blobs were deleted.
+partition in turn. A failing partition does not stop the others, and an orphan that cannot be deleted (an
+immutability policy, a permission, a service error) does not stop the rest of its partition: every orphan
+is tried, then the failures are thrown together as an `AggregateException` whose message says how many
+blobs were deleted. The partition overload throws one inner exception per blob it could not delete; the
+table-wide overload throws one per failed partition, and a partition whose deletes failed contributes an
+`AggregateException` of them. The partition key may be empty or whitespace (only `null` throws): it is
+normalized as ids are on write, so `SweepOrphanBlobsAsync("   ", ...)` sweeps the partition a write of
+`"   |r"` stored (`""` under `IdNormalization.Normalized`, `"   "` under `AsWritten`).
 
 ### Hosted sweep
 
@@ -1402,9 +1446,12 @@ Each round resolves `IStorage<T>` for every registered type (in a fresh scope) a
 `SweepOrphanBlobsAsync(OlderThan)`; the next round starts `Interval` after the previous one ended. A type
 that throws (a partition failure, a store that cannot be built, a timeout) is logged through
 `ILogger<>` at `Error` and retried next round; the other types still run. A store that does not
-implement `IOrphanBlobSweeper` is skipped with a warning. Shutdown cancels the round in progress. Without
-`UnifiedTableStorageOptions.BlobOffload`, or with no type registered, the service logs that once and does
-nothing. The first `AddUnifiedOrphanBlobSweep(configure)` call's options win; out-of-range options throw
+implement `IOrphanBlobSweeper` is skipped with a warning. Shutdown cancels the round in progress. Each
+round sweeps the store that `IStorage<T>` resolves to, whatever `UnifiedTableStorageOptions` are
+registered: a store built with options and a blob client of its own is swept, and a `TableStorage<T>` or
+`InMemoryStorage<T>` without blob offload (or a type with no large-value member) is skipped and logged
+once at `Information`. With no type registered, the service logs that once and does nothing. The first
+`AddUnifiedOrphanBlobSweep(configure)` call's options win; out-of-range options throw
 `ArgumentOutOfRangeException` at registration. Works the same over `AddUnifiedInMemoryStorage`. Every
 instance that registers it sweeps: concurrent sweeps are safe (each delete is conditional) but redundant,
 so a scaled-out app may register it in one instance only.
@@ -1485,7 +1532,9 @@ so a scaled-out app may register it in one instance only.
 - A table shared between a split-aware type and a plain type or a polymorphic store: the reads of
   `TableStorage<T>` (`OneAsync`, `ExistsAsync`, the queries, streams and pages) skip every row that
   carries a `_SplitOf` cell, for every type, so the plain type does not return the split-aware type's
-  continuation rows; `CountAsync` of the plain type still counts them, as on 0.8.3. A plain type and a
+  continuation rows; `CountAsync` of the plain type still counts them, as on 0.8.3, and so does a
+  projected `QueryAsync` of the plain type (one with `QueryOptions.Select`), because `_SplitOf` is not selected.
+  `InMemoryStorage<T>` reads and counts such rows the same way. A plain type and a
   polymorphic store delete a partition as 0.8.3 does, every listed row by key, in chunks of 100. Such a
   delete can remove continuation rows of a split entity that is written while it runs, and leave that
   entity unreadable (`TableValueIntegrityException`): delete such a partition through the split-aware
@@ -1583,8 +1632,9 @@ so a scaled-out app may register it in one instance only.
   takes one extra range query for its parts (on every read, queries included), and an eager offloaded
   value (`string`, `byte[]`) is downloaded from blob storage on every read, one blob per entity, so a
   query over N such entities makes N extra requests. `TableBlobContent` is never downloaded by a read.
-  The entity cache holds the full value.
-  For types with very large eager values use `CacheFor<T>(CachePolicy.Disabled)`.
+  The entity cache holds the full value, and a hit copies it in process (no codec work), but each entry
+  still counts as size 1 against a `SizeLimit`: to bound memory, disable caching
+  (`CacheFor<T>(CachePolicy.Disabled)`) or use a short TTL for types whose values are very large.
 - A `TableBlobContent` on an entity you hold (or one the entity cache returns) names the blob of the version
   it was read from. Once a replace or delete has deleted that blob (at once when it was older than
   `CleanupGrace`, or later by a sweep), `OpenReadAsync` throws `TableValueIntegrityException` saying the
@@ -1659,7 +1709,7 @@ Code that builds its own `TableTransactionAction` lists can measure them as the 
 ```csharp
 long stored = TableRequestSize.EstimateEntityBytes(entity);      // vs MaxEntityBytes (1,000,000)
 long wire = TableRequestSize.EstimateEntityWireBytes(entity);    // upper bound of the JSON body the SDK sends
-bool fits = TableRequestSize.FitsOneTransaction(actions);        // one partition, <= 100 actions,
+bool fits = TableRequestSize.FitsOneTransaction(actions);        // one partition, each row once, <= 100 actions,
                                                                  // <= 3,000,000 B stored, <= 4 MiB - 64 KiB on the wire
 ```
 
@@ -1798,6 +1848,13 @@ does not fail that read; and a builder partial update checks that the row exists
 `WithETag` matches before it looks at its paths, so for a missing row or a stale ETag it throws the 404
 or the conflict where `TableStorage<T>` throws the refusal of the path (a large property, a member
 marked on an interface).
+
+`InMemoryStorage<T>` and `InMemoryPolymorphicStorage<TBase>` succeed and fail where `TableStorage<T>` and
+`PolymorphicTableStorage<TBase>` do over the service. Failures carry the service's `Status` and
+`ErrorCode`, batches are atomic per transaction only, `QueryOptions.Select` projects the row, a cancelled
+token commits nothing, and a key the service refuses is refused. A differential suite
+(`InMemoryFidelityTests`) runs each scenario on both stores, the service side on Azurite. The CHANGELOG's
+0.9.0 "InMemory fidelity" list names each behaviour that changed for tests written against the fake.
 
 The polymorphic store has the same mirror, keyed the same way:
 
