@@ -4,13 +4,11 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 
 /// <summary>
 /// Rule B's refusal (a member marked <see cref="TableValueSplitAttribute"/> holding an object the serializer stores as
-/// columns) names "store an instance of the declared type" only when an instance of the declared type is read back whole
-/// through its whole JSON graph: every type the library's reader constructs through a constructor, at every depth of the
-/// declared member types (collection and dictionary element types included), binds every member its JSON stores, every
-/// type System.Text.Json constructs itself can set every member it stores, and no member on the way is declared as
-/// <see cref="object"/>, an interface or an abstract type. Otherwise only the second remedy is named. The check looked
-/// at the declared type's own members only, so the first remedy was named for a declared type whose member's type does not
-/// bind a member, and followed, that nested member read back null at every size (SERIALIZER-2 of the review of fix wave 9).
+/// columns) never names "store an instance of the declared type", whatever the declared type's JSON graph (ruling R17,
+/// which replaces wave 10's rule that named it when the whole graph was judged to read back whole): it names only the
+/// second remedy, and that remedy, followed, stores the value whole. Wave 10's rule began here: a check of the declared
+/// type's own members named the first remedy for a declared type whose member's type does not bind a member, and followed,
+/// that nested member read back null at every size (SERIALIZER-2 of the review of fix wave 9).
 /// </summary>
 [Collection("OversizedCellPolicy")]
 public class MarkedValueAsColumnsRemedyOverTheWholeGraphTests
@@ -202,43 +200,26 @@ public class MarkedValueAsColumnsRemedyOverTheWholeGraphTests
         public Chain? Doc { get; set; }
     }
 
+    // Ruling R17: also for a declared type whose whole graph is bound (wave 10 named the first remedy for it), the refusal
+    // names only the second remedy.
     [Theory]
     [MemberData(nameof(Stores))]
-    public async Task ADeclaredTypeWhoseWholeGraphIsBound_TheRefusalNamesTheFirstRemedy_AndFollowedItStoresTheValueWhole(string kind)
+    public async Task ADeclaredTypeWhoseWholeGraphIsBound_TheRefusalNamesOnlyTheSecondRemedy(string kind)
     {
         await using var stores = await LargeValueStores.OpenAsync(kind);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
         var refused = await Record.ExceptionAsync(() => stores.Store<OverBoundHolder>(Table).CreateAsync(
             new OverBoundHolder { Id = stores.Id("r"), Doc = new OuterOverBoundFlatSub { Seed = 1 } }, Ct));
         Assert.IsType<NotSupportedException>(refused);
-        Assert.Contains("Store an instance of OuterOverBound in OverBoundHolder.Doc (it is stored as one JSON value), or declare OverBoundHolder.Doc " +
-                        "as OuterOverBoundFlatSub and move [TableValueSplit] from it to the members of OuterOverBoundFlatSub that can hold a large value.",
-            refused.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(FirstRemedy, refused.Message, StringComparison.Ordinal);
+        Assert.Contains("Declare OverBoundHolder.Doc as OuterOverBoundFlatSub and move [TableValueSplit] from it to the members of " +
+                        "OuterOverBoundFlatSub that can hold a large value. Nothing was stored.", refused.Message, StringComparison.Ordinal);
         var chain = await Record.ExceptionAsync(() => stores.Store<ChainHolder>(Table).CreateAsync(new ChainHolder { Id = stores.Id("c"), Doc = new ChainFlatSub() }, Ct));
         Assert.IsType<NotSupportedException>(chain);
-        Assert.Contains("Store an instance of Chain in ChainHolder.Doc (it is stored as one JSON value)", chain.Message, StringComparison.Ordinal);
-
-        foreach (var size in Sizes)
-        {
-            var (a, b, c, d) = (Ascii(size, 1), Ascii(10, 2), Ascii(10, 3), Ascii(10, 4));
-            var id = stores.Id("b" + size);
-            await stores.Store<OverBoundHolder>(Table).CreateAsync(new OverBoundHolder
-            {
-                Id = id,
-                Doc = new OuterOverBound(4, new NestedBound(5, a), [new NestedBound(6, b)], new() { ["k"] = new NestedSettable { Seed = 7, Body = c } }, [new NestedSettable { Seed = 8, Body = d }]),
-            }, Ct);
-            var back = (await stores.Store<OverBoundHolder>(Table).OneAsync(id, Ct))!.Doc;
-            Assert.True(back is { Seed: 4, Inner: { Seed: 5 } inner, Items: [{ Seed: 6 } item], Map: { } map, Array: [{ Seed: 8 } element] }
-                        && back.GetType() == typeof(OuterOverBound) && inner.Body == a && item.Body == b && map["k"] is { Seed: 7 } m && m.Body == c && element.Body == d,
-                $"{kind}, {size}: read back Seed={back?.Seed}, Inner.Body {back?.Inner?.Body?.Length}, Items[0].Body {back?.Items?[0].Body?.Length}, " +
-                $"Map[k].Body {back?.Map?["k"].Body?.Length}, Array[0].Body {back?.Array?[0].Body?.Length} of {size}");
-
-            var cid = stores.Id("c" + size);
-            await stores.Store<ChainHolder>(Table).CreateAsync(new ChainHolder { Id = cid, Doc = new Chain(a, new Chain(b, null)) }, Ct);
-            var cback = (await stores.Store<ChainHolder>(Table).OneAsync(cid, Ct))!.Doc;
-            Assert.True(cback is { Next: { Next: null } next } && cback.Body == a && next.Body == b,
-                $"{kind}, {size}: chain read back Body {cback?.Body?.Length}, Next.Body {cback?.Next?.Body?.Length} of {size}");
-        }
+        Assert.DoesNotContain(FirstRemedy, chain.Message, StringComparison.Ordinal);
+        Assert.Contains("Declare ChainHolder.Doc as ChainFlatSub and move [TableValueSplit] from it", chain.Message, StringComparison.Ordinal);
+        Assert.Empty(await stores.RawRowsAsync<OverBoundHolder>(Table));
+        Assert.Empty(await stores.RawRowsAsync<ChainHolder>(Table));
     }
 
     // ── Every shape of the graph that does not read back whole: the first remedy is not named ────────────────────
@@ -343,9 +324,10 @@ public class MarkedValueAsColumnsRemedyOverTheWholeGraphTests
 
     public static TheoryData<string> Whole() => ["a string", "a bound type", "a list of a bound type", "a settable type", "a dictionary of a settable type", "a nullable int"];
 
+    // Ruling R17: the graphs wave 10 judged to read back whole get only the second remedy too.
     [Theory]
     [MemberData(nameof(Whole))]
-    public void AGraphThatReadsBackWhole_TheRefusalNamesTheFirstRemedy(string shape)
+    public void AGraphThatReadsBackWhole_TheRefusalDoesNotNameTheFirstRemedyEither(string shape)
     {
         var member = shape switch
         {
@@ -357,7 +339,9 @@ public class MarkedValueAsColumnsRemedyOverTheWholeGraphTests
             "a nullable int" => typeof(int?),
             _ => throw new ArgumentOutOfRangeException(nameof(shape)),
         };
-        Assert.Contains("Store an instance of Decl`1 in DeclHolder`1.Doc", Message(member), StringComparison.Ordinal);
+        var message = Message(member);
+        Assert.DoesNotContain(FirstRemedy, message, StringComparison.Ordinal);
+        Assert.Contains("Declare DeclHolder`1.Doc as DeclFlatSub`1 and move [TableValueSplit]", message, StringComparison.Ordinal);
     }
 
     // The second remedy followed for a shape the first one is withheld for: a bound declared type whose member is declared

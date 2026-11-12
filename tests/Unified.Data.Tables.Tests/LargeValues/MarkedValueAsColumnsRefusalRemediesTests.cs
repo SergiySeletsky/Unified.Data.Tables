@@ -5,10 +5,9 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// columns) names only remedies that work, and each one it names, followed, stores the value and reads it back whole at
 /// 10 and 200,000 characters on both stores:
 /// <list type="bullet">
-/// <item>"store an instance of the declared type" only when an instance of it is read back whole: the library's JSON
-/// reader constructs such a type through one constructor and sets nothing else, so only when every member its JSON stores
-/// is a parameter of that constructor (SERIALIZER-3 of the review of fix wave 8: a settable member outside the
-/// constructor was stored and read back null);</item>
+/// <item>never "store an instance of the declared type" (ruling R17, which replaces wave 9's rule that named it when every
+/// member its JSON stores is a parameter of the reader's constructor; SERIALIZER-3 of the review of fix wave 8: a
+/// settable member outside the constructor was stored and read back null): only the declaration remedy;</item>
 /// <item>for a property declared as a nullable struct, the declared type named as <c>S?</c>, and only the remedy that can
 /// be followed (every non-null value of <c>S?</c> is an <c>S</c>, which is stored as columns): declare it as <c>S</c> and
 /// move the attribute to the members of <c>S</c> (SERIALIZER-4).</item>
@@ -88,6 +87,21 @@ public class MarkedValueAsColumnsRefusalRemediesTests
         public BoundBase? Doc { get; set; }
     }
 
+    // The remedy the refusal names, followed: Doc declared as the runtime type, the attribute moved to its members.
+    [TableValueSplit(SplitEncoding.Text)]
+    public sealed class BoundFlatSubMarked : BoundBase
+    {
+        public BoundFlatSubMarked()
+            : base(0)
+        {
+        }
+    }
+
+    public sealed class BoundMovedHolder : Entity
+    {
+        public BoundFlatSubMarked? Doc { get; set; }
+    }
+
     // A struct with a parameterless constructor is stored as columns; the property is declared as its nullable form.
     public struct FlatStruct
     {
@@ -156,26 +170,28 @@ public class MarkedValueAsColumnsRefusalRemediesTests
         }
     }
 
-    // RV8 SERIALIZER-3: a declared type whose constructor binds every member it stores: the first remedy is named, and both
-    // remedies, followed, store and read the value back whole.
+    // RV8 SERIALIZER-3, as ruling R17 restates it: a declared type whose constructor binds every member it stores: the first
+    // remedy is not named either (no rule-B message names it), and the one that is, followed, stores and reads the value back
+    // whole.
     [Theory]
     [MemberData(nameof(Stores))]
-    public async Task ADeclaredTypeWhoseConstructorBindsEveryMember_TheRefusalNamesBothRemedies_AndBothWork(string kind)
+    public async Task ADeclaredTypeWhoseConstructorBindsEveryMember_TheRefusalNamesOnlyTheDeclarationRemedy_AndItWorks(string kind)
     {
         await using var stores = await LargeValueStores.OpenAsync(kind);
         Assert.SkipWhen(stores is null, LargeValueStores.SkipReason);
         var refused = await Record.ExceptionAsync(() =>
             stores.Store<BoundHolder>(Table).CreateAsync(new BoundHolder { Id = stores.Id("r"), Doc = new BoundFlatSub { Seed = 4, Body = "hello" } }, Ct));
         Assert.IsType<NotSupportedException>(refused);
-        Assert.Contains("Store an instance of BoundBase in BoundHolder.Doc (it is stored as one JSON value), or declare BoundHolder.Doc as BoundFlatSub " +
-                        "and move [TableValueSplit] from it to the members of BoundFlatSub that can hold a large value.", refused.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(FirstRemedy, refused.Message, StringComparison.Ordinal);
+        Assert.EndsWith("Declare BoundHolder.Doc as BoundFlatSub and move [TableValueSplit] from it to the members of BoundFlatSub that can hold a " +
+                        "large value. Nothing was stored.", refused.Message, StringComparison.Ordinal);
         foreach (var size in Sizes)
         {
             var id = stores.Id("b" + size);
             var body = BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(size, size + 1);
-            await stores.Store<BoundHolder>(Table).CreateAsync(new BoundHolder { Id = id, Doc = new BoundBase(4, body) }, Ct);
-            var back = (await stores.Store<BoundHolder>(Table).OneAsync(id, Ct))!.Doc;
-            Assert.True(back is { Seed: 4 } && back.Body == body && back.GetType() == typeof(BoundBase), $"{kind}, {size}: read back Seed={back?.Seed}, Body {back?.Body?.Length} of {size}");
+            await stores.Store<BoundMovedHolder>(Table).CreateAsync(new BoundMovedHolder { Id = id, Doc = new BoundFlatSubMarked { Seed = 4, Body = body } }, Ct);
+            var back = (await stores.Store<BoundMovedHolder>(Table).OneAsync(id, Ct))!.Doc;
+            Assert.True(back is { Seed: 4 } && back.Body == body, $"{kind}, {size}: read back Seed={back?.Seed}, Body {back?.Body?.Length} of {size}");
         }
     }
 
@@ -209,13 +225,13 @@ public class MarkedValueAsColumnsRefusalRemediesTests
         }
     }
 
-    // The first remedy is named exactly when an instance of the declared type is read back whole.
+    // Ruling R17: the first remedy is never named.
     [Fact]
-    public void TheFirstRemedy_IsNamedOnlyForADeclaredTypeWhoseConstructorBindsEveryMember()
+    public void TheFirstRemedy_IsNeverNamed()
     {
         static string Message<T>(Type runtime) => TableEntitySerializer.MarkedValueStoredAsColumns("Doc", typeof(T).GetProperty("Doc")!, runtime);
         Assert.DoesNotContain(FirstRemedy, Message<UnboundHolder>(typeof(UnboundFlatSub)), StringComparison.Ordinal);
-        Assert.Contains(FirstRemedy, Message<BoundHolder>(typeof(BoundFlatSub)), StringComparison.Ordinal);
+        Assert.DoesNotContain(FirstRemedy, Message<BoundHolder>(typeof(BoundFlatSub)), StringComparison.Ordinal);
         Assert.DoesNotContain(FirstRemedy, Message<NullableHolder>(typeof(FlatStruct)), StringComparison.Ordinal);
         Assert.DoesNotContain("Nullable`1", Message<NullableHolder>(typeof(FlatStruct)), StringComparison.Ordinal);
     }

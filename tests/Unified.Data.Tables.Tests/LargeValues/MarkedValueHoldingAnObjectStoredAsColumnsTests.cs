@@ -195,7 +195,8 @@ public class MarkedValueHoldingAnObjectStoredAsColumnsTests
     }
 
     // The message names the column, the declared and the runtime type, says what the attribute applies to, and the
-    // remedies; also below a nested object, for a positional record, and through the public serializer.
+    // remedy (ruling R17: only the declaration remedy); also below a nested object, for a positional record, and through the
+    // public serializer.
     [Fact]
     public void TheRefusal_NamesTheColumn_TheDeclaredAndTheRuntimeType_AndWhatToDo()
     {
@@ -205,7 +206,7 @@ public class MarkedValueHoldingAnObjectStoredAsColumnsTests
             "stores a JsonByCtorFlatSub as columns, one for each of its members, not as one value, and [TableValueSplit] on a property applies to " +
             "one value stored in the property's own cells (a string, a byte[] or an object stored as one JSON value), not to an object stored " +
             "as columns: its members would be stored as JsonByCtorFlatSub declares them, and a trimming OversizedCellPolicy could trim them. " +
-            "Store an instance of JsonByCtorBase in MarkedJsonHolder.Doc (it is stored as one JSON value), or declare MarkedJsonHolder.Doc as " +
+            "Declare MarkedJsonHolder.Doc as " +
             "JsonByCtorFlatSub and move [TableValueSplit] from it to the members of JsonByCtorFlatSub that can hold a large value. Nothing was stored.",
             top.Message);
         var nested = Assert.Throws<NotSupportedException>(() => new NestedMarkedJsonHolder { Id = "p|r" }.ToTableEntity("p", "r"));
