@@ -1594,8 +1594,10 @@ internal sealed class TableEntityValue
 
         // A value that fits one cell stays in its cell, unless the planner moved the column off a primary
         // row that was too full: then it takes the split form below, like a value too large for one cell.
+        // A clone (the read cache's in-process copy) keeps every value in one cell whatever its size: it is
+        // never sent, so it is never encoded (no gzip, hash or chunks) and its read never decodes it.
         var moved = state is { Ctx: { } planned } && (planned.ForceSplit.Contains(columnName) || planned.ForceOffload.Contains(columnName));
-        if (!moved && SplitCodec.FitsOneCell(payload, split.Encoding))
+        if (!moved && (state is { Ctx.IsClone: true } || SplitCodec.FitsOneCell(payload, split.Encoding)))
         {
             var column = columnName;
             if (isJson)
