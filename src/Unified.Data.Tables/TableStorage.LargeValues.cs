@@ -9,7 +9,10 @@ namespace Unified.Data.Tables;
 // Large values (TableValueSplit): writes put a split value's primary row and its continuation rows
 // ({RowKey}~0001...) in ONE entity-group transaction, and reads hide continuation rows and reassemble
 // the value before deserializing. Every branch here is reached only for a split-aware T (one with a
-// [TableValueSplit] member), except the IsPartRow skip on reads, which is a no-op for any other type.
+// [TableValueSplit] member), except the IsPartRow skip on reads: OneAsync, ExistsAsync and the queries
+// that fetch whole rows skip a row that carries a _SplitOf cell for every type (a plain type never
+// writes one, but it can share a table with a split-aware type). CountAsync and a projected query of a
+// plain type do not select _SplitOf, so they still count or return such rows, as 0.8.3 does.
 //
 // Whose row is it? A continuation row is the entity's own when the stored primary declares it, or when
 // its _SplitOf cell names the entity (a leftover: the primary was deleted or replaced by a writer that
@@ -771,6 +774,37 @@ public partial class TableStorage<T>
     /// condition and a row that changed or is gone is left alone; the partition delete goes on. A row
     /// whose version is unknown is never deleted here (the service always sends one).
     /// </summary>
+    /// <summary>
+    /// Deletes one transaction of a split-aware partition delete (<see cref="LargeValueTable.PlanPartitionDelete"/>):
+    /// each primary on condition of the version it was listed at, its continuation rows with it. A write
+    /// of one of those entities that committed after the listing changed its primary's version (a write
+    /// that grows an entity adds continuation rows the listing did not see; one that shrinks it deletes
+    /// rows the listing did), so the transaction fails with 412 or 404 and deletes nothing. Each entity
+    /// of the transaction is then deleted on its own as it is now (<see cref="DeleteLargeAsync"/>: its
+    /// primary and every continuation row that names it), so no continuation row is left without its
+    /// primary and the partition delete still completes.
+    /// </summary>
+    private async Task DeletePartitionUnitsAsync(string pk, IReadOnlyList<TableEntity> batch, CancellationToken ct)
+    {
+        var actions = batch.Select(row => new TableTransactionAction(
+            TableTransactionActionType.Delete, row, SplitRowLayout.IsPartRow(row) || !IsVersion(row.ETag) ? ETag.All : row.ETag));
+        try
+        {
+            await client.SubmitTransactionAsync(actions, ct);
+        }
+        catch (RequestFailedException ex) when (ex.Status is 412 or 404)
+        {
+            logger.LogDebug(ex, "{Type} partition {Partition}: an entity changed after the listing; its transaction's entities are deleted one by one",
+                typeName, pk);
+            foreach (var rk in batch.Select(UnitKeyOf).Distinct(StringComparer.Ordinal))
+                await DeleteLargeAsync(pk, rk, ct);
+        }
+    }
+
+    // The row key of the entity a listed row belongs to: its own, or the primary's its _SplitOf cell names.
+    private static string UnitKeyOf(TableEntity row) =>
+        row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is string primary ? primary : row.RowKey ?? string.Empty;
+
     private async Task DeleteListedLeftoversAsync(string pk, string primaryRowKey, IReadOnlyList<TableEntity> rows, CancellationToken ct)
     {
         var primary = await client.GetEntityIfExistsAsync<TableEntity>(pk, primaryRowKey, PartKeys, ct);

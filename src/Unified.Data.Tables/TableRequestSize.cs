@@ -78,8 +78,10 @@ public static class TableRequestSize
 
     /// <summary>
     /// True when <paramref name="actions"/> fit one entity-group transaction as the library plans one: one
-    /// partition, at most <see cref="MaxTransactionActions"/> actions, at most
-    /// <see cref="MaxTransactionEntityBytes"/> stored and at most <see cref="MaxTransactionWireBytes"/> on the wire.
+    /// partition, each row at most once (the service refuses a transaction with two actions on one row,
+    /// 400 <c>InvalidDuplicateRow</c>; row keys compare ordinally), at most <see cref="MaxTransactionActions"/>
+    /// actions, at most <see cref="MaxTransactionEntityBytes"/> stored and at most
+    /// <see cref="MaxTransactionWireBytes"/> on the wire.
     /// </summary>
     /// <param name="actions">The actions of the transaction.</param>
     /// <returns>Whether they fit; an empty set fits.</returns>
@@ -91,6 +93,7 @@ public static class TableRequestSize
         var count = 0;
         long stored = 0;
         long wire = 0;
+        var rowKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var action in actions)
         {
             ArgumentNullException.ThrowIfNull(action, nameof(actions));
@@ -99,6 +102,8 @@ public static class TableRequestSize
             if (count == 1)
                 partitionKey = action.Entity.PartitionKey;
             else if (!string.Equals(partitionKey, action.Entity.PartitionKey, StringComparison.Ordinal))
+                return false;
+            if (!rowKeys.Add(action.Entity.RowKey ?? string.Empty))
                 return false;
             var row = action.ActionType == TableTransactionActionType.Delete
                 ? new TableEntity(action.Entity.PartitionKey, action.Entity.RowKey)

@@ -113,6 +113,17 @@ public class TableRequestSizeTests
     }
 
     [Fact]
+    public void FitsOneTransaction_RefusesTwoActionsOnOneRow()
+    {
+        static TableTransactionAction Act(TableTransactionActionType type, string rk) => new(type, new TableEntity("p", rk) { ["V"] = "x" });
+
+        Assert.False(TableRequestSize.FitsOneTransaction([Act(TableTransactionActionType.Add, "a"), Act(TableTransactionActionType.UpsertMerge, "a")]));
+        Assert.False(TableRequestSize.FitsOneTransaction([Act(TableTransactionActionType.Delete, "a"), Act(TableTransactionActionType.Add, "b"), Act(TableTransactionActionType.Delete, "a")]));
+        // Row keys compare ordinally, as the service compares them: different case is a different row.
+        Assert.True(TableRequestSize.FitsOneTransaction([Act(TableTransactionActionType.Add, "a"), Act(TableTransactionActionType.Add, "A")]));
+    }
+
+    [Fact]
     public void Arguments_AreValidated()
     {
         Assert.Throws<ArgumentNullException>(() => TableRequestSize.EstimateEntityBytes(null!));

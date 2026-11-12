@@ -341,6 +341,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         // primary (rows nothing could read, and that would block the key). Continuation rows listed
         // without their primary may belong to an entity that is live by now: they go last, each group
         // only once no primary exists for it, and each row on condition of the version it was listed at.
+        // Each primary is deleted on condition of the version it was listed at, so a write of the entity
+        // that committed after the listing (it may have added or deleted continuation rows) fails the
+        // transaction instead of leaving rows behind; its entities are then deleted one by one, as they are now.
         IReadOnlyList<TableEntity> whole = entities;
         IReadOnlyList<(string PrimaryRowKey, IReadOnlyList<TableEntity> Rows)> leftovers = [];
         if (LargeValueAware)
@@ -351,6 +354,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         {
             foreach (var batch in transactions)
             {
+                if (LargeValueAware)
+                {
+                    await DeletePartitionUnitsAsync(partition, batch, ct);
+                    continue;
+                }
                 var actions = batch.Select(e =>
                     new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
                 await client.SubmitTransactionAsync(actions, ct);
