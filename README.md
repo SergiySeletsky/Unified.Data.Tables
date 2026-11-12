@@ -659,9 +659,11 @@ type, which may flatten at runtime. The message names the member.
 
 The value the property holds at run time must be one value too. A property declared as a type stored as
 one JSON value by its constructors (a class that is not sealed whose public constructors all take
-parameters, a record) can hold a subclass with a public parameterless constructor, which the serializer
-stores as columns, one per member. A property declared as a nullable struct (`S?`) whose struct has a
-public parameterless constructor holds an `S`, which is stored as columns too. A write of such a value is
+parameters, such as a positional record, or one of whose public constructors carries `[JsonConstructor]`)
+can hold a subclass with a public parameterless constructor (and none marked `[JsonConstructor]`), which
+the serializer stores as columns, one per member. A property declared as a nullable struct (`S?`) whose
+struct declares a public parameterless constructor of its own holds an `S`, which is stored as columns
+too (a struct that declares none is stored as one JSON value). A write of such a value is
 refused with `NotSupportedException` before anything is uploaded or stored, at every size and under every
 `OversizedCellPolicy`, on every write path of both stores (`CreateAsync`, `UpsertAsync`, `UpdateAsync`,
 both batches, and `ToTableEntity`). The message names the column, the property with its declared type
@@ -693,8 +695,10 @@ is not checked: it is written as JSON like every other value of that cell, and a
 `OversizedCellPolicy` can trim that cell. The message names the interface member (`INote.Notes`), the
 implementing class and the remedy: put `[TableValueSplit]` on the property of the implementing class (or
 on that class) and remove it from the interface. When the implementing class or struct is stored as one
-JSON value (it has no public parameterless constructor), an attribute on its members has no effect: put
-`[TableValueSplit]` on the property that holds it instead. For a struct that implements the interface,
+JSON value (a class whose public constructors all take parameters, or a struct that declares no public
+parameterless constructor of its own), an attribute on its members has no effect: put `[TableValueSplit]`
+on the property that holds it instead, declared as the implementing type (on a property declared as the
+interface the attribute is refused, as above). For a struct that implements the interface,
 the message names putting the attribute on the struct's property and removing it from the interface; it
 does not name a class-level attribute, which C# does not allow on a struct. Where an entity holds the
 implementation in a property declared as the interface (or as another type), also mark the entity class
@@ -715,7 +719,7 @@ property declared as a nullable struct `S?` where `S` implements such an interfa
 serializer's column name (`Extra_Notes`, with no `Value` segment) and under the lambda's
 (`x => x.Extra!.Value.Notes`, column `Extra_Value_Notes`), whether the property holds a value or not. The
 message then also names declaring that property as `S`, because a member marked `[TableValueSplit]` of a
-nullable struct is refused in turn ("Declare Order.Extra as S, not nullable ..."). `InMemoryStorage<T>`
+nullable struct is refused in turn ("... and declare Order.Extra as S."). `InMemoryStorage<T>`
 looks at the row first: when the row does not exist it throws `RequestFailedException` (404), and when
 `WithETag` names another version `ConcurrencyConflictException`, as for every builder update;
 `TableStorage<T>` reports the misuse in both cases. The misuse is reported first; a path the declared
@@ -801,7 +805,8 @@ object it holds. The declared types do not show such a member, so it does not ma
 the entity in with a class-level `[TableValueSplit]`. Until it is opted in, the entity is a plain type, and
 a builder update that names such a member's column by name (a key of `UpdateBuilder.Updates`; no lambda
 can name a member the declared types do not have) writes it as an ordinary cell, as 0.8.3 does: under
-`TrimSilently` or `TrimWithMarker` a value too large for one cell is stored trimmed. A whole-entity write
+`TrimSilently` or `TrimWithMarker` a value too large for one cell is stored trimmed (a `TableBlobContent`
+value is refused, see below). A whole-entity write
 of such a value is refused, as below. A read does not know the held object's type either:
 it keeps the instance the entity's constructor puts in the property, and creates the declared type where
 there is none. So initialise such a property with an instance of the type that has the members (without
@@ -1509,10 +1514,12 @@ so a scaled-out app may register it in one instance only.
   serializer's column name (`Extra_Notes`) and under the lambda's (`x => x.Extra!.Value.Notes`, column
   `Extra_Value_Notes`); an ordinary member of the same struct (`Extra_Name`) is still written. A legacy
   `[ColumnAlias]` name of a large property, in any form a read maps onto it, is refused as the property's
-  own name is (see [Large values](#large-values-split-and-blob-offload)). The check reads declared types
-  and attributes by reflection only and constructs nothing; it is remembered per type and path. On a plain
+  own name is (see [Large values](#large-values-split-and-blob-offload)). This check of the declared
+  types reads types and attributes by reflection only and constructs nothing; it is remembered per type and
+  path (for a large-value aware type the path is also resolved as a read resolves it, see
+  [Large values](#large-values-split-and-blob-offload)). On a plain
   type, a member only a runtime subtype declares is not seen: a key of `UpdateBuilder.Updates` that names
-  it writes an ordinary cell, as on 0.8.3. Replace the entity instead (a whole-entity write).
+  it writes an ordinary cell, as on 0.8.3 (a `TableBlobContent` value is refused). Replace the entity instead (a whole-entity write).
 - Batch writes of these types keep the batch contract: per partition, each entity's rows (main row,
   continuation rows, deletes of stale ones) are one unit, units are packed in order into entity-group
   transactions (at most 100 actions and the same byte and 4&nbsp;MiB wire budgets as a single write), and

@@ -87,9 +87,9 @@ Lossless storage of large values, opt-in per property.
     store of a plain type, any value in a `[TableValueSplit]` member or a `TableBlobContent` below a
     runtime subtype, whatever its size (a plain store stores no large-value form; a null member is not
     refused), also through a builder update that sets an object holding it; a property marked
-    `[TableValueSplit]` holding an object the serializer stores as columns (a subclass of its declared type
-    with a public parameterless constructor, or, in a property declared as a nullable struct, a struct
-    with a public parameterless constructor), at every size (the runtime form of the misuse on a property
+    `[TableValueSplit]` holding an object the serializer stores as columns (a subclass of its declared type,
+    such as a positional record, with a public parameterless constructor, or, in a property declared as a
+    nullable struct, a struct that declares a public parameterless constructor of its own), at every size (the runtime form of the misuse on a property
     whose declared type flattens; the message names one remedy: declare the property as the runtime type
     and mark that type's members); a value that needs split cells or a blob below an object whose
     type a read would not recreate, when the object a read creates or keeps there (the declared type of a
@@ -116,7 +116,8 @@ Lossless storage of large values, opt-in per property.
     in any form a read maps (`Old`, `Old__Json`, `Old__GZip`, split cells, `Old__blob`). An ordinary member
     of a nullable struct, and the legacy name of an ordinary property, are written as before. On a plain
     type, an `UpdateBuilder.Updates` key that names a member only a runtime subtype declares writes an
-    ordinary cell, as on 0.8.3 (a trimming `OversizedCellPolicy` can trim it).
+    ordinary cell, as on 0.8.3 (a trimming `OversizedCellPolicy` can trim it; a `TableBlobContent` value is
+    refused).
   - The refusal messages name only remedies that work for the shape: a builder update that would write a
     large value says that a partial update cannot write one on any store and to replace the entity; a
     `TableBlobContent` in an `object` property (refused on every store, aware or not) names the
@@ -481,8 +482,9 @@ Lossless storage of large values, opt-in per property.
   implementing class and the remedy (put the attribute on the property of the implementing class, or on
   that class; for a struct, only the property of the struct, since C# allows no class-level attribute on
   a struct), before anything is stored; such a value is never trimmed. For an implementing class or
-  struct stored as one JSON value (no public parameterless constructor), an attribute on its members has
-  no effect: put `[TableValueSplit]` on the property that holds it. A builder partial update, on both
+  struct stored as one JSON value (a class whose public constructors all take parameters, or a struct that
+  declares no public parameterless constructor of its own), an attribute on its members has no effect: put
+  `[TableValueSplit]` on the property that holds it, declared as the implementing type. A builder partial update, on both
   stores, is refused with the same exception before anything is written when the entity type, or the
   declared type of a property along the updated path, is or implements such an interface, also through a
   property declared as a nullable struct (the message then also names declaring that property as the
