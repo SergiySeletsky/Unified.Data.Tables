@@ -877,7 +877,9 @@ public static class TableEntitySerializer
         // named, or in one only a runtime subtype declares, of which they tell nothing.
         if (plainRoot is not null && value is TableBlobContent)
         {
-            var segments = propertyName.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries);
+            var segments = TypeMetadataCache.LegacyNameTargets(plainRoot, propertyName) is [var renamed]
+                ? [renamed]
+                : propertyName.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries);
             var steps = TypeMetadataCache.DeclaredPath(plainRoot, segments, forMisuse: true).ToList();
             throw new NotSupportedException(segments.Length > 0 && steps.Count == segments.Length
                 ? PlainPathRefusal(plainRoot, segments[..^1], steps[^1][0].Owner, segments[^1], partial: true, contentInAnotherType: true)
@@ -2901,6 +2903,9 @@ internal static class TypeMetadataCache
         if (InterfaceMemberSplit(root) is { } atRoot)
             return ((root, atRoot.Contract, atRoot.Marked), false);
         var steps = DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: true).ToList();
+        // A legacy name of a property of the root: a read maps the whole column onto that property.
+        foreach (var renamed in LegacyNameTargets(root, columnPath))
+            steps.AddRange(DeclaredPath(root, [renamed], forMisuse: true));
         foreach (var step in steps)
         {
             foreach (var (_, property) in step)
@@ -2915,6 +2920,38 @@ internal static class TypeMetadataCache
             Nullable.GetUnderlyingType(m.Member.PropertyType) is { } underlying && FlattensIntoColumns(underlying)
                 ? SplitFor(m.Owner, m.Member, classLevel: null, validate: false) is not null
                 : IsLargeValueMember(m.Owner, m.Member))));
+    }
+
+    /// <summary>
+    /// The names of the properties of <paramref name="root"/> that <paramref name="column"/> is a legacy name of: a
+    /// property-level <see cref="ColumnAliasAttribute"/> of that name on a property of <paramref name="root"/>, or a
+    /// class-level one on <paramref name="root"/> or a base class (a read maps the whole column onto that property when
+    /// the row has no cell of the property's own name). Reflection alone (the attribute is sealed: no user code runs);
+    /// none for a type whose members or attributes cannot be read.
+    /// </summary>
+    internal static List<string> LegacyNameTargets(Type root, string column)
+    {
+        var names = new List<string>();
+#pragma warning disable CA1031 // a type whose attributes cannot be read names no legacy column, as the walk skips it
+        try
+        {
+            foreach (var property in DeclaredProperties(root))
+            {
+                if (property.GetCustomAttributes<ColumnAliasAttribute>(inherit: true).Any(a => a.PropertyName is null && a.LegacyColumnName == column))
+                    names.Add(property.Name);
+            }
+            foreach (var alias in root.GetCustomAttributes<ColumnAliasAttribute>(inherit: true))
+            {
+                if (alias.PropertyName is { } target && alias.LegacyColumnName == column && !names.Contains(target))
+                    names.Add(target);
+            }
+        }
+        catch (Exception)
+        {
+            // The members or attributes of the root cannot be read.
+        }
+#pragma warning restore CA1031
+        return names;
     }
 
     // The first member marked [TableValueSplit] of an interface that t implements (or, t an interface, of t
