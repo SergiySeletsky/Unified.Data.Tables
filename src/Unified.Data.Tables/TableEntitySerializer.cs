@@ -932,8 +932,9 @@ public static class TableEntitySerializer
     /// overload cannot see. For every type, the path is walked through the declared types by reflection alone,
     /// with every member of each segment's name whatever its accessors and attributes (inherited, hidden with
     /// <c>new</c>, overridden; through a nullable struct into the members of the struct; a legacy column name of a
-    /// property as that property): a path that meets a member marked <see cref="TableValueSplitAttribute"/> (on the
-    /// property, or by a class-level attribute that covers it) or a <see cref="TableBlobContent"/> member, at its
+    /// property, in any form a read maps onto it, as that property): a path that meets a member marked
+    /// <see cref="TableValueSplitAttribute"/> (on the property, or by a class-level attribute that covers it) or a
+    /// <see cref="TableBlobContent"/> member, at its
     /// end or on the way, is refused. For a large-value aware type the path is also resolved as a read resolves it
     /// (a default instance may hold a runtime subtype that opts the member in); when that resolution throws (its
     /// constructor or a getter fails), the path may name one, so it is refused too. A path that meets a
@@ -2910,8 +2911,9 @@ internal static class TypeMetadataCache
     /// <see cref="MaxRememberedReadTargets"/>). A property declared as a nullable struct <c>S?</c> is followed into the
     /// members of <c>S</c> (as the serializer names them, and through <c>Value</c>), and <c>S</c> is its declared type for
     /// the misuse, as for a property declared <c>S</c>; and a column that is a legacy name
-    /// (<see cref="ColumnAliasAttribute"/>) of a property of <paramref name="root"/> is walked as that property too (a read
-    /// maps it there). A member only a runtime subtype declares is not seen.
+    /// (<see cref="ColumnAliasAttribute"/>) of a property of <paramref name="root"/>, in any form a read maps onto that
+    /// property (the whole column, its <c>__Json</c> and <c>__GZip</c> cells, its split cells and blob reference), is walked
+    /// as that property too. A member only a runtime subtype declares is not seen.
     /// </summary>
     /// <exception cref="InvalidOperationException">The misuse, naming the interface member and the remedy.</exception>
     /// <exception cref="NotSupportedException">The path names a large-value member.</exception>
@@ -2939,9 +2941,13 @@ internal static class TypeMetadataCache
         if (InterfaceMemberSplit(root) is { } atRoot)
             return ((root, atRoot.Contract, atRoot.Marked), false);
         var steps = DeclaredPath(root, columnPath.Split(TableEntityValue.PathDelimiter, StringSplitOptions.RemoveEmptyEntries), forMisuse: true).ToList();
-        // A legacy name of a property of the root: a read maps the whole column onto that property.
-        foreach (var renamed in LegacyNameTargets(root, columnPath))
-            steps.AddRange(DeclaredPath(root, [renamed], forMisuse: true));
+        // A legacy name of a property of the root, in any form a read maps onto that property (the whole column, its
+        // __Json and __GZip cells, its split cells and its blob reference).
+        foreach (var legacy in ReadMappedLegacyColumns(columnPath))
+        {
+            foreach (var renamed in LegacyNameTargets(root, legacy))
+                steps.AddRange(DeclaredPath(root, [renamed], forMisuse: true));
+        }
         foreach (var step in steps)
         {
             foreach (var (_, property) in step)
@@ -2958,6 +2964,22 @@ internal static class TypeMetadataCache
             Nullable.GetUnderlyingType(m.Member.PropertyType) is { } underlying && FlattensIntoColumns(underlying)
                 ? SplitFor(m.Owner, m.Member, classLevel: null, validate: false) is not null
                 : IsLargeValueMember(m.Owner, m.Member))));
+    }
+
+    // The legacy column a builder update's column is a read-mapped form of: the column itself, and the column without the
+    // suffix of one cell (__Json, __GZip) or of a split-cell or blob-reference cell (SplitCodec.TryParseLargeValueColumn),
+    // the forms in which a read maps a legacy column onto its property (ApplyColumnAliases).
+    private static List<string> ReadMappedLegacyColumns(string column)
+    {
+        var columns = new List<string> { column };
+        foreach (var suffix in new[] { "__Json", "__GZip" })
+        {
+            if (column.Length > suffix.Length && column.EndsWith(suffix, StringComparison.Ordinal))
+                columns.Add(column[..^suffix.Length]);
+        }
+        if (SplitCodec.TryParseLargeValueColumn(column, out var baseColumn, out _, out _) && !columns.Contains(baseColumn))
+            columns.Add(baseColumn);
+        return columns;
     }
 
     /// <summary>

@@ -27,8 +27,10 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// lambda names <c>Doc_Value_Inner_V</c>) and by a key of <see cref="UpdateBuilder{T}.Updates"/>, and a whole-entity write.
 /// A second dimension (fix wave 9, RV8 SERIALIZER-2): every leaf kind as a top-level property with a legacy name
 /// (<see cref="ColumnAliasAttribute"/> on the property, on the entity class, on a base class, on a property declared by a
-/// base class): a key of <c>Updates</c> naming the legacy name is refused exactly as one naming the property is, and the
-/// legacy name of an ordinary property is still written and read back. The outcomes allowed: refused before anything is
+/// base class), in every cell form a read maps onto the property (the whole column, <c>__Json</c>, <c>__GZip</c>, the
+/// split-cell and blob-reference cells; fix wave 10, RV9 SERIALIZER-3): a key of <c>Updates</c> naming the legacy name in a
+/// form is refused exactly as one naming the property in that form is, and the legacy name of an ordinary property is
+/// still written (and, as one cell or its JSON cell, read back). The outcomes allowed: refused before anything is
 /// stored, or stored with every read (point read, after a cache hit, from a new store, query) returning the value
 /// whole; a builder update whose path the declared types name is refused with <see cref="NotSupportedException"/>
 /// (rule A). The documented exceptions, each asserted as documented:
@@ -518,8 +520,9 @@ public class MarkedLeafGeneratorMatrixTests
         Assert.Equal(6, GenericShapes.Count(s => s.Runtime.IsValueType));
         TestContext.Current.TestOutputHelper?.WriteLine(
             $"Legacy names: {LegacyNameCases.Value.Count} combinations ({LegacyLeafKinds.Length} leaf kinds and an ordinary property, " +
-            $"{LegacyNameForms.Length} forms of [ColumnAlias]); {LegacyNameCases.Value.Count * 2} theory rows.");
-        Assert.Equal((LegacyLeafKinds.Length + 1) * LegacyNameForms.Length, LegacyNameCases.Value.Count);
+            $"{LegacyNameForms.Length} forms of [ColumnAlias], {LegacyCellForms.Length} cell forms of the legacy column); {LegacyNameCases.Value.Count * 2} theory rows.");
+        Assert.Equal((LegacyLeafKinds.Length + 1) * LegacyNameForms.Length * LegacyCellForms.Length, LegacyNameCases.Value.Count);
+        Assert.Equal(10, LegacyCellForms.Length);
     }
 
     // ── Legacy names (fix wave 9, RV8 SERIALIZER-2) ───────────────────────────────────────────────────────
@@ -572,7 +575,14 @@ public class MarkedLeafGeneratorMatrixTests
         ("string covered by a class-level attribute", 2, typeof(string)),
     ];
 
-    public sealed record LegacyNameCase(string Name, string Form, string Leaf, bool Ordinary, Type Value, Type Entity);
+    /// <summary>
+    /// The cell forms a read maps a legacy column in onto its property (fix wave 10, RV9 SERIALIZER-3): the whole column,
+    /// one cell of JSON or GZip, and the split-cell and blob-reference cells. A builder update names each form by its
+    /// suffix; the property's own name in the same form is the comparison.
+    /// </summary>
+    internal static readonly string[] LegacyCellForms = ["", .. BuilderUpdateOfALegacyColumnNameInEveryReadFormTests.ReadForms];
+
+    public sealed record LegacyNameCase(string Name, string Form, string Leaf, bool Ordinary, Type Value, Type Entity, string Suffix);
 
     private static readonly Lazy<Dictionary<string, LegacyNameCase>> LegacyNameCases = new(() =>
     {
@@ -581,10 +591,13 @@ public class MarkedLeafGeneratorMatrixTests
         {
             foreach (var leaf in LegacyLeafKinds.Append(("ordinary string (the control)", 1, typeof(string))))
             {
-                var definition = leaf.Item2 switch { 0 => form.Marked, 1 => form.Plain, _ => form.ClassMarked };
-                var ordinary = leaf.Item1.StartsWith("ordinary", StringComparison.Ordinal);
-                var name = $"legacy name {form.Name}, leaf {leaf.Item1}";
-                cases.Add(name, new LegacyNameCase(name, form.Name, leaf.Item1, ordinary, leaf.Item3, definition.MakeGenericType(leaf.Item3)));
+                foreach (var suffix in LegacyCellForms)
+                {
+                    var definition = leaf.Item2 switch { 0 => form.Marked, 1 => form.Plain, _ => form.ClassMarked };
+                    var ordinary = leaf.Item1.StartsWith("ordinary", StringComparison.Ordinal);
+                    var name = $"legacy name {form.Name}, leaf {leaf.Item1}, cell form {LegacyName}{suffix}";
+                    cases.Add(name, new LegacyNameCase(name, form.Name, leaf.Item1, ordinary, leaf.Item3, definition.MakeGenericType(leaf.Item3), suffix));
+                }
             }
         }
         return cases;
@@ -627,18 +640,28 @@ public class MarkedLeafGeneratorMatrixTests
                 TableEntitySerializer.OversizedCellPolicy = policy;
                 try
                 {
-                    foreach (var column in c.Ordinary ? [LegacyName] : new[] { LegacyName, "Content" })
+                    foreach (var column in c.Ordinary ? [LegacyName + c.Suffix] : new[] { LegacyName + c.Suffix, "Content" + c.Suffix })
                     {
                         Exception? thrown = null;
+                        // The JSON cell form of the control holds the value's JSON, which a read maps onto the property.
+                        object cell = c.Ordinary && c.Suffix == "__Json" ? System.Text.Json.JsonSerializer.Serialize(value) : value;
                         var requests = await stores.StorageWritesAsync(store, async () =>
-                            thrown = await Record.ExceptionAsync(() => store.UpdateAsync(id, b => b.Updates[column] = value, Ct)));
+                            thrown = await Record.ExceptionAsync(() => store.UpdateAsync(id, b => b.Updates[column] = cell, Ct)));
                         var row = (await stores.RawRowsAsync<T>(Table)).Single(r => r.RowKey == "legacy");
                         if (c.Ordinary)
                         {
                             Assert.True(thrown is null, $"{label}, Updates[{column}]: {thrown?.GetType().Name}: {thrown?.Message}");
-                            Assert.Equal(value, row[LegacyName]);
-                            Assert.Equal(value, content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
-                            Outcome("builder update of the legacy name of an ordinary property written and read back");
+                            Assert.Equal(cell, row[column]);
+                            // The forms a read maps back into a string without more cells: the whole column and its JSON cell.
+                            if (c.Suffix is "" or "__Json")
+                            {
+                                Assert.Equal(value, content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
+                                Outcome("builder update of the legacy name of an ordinary property written and read back");
+                            }
+                            else
+                            {
+                                Outcome("builder update of the legacy name of an ordinary property written as before");
+                            }
                             continue;
                         }
                         Assert.True(thrown is NotSupportedException && requests.Count == 0
@@ -646,7 +669,7 @@ public class MarkedLeafGeneratorMatrixTests
                             $"{label}, Updates[{column}]: {thrown?.GetType().Name ?? "accepted"}: {thrown?.Message}; requests [{string.Join(", ", requests)}]; cells [{string.Join(", ", row.Keys)}]");
                         Assert.Equal(TableEntitySerializer.PartialUpdateRefusal(column), thrown!.Message);
                         Assert.Null(content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
-                        Outcome(column == LegacyName ? "builder update of the legacy name refused (rule A)" : "builder update of the property's own name refused (rule A)");
+                        Outcome(column.StartsWith(LegacyName, StringComparison.Ordinal) ? "builder update of the legacy name refused (rule A)" : "builder update of the property's own name refused (rule A)");
                     }
                 }
                 finally
