@@ -21,6 +21,9 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
 
     private const int CopyBufferBytes = 81_920;
 
+    // The first buffer a download of an offloaded split value reads into; it doubles up to the claimed length.
+    private const int InitialDownloadBytes = 1 << 20;
+
     private static readonly IReadOnlyDictionary<string, object> NothingResolved = new Dictionary<string, object>(StringComparer.Ordinal);
 
     /// <summary>
@@ -338,7 +341,10 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
     /// through a read that verifies the bytes still match what was prepared. Each
     /// <see cref="TableBlobContent"/> is then bound to its blob; one that already streams another blob (or
     /// a blob of the same name through another blob store) stays bound there, and the property it was
-    /// written from gets a content bound to this one.
+    /// written from gets a content bound to this one. When an upload fails or the write is cancelled, the
+    /// contents whose blobs exist by then are bound all the same (their properties are not reassigned), so
+    /// a retry with the same entity reuses those blobs, also for a content whose source was a forward-only
+    /// stream.
     /// An upload reads a content's source, and a content is bound, while this write holds the content,
     /// so concurrent writes of one content take turns; a caller's seekable stream is put back where the
     /// content starts after every upload, whether it succeeded or not.
@@ -352,65 +358,90 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         if (pending.Count == 0) return;
         var store = blobs ?? throw new BlobOffloadNotConfiguredException(tableName, pending[0].Column);
 
-        foreach (var blob in pending)
+        // The blobs that exist by now (uploaded, or touched), in order. Whatever ends the loop, each of their
+        // contents is bound before this method returns: a content whose blob was uploaded no longer needs
+        // its source, and a retry of the write reuses the blob instead of finding the source released
+        // (a forward-only one's temporary copy is given back when a failed write ends unbound).
+        var done = new List<PendingBlob>(pending.Count);
+        try
         {
-            var name = blob.Reference.Path;
-            var state = await store.GetStateAsync(name, ct);
-            var exists = false;
-            if (state is not null)
+            foreach (var blob in pending)
             {
-                if (!string.Equals(state.Sha256, blob.Reference.Sha256, StringComparison.OrdinalIgnoreCase))
-                    throw new TableValueIntegrityException(blob.Column,
-                        $"blob '{name}' already exists with SHA-256 {state.Sha256}, not {blob.Reference.Sha256}.");
-                try
+                var name = blob.Reference.Path;
+                var state = await store.GetStateAsync(name, ct);
+                var exists = false;
+                if (state is not null)
                 {
-                    await store.TouchAsync(name, ct);
-                    exists = true;
+                    if (!string.Equals(state.Sha256, blob.Reference.Sha256, StringComparison.OrdinalIgnoreCase))
+                        throw new TableValueIntegrityException(blob.Column,
+                            $"blob '{name}' already exists with SHA-256 {state.Sha256}, not {blob.Reference.Sha256}.");
+                    try
+                    {
+                        await store.TouchAsync(name, ct);
+                        exists = true;
+                    }
+                    catch (TableValueIntegrityException)
+                    {
+                        // Deleted (by an orphan sweep) between the state read and the touch: upload it again.
+                    }
                 }
-                catch (TableValueIntegrityException)
-                {
-                    // Deleted (by an orphan sweep) between the state read and the touch: upload it again.
-                }
-            }
 
-            if (!exists)
-                await UploadWithRetryAsync(store, blob, ct);
+                if (!exists)
+                    await UploadWithRetryAsync(store, blob, ct);
+                done.Add(blob);
+            }
+        }
+        catch
+        {
+            // A sibling blob failed, or the write was cancelled: the contents already uploaded are bound
+            // all the same (their properties are left as they are; no entity code runs on this path).
+            foreach (var blob in done)
+                await BindContentAsync(store, blob);
+            throw;
         }
 
-        // Bind only once every blob exists: one content assigned to two properties is uploaded twice
-        // from the same prepared source, and binding releases that source.
-        foreach (var blob in pending)
+        // Bound once every blob exists: one content assigned to two properties is uploaded twice from the
+        // same prepared source, and binding releases that source.
+        foreach (var blob in done)
         {
-            if (blob.Content is not { } content)
-                continue;
-            var name = blob.Reference.Path;
-            var column = blob.Column;
-            var keys = RowKeysOf(name);
-            Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, keys, c);
-            // Bound while this write holds the content: of several writes binding it at once, exactly one
-            // binds the shared instance. The property is assigned after the turn ends (no lock across a setter).
-            // A content bound through another store keeps that store's blob, even under the same name.
-            bool bound;
-            await content.WaitTurnAsync(ct);
-            try
-            {
-                bound = content.Bind(name, open, column, store);
-            }
-            finally
-            {
-                content.EndTurn();
-            }
-            if (bound)
-                continue;
-
             // The content already streams another blob: it was read from another row, or it is on another
             // property or entity as well. That instance is shared (the entity it came from holds it, and so
             // does each cached copy of that entity), so it stays bound where it is, and the entity being
             // written gets a content of its own, bound to the blob its own row references. A property that
             // cannot be assigned keeps the instance as it is.
-            blob.Assign?.Invoke(TableBlobContent.Bound(
-                blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column, store));
+            if (await BindContentAsync(store, blob) is { } own)
+                blob.Assign?.Invoke(own);
         }
+    }
+
+    // Binds the content of a blob that exists to it. Null when the content serves that blob now (or the
+    // blob has no content); otherwise the content of its own the written property is to be given.
+    private async Task<TableBlobContent?> BindContentAsync(IOffloadBlobStore store, PendingBlob blob)
+    {
+        if (blob.Content is not { } content)
+            return null;
+        var name = blob.Reference.Path;
+        var column = blob.Column;
+        var keys = RowKeysOf(name);
+        Func<CancellationToken, Task<Stream>> open = c => OpenLazyAsync(store, column, name, keys, c);
+        // Bound while this write holds the content: of several writes binding it at once, exactly one
+        // binds the shared instance. The property is assigned after the turn ends (no lock across a setter).
+        // A content bound through another store keeps that store's blob, even under the same name.
+        // The wait is not cancellable: the blob exists, and a content left unbound would lose its source
+        // when the write ends (another write holds the content only while it reads or binds it).
+        await content.WaitTurnAsync(CancellationToken.None);
+        bool bound;
+        try
+        {
+            bound = content.Bind(name, open, column, store);
+        }
+        finally
+        {
+            content.EndTurn();
+        }
+        return bound
+            ? null
+            : TableBlobContent.Bound(blob.Reference.Length, blob.Reference.Sha256, blob.Reference.ContentType, name, open, column, store);
     }
 
     /// <summary>
@@ -884,10 +915,15 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffl
         if (reference.Length > Array.MaxLength)
             throw new TableValueIntegrityException(column, $"the blob is {reference.Length:N0} B, too large to read into memory.");
         await using var stream = await store.OpenReadAsync(column, reference.Path, ct);
-        var bytes = new byte[reference.Length];
+        // The buffer grows with what the blob delivers, up to the claimed length: a row that claims far
+        // more than its blob holds (a damaged or hostile row) fails below without that length being allocated.
+        var expected = (int)reference.Length;
+        var bytes = new byte[Math.Min(expected, InitialDownloadBytes)];
         var read = 0;
-        while (read < bytes.Length)
+        while (read < expected)
         {
+            if (read == bytes.Length)
+                Array.Resize(ref bytes, (int)Math.Min(expected, 2L * bytes.Length));
             var n = await stream.ReadAsync(bytes.AsMemory(read), ct);
             if (n == 0)
                 throw new TableValueIntegrityException(column, $"the blob holds {read} bytes, expected {reference.Length}.");
