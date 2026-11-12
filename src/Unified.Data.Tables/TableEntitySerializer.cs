@@ -58,7 +58,10 @@ public static class TableEntitySerializer
     /// property that holds the member with the type that carries it. Or the runtime type is large-value
     /// aware and a value that needs split cells is where a read of that type would not return it into a
     /// large-value member (see <see cref="TableValueSplitAttribute"/>): below an object a read cannot
-    /// create, or one whose type has no member of that name or does not mark it.
+    /// create, or one whose type has no member of that name or does not mark it. Or a property marked
+    /// <see cref="TableValueSplitAttribute"/> holds an object the serializer stores as columns (a subclass
+    /// of its declared type with a public parameterless constructor): the attribute applies to one value
+    /// in the property's own cells, at every size.
     /// </exception>
     public static TableEntity ToTableEntity(
         this object root,
@@ -1547,7 +1550,8 @@ internal sealed class TableEntityValue
     // text as __Json), otherwise split cells; a column the planner moved (ValueWriteContext.ForceSplit)
     // is split whatever its size. Never trims and never consults OversizedCellPolicy.
     // False for a value that is not string, byte[] or JSON-stored (a scalar, or an object that
-    // flattens into columns) — it takes the ordinary path.
+    // flattens into columns) — it takes the ordinary path. An object that flattens into columns in a
+    // property marked [TableValueSplit] itself is refused instead (a class-level attribute does not cover it).
     private bool TrySerializeLarge(
         TableValueSplitAttribute split,
         FlattenState? state,
