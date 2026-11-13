@@ -1,4 +1,5 @@
-﻿using Unified.Data.Tables.Identity.Models;
+﻿using Microsoft.AspNetCore.Identity;
+using Unified.Data.Tables.Identity.Models;
 
 namespace Unified.Data.Tables.Identity
 {
@@ -9,8 +10,9 @@ namespace Unified.Data.Tables.Identity
             IStorage<IdentityUserLoginModel> userLogins,
             IStorage<IdentityUserClaimModel> userClaims,
             IStorage<IdentityUserRoleModel> userRoles,
-            IStorage<IdentityUserTokenModel> userTokens)
-            : base(users, userLogins, userClaims, userRoles, userTokens)
+            IStorage<IdentityUserTokenModel> userTokens,
+            IdentityErrorDescriber? describer = null)
+            : base(users, userLogins, userClaims, userRoles, userTokens, describer)
         {
         }
 

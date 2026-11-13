@@ -97,7 +97,7 @@ namespace Unified.Data.Tables.Identity.Tests
             await Add("u2", "ADMIN");
 
             // Act
-            await _fixture.UserStore.DeleteAsync(new IdentityUser { Id = "u1" }, TestContext.Current.CancellationToken);
+            Assert.True((await _fixture.UserStore.DeleteAsync(await _fixture.ReadUserAsync("u1", TestContext.Current.CancellationToken), TestContext.Current.CancellationToken)).Succeeded);
 
             // Assert
             Assert.Empty(await Store.GetRolesAsync(new IdentityUser { Id = "u1" }, TestContext.Current.CancellationToken));

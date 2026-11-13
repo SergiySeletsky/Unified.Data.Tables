@@ -88,7 +88,7 @@ namespace Unified.Data.Tables.Identity.Tests
             await Store.CreateAsync(new IdentityRole("teacher") { Id = "r2", NormalizedName = "TEACHER" }, TestContext.Current.CancellationToken);
 
             // Act
-            await Store.DeleteAsync(new IdentityRole("admin") { Id = "r1" }, TestContext.Current.CancellationToken);
+            Assert.True((await Store.DeleteAsync(await _fixture.ReadRoleAsync("r1", TestContext.Current.CancellationToken), TestContext.Current.CancellationToken)).Succeeded);
 
             // Assert
             Assert.Null(await Store.FindByIdAsync("r1", TestContext.Current.CancellationToken));
