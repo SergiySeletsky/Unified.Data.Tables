@@ -322,22 +322,38 @@ namespace Unified.Data.Tables.Identity.Tests
         }
 
         [Fact]
-        public async Task UpdateAfterDeleteClaim_Fails()
+        public async Task UserDelete_StaleUpdateDuringCascade_FailsAndDoesNotResurrect()
         {
-            // Arrange — a delete that claimed the row (its fresh stamp) must make a concurrent update of
-            // an earlier copy fail, even before the row itself is gone.
+            // Arrange — a copy read before the delete; its update lands after the delete claimed the row
+            // (rotated its stamp) but while the cascade is still running and the user row still exists.
             await CreateAndReadAsync(NewUser());
             var updater = (await Users.FindByIdAsync("u1", Ct))!;
             var deleter = (await Users.FindByIdAsync("u1", Ct))!;
-            Assert.True((await Users.DeleteAsync(deleter, Ct)).Succeeded);
+            await ((IUserClaimStore<IdentityUser>)Users).AddClaimsAsync(deleter, [new Claim("friendly-name", "Alice")], Ct);
+            IdentityResult? innerUpdate = null;
+            bool rowPresentDuringCascade = false;
+            var claims = new InterleavingStorage<IdentityUserClaimModel>(
+                _fixture.UserClaimRows,
+                () => Task.CompletedTask,
+                beforeDeletePartition: async () =>
+                {
+                    rowPresentDuringCascade = await _fixture.UserRows.OneAsync(IdentityKeys.User("u1"), CancellationToken.None) is not null;
+                    updater.SecurityStamp = "late";
+                    innerUpdate = await Users.UpdateAsync(updater, CancellationToken.None);
+                });
+            var store = new UserStore(_fixture.UserRows, _fixture.RoleRows, _fixture.UserLoginRows, claims,
+                _fixture.UserRoleRows, _fixture.UserTokenRows);
 
             // Act
-            updater.SecurityStamp = "late";
-            var result = await Users.UpdateAsync(updater, Ct);
+            var result = await store.DeleteAsync(deleter, Ct);
 
-            // Assert — and the deleted user was not resurrected
-            AssertConcurrencyFailure(result);
+            // Assert — the stale update was refused mid-cascade, the delete finished, nothing came back
+            Assert.True(rowPresentDuringCascade);
+            Assert.NotNull(innerUpdate);
+            AssertConcurrencyFailure(innerUpdate);
+            Assert.True(result.Succeeded);
             Assert.Equal(0, _fixture.UserRows.Count);
+            Assert.Equal(0, _fixture.UserClaimRows.Count);
         }
 
         // ---- roles -------------------------------------------------------------------------------
@@ -527,9 +543,10 @@ namespace Unified.Data.Tables.Identity.Tests
         /// <summary>
         /// Delegates to an inner storage, and once armed runs <c>interleave</c> right after the next point
         /// read returns, i.e. between a store's read and its write — the window another instance's write
-        /// can land in.
+        /// can land in. <c>beforeDeletePartition</c>, when given, runs before every partition delete, i.e.
+        /// inside a user delete's cascade.
         /// </summary>
-        private sealed class InterleavingStorage<T>(IStorage<T> inner, Func<Task> interleave) : IStorage<T>
+        private sealed class InterleavingStorage<T>(IStorage<T> inner, Func<Task> interleave, Func<Task>? beforeDeletePartition = null) : IStorage<T>
             where T : class, IEntity, new()
         {
             public bool Armed { get; set; }
@@ -546,7 +563,12 @@ namespace Unified.Data.Tables.Identity.Tests
             }
 
             public Task DeleteAsync(string id, CancellationToken ct = default) => inner.DeleteAsync(id, ct);
-            public Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default) => inner.DeletePartitionAsync(partition, ct);
+            public async Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
+            {
+                if (beforeDeletePartition is not null)
+                    await beforeDeletePartition();
+                return await inner.DeletePartitionAsync(partition, ct);
+            }
             public Task<T> CreateAsync(T entity, CancellationToken ct = default) => inner.CreateAsync(entity, ct);
             public Task<T> UpsertAsync(T entity, CancellationToken ct = default) => inner.UpsertAsync(entity, ct);
             public Task<T> UpdateAsync(T entity, CancellationToken ct = default) => inner.UpdateAsync(entity, ct);

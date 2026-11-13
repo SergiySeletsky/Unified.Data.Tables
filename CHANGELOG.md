@@ -51,7 +51,7 @@ All notable changes to this project are documented here. The format is based on
   queries before writing. Two registrations racing on different instances can both pass it. Hosts that
   need a hard guarantee serialize registration or keep their own reservation row.
 
-## [0.9.1] — 2026-11-14
+## [0.9.1] — 2026-11-13
 
 ### Fixed
 
