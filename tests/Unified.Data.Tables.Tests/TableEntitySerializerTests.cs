@@ -134,17 +134,58 @@ public class TableEntitySerializerTests
         Assert.Equal(678.90m, restored.OptionalAmount);
     }
 
+    // The amounts are decimal text, not double literals: since .NET 11 a double-to-decimal cast yields
+    // the double's exact binary value ((decimal)1234.56 == 1234.5599999999999454...), which is not the
+    // money value the test means.
     [Theory]
-    [InlineData(0)]
-    [InlineData(50)]
-    [InlineData(1234.56)]
-    [InlineData(99999.99)]
-    public void Decimal_TypicalMoneyValues_SurviveDoubleStorage(double raw)
+    [InlineData("0")]
+    [InlineData("50")]
+    [InlineData("0.1")]
+    [InlineData("0.01")]
+    [InlineData("1234.56")]
+    [InlineData("-123.4567")]
+    [InlineData("99999.99")]
+    [InlineData("123456789012.345")]
+    public void Decimal_TypicalMoneyValues_SurviveDoubleStorage(string text)
     {
-        var amount = (decimal)raw;
-        var restored = RoundTrip(new EntityWithDecimal { Id = "m", Amount = amount });
+        var amount = decimal.Parse(text, System.Globalization.CultureInfo.InvariantCulture);
+        var restored = RoundTrip(new EntityWithDecimal { Id = "m", Amount = amount, OptionalAmount = amount });
         Assert.Equal(amount, restored.Amount);
+        Assert.Equal(amount, restored.OptionalAmount);
     }
+
+    // A row is read the same whichever runtime wrote it: the cell is just the double nearest the value.
+    [Theory]
+    [InlineData(1234.56, "1234.56")]
+    [InlineData(0.1, "0.1")]
+    [InlineData(-123.4567, "-123.4567")]
+    [InlineData(10.123456789012345678, "10.1234567890123")]
+    public void Decimal_DoubleCell_ReadsBackRoundedTo15SignificantDigits(double cell, string expected)
+    {
+        var te = new TableEntity("pk", "rk") { ["Amount"] = cell, ["OptionalAmount"] = cell };
+
+        var restored = te.FromTableEntity<EntityWithDecimal>();
+
+        var amount = decimal.Parse(expected, System.Globalization.CultureInfo.InvariantCulture);
+        Assert.Equal(amount, restored.Amount);
+        Assert.Equal(amount, restored.OptionalAmount);
+    }
+
+    [Theory]
+    [InlineData(1e-30, "0")]
+    [InlineData(7.92281625142643E+28, "79228162514264300000000000000")]
+    public void DecimalFromCell_HandlesTheEdgesOfDecimalRange(double cell, string expected)
+        => Assert.Equal(decimal.Parse(expected, System.Globalization.CultureInfo.InvariantCulture), TableEntityValue.DecimalFromCell(cell));
+
+    [Theory]
+    [InlineData(79228162514264337593543950336.0)] // 2^96, the double decimal.MaxValue is written as
+    [InlineData(1e29)]
+    [InlineData(-1e29)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    public void DecimalFromCell_OutOfRange_ThrowsOverflow(double cell)
+        => Assert.Throws<OverflowException>(() => TableEntityValue.DecimalFromCell(cell));
 
     [Fact]
     public void Guid_RoundTrip_Preserves()

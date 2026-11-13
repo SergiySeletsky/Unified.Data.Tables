@@ -1939,7 +1939,7 @@ internal sealed class TableEntityValue
             return singleByte[0];
 
         if (t == typeof(decimal))
-            return Convert.ToDecimal(val, CultureInfo.InvariantCulture);
+            return val is double cell ? DecimalFromCell(cell) : Convert.ToDecimal(val, CultureInfo.InvariantCulture);
 
         return Convert.ChangeType(val, t, CultureInfo.InvariantCulture);
     }
@@ -2013,6 +2013,28 @@ internal sealed class TableEntityValue
         if (t == typeof(long)) return l;
         return null; // caller falls through to Convert.ChangeType
     }
+
+    // A decimal is stored as a double cell (Azure Tables has no decimal type), and a double keeps 15
+    // significant decimal digits, so the read rounds the cell to 15 significant digits: 1234.56m is
+    // written as the double nearest 1234.56 and reads back as 1234.56m. Before .NET 11 the runtime's
+    // double-to-decimal conversion did exactly this rounding; since .NET 11 it converts the double's
+    // exact binary value instead (1234.55999999999994543031789362m), and has no switch to restore the
+    // old result (dotnet/runtime#130565), so the rounding is done here, the same on every runtime.
+    // Out of decimal's range, NaN and infinity throw OverflowException, as the runtime conversion does;
+    // like it, any magnitude from 2^96 up (the double decimal.MaxValue is written as) is out of range, even
+    // where its 15-digit rounding would fit.
+    internal static decimal DecimalFromCell(double cell)
+    {
+        if (!double.IsFinite(cell) || Math.Abs(cell) >= DecimalCellLimit)
+            throw new OverflowException("Value was either too large or too small for a Decimal.");
+
+        Span<char> text = stackalloc char[32];
+        cell.TryFormat(text, out var length, "G15", CultureInfo.InvariantCulture);
+        return decimal.Parse(text[..length], NumberStyles.Float, CultureInfo.InvariantCulture);
+    }
+
+    // 2^96, exactly representable as a double.
+    private const double DecimalCellLimit = 79228162514264337593543950336.0;
 
     // Leaves generous headroom under the 32K-char (64 KB UTF-16) cell limit for the marker.
     private const int TruncatedCellChars = 30_000;

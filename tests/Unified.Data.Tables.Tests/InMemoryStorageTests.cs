@@ -68,9 +68,9 @@ public class InMemoryStorageTests
         var loaded = await store.OneAsync("p|r");
 
         // decimal is stored as double by the production serializer — the fake must exhibit the
-        // same precision behaviour instead of hiding it. The expected value is converted at run time:
-        // a constant expression is folded by the compiler, whose own runtime may round differently.
-        Assert.Equal((decimal)(double)amount, loaded!.Amount);
+        // same precision behaviour instead of hiding it: a double keeps 15 significant digits, and
+        // the read rounds to exactly those (on every runtime, see TableEntityValue.DecimalFromCell).
+        Assert.Equal(10.1234567890123m, loaded!.Amount);
     }
 
     [Fact]
