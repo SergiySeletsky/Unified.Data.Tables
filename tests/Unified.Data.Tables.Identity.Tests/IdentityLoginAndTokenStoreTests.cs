@@ -138,7 +138,7 @@ namespace Unified.Data.Tables.Identity.Tests
             await AddLogin("u2", "Google", "k2");
 
             // Act
-            await _fixture.UserStore.DeleteAsync(new IdentityUser { Id = "u1" }, TestContext.Current.CancellationToken);
+            Assert.True((await _fixture.UserStore.DeleteAsync(await _fixture.ReadUserAsync("u1", TestContext.Current.CancellationToken), TestContext.Current.CancellationToken)).Succeeded);
 
             // Assert
             Assert.Empty(await Logins.GetLoginsAsync(new IdentityUser { Id = "u1" }, TestContext.Current.CancellationToken));
@@ -171,7 +171,7 @@ namespace Unified.Data.Tables.Identity.Tests
             await Tokens.SetTokenAsync(user, "p", "b", "2", TestContext.Current.CancellationToken);
 
             // Act
-            await _fixture.UserStore.DeleteAsync(user, TestContext.Current.CancellationToken);
+            Assert.True((await _fixture.UserStore.DeleteAsync(await _fixture.ReadUserAsync("u1", TestContext.Current.CancellationToken), TestContext.Current.CancellationToken)).Succeeded);
 
             // Assert
             Assert.Equal(0, _fixture.UserTokenRows.Count);

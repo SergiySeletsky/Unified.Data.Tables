@@ -66,7 +66,7 @@ namespace Unified.Data.Tables.Identity.Tests
             await AddUserClaim("u2", "friendly-name", "Bob");
 
             // Act
-            await _fixture.UserStore.DeleteAsync(new IdentityUser { Id = "u1" }, TestContext.Current.CancellationToken);
+            Assert.True((await _fixture.UserStore.DeleteAsync(await _fixture.ReadUserAsync("u1", TestContext.Current.CancellationToken), TestContext.Current.CancellationToken)).Succeeded);
 
             // Assert
             Assert.Empty(await UserClaims.GetClaimsAsync(new IdentityUser { Id = "u1" }, TestContext.Current.CancellationToken));
@@ -117,7 +117,7 @@ namespace Unified.Data.Tables.Identity.Tests
             await AddRoleClaim("r2", "perm", "write");
 
             // Act
-            await _fixture.RoleStore.DeleteAsync(new IdentityRole("admin") { Id = "r1" }, TestContext.Current.CancellationToken);
+            Assert.True((await _fixture.RoleStore.DeleteAsync(await _fixture.ReadRoleAsync("r1", TestContext.Current.CancellationToken), TestContext.Current.CancellationToken)).Succeeded);
 
             // Assert
             Assert.Empty(await RoleClaims.GetClaimsAsync(new IdentityRole("admin") { Id = "r1" }, TestContext.Current.CancellationToken));

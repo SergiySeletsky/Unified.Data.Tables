@@ -1924,9 +1924,39 @@ builder.Services.AddUnifiedTableStorage(connectionString, o =>
     o.CacheFor<IdentityUserModel>(CachePolicy.Disabled));
 ```
 
+### Updates and deletes are optimistic: `ConcurrencyStamp` is enforced
+
+Since 0.9.2 the stores treat `ConcurrencyStamp` the way Identity's EF Core stores do. `UpdateAsync`
+and `DeleteAsync` of a user or a role apply only when the stored row still carries the stamp of the
+object passed in; `UpdateAsync` then gives the row (and the object) a fresh stamp. When another
+writer changed the row first (a second instance, the other slot during a swap, a parallel request),
+nothing is written and the result is `IdentityResult.Failed` with the describer's
+`ConcurrencyFailure` (code `"ConcurrencyFailure"`); the object keeps its original stamp, so re-read
+it with `FindByIdAsync`, re-apply the change and try again. The write itself is a full replace
+conditioned on the ETag of the store's own read, so a writer that slips in between the check and the
+write is caught too. An update is still a replace, not a merge, so a column set back to `null` (an
+unlocked user's `LockoutEnd`) is cleared.
+
+A delete claims the row first (a conditional write of a fresh stamp) and only then removes claims,
+logins, roles, tokens and the row; `IStorage<T>` has no conditional delete, and the claim is what
+makes a concurrent update fail rather than be lost. A crash between the claim and the last delete
+leaves the row with a new stamp; re-read and delete again.
+
+Before 0.9.2 an update was an unconditional upsert, so the last writer won and a security-stamp,
+lockout or password change made by another instance could be silently overwritten.
+
+### User name and email uniqueness is a validator check only
+
+`NormalizedUserName` and `NormalizedEmail` are ordinary columns: there are no unique index rows.
+Uniqueness rests on Identity's `UserValidator` (`RequireUniqueEmail`, the duplicate-name check),
+which queries before it writes, so two registrations racing on different instances can both pass it.
+A host that needs a hard guarantee serializes registration or adds its own reservation row.
+
 ### Login rows use `CreateAsync`, not upsert
 
-Every other association table (roles, claims, tokens) upserts. Login rows don't, and that's
+Every other association table (roles, claims, tokens) upserts; the one read-modify-write among them,
+redeeming a two-factor recovery code, is a compare-and-swap on the token row, so a code is redeemed
+at most once. Login rows don't upsert, and that's
 intentional rather than an inconsistency: a login's key is `{provider}|{md5(providerKey)}`, and the
 owning `UserId` lives in the row's *value*, not its key. An upsert would silently reassign
 ownership of an external identity to whoever wrote last; `CreateAsync` fails loud on a duplicate

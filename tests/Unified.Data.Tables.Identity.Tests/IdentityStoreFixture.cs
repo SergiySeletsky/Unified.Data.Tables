@@ -38,6 +38,19 @@ namespace Unified.Data.Tables.Identity.Tests
                 IdentityRoleModel.FromIdentity(new IdentityRole(name) { Id = roleId, NormalizedName = name.ToUpperInvariant() }),
                 cancellationToken);
 
+        /// <summary>
+        /// Reads a user through the store, as UserManager hands one to a delete or update: since 0.9.2 a
+        /// hand-built object carries no stored ConcurrencyStamp and is refused.
+        /// </summary>
+        public async Task<IdentityUser> ReadUserAsync(string userId, CancellationToken cancellationToken) =>
+            await UserStore.FindByIdAsync(userId, cancellationToken)
+            ?? throw new InvalidOperationException($"No user {userId} was seeded.");
+
+        /// <summary>Reads a role through the store; see <see cref="ReadUserAsync"/>.</summary>
+        public async Task<IdentityRole> ReadRoleAsync(string roleId, CancellationToken cancellationToken) =>
+            await RoleStore.FindByIdAsync(roleId, cancellationToken)
+            ?? throw new InvalidOperationException($"No role {roleId} was seeded.");
+
         /// <summary>Seeds a user row directly, bypassing the store under test.</summary>
         public Task SeedUserAsync(string userId, string userName, CancellationToken cancellationToken) =>
             UserRows.UpsertAsync(

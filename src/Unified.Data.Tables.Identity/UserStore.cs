@@ -16,8 +16,9 @@ namespace Unified.Data.Tables.Identity
             IStorage<IdentityUserLoginModel> userLogins,
             IStorage<IdentityUserClaimModel> userClaims,
             IStorage<IdentityUserRoleModel> userRoles,
-            IStorage<IdentityUserTokenModel> userTokens)
-            : base(users, userLogins, userClaims, userRoles, userTokens)
+            IStorage<IdentityUserTokenModel> userTokens,
+            IdentityErrorDescriber? describer = null)
+            : base(users, userLogins, userClaims, userRoles, userTokens, describer)
         {
             this.users = users ?? throw new ArgumentNullException(nameof(users));
             this.roles = roles ?? throw new ArgumentNullException(nameof(roles));

@@ -34,14 +34,24 @@ namespace Unified.Data.Tables.Identity
             IStorage<IdentityUserLoginModel> userLogins,
             IStorage<IdentityUserClaimModel> userClaims,
             IStorage<IdentityUserRoleModel> userRoles,
-            IStorage<IdentityUserTokenModel> userTokens)
+            IStorage<IdentityUserTokenModel> userTokens,
+            IdentityErrorDescriber? describer = null)
         {
             this.users = users ?? throw new ArgumentNullException(nameof(users));
             this.userLogins = userLogins ?? throw new ArgumentNullException(nameof(userLogins));
             this.userClaims = userClaims ?? throw new ArgumentNullException(nameof(userClaims));
             this.userRoles = userRoles ?? throw new ArgumentNullException(nameof(userRoles));
             this.userTokens = userTokens ?? throw new ArgumentNullException(nameof(userTokens));
+            ErrorDescriber = describer ?? new IdentityErrorDescriber();
         }
+
+        /// <summary>
+        /// Describes the errors this store reports, as the EF Core stores do: the describer Identity
+        /// registers (so a localized one applies), or a default one.
+        /// </summary>
+        public IdentityErrorDescriber ErrorDescriber { get; }
+
+        private IdentityResult ConcurrencyFailure() => IdentityResult.Failed(ErrorDescriber.ConcurrencyFailure());
 
         #region IQueryableUserStore
         // Synchronous by force: IQueryableUserStore exposes a property, not a Task. The blocking
@@ -75,9 +85,33 @@ namespace Unified.Data.Tables.Identity
             }
         }
 
+        /// <summary>
+        /// Deletes the user, its claims, logins, roles and tokens when the stored row still carries the
+        /// caller's <see cref="IdentityUser{TKey}.ConcurrencyStamp"/>. When another writer changed the row
+        /// since the caller read it, or the row is gone, nothing is deleted and the result is
+        /// <see cref="IdentityErrorDescriber.ConcurrencyFailure"/>.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="IStorage{T}"/> has no conditional delete, so the check is made binding another way:
+        /// before the cascade the row is rewritten, on condition of the ETag it was read with, with a fresh
+        /// stamp no caller holds. From then on a concurrent update fails, on that ETag or on the stamp, and
+        /// nothing is deleted until this claim succeeds. What remains is a crash or a cancellation between
+        /// the claim and the final row delete: the user row then survives with a new stamp (and possibly
+        /// without some of its child rows), and a delete retried after re-reading the user finishes the job.
+        /// </remarks>
         public async Task<IdentityResult> DeleteAsync(IdentityUser user, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(user);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var id = IdentityKeys.User(user.Id);
+            var current = await users.OneAsync(id, cancellationToken);
+            if (current is null || !ConcurrencyStamps.Matches(current.ConcurrencyStamp, user.ConcurrencyStamp))
+                return ConcurrencyFailure();
+
+            current.ConcurrencyStamp = ConcurrencyStamps.NewStamp();
+            if (!await ConcurrencyStamps.TryReplaceAsync(users, current, current.ETag, cancellationToken))
+                return ConcurrencyFailure();
 
             // Cascade first, user row last: a crash midway leaves orphan child rows rather than a
             // user that cannot be found but still holds logins, roles and claims.
@@ -88,7 +122,7 @@ namespace Unified.Data.Tables.Identity
                 userTokens.DeletePartitionAsync(user.Id, cancellationToken)
             );
 
-            await users.DeleteAsync(IdentityKeys.User(user.Id), cancellationToken);
+            await users.DeleteAsync(id, cancellationToken);
             return IdentityResult.Success;
         }
 
@@ -120,12 +154,40 @@ namespace Unified.Data.Tables.Identity
             return Task.CompletedTask;
         }
 
+        /// <summary>
+        /// Writes the user when the stored row still carries the caller's
+        /// <see cref="IdentityUser{TKey}.ConcurrencyStamp"/>, and gives it a fresh stamp. When another writer
+        /// changed the row since the caller read it, or the row is gone, nothing is written and the result is
+        /// <see cref="IdentityErrorDescriber.ConcurrencyFailure"/>: re-read the user and repeat the change. On
+        /// any failure <paramref name="user"/> keeps the stamp it came with.
+        /// </summary>
         public async Task<IdentityResult> UpdateAsync(IdentityUser user, CancellationToken cancellationToken)
         {
-            // Upsert, i.e. a full replace rather than a merge: only a replace can clear a column
-            // that was set back to null, which is what lets an unlocked user actually unlock.
-            await users.UpsertAsync(IdentityUserModel.FromIdentity(user), cancellationToken);
-            return IdentityResult.Success;
+            ArgumentNullException.ThrowIfNull(user);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var current = await users.OneAsync(IdentityKeys.User(user.Id), cancellationToken);
+            if (current is null || !ConcurrencyStamps.Matches(current.ConcurrencyStamp, user.ConcurrencyStamp))
+                return ConcurrencyFailure();
+
+            var expected = user.ConcurrencyStamp;
+            var written = false;
+            user.ConcurrencyStamp = ConcurrencyStamps.NewStamp();
+            try
+            {
+                // A full replace rather than a merge: only a replace can clear a column that was set
+                // back to null, which is what lets an unlocked user actually unlock. It is conditional on
+                // the ETag of the read above, so a writer that got in between is never overwritten.
+                var model = IdentityUserModel.FromIdentity(user);
+                model.CreatedAt = current.CreatedAt;
+                written = await ConcurrencyStamps.TryReplaceAsync(users, model, current.ETag, cancellationToken);
+                return written ? IdentityResult.Success : ConcurrencyFailure();
+            }
+            finally
+            {
+                if (!written)
+                    user.ConcurrencyStamp = expected;
+            }
         }
         #endregion
 
@@ -438,18 +500,28 @@ namespace Unified.Data.Tables.Identity
             return SetTokenAsync(user, InternalLoginProvider, RecoveryCodeTokenName, mergedCodes, cancellationToken);
         }
 
+        /// <summary>
+        /// Removes <paramref name="code"/> from the user's recovery codes and reports whether it was there.
+        /// The removal is a compare-and-swap on the token row, so two redemptions at once (two instances,
+        /// two requests) can neither both redeem the same code nor write back a list that still holds a code
+        /// the other one used. A code is redeemed at most once; when the response to the write is lost, or
+        /// the row stays contended for every attempt, a valid code can be refused and the user enters
+        /// another one.
+        /// </summary>
         public async Task<bool> RedeemCodeAsync(IdentityUser user, string code, CancellationToken cancellationToken)
         {
-            var mergedCodes = await GetTokenAsync(user, InternalLoginProvider, RecoveryCodeTokenName, cancellationToken) ?? "";
-            var splitCodes = mergedCodes.Split(';');
-            if (splitCodes.Contains(code))
-            {
-                var updatedCodes = new List<string>(splitCodes.Where(s => s != code));
-                await ReplaceCodesAsync(user, updatedCodes, cancellationToken);
-                return true;
-            }
-            return false;
+            ArgumentNullException.ThrowIfNull(user);
+
+            var result = await userTokens.TryTransitionAsync(
+                IdentityKeys.UserToken(user.Id, InternalLoginProvider, RecoveryCodeTokenName),
+                row => SplitCodes(row.Value).Contains(code),
+                row => row.Value = string.Join(";", SplitCodes(row.Value).Where(s => s != code)),
+                maxAttempts: 5,
+                ct: cancellationToken);
+            return result.Succeeded;
         }
+
+        private static string[] SplitCodes(string? mergedCodes) => (mergedCodes ?? "").Split(';');
 
         public async Task<int> CountCodesAsync(IdentityUser user, CancellationToken cancellationToken)
         {

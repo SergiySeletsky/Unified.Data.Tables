@@ -15,12 +15,22 @@ namespace Unified.Data.Tables.Identity
         public RoleStore(
             IStorage<IdentityRoleModel> roles,
             IStorage<IdentityRoleClaimModel> roleClaims,
-            IStorage<IdentityUserRoleModel> userRoles)
+            IStorage<IdentityUserRoleModel> userRoles,
+            IdentityErrorDescriber? describer = null)
         {
             this.roles = roles ?? throw new ArgumentNullException(nameof(roles));
             this.roleClaims = roleClaims ?? throw new ArgumentNullException(nameof(roleClaims));
             this.userRoles = userRoles ?? throw new ArgumentNullException(nameof(userRoles));
+            ErrorDescriber = describer ?? new IdentityErrorDescriber();
         }
+
+        /// <summary>
+        /// Describes the errors this store reports, as the EF Core stores do: the describer Identity
+        /// registers (so a localized one applies), or a default one.
+        /// </summary>
+        public IdentityErrorDescriber ErrorDescriber { get; }
+
+        private IdentityResult ConcurrencyFailure() => IdentityResult.Failed(ErrorDescriber.ConcurrencyFailure());
 
         #region IQueryableRoleStore
         // Synchronous by force: IQueryableRoleStore exposes a property, not a Task.
@@ -43,9 +53,32 @@ namespace Unified.Data.Tables.Identity
             }
         }
 
+        /// <summary>
+        /// Deletes the role, its claims and its user links when the stored row still carries the caller's
+        /// <see cref="IdentityRole{TKey}.ConcurrencyStamp"/>. When another writer changed the row since the
+        /// caller read it, or the row is gone, nothing is deleted and the result is
+        /// <see cref="IdentityErrorDescriber.ConcurrencyFailure"/>.
+        /// </summary>
+        /// <remarks>
+        /// As for a user: <see cref="IStorage{T}"/> has no conditional delete, so before the cascade the row
+        /// is rewritten, on condition of the ETag it was read with, with a fresh stamp no caller holds. A
+        /// crash or a cancellation between that claim and the final row delete leaves the role with a new
+        /// stamp (and possibly without some of its claims and links); a delete retried after re-reading the
+        /// role finishes the job.
+        /// </remarks>
         public async Task<IdentityResult> DeleteAsync(IdentityRole role, CancellationToken cancellationToken)
         {
             ArgumentNullException.ThrowIfNull(role);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var id = IdentityKeys.Role(role.Id);
+            var current = await roles.OneAsync(id, cancellationToken);
+            if (current is null || !ConcurrencyStamps.Matches(current.ConcurrencyStamp, role.ConcurrencyStamp))
+                return ConcurrencyFailure();
+
+            current.ConcurrencyStamp = ConcurrencyStamps.NewStamp();
+            if (!await ConcurrencyStamps.TryReplaceAsync(roles, current, current.ETag, cancellationToken))
+                return ConcurrencyFailure();
 
             // Cascade first, role row last.
             await Task.WhenAll(
@@ -53,7 +86,7 @@ namespace Unified.Data.Tables.Identity
                 DeleteRoleUsersAsync(role.Id, cancellationToken)
             );
 
-            await roles.DeleteAsync(IdentityKeys.Role(role.Id), cancellationToken);
+            await roles.DeleteAsync(id, cancellationToken);
             return IdentityResult.Success;
         }
 
@@ -95,12 +128,39 @@ namespace Unified.Data.Tables.Identity
             return Task.CompletedTask;
         }
 
+        /// <summary>
+        /// Writes the role when the stored row still carries the caller's
+        /// <see cref="IdentityRole{TKey}.ConcurrencyStamp"/>, and gives it a fresh stamp. When another writer
+        /// changed the row since the caller read it, or the row is gone, nothing is written and the result is
+        /// <see cref="IdentityErrorDescriber.ConcurrencyFailure"/>: re-read the role and repeat the change. On
+        /// any failure <paramref name="role"/> keeps the stamp it came with.
+        /// </summary>
         public async Task<IdentityResult> UpdateAsync(IdentityRole role, CancellationToken cancellationToken)
         {
-            // Upsert, i.e. a full replace rather than a merge, and keyed by role id, so a rename
-            // updates the existing row instead of minting a second one.
-            await roles.UpsertAsync(IdentityRoleModel.FromIdentity(role), cancellationToken);
-            return IdentityResult.Success;
+            ArgumentNullException.ThrowIfNull(role);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var current = await roles.OneAsync(IdentityKeys.Role(role.Id), cancellationToken);
+            if (current is null || !ConcurrencyStamps.Matches(current.ConcurrencyStamp, role.ConcurrencyStamp))
+                return ConcurrencyFailure();
+
+            var expected = role.ConcurrencyStamp;
+            var written = false;
+            role.ConcurrencyStamp = ConcurrencyStamps.NewStamp();
+            try
+            {
+                // A full replace keyed by role id, so a rename updates the existing row instead of
+                // minting a second one; conditional on the ETag of the read above.
+                var model = IdentityRoleModel.FromIdentity(role);
+                model.CreatedAt = current.CreatedAt;
+                written = await ConcurrencyStamps.TryReplaceAsync(roles, model, current.ETag, cancellationToken);
+                return written ? IdentityResult.Success : ConcurrencyFailure();
+            }
+            finally
+            {
+                if (!written)
+                    role.ConcurrencyStamp = expected;
+            }
         }
         #endregion
 
