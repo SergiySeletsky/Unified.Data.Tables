@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-11-13
+
+### Fixed
+
+- **Identity: an update of a user or role could silently undo another writer's change.** The stores
+  stored `ConcurrencyStamp` but never checked it: `UserStore.UpdateAsync` and `RoleStore.UpdateAsync`
+  were unconditional upserts, so the last writer won. On a multi-instance host, or while both slots run
+  during a swap, a security-stamp rotation (sign out everywhere), a lockout, a password change or a
+  confirmed email written by one instance was overwritten by another instance saving an older copy of
+  the same user, with no error. An update also recreated a user or role that had been deleted. Updates
+  now follow Identity's contract, as the EF Core stores do: the write applies only when the stored row
+  still carries the caller's `ConcurrencyStamp`, it gives the row a fresh stamp, and it is a full replace
+  conditioned on the ETag of the store's own read (so a writer that lands between the check and the
+  write is caught too, and a column set back to null, such as an unlocked user's `LockoutEnd`, is still
+  cleared). A mismatch, or a row that is gone, returns `IdentityResult.Failed` with
+  `IdentityErrorDescriber.ConcurrencyFailure()` (code `ConcurrencyFailure`); the caller's object keeps the
+  stamp it came with. The row's `CreatedAt` is now kept by an update instead of being reset.
+- **Identity: a delete of a user or role ignored `ConcurrencyStamp` too.** `DeleteAsync` now checks the
+  stamp before the cascade and fails with `ConcurrencyFailure`, deleting nothing, when it does not match
+  or the row is gone. `IStorage<T>` has no conditional delete, so the delete first claims the row with an
+  ETag-conditioned write of a fresh stamp, and only then removes claims, logins, roles or tokens and the
+  row: a concurrent update fails rather than being lost.
+- **Identity: two concurrent recovery-code redemptions could put a used code back.** `RedeemCodeAsync`
+  read the code list and upserted the remainder, so of two redemptions at once the later write restored
+  the code the earlier one had used (and both could redeem the same code). It is now a compare-and-swap
+  on the token row (`TryTransitionAsync`): a code is redeemed at most once.
+- The stores take an optional `IdentityErrorDescriber`, as the EF Core stores do; under
+  `AddUnifiedIdentityStores()` the one Identity registers is used, so a localized describer applies.
+
+### Upgrade notes
+
+- **Behaviour change (Identity).** An update or delete of a user or role object that was not read from
+  the store, or whose `ConcurrencyStamp` is stale or was edited, now fails with `ConcurrencyFailure`
+  instead of overwriting (or recreating) the row; so does a delete of a user or role that does not
+  exist, which used to succeed. Code that builds an `IdentityUser` by hand and saves it with
+  `UpdateAsync` must read it first. Callers that see `ConcurrencyFailure` re-read with `FindByIdAsync`,
+  re-apply the change and retry. `UserManager` and `RoleManager` already pass the failure through as a
+  failed `IdentityResult`. Stored rows need no migration; rows whose stamp is null match an object whose
+  stamp is null.
+- A crash or cancellation between a delete's claim and its final row delete leaves the user or role row
+  with a new stamp (and possibly without some of its child rows); a delete retried after re-reading
+  finishes it.
+- **Known limitation: user name and email uniqueness.** `NormalizedUserName` and `NormalizedEmail` are
+  plain columns with no unique index rows, so uniqueness is only Identity's validator check, which
+  queries before writing. Two registrations racing on different instances can both pass it. Hosts that
+  need a hard guarantee serialize registration or keep their own reservation row.
+
 ## [0.9.1] — 2026-11-14
 
 ### Fixed
