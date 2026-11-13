@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-11-14
+
+### Fixed
+
+- **`decimal` values read back wrong on .NET 11.** A `decimal` is stored as a double cell. Up to .NET 10
+  the runtime's double-to-`decimal` conversion rounded to 15 significant digits, so `1234.56m` read back
+  as `1234.56m`; .NET 11 made the conversion exact
+  ([breaking change](https://learn.microsoft.com/dotnet/core/compatibility/core-libraries/11/decimal-biginteger-floating-point-conversions)),
+  so an app running on the .NET 11 runtime read `1234.5599999999999454...`. The read now rounds the cell
+  to 15 significant digits itself, giving the .NET 10 result on every runtime. The write is unchanged and
+  stored rows need no migration. The same rounding decides whether a builder update keeps a cached entity
+  warm. A cell out of `decimal`'s range, NaN or an infinity still throws as before.
+
+### Changed
+
+- The test projects target `net10.0` and `net11.0`, and CI installs both SDKs, so a runtime behaviour
+  change is caught before a release. The packages still target `net10.0` (and `netstandard2.0` for the
+  abstractions).
+
 ## [0.9.0] — 2026-11-12
 
 Lossless storage of large values, opt-in per property.

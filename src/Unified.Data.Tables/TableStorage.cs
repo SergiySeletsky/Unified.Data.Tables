@@ -1186,12 +1186,12 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // and a read returns it as the default value.
     private static readonly DateTimeOffset DateSentinel = new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
-    // What a read makes of a decimal's double cell (the invariant conversion), or null where it fails.
+    // What a read makes of a decimal's double cell, or null where it fails.
     private static decimal? DecimalReadBack(double cell)
     {
         try
         {
-            return Convert.ToDecimal(cell, System.Globalization.CultureInfo.InvariantCulture);
+            return TableEntityValue.DecimalFromCell(cell);
         }
         catch (OverflowException)
         {
