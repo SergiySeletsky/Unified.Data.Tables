@@ -1,0 +1,15 @@
+# Nested objects: flattened to Parent_Child columns at every depth; a positional record and a list are one JSON cell; a null object stores nothing.
+row PartitionKey="golden" RowKey="nested"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Home_City	Edm.String	"Kyiv"
+	Home_Country	Edm.String	"UA"
+	Home_Door	Edm.String	"Blue"
+	Home_Floor	Edm.Int32	3
+	Home_Street_Name	Edm.String	"Khreshchatyk"
+	Home_Street_Number	Edm.Int32	22
+	Home_Tags__Json	Edm.String	"[\u0022home\u0022,\u0022primary\u0022]"
+	Id	Edm.String	"golden|nested"
+	Position__Json	Edm.String	"{\u0022lat\u0022:50.4501,\u0022lng\u0022:30.5234}"
+	Title	Edm.String	"Nested"
+	UpdatedAt	Edm.DateTime	"2025-03-15T16:10:27.1234567Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenNested	{"Title":"Nested","Home":{"City":"Kyiv","Country":"UA","Floor":3,"Door":9,"Street":{"Name":"Khreshchatyk","Number":22},"Tags":["home","primary"]},"Work":null,"Position":{"Lat":50.4501,"Lng":30.5234},"Previous":null,"Id":"golden|nested","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-15T16:10:27.1234567\u002B00:00"}

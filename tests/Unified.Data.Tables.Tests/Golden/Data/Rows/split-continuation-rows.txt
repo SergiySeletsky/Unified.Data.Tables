@@ -1,0 +1,46 @@
+# [TableValueSplit] values too large for one row: the chunks move to continuation rows (RowKey~0001, ...) that name their entity in _SplitOf.
+row PartitionKey="golden" RowKey="split-rows"
+	Body__c0	Edm.String	sha256=6ff7ab956b2ecf2d14cf52a24195677d24c2795856c7b9e393533aea3c74ef38,utf8-bytes=45861,head="uG\u00E9AV\u4E2DI z9\u044FKYJ1pe\u00E9sps8mWOtw
+	Body__c1	Edm.String	sha256=e7146f4efbd551adfcd9abf579857f8e159288e9437b047348d536903ff792a0,utf8-bytes=45682,head="\uD83D\uDE00Ys6pHy9B9\u00DF\u6587hYly0PgUk\u044
+	Body__c10	Edm.String	sha256=8e89b9e946bac9c1b617f4850e8e4bd4706ddff62b49b7c280640b17d97de248,utf8-bytes=45482,head="V 9mF ShzOC7soCE rpzAO q\u044FJizlq\u044FXMQkSk
+	Body__c11	Edm.String	sha256=90b254295171c78a42011f1586f6814c0a81cbe2aca5965a51289cae7488426b,utf8-bytes=45642,head="L UNMbDk9F93ecrQh0Frnmz ISM\u00E9GrTwez\u00DFcr
+	Body__c12	Edm.String	sha256=e54e0a6c432f4dbf4a3a5100c9a9a74326b1cbc946c9402337c4eeda74517b40,utf8-bytes=45882,head=" z6aaQQ\u6587DM\u4E2D\u4E2Dja4\u4E2DCDB\u00E9cJ
+	Body__c13	Edm.String	sha256=d11cbb8735113f5fea4cd5848eac07f3089d088442041b2eac0d35171f3b0837,utf8-bytes=45502,head="G3nl1QNjNkq7RAKpTIDW9qR0V2b LQ3qH84v Ly wXKFS t
+	Body__c14	Edm.String	sha256=9fc6bf6bb83b6053831b1deae1ee5a6387c7c20e0a29b7c6675b4b697ce01aa9,utf8-bytes=45322,head="vX89Uu7DG\u0416UxxE\u00E9nQru2Zq6vgzm2rwc9yadXC
+	Body__c2	Edm.String	sha256=7bd1675b2d2af83664a06a60512256a86bf5e5b8fa4b06b714b91479d57cc948,utf8-bytes=45282,head="FAcJIjpdyY\u044FnnVx\u4E2D9UR0mo8a0\u4E2Dd8gAaJ
+	Body__c3	Edm.String	sha256=b5ec396a262194bf80c9b8e4f735b841a0636f9b1acf7d7aec3cbae9c8b71f12,utf8-bytes=45392,head="T \u044F \u00DFW uqCUOS X 5pN1\u4E2DJn1Y 9b9pA1
+	Body__c4	Edm.String	sha256=ccb35e92807e53be52c72a5387b594db2f90bf00fd6a668edd022028aff99f21,utf8-bytes=45467,head="2Rf w\u6587JZyZND0VDExwRmPlti7JOvCxr\u0416rOKdC
+	Body__c5	Edm.String	sha256=489f1238e62168b45ae5fe49708c39c9a5b8dcbdb63c8b95cc414a1556c66161,utf8-bytes=45782,head="6tN QG59T\u044F70YtVR\u4E2DCzsSPW8l\u4E2DwB33\u
+	Body__c6	Edm.String	sha256=18b6453f5dac38b1f76222ed292ffeaf6ee2d4ca62a6f170f32ec3ab98fa6fac,utf8-bytes=45147,head="QPadQcg2w\u6587itU\u0416p0i1xff TZB1G\u6587q\u0
+	Body__c7	Edm.String	sha256=b20f9bb346c6280e3422a6438acb860c20d57cb7811ec9d9079fe7b077098c08,utf8-bytes=45547,head="qd06G\u0416GiiFXso\u4E2DCYzj\u00E9iez9 Z4Q\u00D
+	Body__c8	Edm.String	sha256=ca452c9da032f393c15e137f08052f56fc50f7278e7ba90d8d55315ccf6ac9ab,utf8-bytes=45562,head="IXCm\u4E2DvYm6fo0vEGmUhxeocQS\u044FniL\u0416 LS
+	Body__c9	Edm.String	sha256=b8c8eaa5b5a089bf10465cd0fce6d30ca3fa6937bfed0e55bf272cda807da72e,utf8-bytes=45877,head="oUxx\u00E9L7aUH\u4E2DGiD\u0416\u4E2Do1vOTbncdJM
+	Body__chunks	Edm.Int32	22
+	Body__enc	Edm.String	"text"
+	Body__len	Edm.Int64	"779036"
+	Body__sha256	Edm.String	"8222f23b54f6003590cf74926a6bc161db13eb31b61fe30fc266c5af63f0933e"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|split-rows"
+	Image__chunks	Edm.Int32	5
+	Image__enc	Edm.String	"binary"
+	Image__len	Edm.Int64	"300000"
+	Image__sha256	Edm.String	"977eccc99e5d7e929cfc8ed1f3ecd2b69a1b7f8bb54212f4b0e91da731df1b76"
+	Title	Edm.String	"rows"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	_SplitParts	Edm.Int32	1
+row PartitionKey="golden" RowKey="split-rows~0001"
+	Body__c15	Edm.String	sha256=4a10d89301ee8a31628d147c8867960c71821eecda23a27a824fff270751ec96,utf8-bytes=45557,head="BxvWa 8M\u00E9PpdpfAAs mKL10b4NY\u4E2D\u6587JTs
+	Body__c16	Edm.String	sha256=d2431071b7720e071aac55104d88a430f2b58fb473e83fabbaee9ce4ae2cfe71,utf8-bytes=45347,head="ZAorBZma9m9WsZHU hG gkN1p8qP\u00DFh7aUP1F \u044
+	Body__c17	Edm.String	sha256=664b530e22361c0a3fb7cf8bafc97ab1cd4459b7a5e3de6102f8bd14db69c2f5,utf8-bytes=45347,head="hJ\u044FOaV\u0416SL0E\u0416DxCXJ \u00E9\u044Fzq
+	Body__c18	Edm.String	sha256=3a779bf450226439c8cdbc270581575d2be1678b4ccd8dbfb1f9c7bac2d1e8d7,utf8-bytes=45607,head="T21bDa0jGSeHWHZae1LbIUtj1jFHizVKBYpjBh Tn3CAHRX
+	Body__c19	Edm.String	sha256=12643c00ea2d75f1b6ef32e26bbcc4ab30062934bf0c9fef8a58acc50ebb18c2,utf8-bytes=45457,head="mwpqa\u4E2Dal58Il6\u00E95qatfPiz\u00DF9fDvGvM7T
+	Body__c20	Edm.String	sha256=f417369c281ae47b9df02238498892e3c9b9cfd5bc419e2bc2e2e4ff0d2731b7,utf8-bytes=45437,head="FlTsKVCBQ \u0416u7gtDwI   A O KRCNcX70lOk\u00DF
+	Body__c21	Edm.String	sha256=423617038f40dcbbfb3845920b289a5336f0b8b0b6f625ef7e422362bc3cfff2,utf8-bytes=40113,head="T1TC1NaKOy2 XsD \u044FLCbdokJaWmmK8Pb SgXcR0zKg
+	Image__c0	Edm.Binary	sha256=5b9d3d47361a48f8da85ce605a615fe3a554a6fd8a3ef74dd6ace455902ddd89,utf8-bytes=87386,head="mY/I+SuRgVOyoGvqWoiyO+Q4r7TuNtJLcE3BU4iKv4t4Z1B
+	Image__c1	Edm.Binary	sha256=d65b53a9f3357e114cc5b2bfcea5a4aa66c15ae4abefeb77bf450eac80e7a7e7,utf8-bytes=87386,head="AuQZFqS2YsA7ldyn802zSI3NQBGnm/P4OYJyUGGPANhhPCE
+	Image__c2	Edm.Binary	sha256=eb3bee6e3964d9e79f94adeeb374b42a25680e7b76008115afbcf09ebadf9c35,utf8-bytes=87386,head="azlqMx3bQy3Eik1kjBK0VTZi0W5gABSlArcjTTqUQSVKEfK
+	Image__c3	Edm.Binary	sha256=94b31abf36b2da846adfe327fd8f2e095e938b673b452d70b94bf50579fb89b7,utf8-bytes=87386,head="1I67UJYAJJpNf74hJde1Yt/3YssZZTVSy+zUShOZgnIz5sN
+	Image__c4	Edm.Binary	sha256=e8df33360bcb378eeb3385689ce0ff2efd1f80d08a97062bbe06f92dc260de59,utf8-bytes=50478,head="PeMMbQ8lBQfWdC/evpy2b4iM8yjSylb/lCGFR+yew78cu5T
+	_SplitIndex	Edm.Int32	1
+	_SplitOf	Edm.String	"split-rows"
+read	Unified.Data.Tables.Tests.Golden.GoldenSplit	{"Title":"rows","Body":"sha256-of-utf16le=6ee5404e963360b1069df5839032187472856f898dc39fb64b2ae34f0c11f2a4,chars=700000","Image":"sha256-of-utf16le=121050f8e0af0db39f1abee4e9320f10e135e0691b69e732c6c22da3e4e16ddb,chars=400000","Items":null,"Zipped":null,"Id":"golden|split-rows","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

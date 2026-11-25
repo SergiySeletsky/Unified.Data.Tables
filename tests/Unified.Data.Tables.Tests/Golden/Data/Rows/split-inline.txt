@@ -1,0 +1,11 @@
+# [TableValueSplit] values small enough for one cell: ordinary cells, no split metadata.
+row PartitionKey="golden" RowKey="split-inline"
+	Body	Edm.String	sha256=5f547a015e2b5b5348ecfb885244cc26d147761e00d97d50b0701e8824a2a942,utf8-bytes=45342,head="YEFZLzcp6HSckG NxQqnjg\u0416w 8\u00E9\u044FIioN
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|split-inline"
+	Image	Edm.Binary	sha256=72b0d03568e0f04857f156b896d2510465ecc39b04649b22818d90d698c46e0b,utf8-bytes=1338,head="nSgTc9xKmJ8TfVit0jmp075l72OQhzskXDsz5hXmN1FPrML
+	Items__Json	Edm.String	"[\u0022a\u0022,\u0022b\u0022]"
+	Title	Edm.String	"inline"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Zipped	Edm.String	"short"
+read	Unified.Data.Tables.Tests.Golden.GoldenSplit	{"Title":"inline","Body":"sha256-of-utf16le=6d13c58a83c042ee7714cbfeab4ae6fdb548951da302c4ec0724e5811a32c51f,chars=32000","Image":"sha256-of-utf16le=9db8cb5844e19e58bff5ffd2326313203b16678495fb5eff7e09b3a6ec1dc11a,chars=1336","Items":["a","b"],"Zipped":"short","Id":"golden|split-inline","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

@@ -1,0 +1,32 @@
+# Values at the edge of their type, and the ones stored as something else: a default date as 1601-01-01, an unsigned value above the signed range wrapped to a negative Int64, NaN as an annotated string. All of them read back as written.
+row PartitionKey="golden" RowKey="scalar-edges"
+	BytesEmpty	Edm.Binary	""
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	DateTimeDefault	Edm.DateTime	"1601-01-01T00:00:00.0000000Z"
+	DateTimeOffsetDefault	Edm.DateTime	"1601-01-01T00:00:00.0000000Z"
+	DateTimeUnspecified	Edm.DateTime	"2024-06-01T12:00:00.0000000Z"
+	DecimalCents	Edm.Double	19.99
+	DecimalMoney	Edm.Double	1234.56
+	DecimalNegative	Edm.Double	-1E-06
+	DecimalTenth	Edm.Double	0.1
+	DecimalWhole	Edm.Double	1000
+	DoubleEpsilon	Edm.Double	5E-324
+	DoubleLarge	Edm.Double	1.7976931348623157E+308
+	DoubleNaN	Edm.Double	"NaN"
+	DoubleNegativeZero	Edm.Double	-0
+	DoubleTenth	Edm.Double	0.1
+	DoubleWhole	Edm.Double	42
+	GuidEmpty	Edm.Guid	"00000000-0000-0000-0000-000000000000"
+	Id	Edm.String	"golden|scalar-edges"
+	Int32Max	Edm.Int32	2147483647
+	Int32Min	Edm.Int32	-2147483648
+	Int64Max	Edm.Int64	"9223372036854775807"
+	Int64Min	Edm.Int64	"-9223372036854775808"
+	TextControl	Edm.String	"line one\r\nline two\ttabbed\u0001\u007F\u00A0\u2028"
+	TextWhitespace	Edm.String	"  leading and trailing  "
+	TimeSpanDays	Edm.String	"400.00:00:00"
+	TimeSpanNegative	Edm.String	"-00:00:01.5000000"
+	UInt32Max	Edm.Int64	"4294967295"
+	UInt64Max	Edm.Int64	"-1"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenScalarEdges	{"Int32Min":-2147483648,"Int32Max":2147483647,"Int64Min":-9223372036854775808,"Int64Max":9223372036854775807,"UInt32Max":4294967295,"UInt64Max":18446744073709551615,"DoubleTenth":0.1,"DoubleWhole":42,"DoubleNegativeZero":-0,"DoubleLarge":1.7976931348623157E+308,"DoubleEpsilon":5E-324,"DoubleNaN":"NaN","DecimalMoney":1234.56,"DecimalCents":19.99,"DecimalTenth":0.1,"DecimalWhole":1000,"DecimalNegative":-0.000001,"DateTimeDefault":"0001-01-01T00:00:00","DateTimeUnspecified":"2024-06-01T12:00:00","DateTimeOffsetDefault":"0001-01-01T00:00:00\u002B00:00","GuidEmpty":"00000000-0000-0000-0000-000000000000","BytesEmpty":"","TimeSpanNegative":"-00:00:01.5000000","TimeSpanDays":"400.00:00:00","TextWhitespace":"  leading and trailing  ","TextControl":"line one\r\nline two\ttabbed\u0001\u007F\u00A0\u2028","Id":"golden|scalar-edges","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

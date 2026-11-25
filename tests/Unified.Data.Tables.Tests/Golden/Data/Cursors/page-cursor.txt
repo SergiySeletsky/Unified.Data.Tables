@@ -1,0 +1,14 @@
+# PageCursor: Fingerprint(partition, rowKeyPrefix, pageSize) and Encode(fingerprint, inner).
+# partition	rowKeyPrefix	pageSize	inner	fingerprint	token
+null	null	100	"tenant-a\u0000ord-0100"	"~|~|100"	fnx+fDEwMA==.dGVuYW50LWEAb3JkLTAxMDA=
+"p"	null	10	"p\u0000r"	"1:p|~|10"	MTpwfH58MTA=.cABy
+"tenant-a"	null	100	"tenant-a\u0000ord-0100"	"8:tenant-a|~|100"	ODp0ZW5hbnQtYXx+fDEwMA==.dGVuYW50LWEAb3JkLTAxMDA=
+"tenant-a"	"ord-"	25	"tenant-a\u0000ord-0025"	"8:tenant-a|4:ord-|25"	ODp0ZW5hbnQtYXw0Om9yZC18MjU=.dGVuYW50LWEAb3JkLTAwMjU=
+"tenant-a"	"ord-"	1000	"1!12!dGVuYW50LWE- 1!12!b3JkLTEwMDA-"	"8:tenant-a|4:ord-|1000"	ODp0ZW5hbnQtYXw0Om9yZC18MTAwMA==.MSExMiFkR1Z1WVc1MExXRS0gMSExMiFiM0prTFRFd01EQS0=
+null	null	1000	"1!12!dGVuYW50LWI- "	"~|~|1000"	fnx+fDEwMDA=.MSExMiFkR1Z1WVc1MExXSS0g
+"a"	"b"	10	"a\u0000b1"	"1:a|1:b|10"	MTphfDE6YnwxMA==.YQBiMQ==
+"ab"	null	10	"ab\u0000b1"	"2:ab|~|10"	MjphYnx+fDEw.YWIAYjE=
+"~"	"~"	1	"~\u0000~"	"1:~|1:~|1"	MTp+fDE6fnwx.fgB+
+"1:x|2:y"	"3:z|"	7	"1:x|2:y\u00003:z|9"	"7:1:x|2:y|4:3:z||7"	NzoxOnh8Mjp5fDQ6Mzp6fHw3.MTp4fDI6eQAzOnp8OQ==
+""	""	5	"\u0000"	"0:|0:|5"	MDp8MDp8NQ==.AA==
+"\u044E\u043D\u0456\u043A\u043E\u0434-\u4E2D\u6587"	"\u00E9\uD83D\uDE00"	50	"\u044E\u043D\u0456\u043A\u043E\u0434-\u4E2D\u6587\u0000\u00E9\uD83D\uDE00-1"	"9:\u044E\u043D\u0456\u043A\u043E\u0434-\u4E2D\u6587|3:\u00E9\uD83D\uDE00|50"	OTrRjtC90ZbQutC+0LQt5Lit5paHfDM6w6nwn5iAfDUw.0Y7QvdGW0LrQvtC0LeS4reaWhwDDqfCfmIAtMQ==

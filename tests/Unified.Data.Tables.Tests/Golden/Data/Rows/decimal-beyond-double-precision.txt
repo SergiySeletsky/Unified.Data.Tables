@@ -1,0 +1,12 @@
+# A decimal with more digits than a double holds: stored as the nearest double and read back rounded to 15 significant digits, so writing what was read stores another double. The second row is that rewrite.
+row PartitionKey="golden" RowKey="decimal-precision"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Decimal	Edm.Double	123456789.12345679
+	Id	Edm.String	"golden|decimal-precision"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenNullableScalars	{"Text":null,"Flag":null,"Int32":null,"Int64":null,"Double":null,"Decimal":123456789.123457,"Guid":null,"DateTime":null,"DateTimeOffset":null,"TimeSpan":null,"Bytes":null,"Colour":null,"UInt32":null,"UInt64":null,"Id":"golden|decimal-precision","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}
+row PartitionKey="golden" RowKey="decimal-precision"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Decimal	Edm.Double	123456789.123457
+	Id	Edm.String	"golden|decimal-precision"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"

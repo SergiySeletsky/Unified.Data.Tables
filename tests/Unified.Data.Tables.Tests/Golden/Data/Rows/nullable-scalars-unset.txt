@@ -1,0 +1,6 @@
+# The nullable form of every scalar, all null: no cell is stored for any of them.
+row PartitionKey="golden" RowKey="nullable-unset"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|nullable-unset"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenNullableScalars	{"Text":null,"Flag":null,"Int32":null,"Int64":null,"Double":null,"Decimal":null,"Guid":null,"DateTime":null,"DateTimeOffset":null,"TimeSpan":null,"Bytes":null,"Colour":null,"UInt32":null,"UInt64":null,"Id":"golden|nullable-unset","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

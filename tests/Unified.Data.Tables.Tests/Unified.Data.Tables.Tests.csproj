@@ -40,4 +40,9 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The golden corpus: what 0.9.2 puts on the wire, asserted verbatim (see Golden/GoldenFile.cs). -->
+    <None Include="Golden\Data\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

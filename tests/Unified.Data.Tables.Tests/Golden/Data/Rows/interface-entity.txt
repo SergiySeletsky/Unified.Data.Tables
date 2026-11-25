@@ -1,0 +1,7 @@
+# An IEntity that does not derive Entity: the same columns; ETag, Timestamp and a get-only member are not stored.
+row PartitionKey="golden" RowKey="interface"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|interface"
+	Name	Edm.String	"interface only"
+	UpdatedAt	Edm.DateTime	"2025-03-15T16:10:27.1234567Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenInterfaceEntity	{"Id":"golden|interface","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-15T16:10:27.1234567\u002B00:00","Name":"interface only","Computed":"interface only!"}

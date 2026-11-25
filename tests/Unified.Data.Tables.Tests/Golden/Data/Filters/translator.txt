@@ -1,0 +1,70 @@
+# TableFilterTranslator.Translate<GoldenFilterEntity>(predicate)
+x => x.Name == "alice"	Name eq 'alice'
+x => "alice" == x.Name	Name eq 'alice'
+x => x.Name == "O'Brien's"	Name eq 'O''Brien''s'
+x => x.Name == ""	Name eq ''
+x => x.Name == "100% a&b <c> \"d\" e/f\\g"	Name eq '100% a&b <c> "d" e/f\g'
+x => x.Name == "Zażółć 中文 😀"	"Name eq 'Za\u017C\u00F3\u0142\u0107 \u4E2D\u6587 \uD83D\uDE00'"
+x => x.Name == name	Name eq 'captured'
+x => x.Name == name + "-suffix"	Name eq 'captured-suffix'
+x => x.Note == "set"	Note eq 'set'
+x => x.Active	Active eq true
+x => !x.Active	not (Active eq true)
+x => x.Active == false	Active eq false
+x => x.Active != true	Active ne true
+x => x.Verified == true	Verified eq true
+x => x.Count == 3	Count eq 3
+x => x.Count != 3	Count ne 3
+x => x.Count < 3	Count lt 3
+x => x.Count <= 3	Count le 3
+x => x.Count > 3	Count gt 3
+x => x.Count >= 3	Count ge 3
+x => 3 < x.Count	Count gt 3
+x => 3 >= x.Count	Count le 3
+x => x.Count == -1	Count eq -1
+x => x.Count == int.MinValue	Count eq -2147483648
+x => x.Count == limit + 1	Count eq 42
+x => x.Rank == 2	Rank eq 2
+x => x.Rank > 2	Rank gt 2
+x => x.Small == 4000000000u	Small eq 4000000000L
+x => x.Small < 10	Small lt 10L
+x => x.Big == 1234567890123L	Big eq 1234567890123L
+x => x.Big >= long.MinValue	Big ge -9223372036854775808L
+x => x.Big < 5	Big lt 5L
+x => x.Huge == 18446744073709551615UL	Huge eq -1L
+x => x.Huge != 7UL	Huge ne 7L
+x => x.Ratio > 0.5	Ratio gt 0.5
+x => x.Ratio == 1.0	Ratio eq 1
+x => x.Ratio < 1e-7	Ratio lt 1E-07
+x => x.Ratio >= -1.7976931348623157E+308	Ratio ge -1.7976931348623157E+308
+x => x.Ratio != 0.1	Ratio ne 0.1
+x => x.Price == 19.99m	Price eq 19.99
+x => x.Price >= 1000m	Price ge 1000
+x => x.Price < 0.000001m	Price lt 1E-06
+x => x.Token == token	Token eq guid'0f8fad5b-d9cb-469f-a165-70867728950e'
+x => x.Token != Guid.Empty	Token ne guid'00000000-0000-0000-0000-000000000000'
+x => x.When >= when	When ge datetime'2024-02-29T23:59:58.7654321Z'
+x => x.When < new DateTime(2024, 1, 1)	When lt datetime'2024-01-01T00:00:00Z'
+x => x.Seen < seen	Seen lt datetime'2025-03-14T15:09:26.5358979Z'
+x => x.Seen >= GoldenData.Instant	Seen ge datetime'2025-03-14T15:09:26.5358979Z'
+x => x.CreatedAt >= GoldenData.Instant && x.UpdatedAt < GoldenData.Later	(CreatedAt ge datetime'2025-03-14T15:09:26.5358979Z' and UpdatedAt lt datetime'2025-03-15T16:10:27.1234567Z')
+x => x.Colour == GoldenColour.Green	Colour eq 'Green'
+x => x.Colour != GoldenColour.Red	Colour ne 'Red'
+x => x.Colour == colour	Colour eq 'Blue'
+x => x.Home.City == "Kyiv"	Home_City eq 'Kyiv'
+x => x.Home.Street.Number > 10	Home_Street_Number gt 10
+x => x.Home.Street.Name == "Rynok"	Home_Street_Name eq 'Rynok'
+x => x.Home.Floor == 3	Home_Floor eq 3
+x => x.Home.Door == GoldenColour.Blue	Home_Door eq 'Blue'
+x => x.Id == "tenant-a|ord-0001"	(PartitionKey eq 'tenant-a' and RowKey eq 'ord-0001')
+x => x.Id == "solo"	(PartitionKey eq 'solo' and RowKey eq 'solo')
+x => x.Id == "tenant-a|ord|with|pipes"	(PartitionKey eq 'tenant-a' and RowKey eq 'ord|with|pipes')
+x => "it's|quoted" == x.Id	(PartitionKey eq 'it''s' and RowKey eq 'quoted')
+x => x.Name == "a" && x.Count > 1	(Name eq 'a' and Count gt 1)
+x => x.Name == "a" || x.Name == "b"	(Name eq 'a' or Name eq 'b')
+x => x.Name == "a" && x.Count > 1 && x.Active	((Name eq 'a' and Count gt 1) and Active eq true)
+x => x.Name == "a" || x.Name == "b" && x.Count > 1	(Name eq 'a' or (Name eq 'b' and Count gt 1))
+x => (x.Name == "a" || x.Name == "b") && !(x.Count < 5) && x.Active	(((Name eq 'a' or Name eq 'b') and not (Count lt 5)) and Active eq true)
+x => !(x.Active && x.Count == 0)	not ((Active eq true and Count eq 0))
+x => x.Id == "tenant-a|ord-0001" || x.Id == "tenant-a|ord-0002"	((PartitionKey eq 'tenant-a' and RowKey eq 'ord-0001') or (PartitionKey eq 'tenant-a' and RowKey eq 'ord-0002'))
+x => x.Home.City == "Kyiv" && (x.Colour == GoldenColour.Green || x.Price >= 10m) && x.Seen < seen	((Home_City eq 'Kyiv' and (Colour eq 'Green' or Price ge 10)) and Seen lt datetime'2025-03-14T15:09:26.5358979Z')

@@ -1,0 +1,10 @@
+# TableStorage<T>.QueryPageAsync through the Azure SDK: the request it sends ($filter, $top), the continuation
+# the service answers with (x-ms-continuation-NextPartitionKey / -NextRowKey), and the token the store issues.
+# query	$filter	$top	NextPartitionKey	NextRowKey	token
+partition	"PartitionKey eq 'tenant-a'"	2	1!12!dGVuYW50LWE-	1!12!b3JkLTAwMDE-	ODp0ZW5hbnQtYXx+fDI=.MSExMiFkR1Z1WVc1MExXRS0gMSExMiFiM0prTFRBd01ERS0=
+partition in natural form	"PartitionKey eq 'tenant-a'"	2	1!12!dGVuYW50LWE-	1!12!b3JkLTAwMDE-	ODp0ZW5hbnQtYXx+fDI=.MSExMiFkR1Z1WVc1MExXRS0gMSExMiFiM0prTFRBd01ERS0=
+partition and prefix	"PartitionKey eq 'tenant-a' and RowKey ge 'ord-' and RowKey lt 'ord.'"	2	1!12!dGVuYW50LWE-	1!12!b3JkLTAwMDM-	ODp0ZW5hbnQtYXw0Om9yZC18Mg==.MSExMiFkR1Z1WVc1MExXRS0gMSExMiFiM0prTFRBd01ETS0=
+whole table	null	3	1!12!dGVuYW50LWE-	1!12!b3JkLTAwMDI-	fnx+fDM=.MSExMiFkR1Z1WVc1MExXRS0gMSExMiFiM0prTFRBd01ESS0=
+whole table, the service names the next partition only	null	3	1!12!dGVuYW50LWI-	null	fnx+fDM=.MSExMiFkR1Z1WVc1MExXSS0g
+default page size	"PartitionKey eq 'tenant-a'"	100	1!12!dGVuYW50LWE-	1!12!b3JkLTAxMDA-	ODp0ZW5hbnQtYXx+fDEwMA==.MSExMiFkR1Z1WVc1MExXRS0gMSExMiFiM0prTFRBeE1EQS0=
+page size above the service maximum	"PartitionKey eq 'tenant-a'"	1000	1!12!dGVuYW50LWE-	1!12!b3JkLTEwMDA-	ODp0ZW5hbnQtYXx+fDEwMDA=.MSExMiFkR1Z1WVc1MExXRS0gMSExMiFiM0prTFRFd01EQS0=

@@ -1,0 +1,10 @@
+# A list as __Json; a list whose JSON exceeds one cell and a string over 32,000 chars as __GZip (a string cell of base64 GZip bytes).
+row PartitionKey="golden" RowKey="fallbacks"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|fallbacks"
+	LargeList__GZip	Edm.String	gzip-base64{inflated-sha256=5dea5de1f0bd9a23c5eadc83e596f8474f796cb584811cb88be5edb9c714b3cd,inflated-bytes=80001}
+	LongText__GZip	Edm.String	gzip-base64{inflated-sha256=5c22c0a7b75e7c1f6e096da834d6ba66e8cc32355bc80f07789230b2666bb64c,inflated-bytes=50963}
+	ShortText	Edm.String	sha256=bdccdc89a660cdd9498f7ba8781f9301ae4ec934e1c16073a49ba900b2f27985,utf8-bytes=45447,head="\u00DFxRIA\u044F9\u044Fg  W0d0lMFYmHiZ401qi9Czb
+	SmallList__Json	Edm.String	"[\u0022one\u0022,\u0022two\u0022,\u0022three\u0022]"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenFallbacks	{"SmallList":["one","two","three"],"LargeList":"sha256-of-json=5dea5de1f0bd9a23c5eadc83e596f8474f796cb584811cb88be5edb9c714b3cd,items=2000","ShortText":"sha256-of-utf16le=0a9d8972869efb2b3bb80c41476bee8c15eeae225e7a99768d03fe8ea71e2c8f,chars=32000","LongText":"sha256-of-utf16le=cb8eb95aa6ab137550226118ffb109390f962d029e23d43bdfb49ba9ce7c1ac8,chars=50000","Id":"golden|fallbacks","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

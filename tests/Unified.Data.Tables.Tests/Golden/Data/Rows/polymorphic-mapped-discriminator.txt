@@ -1,0 +1,14 @@
+# A polymorphic entry under a TypeDiscriminatorMap: the mapped name in _TypeName.
+row PartitionKey="stream-1" RowKey="0000000002"
+	Created	Edm.DateTime	"2025-03-15T16:10:27.1234567Z"
+	Id	Edm.String	"order-1"
+	Reason	Edm.String	"customer request"
+	Severity	Edm.String	"Red"
+	_TypeName	Edm.String	"order.cancelled"
+read	Unified.Data.Tables.Tests.Golden.GoldenOrderCancelled	{"Reason":"customer request","Severity":0,"Id":"order-1","Created":"2025-03-15T16:10:27.1234567\u002B00:00"}
+read-discriminator	order.cancelled
+read-column	Created	DateTimeOffset	2025-03-15T16:10:27.1234567+00:00
+read-column	Id	String	"order-1"
+read-column	Reason	String	"customer request"
+read-column	Severity	String	"Red"
+read-column	_TypeName	String	"order.cancelled"
