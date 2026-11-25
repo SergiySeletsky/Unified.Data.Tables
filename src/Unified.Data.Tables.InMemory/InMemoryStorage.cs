@@ -293,6 +293,11 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         {
             throw new ArgumentNullException(nameof(entity));
         }
+        // "*" is not a version: refused, as TableStorage<T> refuses it, before anything is read or
+        // written. An unconditional replace is spelled ConcurrencyMode.LastWriterWins, which never looks
+        // at the ETag.
+        if (mode != ConcurrencyMode.LastWriterWins && entity.ETag == "*")
+            throw new ArgumentException(ConcurrencyMessages.WildcardETagOnUpdate(typeof(T).Name), nameof(entity));
         if (LargeValueAware)
             return UpdateLargeAsync(entity, mode, ct);
 

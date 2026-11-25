@@ -1,3 +1,5 @@
+using Azure.Data.Tables;
+
 namespace Unified.Data.Tables;
 
 /// <summary>
@@ -20,6 +22,33 @@ public sealed class UnifiedTableStorageOptions : StorageOptions
         get => (BlobOffloadOptions?)Offload;
         set => Offload = value;
     }
+
+    /// <summary>
+    /// Configures the <see cref="TableClientOptions"/> of the <see cref="TableServiceClient"/> the library
+    /// builds (the connection-string and credential overloads of <c>AddUnifiedTableStorage</c>): the retry
+    /// policy and its delays, a transport, diagnostics, policies of the host. It runs once, when the
+    /// container builds the client, before the library adds its own policy (the retry observation of
+    /// <see cref="TableClientOptionsExtensions.AddRetryObservation"/>), which it adds whatever this does.
+    /// <c>null</c> (the default) leaves the SDK's defaults.
+    /// </summary>
+    /// <remarks>
+    /// Not used for a <see cref="TableServiceClient"/> the host registers itself, which is kept as it is:
+    /// configure that client where it is built, and add
+    /// <see cref="TableClientOptionsExtensions.AddRetryObservation"/> to its options there. The hook of the
+    /// registered options is the one that runs (the first call's, like every other option).
+    /// </remarks>
+    public Action<TableClientOptions>? ConfigureTableClient { get; set; }
+
+    /// <summary>
+    /// Declares what an acknowledged write survives, for <see cref="StorageInfo.Durability"/>, when the
+    /// endpoint cannot say it. <c>null</c> (the default) lets the store decide from its endpoint's host:
+    /// <see cref="Durability.Replicated"/> for an Azure Storage table host
+    /// (<c>{account}.table.core.windows.net</c> and its sovereign-cloud equivalents),
+    /// <see cref="Durability.Unknown"/> for any other (Azurite, a custom domain, a proxy, Cosmos DB). Set it
+    /// for a storage account behind a custom domain, or for an emulator whose durability the host knows.
+    /// The value is reported as declared; nothing checks it.
+    /// </summary>
+    public Durability? DeclaredDurability { get; set; }
 
     /// <summary>
     /// Override the cache policy for one entity type (e.g. disable for high-churn types or

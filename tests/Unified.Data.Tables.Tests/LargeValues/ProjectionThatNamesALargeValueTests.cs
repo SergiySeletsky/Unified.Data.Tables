@@ -252,8 +252,9 @@ public class ProjectionThatNamesALargeValueTests
         public string? Name { get; set; }
     }
 
-    // Rule 2: a plain type's projection is sent exactly as in 0.8.3, whatever it names, and nothing is
-    // resolved or constructed to decide it.
+    // Rule 2: a plain type's projection is sent as written, whatever it names, after the system columns
+    // (since 0.10.0 with _SplitOf among them, so continuation rows are skipped), and nothing is resolved
+    // or constructed to decide it.
     [Fact]
     public void BuildSelect_OfAPlainType_IsSentAsWritten_WithoutConstructingTheEntity()
     {
@@ -263,10 +264,10 @@ public class ProjectionThatNamesALargeValueTests
         var before = CountedPlainDoc.Constructed;
 
         Assert.Equal(
-            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "NoSuchColumn", "Owner_Name", "Body__c0", "Owner"],
+            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "NoSuchColumn", "Owner_Name", "Body__c0", "Owner"],
             TableStorage<CountedPlainDoc>.BuildSelect(new QueryOptions { Select = ["NoSuchColumn", "Owner_Name", "Body__c0", "Owner", "odata.etag"] }));
         Assert.Equal(
-            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Value"],
+            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "Value"],
             TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = ["Value"] }));
 
         Assert.Equal(before, CountedPlainDoc.Constructed);

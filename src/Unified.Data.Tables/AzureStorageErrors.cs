@@ -21,7 +21,11 @@ namespace Unified.Data.Tables;
 ///   <item><description>400 and 413: <see cref="StorageRequestRejectedException"/>.</description></item>
 ///   <item><description>408, 429, 500, 502, 503, 504, a failure without a response (status 0), the SDK's
 ///   "retry failed" aggregate and a cancellation the caller did not ask for (the SDK's network timeout):
-///   <see cref="TransientStorageException"/>.</description></item>
+///   <see cref="TransientStorageException"/>. Every <see cref="OperationCanceledException"/> raised while
+///   the caller's token is not cancelled is read as that timeout, whatever raised it: the attempts of a
+///   request are observed (<see cref="RequestAttempts"/>) only on a client that has the observation
+///   policy, and the table's lazy creation is one request shared by every waiting call, so "no attempt
+///   of this call timed out" cannot be told from "this call saw none of them".</description></item>
 ///   <item><description>Anything else: <see cref="StorageException"/> itself.</description></item>
 /// </list>
 /// A failure of the blob store never says a row or a table is missing, a duplicate or in conflict: its
@@ -63,13 +67,24 @@ internal static class AzureStorageErrors
     /// <param name="id">The id of the row the call addressed, when it addressed one.</param>
     /// <param name="write">
     /// True when the call may change stored data. A transient failure of it may have committed, and a
-    /// duplicate or a conflict may be the call's own write, applied by an attempt the SDK retried: both
-    /// flags are set conservatively, because the attempts of a request are not observed here.
+    /// duplicate or a conflict may be the call's own write, applied by an attempt the SDK retried.
     /// </param>
-    internal static StorageException Map(Exception ex, string entityType, string tableName, string? id, bool write)
+    /// <param name="attempts">
+    /// What the call saw of its own requests (<see cref="RequestAttempts"/>), or null when it kept no
+    /// log. Without one, and with a log that noted nothing (the client has no observation policy), both
+    /// flags of a write are set conservatively. With one, a transient failure of a write has not
+    /// committed when every attempt of every write request was definitely rejected, and a duplicate or a
+    /// conflict is not the call's own write when no write request of the call was sent twice. (A member
+    /// that knows which request failed asks about that request alone; this is the answer for a failure
+    /// nothing caught on its way out.)
+    /// </param>
+    internal static StorageException Map(
+        Exception ex, string entityType, string tableName, string? id, bool write, RequestAttempts? attempts = null)
     {
+        var mayBeOwnWrite = write && (attempts?.MayBeOwnWrite(0) ?? true);
+        var mayHaveCommitted = write && (attempts?.MayHaveCommitted ?? true);
         if (ex is not RequestFailedException failure)
-            return Transient(ex, null, entityType, write);
+            return Transient(ex, null, entityType, write, mayHaveCommitted);
 
         var code = failure.ErrorCode;
         switch (failure.Status)
@@ -81,14 +96,14 @@ internal static class AzureStorageErrors
                     ? new EntityNotFoundException($"{entityType}: a row the request needs does not exist.", failure) { ProviderErrorCode = code }
                     : new EntityNotFoundException(entityType, id, failure) { ProviderErrorCode = code };
             case 409 when string.IsNullOrEmpty(code) || string.Equals(code, "EntityAlreadyExists", StringComparison.Ordinal):
-                return Duplicate(entityType, id, failure, mayBeOwnWrite: write);
+                return Duplicate(entityType, id, failure, mayBeOwnWrite);
             case 412:
-                return Conflict(entityType, id, failure, mayBeOwnWrite: write);
+                return Conflict(entityType, id, failure, mayBeOwnWrite);
             case 400 or 413:
                 return new StorageRequestRejectedException(
                     $"{entityType}: the storage service rejected the request ({Describe(failure)}). Sending it again fails the same way.", code, failure);
             case 0 or 408 or 429 or 500 or 502 or 503 or 504:
-                return Transient(failure, failure, entityType, write);
+                return Transient(failure, failure, entityType, write, mayHaveCommitted);
             default:
                 return new StorageException($"{entityType}: the storage request failed ({Describe(failure)}).", code, failure);
         }
@@ -105,13 +120,13 @@ internal static class AzureStorageErrors
     {
         var subject = $"Blob container '{containerName}'";
         if (ex is not RequestFailedException failure)
-            return Transient(ex, null, subject, write);
+            return Transient(ex, null, subject, write, mayHaveCommitted: write);
 
         return failure.Status switch
         {
             400 or 413 => new StorageRequestRejectedException(
                 $"{subject}: the blob service rejected the request ({Describe(failure)}). Sending it again fails the same way.", failure.ErrorCode, failure),
-            0 or 408 or 429 or 500 or 502 or 503 or 504 => Transient(failure, failure, subject, write),
+            0 or 408 or 429 or 500 or 502 or 503 or 504 => Transient(failure, failure, subject, write, mayHaveCommitted: write),
             _ => new StorageException($"{subject}: the blob request failed ({Describe(failure)}).", failure.ErrorCode, failure),
         };
     }
@@ -187,15 +202,19 @@ internal static class AzureStorageErrors
 
     // inner: the exception the neutral one wraps (the SDK's own, whatever its type); failure: the same
     // one when it is a RequestFailedException, for its code and its Retry-After header.
-    private static TransientStorageException Transient(Exception inner, RequestFailedException? failure, string subject, bool write)
+    // mayHaveCommitted: false for a read, and for a write whose every attempt was seen to be rejected.
+    private static TransientStorageException Transient(
+        Exception inner, RequestFailedException? failure, string subject, bool write, bool mayHaveCommitted)
     {
         var what = failure is null
             ? inner is OperationCanceledException ? "the request timed out" : "the request failed after the SDK's retries"
             : failure.Status == 0 ? "the request got no response" : $"the service could not serve the request ({Describe(failure)})";
-        var outcome = write
-            ? "It may have been applied: read the row before repeating a write that is not idempotent."
-            : "It may succeed when tried again.";
-        return new TransientStorageException($"{subject}: {what}. {outcome}", mayHaveCommitted: write, RetryAfter(failure), inner)
+        var outcome = !write
+            ? "It may succeed when tried again."
+            : mayHaveCommitted
+                ? "It may have been applied: read the row before repeating a write that is not idempotent."
+                : "No attempt of it was applied; it may succeed when tried again.";
+        return new TransientStorageException($"{subject}: {what}. {outcome}", mayHaveCommitted, RetryAfter(failure), inner)
         {
             ProviderErrorCode = failure?.ErrorCode,
         };

@@ -19,6 +19,14 @@ public enum DeleteStatus
     /// it as "gone, possibly by me": a caller that runs a side effect only for a delete it performed must
     /// decide by its own record, not by this result. A provider that never retries a request (the
     /// in-memory one) never returns it.
+    /// <para>
+    /// It is also the answer for a row that is gone when the provider cannot observe the attempts of its
+    /// own request, and so cannot rule the lost attempt out: on the Azure provider, a delete request
+    /// answered "not found" over a <c>TableServiceClient</c> that was built without the library's retry
+    /// observation (<c>TableClientOptionsExtensions.AddRetryObservation</c>; the clients
+    /// <c>AddUnifiedTableStorage</c> builds have it). Such a store answers <see cref="NotFound"/> only when
+    /// it sent no delete at all.
+    /// </para>
     /// </summary>
     Indeterminate,
 }

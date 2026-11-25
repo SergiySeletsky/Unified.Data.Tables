@@ -12,6 +12,31 @@ public class StorageOptions
 {
     private readonly Dictionary<Type, CachePolicy> overrides = [];
     private OffloadOptions? offload;
+    private TimeProvider timeProvider = TimeProvider.System;
+
+    /// <summary>
+    /// The clock a store reads when it stamps <see cref="IEntity.CreatedAt"/> and
+    /// <see cref="IEntity.UpdatedAt"/> on a write, and when it falls back to the client's time for the
+    /// cleanup grace of offloaded values. Defaults to <see cref="System.TimeProvider.System"/>; set a
+    /// fake one in tests that assert on stamps.
+    /// </summary>
+    /// <remarks>
+    /// It does not reach what the store does not set: the service's own <see cref="IEntity.Timestamp"/>,
+    /// a value an entity's property initializer assigns when the entity is constructed (the
+    /// <see cref="Entity"/> base class initializes <c>CreatedAt</c> and <c>UpdatedAt</c> from the system
+    /// clock), and the <c>CreatedAt</c> an upsert keeps because the entity already carries one. Read cache
+    /// expiry is timed by the <c>IMemoryCache</c> the host registers, which has a clock of its own.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The value is null.</exception>
+    public TimeProvider TimeProvider
+    {
+        get => timeProvider;
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            timeProvider = value;
+        }
+    }
 
     /// <summary>
     /// Default cache policy for all entity types. Defaults to <c>CachePolicy.Sliding(1h)</c> —

@@ -102,7 +102,10 @@ internal static class ProjectionColumns<T>
 
         var columns = new List<string>(requested.Count + SystemColumns.Length + SplitSystemColumns.Length);
         columns.AddRange(SystemColumns);
-        if (LargeValueAware) columns.AddRange(SplitSystemColumns);
+        // _SplitOf is selected for every type, so a continuation row is recognised and skipped whatever
+        // type scans the table: a type without large values can share a table with one that has them
+        // (until 0.10.0 its projected scans returned those rows as entities).
+        columns.AddRange(LargeValueAware ? SplitSystemColumns : PartRowMarker);
         foreach (var column in requested)
         {
             if (!string.Equals(column, ETagToken, StringComparison.Ordinal) && !columns.Contains(column, StringComparer.Ordinal))
@@ -182,6 +185,9 @@ internal static class ProjectionColumns<T>
             return false;
         return TableEntitySerializer.FlattensToColumns(type);
     }
+
+    /// <summary>The one column every projection adds so a continuation row can be recognised and skipped.</summary>
+    private static readonly string[] PartRowMarker = [SystemColumnNames.SplitOf];
 
     /// <summary>Columns a split-aware projection adds so continuation rows can be recognised and skipped.</summary>
     private static readonly string[] SplitSystemColumns =

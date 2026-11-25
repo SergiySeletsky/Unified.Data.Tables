@@ -1059,7 +1059,7 @@ public class TableStorageSplitTests
         Assert.Equal(["PartitionKey"], Assert.Single(selects)!);
         // (0.8.x also sent "odata.etag" here; the row's version is not a column and is no longer selected.)
         Assert.Equal(
-            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Name"],
+            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "Name"],
             TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = ["Name"] })!);
     }
 }

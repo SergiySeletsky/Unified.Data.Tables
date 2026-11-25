@@ -28,7 +28,7 @@ public class ProjectedSelectETagTests
     {
         var select = TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = ["Name"] })!;
 
-        Assert.Equal(["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Name"], select);
+        Assert.Equal(["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "Name"], select);
         Assert.DoesNotContain(ETagToken, select);
     }
 
@@ -50,11 +50,11 @@ public class ProjectedSelectETagTests
     public void BuildSelect_DropsTheETagTokenACallerNamed()
     {
         Assert.Equal(
-            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Name"],
+            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "Name"],
             TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = [ETagToken, "Name"] })!);
         // Still a projection (never "every column") when the token was all the caller named.
         Assert.Equal(
-            ["PartitionKey", "RowKey", "Timestamp", "_TypeName"],
+            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf"],
             TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = [ETagToken] })!);
         Assert.Equal(
             ["PartitionKey", "RowKey", "Timestamp", "_TypeName",
@@ -78,7 +78,7 @@ public class ProjectedSelectETagTests
             streamed.Add(entity);
 
         Assert.Equal(3, selects.Count);
-        Assert.All(selects, select => Assert.Equal(["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Name"], select!));
+        Assert.All(selects, select => Assert.Equal(["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "Name"], select!));
         Assert.All(listed.Concat(page.Items).Concat(streamed), entity => Assert.Equal("W/\"etag1\"", entity.ETag));
     }
 

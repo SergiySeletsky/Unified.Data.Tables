@@ -50,7 +50,7 @@ public class MergedLaneSeamTests
         var select = TableStorage<SeamCountedPlain>.BuildSelect(new QueryOptions { Select = ["Title", "Owner_Name", "NoSuchColumn"] });
         using var h = new StorageHarness<SeamCountedPlain>();
 
-        Assert.Equal(["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Title", "Owner_Name", "NoSuchColumn"], select);
+        Assert.Equal(["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "Title", "Owner_Name", "NoSuchColumn"], select);
         Assert.Equal(0, SeamCountedPlain.Constructed);
     }
 

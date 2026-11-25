@@ -26,9 +26,12 @@ public static partial class ServiceCollectionExtensions
 
     /// <summary>
     /// Registers the in-memory cache, the configured <see cref="UnifiedTableStorageOptions"/>, and
-    /// the open-generic <see cref="IStorage{T}"/> → <see cref="TableStorage{T}"/> mapping. The
+    /// the open-generic <see cref="IStorage{T}"/> → <see cref="TableStorage{T}"/> mapping, and the
+    /// experimental <c>ITableStore</c> (the account's tables as untyped rows) over the registered client. The
     /// caller must separately register a <see cref="TableServiceClient"/> (and, if protected
-    /// properties are used, an <see cref="IProtectedPropertyAuthorizer"/>). With
+    /// properties are used, an <see cref="IProtectedPropertyAuthorizer"/>); build it with
+    /// <see cref="TableClientOptionsExtensions.AddRetryObservation"/> on its options so the stores can
+    /// observe the SDK's retries (see <see cref="DuplicateKeyException.MayBeOwnWrite"/>). With
     /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> set, the blob client is
     /// <see cref="BlobOffloadOptions.ServiceClient"/>, or the host's registered <see cref="BlobServiceClient"/>
     /// when <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/> is true; without one, resolving a
@@ -63,7 +66,9 @@ public static partial class ServiceCollectionExtensions
     /// <summary>
     /// Registers a <see cref="TableServiceClient"/> built from <paramref name="connectionString"/> alongside
     /// the cache, options, and the open-generic <see cref="IStorage{T}"/> mapping. A client already
-    /// registered is kept. When <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set (and names no
+    /// registered is kept. The client is built with the registered options'
+    /// <see cref="UnifiedTableStorageOptions.ConfigureTableClient"/> hook and the library's retry
+    /// observation (<see cref="TableClientOptionsExtensions.AddRetryObservation"/>). When <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set (and names no
     /// <see cref="BlobOffloadOptions.ServiceClient"/> and does not set
     /// <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/>), blob offload uses a
     /// <see cref="BlobServiceClient"/> built from the same string if it has a blob endpoint (a
@@ -87,7 +92,7 @@ public static partial class ServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
 
-        services.TryAddSingleton(_ => new TableServiceClient(connectionString));
+        services.TryAddSingleton(sp => BuildServiceClient(sp, clientOptions => new TableServiceClient(connectionString, clientOptions)));
         return AddCore(services, configure,
             () => HasBlobEndpoint(connectionString) ? BlobClientFrom(connectionString) : null);
     }
@@ -95,7 +100,9 @@ public static partial class ServiceCollectionExtensions
     /// <summary>
     /// Registers a <see cref="TableServiceClient"/> authenticated with a <see cref="TokenCredential"/>
     /// (e.g. a managed identity via <c>DefaultAzureCredential</c>) alongside the cache, options,
-    /// and the open-generic <see cref="IStorage{T}"/> mapping. A client already registered is kept. When
+    /// and the open-generic <see cref="IStorage{T}"/> mapping. A client already registered is kept. The
+    /// client is built with the registered options' <see cref="UnifiedTableStorageOptions.ConfigureTableClient"/>
+    /// hook and the library's retry observation (<see cref="TableClientOptionsExtensions.AddRetryObservation"/>). When
     /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set (and names no
     /// <see cref="BlobOffloadOptions.ServiceClient"/> and does not set
     /// <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/>) and the endpoint's host is an Azure
@@ -120,9 +127,20 @@ public static partial class ServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(endpoint);
         ArgumentNullException.ThrowIfNull(credential);
 
-        services.TryAddSingleton(_ => new TableServiceClient(endpoint, credential));
+        services.TryAddSingleton(sp => BuildServiceClient(sp, clientOptions => new TableServiceClient(endpoint, credential, clientOptions)));
         return AddCore(services, configure,
             () => BlobEndpointFor(endpoint) is { } blobEndpoint ? new BlobServiceClient(blobEndpoint, credential) : null);
+    }
+
+    // The TableServiceClient the library builds itself: the registered options' ConfigureTableClient hook
+    // runs on its TableClientOptions first (retry settings, a transport, the host's policies), then the
+    // library adds its retry observation, so the stores over this client can tell a request that was
+    // sent once from one the SDK retried. A client the host registered is never built here.
+    private static TableServiceClient BuildServiceClient(IServiceProvider provider, Func<TableClientOptions, TableServiceClient> build)
+    {
+        var clientOptions = new TableClientOptions();
+        provider.GetService<UnifiedTableStorageOptions>()?.ConfigureTableClient?.Invoke(clientOptions);
+        return build(clientOptions.AddRetryObservation());
     }
 
     private static IServiceCollection AddCore(
@@ -182,6 +200,10 @@ public static partial class ServiceCollectionExtensions
         // it keeps these options, as it did while both providers shared one options type.
         services.TryAddSingleton<StorageOptions>(sp => sp.GetRequiredService<UnifiedTableStorageOptions>());
         services.TryAddSingleton(typeof(IStorage<>), typeof(TableStorage<>));
+#pragma warning disable UDT0001 // the experimental table store is registered, not used, here
+        // The account's tables (list, exists, create, delete, raw rows) over the registered client.
+        services.TryAddSingleton<ITableStore>(sp => new AzureTableStore(sp.GetRequiredService<TableServiceClient>()));
+#pragma warning restore UDT0001
         return services;
     }
 

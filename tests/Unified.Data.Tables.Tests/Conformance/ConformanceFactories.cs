@@ -16,14 +16,9 @@ internal sealed class InMemoryConformanceFactory : IConformanceStoreFactory
 {
     public string Name => "InMemory";
 
-    // What the in-memory provider does not do yet. Each entry is a finding of the kit that a later
-    // package of 0.10.0 closes; the list must be empty when the release ships.
-    public IReadOnlyCollection<string> Leniencies { get; } =
-    [
-        // B5 of the 0.10.0 plan: "*" on a whole-entity update is compared as a version (it never matches,
-        // so the update conflicts) instead of being refused. Closed by the row-store engine (WP5).
-        ConformanceLeniencies.WildcardETagOnUpdate,
-    ];
+    // What the in-memory provider does not do yet: nothing the kit has a leniency for. (The wildcard
+    // ETag on a whole-entity update, B5 of the 0.10.0 plan, is refused since the Azure provider refuses it.)
+    public IReadOnlyCollection<string> Leniencies { get; } = [];
 
     public Task<ConformanceStore<T>> CreateStoreAsync<T>(ConformanceStoreSettings settings, CancellationToken ct = default)
         where T : class, IEntity, new()
@@ -74,19 +69,16 @@ internal sealed class AzuriteConformanceFactory : IConformanceStoreFactory
     private static readonly Lazy<Task<bool>> Probe =
         new(() => TestSupport.AzuriteProbe.ProbeAsync(ConnectionString, blobs: true, TestSupport.AzuriteProbe.Required));
 
-    private static readonly Lazy<TableServiceClient> Tables = new(() => new TableServiceClient(ConnectionString));
+    // Built as AddUnifiedTableStorage(connectionString) builds its client: with the retry observation, so
+    // a conditional delete of a row that is not there answers NotFound, not Indeterminate.
+    private static readonly Lazy<TableServiceClient> Tables =
+        new(() => new TableServiceClient(ConnectionString, new TableClientOptions().AddRetryObservation()));
     private static readonly Lazy<BlobServiceClient> Blobs = new(() => new BlobServiceClient(ConnectionString));
 
     public string Name => "AzureTables on Azurite";
 
-    // What differs on the Azure provider, or on the emulator it runs against here. As for the in-memory
-    // provider, the provider entries are findings a later package of 0.10.0 closes.
-    public IReadOnlyCollection<string> Leniencies { get; } =
-    [
-        // B5 of the 0.10.0 plan: "*" on a whole-entity update is sent as If-Match: * and overwrites
-        // whatever the version (a silent last-writer-wins) instead of being refused. Closed by WP4.
-        ConformanceLeniencies.WildcardETagOnUpdate,
-    ];
+    // What differs on the Azure provider, or on the emulator it runs against here: nothing.
+    public IReadOnlyCollection<string> Leniencies { get; } = [];
 
     /// <summary>Whether Azurite answers; the probe runs once per test run.</summary>
     internal static Task<bool> AvailableAsync() => Probe.Value;

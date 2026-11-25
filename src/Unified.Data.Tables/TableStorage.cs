@@ -36,6 +36,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             .Select(x => (x.Prop, x.Attr!))
             .ToList();
 
+    private readonly TableServiceClient serviceClient;
     private readonly TableClient client;
     private readonly IMemoryCache cache;
     private readonly ILogger<TableStorage<T>> logger;
@@ -44,6 +45,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     private readonly IdNormalization idNormalization;
     private readonly bool implicitLastWriterWins;
     private readonly string typeName = typeof(T).Name;
+
+    // The clock that stamps CreatedAt and UpdatedAt (StorageOptions.TimeProvider; the system clock by default).
+    private readonly TimeProvider clock;
 
     // Cache keys name the fully-qualified type and the table (its account endpoint and its name), so two
     // entity types with the same simple name in different namespaces, and two stores of one type over two
@@ -131,12 +135,15 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         cachePolicy = opts.ResolveCachePolicy(typeof(T));
         idNormalization = opts.IdNormalization;
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
+        clock = opts.TimeProvider;
         tableName = ResolveTableName(opts);
+        this.serviceClient = serviceClient;
         client = serviceClient.GetTableClient(tableName);
         cacheKeyPrefix = CacheKeyPrefix(serviceClient, tableName);
         tableInitializer = new TableInitializer(client);
-        large = new LargeValueTable(tableName, opts.BlobOffload, blobs, typeof(T));
+        large = new LargeValueTable(tableName, opts.BlobOffload, blobs, typeof(T)) { Clock = clock };
         large.OnBlobMissing(ForgetRowWithMissingBlob);
+        info = AzureStorageInfo.Describe(serviceClient, tableName, opts, cachePolicy.Enabled);
     }
 
     // The prefix of every cache key of this store: the entity type, then the table it reads, named by the
@@ -221,23 +228,27 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     // The provider-neutral exception for an SDK failure that is leaving a member of this store (see
     // AzureStorageErrors for what maps to what). write: the member may change stored data, so a transient
-    // failure may have committed and a duplicate or conflict may be the call's own retried write.
+    // failure may have committed and a duplicate or conflict may be the call's own retried write, unless
+    // the attempts the call saw of its requests (RequestAttempts) show otherwise.
     private StorageException Failed(Exception ex, bool write, string? id = null) =>
-        AzureStorageErrors.Map(ex, typeName, tableName, id, write);
+        AzureStorageErrors.Map(ex, typeName, tableName, id, write, write ? RequestAttempts.Current : null);
 
-    // A duplicate key or a lost version check the service reported for a write. The SDK may have
-    // retried the request, so either can be the call's own write (see MayBeOwnWrite).
-    private DuplicateKeyException Duplicate(string id, RequestFailedException ex) =>
-        AzureStorageErrors.Duplicate(typeName, id, ex, mayBeOwnWrite: true);
+    // A duplicate key or a lost version check the service reported for a write request sent since
+    // `sent` (RequestAttempts.MarkCurrent, taken just before the SDK call). The SDK may have retried
+    // the request, so either can be the call's own write: it is reported as one when an earlier attempt
+    // was sent, and when the attempts could not be observed (see MayBeOwnWrite).
+    private DuplicateKeyException Duplicate(string id, RequestFailedException ex, int sent) =>
+        AzureStorageErrors.Duplicate(typeName, id, ex, RequestAttempts.MayBeOwnWriteSince(sent));
 
-    private ConcurrencyConflictException Conflict(string id, RequestFailedException? ex) =>
-        AzureStorageErrors.Conflict(typeName, id, ex, mayBeOwnWrite: ex is not null);
+    private ConcurrencyConflictException Conflict(string id, RequestFailedException? ex, int sent) =>
+        AzureStorageErrors.Conflict(typeName, id, ex, mayBeOwnWrite: ex is not null && RequestAttempts.MayBeOwnWriteSince(sent));
 
     private Task EnsureTableAsync(CancellationToken ct) => tableInitializer.EnsureAsync(ct);
 
     /// <inheritdoc />
     public async Task<T> CreateAsync(T entity, CancellationToken ct = default)
     {
+        RequestAttempts.Begin();
         try
         {
             return await CreateCoreAsync(entity, ct);
@@ -258,7 +269,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         await EnsureTableAsync(ct);
 
-        entity.CreatedAt = DateTimeOffset.UtcNow;
+        entity.CreatedAt = clock.GetUtcNow();
         entity.UpdatedAt = entity.CreatedAt; // an insert is a write — keep audit stamps consistent
         entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
@@ -275,6 +286,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
         Response addResponse;
+        var sent = RequestAttempts.MarkCurrent();
         try
         {
             addResponse = await client.AddEntityAsync(dataEntity, ct);
@@ -284,7 +296,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // An existing key is an EXPECTED outcome of concurrent creates — surface it
             // provider-agnostically (GetOrCreateAsync/MutateOrCreateAsync absorb it entirely).
             EvictAfterFailedWrite(entity.Id, partitionKey);
-            throw Duplicate(entity.Id, ex);
+            throw Duplicate(entity.Id, ex, sent);
         }
         catch (Exception)
         {
@@ -317,9 +329,10 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task DeleteAsync(string id, CancellationToken ct = default)
     {
+        RequestAttempts.Begin();
         try
         {
-            await DeleteCoreAsync(id, ct);
+            await DeleteCoreAsync(id, ifMatch: null, ct);
         }
         catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
         {
@@ -327,7 +340,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         }
     }
 
-    private async Task DeleteCoreAsync(string id, CancellationToken ct)
+    // The one delete of a row by id, behind DeleteAsync and the conditional deletes (IConditionalDelete):
+    // unconditional, or on condition of the version ifMatch names. Returns what it found.
+    private async Task<DeleteStatus> DeleteCoreAsync(string id, ETag? ifMatch, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
@@ -339,27 +354,88 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         await EnsureTableAsync(ct);
 
         var (partitionKey, rowKey) = GetEntityKeys(id);
+        DeleteStatus status;
         try
         {
-            if (LargeValueAware)
-                await DeleteLargeAsync(partitionKey, rowKey, ct);
-            else
-                await client.DeleteEntityAsync(partitionKey, rowKey, cancellationToken: ct);
+            status = LargeValueAware
+                ? await DeleteLargeAsync(partitionKey, rowKey, ifMatch, ct)
+                : await DeleteRowAsync(id, partitionKey, rowKey, ifMatch, ct);
         }
         catch (Exception)
         {
-            // It may have committed (a timeout, a cancellation after the request was sent).
+            // It may have committed (a timeout, a cancellation after the request was sent), and a failed
+            // version check says the cached entity is not the stored one.
             EvictAfterFailedWrite(id, partitionKey);
             throw;
         }
 
         cache.Remove(EntityCacheKey(id));
         InvalidateQueryCache(partitionKey);
+        return status;
+    }
+
+    // One row without continuation rows: one request. The SDK does not throw for a row that is not
+    // there: it returns the 404, so whether there was a row is read from the response's status.
+    private async Task<DeleteStatus> DeleteRowAsync(string id, string partitionKey, string rowKey, ETag? ifMatch, CancellationToken ct)
+    {
+        var sent = RequestAttempts.MarkCurrent();
+        Response response;
+        try
+        {
+            response = await client.DeleteEntityAsync(partitionKey, rowKey, ifMatch ?? default, ct);
+        }
+        catch (RequestFailedException ex) when (ifMatch is not null && ex.Status == 412)
+        {
+            // The row is another version than the one the caller named: never retried on a caller's ETag.
+            throw Conflict(id, ex, sent);
+        }
+        return DeleteOutcome(response, sent);
+    }
+
+    // What a delete request that the service answered says about the row. Anything but 404: the row was
+    // there and this response is its removal. 404: no row. It was never there, or another writer removed
+    // it, when exactly one attempt of the request was sent; when an earlier attempt was sent (the SDK
+    // retried after a timeout or a dropped connection), or the attempts could not be observed, that
+    // attempt may have been the one that removed it, and the answer is Indeterminate. A table that does
+    // not exist holds no row whatever was sent.
+    private static DeleteStatus DeleteOutcome(Response? response, int sent)
+    {
+        if (!IsNotFound(response, out var tableMissing))
+            return DeleteStatus.Deleted;
+        return !tableMissing && RequestAttempts.MayBeOwnWriteSince(sent) ? DeleteStatus.Indeterminate : DeleteStatus.NotFound;
+    }
+
+    // True for a 404 the SDK returned instead of throwing; tolerates the responses of test doubles.
+    private static bool IsNotFound(Response? response, out bool tableMissing)
+    {
+        tableMissing = false;
+#pragma warning disable CA1031 // a response that cannot be read (a test double) is not a 404, and names no table
+        try
+        {
+            if (response is null || response.Status != 404)
+                return false;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+        try
+        {
+            tableMissing = response.Headers.TryGetValue("x-ms-error-code", out var code)
+                && string.Equals(code, "TableNotFound", StringComparison.Ordinal);
+        }
+        catch (Exception)
+        {
+            tableMissing = false;
+        }
+        return true;
+#pragma warning restore CA1031
     }
 
     /// <inheritdoc />
     public async Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
     {
+        RequestAttempts.Begin();
         try
         {
             return await DeletePartitionCoreAsync(partition, ct);
@@ -410,6 +486,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             (whole, leftovers) = LargeValueTable.SeparateListedLeftovers(entities);
         IEnumerable<IReadOnlyList<TableEntity>> transactions =
             LargeValueAware ? LargeValueTable.PlanPartitionDelete(whole) : entities.Chunk(100);
+        // Listed rows another writer deleted before this call reached them: not deleted by it, not counted.
+        var goneMeanwhile = 0;
         try
         {
             foreach (var batch in transactions)
@@ -421,7 +499,24 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 }
                 var actions = batch.Select(e =>
                     new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
-                await client.SubmitTransactionAsync(actions, ct);
+                try
+                {
+                    await client.SubmitTransactionAsync(actions, ct);
+                }
+                catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
+                {
+                    // A delete of a missing row fails its whole transaction, and nothing of it is applied:
+                    // another writer deleted one of the listed rows meanwhile. That is a lost race, not a
+                    // failure: the rows of this transaction are deleted one by one (a single delete of a
+                    // row that is gone is a no-op), and the partition delete goes on.
+                    logger.LogDebug(ex, "{Type} partition {Partition}: a row was deleted after the listing; its transaction's rows are deleted one by one",
+                        typeName, partition);
+                    foreach (var row in batch)
+                    {
+                        if (IsNotFound(await client.DeleteEntityAsync(row.PartitionKey, row.RowKey, ETag.All, ct), out _))
+                            goneMeanwhile++;
+                    }
+                }
             }
             foreach (var (primaryRowKey, rows) in leftovers)
                 await DeleteListedLeftoversAsync(partition, primaryRowKey, rows, ct);
@@ -435,6 +530,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 cache.Remove(EntityCacheKey($"{e.PartitionKey}{Separator}{e.RowKey}"));
         }
 
+        logicalCount -= goneMeanwhile;
         logger.LogInformation("Batch-deleted {Count} {Type} entities from partition {Partition}",
             logicalCount, typeName, partition);
 
@@ -667,7 +763,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null, CancellationToken ct = default)
     {
-        options?.ThrowIfRowKeyRangeNotImplemented(nameof(TableStorage<T>));
+        var range = RangeOf(options);
         var partition = string.IsNullOrWhiteSpace(options?.Partition) ? null : NormalizeId(options!.Partition);
         // Normalize the RowKey prefix too: writes normalize the whole id, so stored RowKeys are
         // normalized — a natural-form prefix would otherwise silently match nothing, exactly like an
@@ -692,7 +788,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         // A projection that omits every large value is not assembled (its cells were not fetched).
         var select = BuildSelect(options);
         return AzureStorageErrors.GuardAsync(
-            StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, select, assemble: LargeValueAware && select is null),
+            StreamAsync(BuildFilter(partition, rowKeyPrefix, range), take, warmCache: false, ct, select, assemble: LargeValueAware && select is null),
             ex => Failed(ex, write: false), ct);
     }
 
@@ -782,7 +878,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     private async Task<EntityPage<T>> QueryPageCoreAsync(QueryOptions options, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(options);
-        options.ThrowIfRowKeyRangeNotImplemented(nameof(TableStorage<T>));
+        var range = RangeOf(options);
 
         var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition);
         // Normalize the prefix to the stored form (see QueryStreamAsync); done BEFORE the fingerprint so
@@ -797,7 +893,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             throw new ArgumentOutOfRangeException(nameof(options), options.Take, "Take (page size) must be positive.");
 
         var pageSize = options.Take is int t ? Math.Min(t, 1000) : 100;
-        var fingerprint = PageCursor.Fingerprint(partition, rowKeyPrefix, pageSize);
+        // With no bound this is the three-part fingerprint every earlier release issued, so a cursor from
+        // 0.9.2 still decodes; a bound (as it is compared, normalized) and its inclusivity are part of it.
+        var fingerprint = PageCursor.Fingerprint(partition, rowKeyPrefix, pageSize, range.From, range.FromInclusive, range.To, range.ToInclusive);
         var innerToken = options.ContinuationToken is null ? null : PageCursor.Decode(options.ContinuationToken, fingerprint);
 
         var select = BuildSelect(options);
@@ -806,7 +904,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var mark = select is null ? BeginScan() : default;
         await EnsureTableAsync(ct);
 
-        var filter = BuildFilter(partition, rowKeyPrefix);
+        var filter = BuildFilter(partition, rowKeyPrefix, range);
         var assemble = LargeValueAware && select is null;
         var pageable = client.QueryAsync<TableEntity>(filter, pageSize, select, ct);
 
@@ -961,6 +1059,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     private async Task<int> WriteBatchAsync(
         IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
+        RequestAttempts.Begin();
         try
         {
             return await WriteBatchCoreAsync(entities, actionType, ct);
@@ -994,7 +1093,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             }
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = clock.GetUtcNow();
         var rows = new List<(string Partition, string Id, TableEntity Row)>(entities.Count);
         foreach (var entity in entities)
         {
@@ -1057,6 +1156,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 Array.Copy(groupRows, range.Start, chunk, 0, range.Count);
 
                 var actions = chunk.Select(r => new TableTransactionAction(actionType, r.Row, ETag.All));
+                var sent = RequestAttempts.MarkCurrent();
                 try
                 {
                     await client.SubmitTransactionAsync(actions, ct);
@@ -1071,18 +1171,51 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                     var duplicateId = ex.FailedTransactionActionIndex is int i && i >= 0 && i < chunk.Length
                         ? chunk[i].Id
                         : chunk[0].Partition + Separator + "?";
-                    throw Duplicate(duplicateId, ex);
+                    throw Duplicate(duplicateId, ex, sent);
                 }
             }
         }
     }
 
-    private static string? BuildFilter(string? partition, string? rowKeyPrefix)
+    /// <summary>
+    /// The RowKey range of a query (<see cref="QueryOptions.FromRowKey"/>, <see cref="QueryOptions.ToRowKey"/>)
+    /// as it is compared with the stored keys: each bound normalized the way ids are. The default value is
+    /// "no range".
+    /// </summary>
+    private readonly record struct RowKeyRange(string? From, bool FromInclusive, string? To, bool ToInclusive);
+
+    // Checks the range (it needs a partition and excludes a prefix) and normalizes its bounds as writes
+    // normalize the keys they store, so a natural-form bound meets the stored RowKeys; under
+    // IdNormalization.AsWritten a bound is used as written. An empty bound is a bound, not "none".
+    private RowKeyRange RangeOf(QueryOptions? options)
+    {
+        if (options is null || !options.HasRowKeyRange)
+            return default;
+        options.ValidateRowKeyRange();
+        return new RowKeyRange(
+            options.FromRowKey is null ? null : NormalizeId(options.FromRowKey), options.FromInclusive,
+            options.ToRowKey is null ? null : NormalizeId(options.ToRowKey), options.ToInclusive);
+    }
+
+    private static string? BuildFilter(string? partition, string? rowKeyPrefix, RowKeyRange range = default)
     {
         if (partition is null)
             return null;
         if (rowKeyPrefix is null)
-            return TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
+        {
+            // The partition, then each bound that is set (a range excludes a prefix). Without a bound
+            // the text is what every earlier release sent.
+            var filter = TableClient.CreateQueryFilter($"PartitionKey eq {partition}");
+            if (range.From is { } from)
+                filter += " and " + (range.FromInclusive
+                    ? TableClient.CreateQueryFilter($"RowKey ge {from}")
+                    : TableClient.CreateQueryFilter($"RowKey gt {from}"));
+            if (range.To is { } to)
+                filter += " and " + (range.ToInclusive
+                    ? TableClient.CreateQueryFilter($"RowKey le {to}")
+                    : TableClient.CreateQueryFilter($"RowKey lt {to}"));
+            return filter;
+        }
 
         // Canonical prefix range: RowKey >= prefix AND RowKey < next(prefix).
         var upperBound = NextPrefix(rowKeyPrefix);
@@ -1116,6 +1249,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task<string> UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default)
     {
+        RequestAttempts.Begin();
         try
         {
             return await UpdateCoreAsync(id, builderAction, ct);
@@ -1163,21 +1297,23 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             }
         }
         // Always bump UpdatedAt — set last so it wins over any caller-supplied value.
-        partial[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
+        partial[nameof(Entity.UpdatedAt)] = clock.GetUtcNow();
 
         var condition = builder.ETag is null ? ETag.All : new ETag(builder.ETag);
         var mark = BeginWrite(id); // before the storage call (see WriteGenerations)
         Response resp;
+        var sent = RequestAttempts.MarkCurrent();
         try
         {
             resp = await client.UpdateEntityAsync(partial, condition, TableUpdateMode.Merge, ct);
         }
         catch (RequestFailedException ex) when (ex.Status == 412)
         {
-            // Conditional merge lost the race. The 412 proves a foreign writer touched the row,
-            // so the cached entity AND any cached query results for its partition are stale.
+            // Conditional merge lost the race. The 412 says the row is another version than the one
+            // named (another writer's, or this call's own retried merge), so the cached entity AND any
+            // cached query results for its partition are stale.
             EvictAfterFailedWrite(id, partitionKey);
-            throw Conflict(id, ex);
+            throw Conflict(id, ex, sent);
         }
         catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
         {
@@ -1334,6 +1470,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task<T> UpdateAsync(T entity, ConcurrencyMode mode, CancellationToken ct = default)
     {
+        RequestAttempts.Begin();
         try
         {
             return await UpdateCoreAsync(entity, mode, ct);
@@ -1351,6 +1488,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             throw new ArgumentNullException(nameof(entity));
         }
         RefuseReservedRowKey(entity.Id);
+        // "*" is not a version: sent as If-Match it replaces whatever is stored, a last-writer-wins write
+        // nobody asked for. Refused before anything is read or sent; an unconditional replace is spelled
+        // ConcurrencyMode.LastWriterWins (which never looks at the ETag, so "*" is harmless there).
+        if (mode != ConcurrencyMode.LastWriterWins && entity.ETag == "*")
+            throw new ArgumentException(ConcurrencyMessages.WildcardETagOnUpdate(typeName), nameof(entity));
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
@@ -1385,7 +1527,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 "(last-writer-wins) because ImplicitLastWriterWins is enabled. Round-trip the ETag, " +
                 "use MutateAsync, or spell it ConcurrencyMode.LastWriterWins.", typeName, entity.Id);
 
-        entity.UpdatedAt = DateTimeOffset.UtcNow;
+        entity.UpdatedAt = clock.GetUtcNow();
         entity.Timestamp = null; // service last-write time is unknown until the next read
 
         await EnsureTableAsync(ct);
@@ -1399,6 +1541,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         var dataEntity = TableEntitySerializer.ToPlainTableEntity(entity, partitionKey, rowKey, typeof(T));
 
+        var sent = RequestAttempts.MarkCurrent();
         try
         {
             var updateResponse = await client.UpdateEntityAsync(dataEntity, etag, TableUpdateMode.Replace, ct);
@@ -1415,7 +1558,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // and the partition's cached query results are stale, so drop both — a follow-up read
             // (e.g. MutateAsync's retry) must see the fresh row.
             EvictAfterFailedWrite(entity.Id, partitionKey);
-            throw Conflict(entity.Id, ex);
+            throw Conflict(entity.Id, ex, sent);
         }
         catch (Exception)
         {
@@ -1430,6 +1573,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task<T> UpsertAsync(T entity, CancellationToken ct = default)
     {
+        RequestAttempts.Begin();
         try
         {
             return await UpsertCoreAsync(entity, ct);
@@ -1452,9 +1596,10 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
         // Preserve a caller-supplied creation stamp (read-modify-write flows); stamp fresh
         // otherwise. UpdatedAt is always bumped — an upsert is a write either way.
+        var now = clock.GetUtcNow();
         if (entity.CreatedAt == default)
-            entity.CreatedAt = DateTimeOffset.UtcNow;
-        entity.UpdatedAt = DateTimeOffset.UtcNow;
+            entity.CreatedAt = now;
+        entity.UpdatedAt = now;
         entity.Timestamp = null; // service last-write time is unknown until the next read
         entity.Id = NormalizeId(entity.Id);
 

@@ -10,6 +10,17 @@ namespace Unified.Data.Tables;
 /// <remarks>
 /// A cancelled caller token is not a transient failure: it still throws
 /// <see cref="OperationCanceledException"/>.
+/// <para>
+/// On the Azure provider every <see cref="OperationCanceledException"/> that leaves a storage call while
+/// the caller's own token is not cancelled is reported as this exception, with the cancellation as its
+/// <see cref="Exception.InnerException"/>: it is how the SDK reports its network timeout once its retries
+/// are used up. The rule is by the token alone, not by who threw: a cancellation raised by code the call
+/// runs on the caller's behalf (a stream handed to the store that is cancelled by a token of its own, an
+/// authorizer, a cache callback) while the caller's token is live is reported the same way. The store
+/// cannot soundly tell the two apart: it observes the attempts of its requests only on a client that has
+/// the library's retry observation, and the lazy creation of a table is one request shared by every call
+/// waiting for it.
+/// </para>
 /// </remarks>
 public class TransientStorageException : StorageException
 {
@@ -19,6 +30,14 @@ public class TransientStorageException : StorageException
     /// conservative default): a request can be applied by the service and its response lost, so a
     /// write that timed out, or whose earlier attempt did, may have committed. Before repeating a write
     /// that is not idempotent, read the row.
+    /// <para>
+    /// The Azure provider knows it when it observed every attempt of every write request of the call (a
+    /// client with the library's retry observation) and each was definitely rejected: a client error
+    /// other than a request timeout (throttling, 429, among them) or the service's own 503
+    /// <c>ServerBusy</c>. An attempt without a response, a server error (the service documents its 500
+    /// timeout as "may or may not have succeeded") and a gateway's 502, 503 or 504 are not proof, and a
+    /// batch write whose earlier transactions were accepted has committed those.
+    /// </para>
     /// </summary>
     public bool MayHaveCommitted { get; set; } = true;
 

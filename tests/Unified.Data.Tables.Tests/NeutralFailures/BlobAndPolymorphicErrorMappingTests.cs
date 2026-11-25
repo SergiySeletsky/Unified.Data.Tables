@@ -295,16 +295,23 @@ public class BlobAndPolymorphicErrorMappingTests
 
         var thrown = await Record.ExceptionAsync(() => CallAsync(h.Store, member));
 
-        if (member == "delete")
-        {
-            // Deleting what is not there is a no-op, whatever is missing (unchanged).
-            Assert.Null(thrown);
-            return;
-        }
+        // The delete too, since 0.10.0: only a missing ROW makes it a no-op (see the next test). Until then
+        // it swallowed every 404, the table's among them.
         var table = Assert.IsType<TableNotFoundException>(thrown);
         Assert.Equal("TestTable", table.TableName);
         Assert.Same(failure, table.InnerException);
         _ = write; // the same type for a read and a write
+    }
+
+    [Theory]
+    [InlineData("ResourceNotFound")]
+    [InlineData("EntityNotFound")]
+    [InlineData(null)]
+    public async Task Delete_OfAMissingRow_IsStillANoOp_WhenTheClientThrowsIts404(string? code)
+    {
+        using var h = FailingEverything(new RequestFailedException(404, "The specified resource does not exist.", code, null), "delete");
+
+        Assert.Null(await Record.ExceptionAsync(() => CallAsync(h.Store, "delete")));
     }
 
     [Fact]

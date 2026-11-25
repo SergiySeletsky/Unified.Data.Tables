@@ -86,22 +86,24 @@ public class ConformanceKitTests
         Assert.Equal(ConformanceSuite.All.Count, results.Count);
         // No side interface is implemented yet (the in-memory package of 0.10.0 adds them all).
         Assert.Equal(CapabilityScenarios.Except(RunWithoutTheCapability).Order(StringComparer.Ordinal), Names(results, ConformanceOutcome.NotSupported));
-        // The one declared difference, still needed (see InMemoryConformanceFactory.Leniencies).
-        Assert.Equal(["Logical.Update.WildcardETag_IsRefused"], Names(results, ConformanceOutcome.Lenient));
+        // No declared difference is left: the wildcard ETag on an update is refused (B5).
+        Assert.Empty(Names(results, ConformanceOutcome.Lenient));
         Assert.Empty(ConformanceSuite.UnneededLeniencies(new InMemoryConformanceFactory(), results));
     }
 
     [Fact]
-    public async Task TheAzureProvider_OnAzurite_PassesEveryScenario_ButTheCapabilitiesItDoesNotHaveYet()
+    public async Task TheAzureProvider_OnAzurite_PassesEveryScenario_TheCapabilitiesIncluded()
     {
         Assert.SkipUnless(await AzuriteConformanceFactory.AvailableAsync(), AzuriteConformanceFactory.SkipReason);
 
         var results = await ConformanceSuite.RunAllAsync(new AzuriteConformanceFactory(), Ct);
 
         Assert.True(ConformanceSuite.DescribeFailures(results) is null, ConformanceSuite.DescribeFailures(results));
-        // Exactly what the in-memory provider does not pass: the two providers agree on every scenario.
-        Assert.Equal(CapabilityScenarios.Except(RunWithoutTheCapability).Order(StringComparer.Ordinal), Names(results, ConformanceOutcome.NotSupported));
-        Assert.Equal(["Logical.Update.WildcardETag_IsRefused"], Names(results, ConformanceOutcome.Lenient));
+        Assert.Equal(ConformanceSuite.All.Count, results.Count);
+        // Passed, not "not supported" and not lenient: the Azure provider exposes every capability through
+        // the probe (conditional delete, atomic batch and insert, storage info, the raw table and the
+        // table store) and answers a query with RowKey bounds, so every scenario of the kit runs and passes.
+        Assert.True(results.All(r => r.Outcome == ConformanceOutcome.Passed), Describe(results));
         Assert.Empty(ConformanceSuite.UnneededLeniencies(new AzuriteConformanceFactory(), results));
     }
 
@@ -169,7 +171,6 @@ public class ConformanceKitTests
         var results = await ConformanceSuite.RunAllAsync(declared, Ct);
 
         Assert.Null(ConformanceSuite.DescribeFailures(results));
-        // The wildcard rule is still broken underneath the reference (the in-memory store), so it stays.
         Assert.Equal([ConformanceLeniencies.RowKeyRangeIgnored, fixedSince, "no-such-leniency"], ConformanceSuite.UnneededLeniencies(declared, results));
     }
 
@@ -242,24 +243,34 @@ public class ConformanceKitTests
         // Two stores in one scenario: both are released.
         await ConformanceSuite.Get("Logical.Count.CountsTheTableAndAPartition").RunAsync(factory, Ct);
         Assert.Equal(3, disposed);
-        // Lenient here (the in-memory store compares "*" as a version): released all the same.
-        Assert.Equal(ConformanceOutcome.Failed, (await ConformanceSuite.Get("Logical.Update.WildcardETag_IsRefused").TryRunAsync(factory, Ct)).Outcome);
+        // A scenario that fails (a store that reads nothing back): released all the same.
+        var failing = new Tracking(() => disposed++, readsNothing: true);
+        Assert.Equal(ConformanceOutcome.Failed, (await ConformanceSuite.Get("Logical.Create.StoresTheRow_AndReturnsItWithAnETag").TryRunAsync(failing, Ct)).Outcome);
         Assert.Equal(4, disposed);
     }
 
-    private sealed class Tracking(Action onDispose) : IConformanceStoreFactory
+    // A store whose point read finds nothing: what makes a scenario fail for the test above.
+    private sealed class ReadsNothing<T>(IStorage<T> inner) : DelegatingStorage<T>(inner) where T : class, IEntity, new()
+    {
+        public override Task<T?> OneAsync(string id, CancellationToken ct = default) => Task.FromResult<T?>(null);
+    }
+
+    private sealed class Tracking(Action onDispose, bool readsNothing = false) : IConformanceStoreFactory
     {
         public string Name => "tracking";
 
         public IReadOnlyCollection<string> Leniencies => [];
 
         public Task<ConformanceStore<T>> CreateStoreAsync<T>(ConformanceStoreSettings settings, CancellationToken ct = default)
-            where T : class, IEntity, new() =>
-            Task.FromResult(new ConformanceStore<T>(InMemoryConformanceFactory.Create<T>(settings), dispose: () =>
+            where T : class, IEntity, new()
+        {
+            IStorage<T> store = InMemoryConformanceFactory.Create<T>(settings);
+            return Task.FromResult(new ConformanceStore<T>(readsNothing ? new ReadsNothing<T>(store) : store, dispose: () =>
             {
                 onDispose();
                 return ValueTask.CompletedTask;
             }));
+        }
 
         public Task<ConformancePolymorphicStore<TBase>> CreatePolymorphicStoreAsync<TBase>(CancellationToken ct = default)
             where TBase : class => throw new NotSupportedException();

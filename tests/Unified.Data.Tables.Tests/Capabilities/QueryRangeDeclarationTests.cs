@@ -219,19 +219,22 @@ public class QueryRangeDeclarationTests
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
-    public async Task Azure_RefusesABoundedQuery_BeforeAnyRequest(int query)
+    public async Task Azure_AnswersABoundedQuery_WithTheBoundsInTheFilter(int query)
     {
+        // Until the Azure provider implemented the range it refused these with NotSupportedException
+        // before any request; now each of the three query members sends the bounds to the service.
         var options = BoundedQueries[query];
         var transport = new ScriptedTableTransport(_ => new ScriptedTableTransport.Answer(200, "{\"value\":[]}"));
         var storage = new TableStorage<TestEntity>(transport.Service(), new MemoryCache(new MemoryCacheOptions()),
             NullLogger<TableStorage<TestEntity>>.Instance, authorizer: null, options: new UnifiedTableStorageOptions { Cache = CachePolicy.Disabled });
 
-        await Assert.ThrowsAsync<NotSupportedException>(() => storage.QueryAsync(options, Ct));
-        await Assert.ThrowsAsync<NotSupportedException>(async () => { await foreach (var _ in storage.QueryStreamAsync(options, Ct)) { } });
-        await Assert.ThrowsAsync<NotSupportedException>(() => storage.QueryPageAsync(options, Ct));
+        Assert.Empty(await storage.QueryAsync(options, Ct));
+        await foreach (var _ in storage.QueryStreamAsync(options, Ct)) { }
+        Assert.Empty((await storage.QueryPageAsync(options, Ct)).Items);
 
-        Assert.Empty(transport.EntityRequests);
-        Assert.DoesNotContain(transport.Requests, r => r.Method == "GET");
+        var queries = transport.Requests.Where(r => r.Method == "GET").ToList();
+        Assert.Equal(3, queries.Count);
+        Assert.All(queries, q => Assert.Contains("RowKey ", q.Query, StringComparison.Ordinal));
     }
 
     [Fact]

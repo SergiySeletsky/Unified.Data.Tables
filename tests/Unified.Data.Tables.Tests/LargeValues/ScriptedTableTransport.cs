@@ -55,6 +55,28 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
         new(new Uri("https://acct.table.core.windows.net/"), new TableSharedKeyCredential("acct", Convert.ToBase64String(new byte[32])),
             new TableClientOptions { Transport = this, Retry = { MaxRetries = 0 } });
 
+    /// <summary>
+    /// A table client of the real SDK over this transport whose retry policy sends a request again (at
+    /// once) after a failure without a response, as the SDK does in production: an answer that throws
+    /// <see cref="IOException"/> is a lost response. <paramref name="observe"/> adds the library's retry
+    /// observation, as the clients <c>AddUnifiedTableStorage</c> builds have it.
+    /// </summary>
+    public TableServiceClient RetryingService(bool observe = true, int maxRetries = 3)
+    {
+        var options = new TableClientOptions { Transport = this };
+        options.Retry.MaxRetries = maxRetries;
+        options.Retry.Mode = RetryMode.Fixed;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(1);
+        options.Retry.MaxDelay = TimeSpan.FromMilliseconds(1);
+        if (observe)
+            options.AddRetryObservation();
+        return new TableServiceClient(new Uri("https://acct.table.core.windows.net/"),
+            new TableSharedKeyCredential("acct", Convert.ToBase64String(new byte[32])), options);
+    }
+
+    /// <summary>The answer of a request whose response never arrives (the SDK retries it).</summary>
+    public static Answer Lost() => throw new IOException("Simulated: the connection dropped before the response arrived.");
+
     public override Request CreateRequest() => HttpClientTransport.Shared.CreateRequest();
 
     public override void Process(HttpMessage message)

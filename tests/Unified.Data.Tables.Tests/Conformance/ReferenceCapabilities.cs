@@ -494,7 +494,7 @@ internal sealed class ReferenceConformanceFactory(ReferenceFlaws flaws = Referen
 {
     public string Name => flaws == ReferenceFlaws.None ? "Reference" : $"Reference ({flaws})";
 
-    public IReadOnlyCollection<string> Leniencies { get; } = [ConformanceLeniencies.WildcardETagOnUpdate, .. leniencies];
+    public IReadOnlyCollection<string> Leniencies { get; } = [.. leniencies];
 
     public Task<ConformanceStore<T>> CreateStoreAsync<T>(ConformanceStoreSettings settings, CancellationToken ct = default)
         where T : class, IEntity, new()
