@@ -123,7 +123,6 @@ Critical path, in order:
 8. **WP7 Identity**: drop the catch-all probe in `ConcurrencyStamps.cs:42-62`; use conditional delete in `UserStoreBase.cs:354-358` and `:382-387` through the capability probe, falling back to today's path on stores without it.
 9. **WP8 Release plumbing**: `Directory.Build.props`, `CHANGELOG.md` with BREAKING labels and upgrade notes, `README.md`, `Unified.Data.Tables.slnx`, Info-level analyzer.
 
-Step zero, before any code: replace the note in PR #22 (`docs/design/engine-storage-gaps.md` on `docs/engine-storage-gaps`) with this design, so the PR you review is the cross-consumer one.
 
 ## Adoption PRs
 
