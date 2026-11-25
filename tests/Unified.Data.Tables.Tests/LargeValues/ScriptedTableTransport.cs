@@ -12,7 +12,8 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// URL and <c>If-Match</c>) and answers with what a test scripts for it, so a test can assert exactly
 /// what <see cref="TableStorage{T}"/> puts on the wire and how it reads the answer.
 /// </summary>
-internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, ScriptedTableTransport.Answer> respond) : HttpPipelineTransport
+internal sealed class ScriptedTableTransport(
+    Func<ScriptedTableTransport.Sent, ScriptedTableTransport.Answer> respond, bool scriptTableCreation = false) : HttpPipelineTransport
 {
     /// <summary>A request as the SDK sent it.</summary>
     /// <param name="Method">The HTTP method.</param>
@@ -89,8 +90,8 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
             Uri.UnescapeDataString(uri.Query.TrimStart('?')),
             message.Request.Headers.TryGetValue("If-Match", out var ifMatch) ? ifMatch : null);
         lock (Requests) Requests.Add(sent);
-        // The lazy table creation is not what a test scripts: it always succeeds.
-        var answer = sent.Method == "POST" && sent.Path.EndsWith("/Tables", StringComparison.Ordinal) ? new Answer(204) : respond(sent);
+        // The lazy table creation is not what a test scripts, unless it asks to: it always succeeds.
+        var answer = !scriptTableCreation && sent.Method == "POST" && sent.Path.EndsWith("/Tables", StringComparison.Ordinal) ? new Answer(204) : respond(sent);
         message.Response = new Canned(answer, message.Request.ClientRequestId);
     }
 

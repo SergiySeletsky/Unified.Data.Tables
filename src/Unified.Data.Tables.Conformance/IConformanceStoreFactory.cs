@@ -15,6 +15,14 @@ namespace Unified.Data.Tables.Conformance;
 /// and several scenarios may run at once. What the store allocated is released when the returned
 /// <see cref="ConformanceStore{T}"/> is disposed, which the kit does at the end of each scenario.
 /// </para>
+/// <para>
+/// <b>A store that cannot see its own retries.</b> The conditional-delete scenarios expect
+/// <see cref="DeleteStatus.NotFound"/> for a row that is not there. A store that cannot observe the
+/// attempts of its own request answers <see cref="DeleteStatus.Indeterminate"/> instead and fails them.
+/// For the Azure provider that is a store over a <c>TableServiceClient</c> the factory built itself:
+/// build its <c>TableClientOptions</c> with <c>AddRetryObservation()</c> (the clients
+/// <c>AddUnifiedTableStorage</c> builds from a connection string or a credential have it already).
+/// </para>
 /// </remarks>
 public interface IConformanceStoreFactory
 {

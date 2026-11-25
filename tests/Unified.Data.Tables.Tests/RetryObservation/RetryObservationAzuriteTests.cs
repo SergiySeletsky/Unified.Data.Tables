@@ -149,6 +149,93 @@ public sealed class RetryObservationAzuriteTests : AzuriteCleanupTestBase
     }
 
     [Fact]
+    public async Task Azurite_APartitionDeleteWhoseTransactionResponseIsLost_CountsTheRowsItDeleted()
+    {
+        SkipUnlessAvailable();
+        var lose = new LoseFirstResponse(IsBatch);
+        var store = SplitOnlyStore<SimpleEntity>(ClientThatLoses(lose));
+        foreach (var rk in new[] { "a", "b", "c" })
+            await store.CreateAsync(new SimpleEntity { Id = Id(rk) }, Ct);
+
+        // The transaction is applied, its response is lost, and the SDK's retry is refused for a row that
+        // is gone: the rows are this call's own deletes, all of them.
+        var deleted = await store.DeletePartitionAsync(Pk, Ct);
+
+        Assert.Equal(1, lose.Fired);
+        Assert.Equal(3, deleted);
+        Assert.Equal(0, await store.CountAsync(Pk, Ct));
+    }
+
+    [Fact]
+    public async Task Azurite_APartitionDeleteThatLosesARaceForOneRow_DoesNotCountThatRow_WithOrWithoutTheObservation()
+    {
+        SkipUnlessAvailable();
+        foreach (var observe in new[] { true, false })
+        {
+            // Before the transaction goes out, another writer deletes one of the listed rows.
+            var racing = SplitOnlyStore<SimpleEntity>();
+            var race = new BeforeFirst(IsBatch, () => racing.DeleteAsync(Id("b"), Ct));
+            var options = new TableClientOptions();
+            if (observe)
+                options.AddRetryObservation();
+            options.AddPolicy(race, HttpPipelinePosition.PerCall);
+            var store = SplitOnlyStore<SimpleEntity>(new TableServiceClient(AzuriteConnection.ConnectionString, options));
+            foreach (var rk in new[] { "a", "b", "c" })
+                await store.CreateAsync(new SimpleEntity { Id = Id(rk) }, Ct);
+
+            var deleted = await store.DeletePartitionAsync(Pk, Ct);
+
+            Assert.Equal(2, deleted);
+            Assert.Equal(0, await store.CountAsync(Pk, Ct));
+        }
+    }
+
+    [Fact]
+    public async Task Azurite_APolymorphicPartitionDeleteWhoseTransactionResponseIsLost_CountsTheRowsItDeleted()
+    {
+        SkipUnlessAvailable();
+        var lose = new LoseFirstResponse(IsBatch);
+        var table = "Poly" + Guid.NewGuid().ToString("N");
+        var store = new PolymorphicTableStorage<TestMessage>(
+            ClientThatLoses(lose), table, Microsoft.Extensions.Logging.Abstractions.NullLogger<PolymorphicTableStorage<TestMessage>>.Instance);
+        try
+        {
+            foreach (var rk in new[] { "a", "b" })
+                await store.InsertAsync(new PolymorphicWrite<TestMessage>(new TableKey(Pk, rk), new TestCommand { Id = rk, Operation = "go" }), Ct);
+
+            var deleted = await store.DeletePartitionAsync(Pk, Ct);
+
+            Assert.Equal(1, lose.Fired);
+            Assert.Equal(2, deleted);
+            Assert.Equal(0, await store.DeletePartitionAsync(Pk, Ct));
+        }
+        finally
+        {
+            await TableService.DeleteTableAsync(table, CancellationToken.None);
+        }
+    }
+
+    /// <summary>Runs an action once, before the first request that <paramref name="matches"/> is sent.</summary>
+    private sealed class BeforeFirst(Func<Request, bool> matches, Func<Task> action) : HttpPipelinePolicy
+    {
+        private int fired;
+
+        public override async ValueTask ProcessAsync(HttpMessage message, ReadOnlyMemory<HttpPipelinePolicy> pipeline)
+        {
+            if (matches(message.Request) && Interlocked.Exchange(ref fired, 1) == 0)
+                await action();
+            await ProcessNextAsync(message, pipeline);
+        }
+
+        public override void Process(HttpMessage message, ReadOnlyMemory<HttpPipelinePolicy> pipeline)
+        {
+            if (matches(message.Request) && Interlocked.Exchange(ref fired, 1) == 0)
+                action().GetAwaiter().GetResult();
+            ProcessNext(message, pipeline);
+        }
+    }
+
+    [Fact]
     public async Task Azurite_AnAtomicCreateWhoseResponseIsLost_IsReportedAsADuplicateThatMayBeItsOwn()
     {
         SkipUnlessAvailable();

@@ -1,3 +1,5 @@
+using Azure.Core;
+using Azure.Core.Pipeline;
 using Azure.Data.Tables;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -308,6 +310,152 @@ public class RetryObservationTests
         Assert.False(transient.MayHaveCommitted);
     }
 
+    // ── an earlier attempt the service definitely refused was not applied ──
+
+    [Fact]
+    public async Task AWrite_WhoseEarlierAttemptsWereDefinitelyRejected_IsNotItsOwnWrite()
+    {
+        Answer Busy() => Failure(503, "ServerBusy");
+        Answer Throttled() => Failure(429, "TooManyRequests");
+
+        var duplicate = await Assert.ThrowsAsync<DuplicateKeyException>(() => Store(Scripted(Busy, Throttled, Duplicate)).CreateAsync(Row(), Ct));
+        var conflict = await Assert.ThrowsAsync<ConcurrencyConflictException>(() => Store(Scripted(Throttled, Mismatch)).UpdateAsync(Row(V1), Ct));
+
+        // Neither refused attempt can have written the row or the version that is in the way.
+        Assert.False(duplicate.MayBeOwnWrite);
+        Assert.False(conflict.MayBeOwnWrite);
+        Assert.Equal(DeleteStatus.NotFound, await Store(Scripted(Busy, Missing)).DeleteIfExistsAsync("p|r", Ct));
+    }
+
+    [Fact]
+    public async Task AWrite_WithOneEarlierAttemptThatMayHaveBeenApplied_MayBeItsOwnWrite_WhateverCameBetween()
+    {
+        Answer Busy() => Failure(503, "ServerBusy");
+
+        var duplicate = await Assert.ThrowsAsync<DuplicateKeyException>(() => Store(Scripted(Lost, Busy, Duplicate)).CreateAsync(Row(), Ct));
+        // A gateway's 503 and the service's 500 are no proof that the request was not applied.
+        var afterGateway = await Assert.ThrowsAsync<DuplicateKeyException>(
+            () => Store(Scripted(() => Failure(503, null), Duplicate)).CreateAsync(Row(), Ct));
+        var afterTimeout = await Assert.ThrowsAsync<ConcurrencyConflictException>(
+            () => Store(Scripted(() => Failure(500, "OperationTimedOut"), Mismatch)).UpdateAsync(Row(V1), Ct));
+
+        Assert.True(duplicate.MayBeOwnWrite);
+        Assert.True(afterGateway.MayBeOwnWrite);
+        Assert.True(afterTimeout.MayBeOwnWrite);
+        Assert.Equal(DeleteStatus.Indeterminate, await Store(Scripted(Lost, Busy, Missing)).DeleteIfExistsAsync("p|r", Ct));
+    }
+
+    // ── a table whose name ends in "Tables" is not the table creation ─────
+
+    [Fact]
+    public async Task ACreate_IntoATableNamedLikeTheTableCreation_IsAWrite()
+    {
+        static TableStorage<TimeTables> Timetables(ScriptedTableTransport transport) =>
+            new(transport.RetryingService(), new MemoryCache(new MemoryCacheOptions()), NullLogger<TableStorage<TimeTables>>.Instance,
+                authorizer: null, options: new UnifiedTableStorageOptions { Cache = CachePolicy.Disabled });
+        var lost = Scripted(Lost, Lost, Lost, Lost);
+
+        var transient = await Assert.ThrowsAsync<TransientStorageException>(() => Timetables(lost).CreateAsync(new TimeTables { Id = "p|r" }, Ct));
+        var retried = await Assert.ThrowsAsync<DuplicateKeyException>(
+            () => Timetables(Scripted(Lost, Duplicate)).CreateAsync(new TimeTables { Id = "p|r" }, Ct));
+        var once = await Assert.ThrowsAsync<DuplicateKeyException>(
+            () => Timetables(Scripted(Duplicate)).CreateAsync(new TimeTables { Id = "p|r" }, Ct));
+
+        Assert.Equal(4, lost.Requests.Count(r => r.Method == "POST" && r.Path == "/TimeTables"));
+        Assert.True(transient.MayHaveCommitted);
+        Assert.Contains("It may have been applied", transient.Message, StringComparison.Ordinal);
+        Assert.True(retried.MayBeOwnWrite);
+        Assert.False(once.MayBeOwnWrite);
+    }
+
+    [Fact]
+    public async Task APolymorphicInsert_IntoATableNamedLikeTheTableCreation_IsAWrite()
+    {
+        static PolymorphicTableStorage<TestMessage> Events(ScriptedTableTransport transport) =>
+            new(transport.RetryingService(), "TimeTables", NullLogger<PolymorphicTableStorage<TestMessage>>.Instance);
+        var write = new PolymorphicWrite<TestMessage>(new TableKey("p", "r"), new TestCommand { Id = "c", Operation = "go" });
+        var lost = Scripted(Lost, Lost, Lost, Lost);
+
+        var transient = await Assert.ThrowsAsync<TransientStorageException>(() => Events(lost).InsertAsync(write, Ct));
+        var retried = await Assert.ThrowsAsync<DuplicateKeyException>(() => Events(Scripted(Lost, Duplicate)).InsertAsync(write, Ct));
+        var once = await Assert.ThrowsAsync<DuplicateKeyException>(() => Events(Scripted(Duplicate)).InsertAsync(write, Ct));
+
+        Assert.Equal(4, lost.Requests.Count(r => r.Method == "POST" && r.Path == "/TimeTables"));
+        Assert.True(transient.MayHaveCommitted);
+        Assert.True(retried.MayBeOwnWrite);
+        Assert.False(once.MayBeOwnWrite);
+    }
+
+    [Fact]
+    public async Task TheTableCreationItself_IsNotAWrite_WhereverTheAccountSits()
+    {
+        // The creation is the first request of a new store; here it is the one that is refused as busy,
+        // on a path-style endpoint (the emulator's), and nothing of the call can have stored a row.
+        Answer Busy() => Failure(503, "ServerBusy");
+        var transport = new ScriptedTableTransport(_ => Busy(), scriptTableCreation: true);
+        var options = new TableClientOptions { Transport = transport }.AddRetryObservation();
+        options.Retry.MaxRetries = 1;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(1);
+        var store = new TableStorage<TestEntity>(
+            new TableServiceClient(new Uri("http://127.0.0.1:10002/devstoreaccount1"), new TableSharedKeyCredential("devstoreaccount1", Convert.ToBase64String(new byte[32])), options),
+            new MemoryCache(new MemoryCacheOptions()), NullLogger<TableStorage<TestEntity>>.Instance);
+
+        var transient = await Assert.ThrowsAsync<TransientStorageException>(() => store.CreateAsync(Row(), Ct));
+
+        Assert.NotEmpty(transport.Requests);
+        Assert.All(transport.Requests, r => Assert.Equal("/devstoreaccount1/Tables", r.Path));
+        Assert.False(transient.MayHaveCommitted);
+    }
+
+    // ── the log of a call does not grow with the requests it sends ────────
+
+    [Fact]
+    public void TheLog_AnswersPerMark_WithoutKeepingItsRequests()
+    {
+        var pipeline = HttpPipelineBuilder.Build(new TableClientOptions());
+        var attempts = RequestAttempts.Begin();
+        HttpMessage Message(RequestMethod method, string path)
+        {
+            var message = pipeline.CreateMessage();
+            message.Request.Method = method;
+            message.Request.Uri.Reset(new Uri("https://acct.table.core.windows.net" + path));
+            return message;
+        }
+
+        // A read, then a write whose first attempt is lost and whose second is refused.
+        using var read = Message(RequestMethod.Get, "/T()");
+        attempts.Ended(attempts.Sending(read)!, 200, null);
+        var beforeFirst = attempts.Mark();
+        using var first = Message(RequestMethod.Put, "/T(PartitionKey='p',RowKey='r')");
+        attempts.Ended(attempts.Sending(first)!, 0, null);
+        // The same attempt seen again while it is in flight (the policy added twice) is not a second one.
+        var again = attempts.Sending(first)!;
+        Assert.Null(attempts.Sending(first));
+        attempts.Ended(again, 412, "UpdateConditionNotSatisfied");
+        var beforeSecond = attempts.Mark();
+        using var second = Message(RequestMethod.Delete, "/T(PartitionKey='p',RowKey='r')");
+        attempts.Ended(attempts.Sending(second)!, 404, "ResourceNotFound");
+
+        Assert.Equal(1, beforeFirst);
+        Assert.Equal(2, beforeSecond);
+        Assert.True(attempts.MayBeOwnWrite(0));
+        Assert.True(attempts.MayBeOwnWrite(beforeFirst));
+        Assert.True(attempts.RetriedInDoubt(beforeFirst));
+        Assert.False(attempts.MayBeOwnWrite(beforeSecond));
+        Assert.False(attempts.RetriedInDoubt(beforeSecond));
+        // Nothing noted since: unobserved, so answered conservatively, but no retry was seen.
+        Assert.True(attempts.MayBeOwnWrite(attempts.Mark()));
+        Assert.False(attempts.RetriedInDoubt(attempts.Mark()));
+        Assert.True(attempts.MayHaveCommitted);
+
+        // A message that carries the note of another call's log is noted afresh in this one.
+        var other = RequestAttempts.Begin();
+        other.Ended(other.Sending(first)!, 409, "EntityAlreadyExists");
+        Assert.Equal(1, other.Mark());
+        Assert.False(other.MayBeOwnWrite(0));
+        Assert.False(other.MayHaveCommitted);
+    }
+
     // ── a retried read never labels the write that follows it ─────────────
 
     [Fact]
@@ -345,4 +493,9 @@ public class RetryObservationTests
         Assert.False(once.MayBeOwnWrite);
         Assert.True(unobserved.MayBeOwnWrite);
     }
+}
+
+/// <summary>An entity whose table (named after the type) ends in "Tables", like the path of the service's table creation.</summary>
+public sealed class TimeTables : Entity
+{
 }

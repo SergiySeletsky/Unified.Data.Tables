@@ -15,7 +15,9 @@ public enum DeleteStatus
     /// <summary>
     /// The row is gone, but the provider cannot tell whether this call removed it or it was already
     /// missing: an earlier attempt of the same request was sent (the Azure SDK retries after a timeout or
-    /// a dropped connection) and its response was lost, so the attempt that answered found nothing. Treat
+    /// a dropped connection) and may have been applied (its response was lost, or was no proof of a
+    /// refusal), so the attempt that answered found nothing. An earlier attempt the service definitely
+    /// refused (throttled, turned away as busy) removed nothing and does not make the answer this. Treat
     /// it as "gone, possibly by me": a caller that runs a side effect only for a delete it performed must
     /// decide by its own record, not by this result. A provider that never retries a request (the
     /// in-memory one) never returns it.

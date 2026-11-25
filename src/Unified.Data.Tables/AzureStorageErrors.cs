@@ -74,7 +74,8 @@ internal static class AzureStorageErrors
     /// log. Without one, and with a log that noted nothing (the client has no observation policy), both
     /// flags of a write are set conservatively. With one, a transient failure of a write has not
     /// committed when every attempt of every write request was definitely rejected, and a duplicate or a
-    /// conflict is not the call's own write when no write request of the call was sent twice. (A member
+    /// conflict is not the call's own write when no write request of the call was sent again after an
+    /// attempt that may have been applied. (A member
     /// that knows which request failed asks about that request alone; this is the answer for a failure
     /// nothing caught on its way out.)
     /// </param>

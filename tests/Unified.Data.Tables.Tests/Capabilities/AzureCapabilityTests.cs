@@ -48,6 +48,8 @@ public class AzureCapabilityTests
         Assert.Same(raw, rawAgain);
         Assert.True(store.TryGetCapability<TestEntity, ITableStore>(out var tables));
         Assert.IsType<AzureTableStore>(tables);
+        Assert.True(store.TryGetCapability<TestEntity, ITableStore>(out var tablesAgain));
+        Assert.Same(tables, tablesAgain);
         // Not a side interface of a typed store.
         Assert.False(store.TryGetCapability<TestEntity, IAtomicInsert<TestMessage>>(out _));
         Assert.False(store.TryGetCapability<TestEntity, IDisposable>(out _));
@@ -64,7 +66,9 @@ public class AzureCapabilityTests
         Assert.True(store.TryGetCapability<TestMessage, IStorageInfo>(out _));
         Assert.True(store.TryGetCapability<TestMessage, IRawTable>(out var raw));
         Assert.Equal("TestTable", raw.TableName);
-        Assert.True(store.TryGetCapability<TestMessage, ITableStore>(out _));
+        Assert.True(store.TryGetCapability<TestMessage, ITableStore>(out var tables));
+        Assert.True(store.TryGetCapability<TestMessage, ITableStore>(out var tablesAgain));
+        Assert.Same(tables, tablesAgain);
         Assert.False(store.TryGetCapability<TestMessage, IAtomicBatch<TestEntity>>(out _));
     }
 

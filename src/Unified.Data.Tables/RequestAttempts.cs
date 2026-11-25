@@ -28,8 +28,19 @@ internal sealed class RequestAttempts
 {
     private static readonly AsyncLocal<RequestAttempts?> Ambient = new();
 
+    // The log keeps no request: each one carries its own note (Noted, a property of its HttpMessage),
+    // and the log holds only what its questions need, so a call that sends a hundred thousand requests
+    // (a partition delete over millions of rows) costs it nothing more than one that sends two.
     private readonly Lock gate = new();
-    private readonly List<Noted> requests = [];
+    // Requests noted so far; a request's position is the count when it was first sent.
+    private int count;
+    // The position of the last write request noted, or -1.
+    private int lastWrite = -1;
+    // The position of the last write request of which an attempt was sent after an earlier attempt that
+    // may have been applied, or -1.
+    private int lastWriteRetriedInDoubt = -1;
+    // Whether an attempt of any write request may have been applied.
+    private bool writeMayHaveBeenApplied;
 
     /// <summary>The log of the storage call this code runs in, or null outside one.</summary>
     internal static RequestAttempts? Current => Ambient.Value;
@@ -55,35 +66,47 @@ internal sealed class RequestAttempts
     /// </summary>
     internal static bool MayBeOwnWriteSince(int mark) => Current?.MayBeOwnWrite(mark) ?? true;
 
+    /// <summary>
+    /// Whether a write request sent since <paramref name="mark"/> was seen to be sent again after an
+    /// attempt that may have been applied (see <see cref="RetriedInDoubt(int)"/>); false outside a
+    /// storage call and on a client without the observation, where nothing is seen.
+    /// </summary>
+    internal static bool RetriedInDoubtSince(int mark) => Current?.RetriedInDoubt(mark) ?? false;
+
     /// <summary>The position in the log now.</summary>
     internal int Mark()
     {
         lock (gate)
-            return requests.Count;
+            return count;
     }
 
     /// <summary>
     /// Whether a row the service reported in the way of a write sent since <paramref name="mark"/> (a
     /// duplicate key, a failed version check, a row already gone) may be that write's own doing: true
-    /// when an earlier attempt of one of those requests was sent, and true when no write request was
-    /// noted at all (the client has no observation policy). False only when every write request since
-    /// the mark was sent exactly once.
+    /// when one of those requests was sent again after an attempt that may have been applied (one that
+    /// ended without a response, or with an answer that is no proof of a refusal), and true when no write
+    /// request was noted at all (the client has no observation policy). False when every write request
+    /// since the mark was sent exactly once, and when every earlier attempt of each was definitely
+    /// rejected by the service (throttled, or refused as busy): such an attempt wrote nothing.
     /// </summary>
     internal bool MayBeOwnWrite(int mark)
     {
         lock (gate)
         {
-            var observed = false;
-            for (var i = Math.Max(mark, 0); i < requests.Count; i++)
-            {
-                if (!requests[i].Write)
-                    continue;
-                if (requests[i].Attempts > 1)
-                    return true;
-                observed = true;
-            }
-            return !observed;
+            mark = Math.Max(mark, 0);
+            return lastWriteRetriedInDoubt >= mark || lastWrite < mark;
         }
+    }
+
+    /// <summary>
+    /// Whether a write request sent since <paramref name="mark"/> was sent again after an attempt of it
+    /// that may have been applied. Unlike <see cref="MayBeOwnWrite(int)"/> it is false when nothing was
+    /// observed: it says what was seen, not what cannot be ruled out.
+    /// </summary>
+    internal bool RetriedInDoubt(int mark)
+    {
+        lock (gate)
+            return lastWriteRetriedInDoubt >= Math.Max(mark, 0);
     }
 
     /// <summary>
@@ -96,16 +119,7 @@ internal sealed class RequestAttempts
         get
         {
             lock (gate)
-            {
-                if (requests.Count == 0)
-                    return true;
-                foreach (var request in requests)
-                {
-                    if (request.Write && request.MayHaveBeenApplied)
-                        return true;
-                }
-                return false;
-            }
+                return count == 0 || writeMayHaveBeenApplied;
         }
     }
 
@@ -115,23 +129,21 @@ internal sealed class RequestAttempts
         lock (gate)
         {
             // Another attempt of a request already noted is the same message, sent again by the retry
-            // policy (the SDK's, or one the host put in its place).
-            Noted? noted = null;
-            for (var i = requests.Count - 1; i >= 0 && noted is null; i--)
+            // policy (the SDK's, or one the host put in its place): it carries its note. A note of
+            // another log is not this call's (a message is not expected to cross calls).
+            if (!message.TryGetProperty(typeof(Noted), out var carried) || carried is not Noted noted || !ReferenceEquals(noted.Log, this))
             {
-                if (ReferenceEquals(requests[i].Message.Target, message))
-                    noted = requests[i];
-            }
-            if (noted is null)
-            {
-                noted = new Noted(message, IsRowWrite(message.Request));
-                requests.Add(noted);
+                noted = new Noted(this, count++, IsRowWrite(message.Request));
+                message.SetProperty(typeof(Noted), noted);
+                if (noted.Write)
+                    lastWrite = noted.Position;
             }
             // The policy added twice to one pipeline sees each attempt twice: counted once.
             if (noted.InFlight)
                 return null;
             noted.InFlight = true;
-            noted.Attempts++;
+            if (noted.Write && noted.MayHaveBeenApplied)
+                lastWriteRetriedInDoubt = Math.Max(lastWriteRetriedInDoubt, noted.Position);
             return noted;
         }
     }
@@ -142,19 +154,28 @@ internal sealed class RequestAttempts
         lock (gate)
         {
             noted.InFlight = false;
-            if (!DefinitelyRejected(status, errorCode))
-                noted.MayHaveBeenApplied = true;
+            if (DefinitelyRejected(status, errorCode))
+                return;
+            noted.MayHaveBeenApplied = true;
+            if (noted.Write)
+                writeMayHaveBeenApplied = true;
         }
     }
 
-    // A request that can change rows. Reads cannot; nor does the lazy creation of the table itself
-    // (POST {account}/Tables), which every store sends once and which stores no row.
+    // A request that can change rows: everything that is not proven otherwise. Reads cannot; nor does
+    // the lazy creation of the table itself, which every store sends once and which stores no row. That
+    // one is recognised exactly: a POST whose last path segment is "Tables" ({account}/Tables, or
+    // /{account}/Tables on a path-style endpoint). The service reserves that name, so no table has it,
+    // while an insert into a table whose name merely ends that way (POST /TimeTables) is a write.
     private static bool IsRowWrite(Request request)
     {
         var method = request.Method;
         if (method == RequestMethod.Get || method == RequestMethod.Head || method == RequestMethod.Options)
             return false;
-        return !(method == RequestMethod.Post && request.Uri.Path.TrimEnd('/').EndsWith("Tables", StringComparison.Ordinal));
+        if (method != RequestMethod.Post)
+            return true;
+        var path = request.Uri.Path.AsSpan().TrimEnd('/');
+        return !path[(path.LastIndexOf('/') + 1)..].Equals("Tables", StringComparison.Ordinal);
     }
 
     // The answers after which a request is known not to have been applied: a client error other than a
@@ -166,15 +187,14 @@ internal sealed class RequestAttempts
         (status is >= 400 and < 500 and not 408)
         || (status == 503 && string.Equals(errorCode, "ServerBusy", StringComparison.Ordinal));
 
-    /// <summary>One request of the call, with what its attempts showed.</summary>
-    internal sealed class Noted(HttpMessage message, bool write)
+    /// <summary>One request of the call, with what its attempts showed. It travels with its message.</summary>
+    internal sealed class Noted(RequestAttempts log, int position, bool write)
     {
-        // Weak: the log must not keep a request (and its body) alive for as long as the storage call runs.
-        public WeakReference Message { get; } = new(message);
+        public RequestAttempts Log { get; } = log;
+
+        public int Position { get; } = position;
 
         public bool Write { get; } = write;
-
-        public int Attempts { get; set; }
 
         public bool InFlight { get; set; }
 
@@ -268,12 +288,15 @@ public static class TableClientOptionsExtensions
     /// <remarks>
     /// With it, a store over the client reports what it saw: <see cref="DuplicateKeyException.MayBeOwnWrite"/>
     /// and <see cref="ConcurrencyConflictException.MayBeOwnWrite"/> are false when exactly one attempt of the
-    /// request was sent, <see cref="TransientStorageException.MayHaveCommitted"/> is false when every
-    /// attempt was definitely rejected, and a conditional delete (<see cref="IConditionalDelete{T}"/>)
-    /// answers <see cref="DeleteStatus.NotFound"/> for a row that was not there. Without it the attempts
-    /// cannot be observed and each of those is answered conservatively (true, true and
-    /// <see cref="DeleteStatus.Indeterminate"/>). The policy changes no request and no response; adding it
-    /// twice counts each attempt once.
+    /// request was sent (and when every earlier attempt was definitely rejected: throttled, or refused as
+    /// busy), <see cref="TransientStorageException.MayHaveCommitted"/> is false when every attempt was
+    /// definitely rejected, and a conditional delete (<see cref="IConditionalDelete{T}"/>) answers
+    /// <see cref="DeleteStatus.NotFound"/> for a row that was not there. Without it the attempts cannot
+    /// be observed and each of those is answered conservatively (true, true and
+    /// <see cref="DeleteStatus.Indeterminate"/>): a store over a client the host built without this call
+    /// never answers <see cref="DeleteStatus.NotFound"/> for a delete it sent, and so does not pass the
+    /// conditional-delete scenarios of the conformance kit. The policy changes no request and no
+    /// response; adding it twice counts each attempt once.
     /// </remarks>
     /// <param name="options">The options a <see cref="TableServiceClient"/> is about to be built with.</param>
     /// <returns><paramref name="options"/>, for chaining.</returns>

@@ -85,6 +85,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
 
 #pragma warning disable UDT0001 // the experimental raw-table API is handed out here, not used
     private AzureRawTable? rawTable;
+    private AzureTableStore? tableStore;
 
     /// <summary>
     /// The store's implementation of the side interface <typeparamref name="TCap"/>: the store itself for
@@ -101,7 +102,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
         if (capability is null && typeof(TCap) == typeof(IRawTable))
             capability = (rawTable ??= new AzureRawTable(client, tableName, initializer.EnsureAsync)) as TCap;
         if (capability is null && typeof(TCap) == typeof(ITableStore))
-            capability = new AzureTableStore(serviceClient) as TCap;
+            capability = (tableStore ??= new AzureTableStore(serviceClient)) as TCap;
         return capability is not null;
     }
 #pragma warning restore UDT0001
@@ -494,6 +495,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
             for (var i = range.Start; i < range.Start + range.Count; i++)
                 actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, rows[i], ETag.All));
 
+            var sent = RequestAttempts.MarkCurrent();
             try
             {
                 await client.SubmitTransactionAsync(actions, ct);
@@ -502,17 +504,13 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
             catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
             {
                 // A delete of a missing row fails its whole transaction, and nothing of it is applied:
-                // another writer deleted one of the listed rows meanwhile. That is a lost race, not a
-                // failure: the rows of this transaction are deleted one by one (the SDK returns the 404
-                // of a row that is gone instead of throwing it), and only the ones this call removed count.
+                // another writer deleted one of the listed rows meanwhile, or an earlier attempt of this
+                // very transaction was applied and its response lost. Neither is a failure: the rows of
+                // this transaction are deleted one by one, and only the ones this call removed count.
                 logger.LogDebug(ex, "A row of partition {Partition} in {Table} was deleted after the listing; its transaction's rows are deleted one by one.",
                     partition, tableName);
-                for (var i = range.Start; i < range.Start + range.Count; i++)
-                {
-                    var response = await client.DeleteEntityAsync(rows[i].PartitionKey, rows[i].RowKey, ETag.All, ct);
-                    if (response is null || response.Status != 404)
-                        deleted++;
-                }
+                var chunk = rows.GetRange(range.Start, range.Count);
+                deleted += chunk.Count - await PartitionDeleteLostRace.DeleteOneByOneAsync(client, chunk, sent, ct);
             }
         }
 

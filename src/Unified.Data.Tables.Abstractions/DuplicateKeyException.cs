@@ -14,8 +14,10 @@ public class DuplicateKeyException : StorageException
 {
     /// <summary>
     /// Whether the row that is in the way may be this very call's own write. True unless the provider
-    /// observed that no earlier attempt of this request was sent: a provider that retries (the Azure SDK
-    /// does, after a timeout or a dropped connection) can have an attempt applied whose response was lost,
+    /// observed that no earlier attempt of this request can have been applied (the request was sent once,
+    /// or every earlier attempt was definitely refused by the service: throttled, or turned away as
+    /// busy): a provider that retries (the Azure SDK does, after a timeout or a dropped connection) can
+    /// have an attempt applied whose response was lost,
     /// and its next attempt then finds the row that attempt created. False means only that no such retry
     /// was seen in this call, not that another writer is proven: a caller's own retry of the whole call
     /// (after a <see cref="TransientStorageException"/>, a redelivered message, a restart) looks the same

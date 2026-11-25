@@ -31,7 +31,9 @@ public static partial class ServiceCollectionExtensions
     /// caller must separately register a <see cref="TableServiceClient"/> (and, if protected
     /// properties are used, an <see cref="IProtectedPropertyAuthorizer"/>); build it with
     /// <see cref="TableClientOptionsExtensions.AddRetryObservation"/> on its options so the stores can
-    /// observe the SDK's retries (see <see cref="DuplicateKeyException.MayBeOwnWrite"/>). With
+    /// observe the SDK's retries (see <see cref="DuplicateKeyException.MayBeOwnWrite"/>); over a client
+    /// without it, a conditional delete (<see cref="IConditionalDelete{T}"/>) of a row that is not there
+    /// answers <see cref="DeleteStatus.Indeterminate"/>, never <see cref="DeleteStatus.NotFound"/>. With
     /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> set, the blob client is
     /// <see cref="BlobOffloadOptions.ServiceClient"/>, or the host's registered <see cref="BlobServiceClient"/>
     /// when <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/> is true; without one, resolving a

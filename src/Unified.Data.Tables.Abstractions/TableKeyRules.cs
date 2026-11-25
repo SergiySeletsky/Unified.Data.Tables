@@ -27,6 +27,13 @@ public static class TableKeyRules
     /// The longest key the check accepts, in UTF-16 characters. The service documents a limit of 1 KiB
     /// per key and stores strings as UTF-16, so the limit is counted as 512 characters: the conservative
     /// reading, under which a key that passes here is never refused by the service for its size.
+    /// <para>
+    /// It is a conservative bound, not the service's measured limit: the documentation gives the size in
+    /// bytes without naming the encoding, and the service may accept a longer key (up to 1,024
+    /// characters, if it counts one byte a character). A key of 513 to 1,024 characters is therefore
+    /// refused here although a storage account might take it. The Azure provider itself does not apply
+    /// this check to the ids it stores; the service decides there.
+    /// </para>
     /// </summary>
     public const int MaxKeyLength = 512;
 

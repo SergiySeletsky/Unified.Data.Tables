@@ -17,6 +17,8 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
 #pragma warning disable UDT0001 // the experimental raw-table API is handed out here, not used
     // The raw view of this store's table, built when first asked for.
     private AzureRawTable? rawTable;
+    // The tables of the store's account, built when first asked for.
+    private AzureTableStore? tableStore;
 
     /// <summary>
     /// The store's implementation of the side interface <typeparamref name="TCap"/>: the store itself for
@@ -34,7 +36,7 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
         if (capability is null && typeof(TCap) == typeof(IRawTable))
             capability = (rawTable ??= new AzureRawTable(client, tableName, EnsureTableAsync)) as TCap;
         if (capability is null && typeof(TCap) == typeof(ITableStore))
-            capability = new AzureTableStore(serviceClient) as TCap;
+            capability = (tableStore ??= new AzureTableStore(serviceClient)) as TCap;
         return capability is not null;
     }
 #pragma warning restore UDT0001

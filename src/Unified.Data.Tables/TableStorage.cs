@@ -394,10 +394,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     // What a delete request that the service answered says about the row. Anything but 404: the row was
     // there and this response is its removal. 404: no row. It was never there, or another writer removed
-    // it, when exactly one attempt of the request was sent; when an earlier attempt was sent (the SDK
-    // retried after a timeout or a dropped connection), or the attempts could not be observed, that
-    // attempt may have been the one that removed it, and the answer is Indeterminate. A table that does
-    // not exist holds no row whatever was sent.
+    // it, when exactly one attempt of the request was sent (or every earlier attempt was definitely
+    // rejected: throttled, refused as busy); when the request was sent again after an attempt that may
+    // have been applied (the SDK retried after a timeout or a dropped connection), or the attempts could
+    // not be observed, that attempt may have been the one that removed it, and the answer is
+    // Indeterminate. A table that does not exist holds no row whatever was sent.
     private static DeleteStatus DeleteOutcome(Response? response, int sent)
     {
         if (!IsNotFound(response, out var tableMissing))
@@ -499,6 +500,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 }
                 var actions = batch.Select(e =>
                     new TableTransactionAction(TableTransactionActionType.Delete, e, ETag.All));
+                var sent = RequestAttempts.MarkCurrent();
                 try
                 {
                     await client.SubmitTransactionAsync(actions, ct);
@@ -506,16 +508,14 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                 catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
                 {
                     // A delete of a missing row fails its whole transaction, and nothing of it is applied:
-                    // another writer deleted one of the listed rows meanwhile. That is a lost race, not a
-                    // failure: the rows of this transaction are deleted one by one (a single delete of a
-                    // row that is gone is a no-op), and the partition delete goes on.
+                    // another writer deleted one of the listed rows meanwhile, or an earlier attempt of
+                    // this very transaction was applied and its response lost. Neither is a failure: the
+                    // rows of this transaction are deleted one by one (a single delete of a row that is
+                    // gone is a no-op), the ones this call did not remove are left out of the count, and
+                    // the partition delete goes on.
                     logger.LogDebug(ex, "{Type} partition {Partition}: a row was deleted after the listing; its transaction's rows are deleted one by one",
                         typeName, partition);
-                    foreach (var row in batch)
-                    {
-                        if (IsNotFound(await client.DeleteEntityAsync(row.PartitionKey, row.RowKey, ETag.All, ct), out _))
-                            goneMeanwhile++;
-                    }
+                    goneMeanwhile += await PartitionDeleteLostRace.DeleteOneByOneAsync(client, batch, sent, ct);
                 }
             }
             foreach (var (primaryRowKey, rows) in leftovers)
