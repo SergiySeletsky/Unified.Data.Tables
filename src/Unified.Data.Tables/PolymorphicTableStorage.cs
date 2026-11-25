@@ -307,6 +307,9 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
         await foreach (var row in client.QueryAsync<TableEntity>(
                            PartitionFilter(partition), maxPerPage: null, select: null, ct))
         {
+            // The SDK looks at the token only when it asks for the next page: a token cancelled between two
+            // rows of one page ends the stream at the next row, as it does on every other provider.
+            ct.ThrowIfCancellationRequested();
             yield return ToEntry(row);
 
             if (take is { } limit && ++yielded >= limit)

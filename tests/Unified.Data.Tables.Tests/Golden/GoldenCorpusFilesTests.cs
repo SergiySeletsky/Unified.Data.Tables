@@ -3,11 +3,14 @@ namespace Unified.Data.Tables.Tests.Golden;
 /// <summary>
 /// The golden corpus is a fixed set of files. A golden test reads its expectation from the source tree
 /// (see <see cref="GoldenFile.ReadOrNull"/>), and this test holds the set itself: a file deleted from
-/// <c>Golden/Data</c> fails here by name, and so does a file nobody asserts.
+/// <c>Golden/Data</c> fails here by name, and so does a file added there without being listed. The list
+/// is kept by hand: it is not derived from what the golden tests read, so a file whose test is deleted
+/// stays listed (and passes here) until it is removed from the list and the directory together.
 /// </summary>
 public class GoldenCorpusFilesTests
 {
-    // Every file a golden test names. A new case adds its file here in the same change.
+    // Every file a golden test names, kept by hand. A new case adds its file here in the same change, and
+    // a removed case removes it.
     private static readonly string[] Expected =
     [
         "Cursors/azure-paging.txt",

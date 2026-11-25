@@ -108,7 +108,8 @@ jobs:
       # Unified.Data.Tables.Core binds to the abstractions' internals, and the two providers
       # (Unified.Data.Tables and Unified.Data.Tables.InMemory) to the internals and the provider SPI of
       # both, so each must depend on EXACTLY the version packed beside it:
-      # [1.2.3], not NuGet's default >= 1.2.3. The pins come from a target in Directory.Build.targets
+      # [1.2.3], not NuGet's default >= 1.2.3. The conformance kit pins the abstractions whose contract its
+      # scenarios state, and its xUnit adapter the kit whose scenarios it lists. The pins come from a target in Directory.Build.targets
       # that hooks a private NuGet target; if an SDK update renames that target they vanish without a
       # warning. Read them back from the packages about to be pushed and stop the publish without them.
       - name: Verify exact sibling-package versions
@@ -144,6 +145,8 @@ jobs:
           require_exact Unified.Data.Tables Unified.Data.Tables.Core
           require_exact Unified.Data.Tables.InMemory Unified.Data.Tables.Abstractions
           require_exact Unified.Data.Tables.InMemory Unified.Data.Tables.Core
+          require_exact Unified.Data.Tables.Conformance Unified.Data.Tables.Abstractions
+          require_exact Unified.Data.Tables.Conformance.Xunit Unified.Data.Tables.Conformance
 
       - name: NuGet login (OIDC trusted publishing)
         id: login

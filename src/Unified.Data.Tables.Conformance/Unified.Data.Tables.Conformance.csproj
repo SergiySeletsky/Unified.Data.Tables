@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net10.0</TargetFrameworks>
+    <PackageId>Unified.Data.Tables.Conformance</PackageId>
+    <RootNamespace>Unified.Data.Tables.Conformance</RootNamespace>
+    <AssemblyName>Unified.Data.Tables.Conformance</AssemblyName>
+    <Description>Conformance kit for Unified.Data.Tables stores: named, framework-neutral scenarios that hold any IStorage&lt;T&gt; or IPolymorphicStorage&lt;TBase&gt; (a provider, a decorator, a hand-written fake) to the contract every provider of the library keeps, in five tiers (logical, failures, capabilities, polymorphic, large values). Describe the store with a small factory, run the scenarios from any test framework, and read per-scenario results; a fake that is not there yet declares named leniencies and is reported instead of failed. Ships two decorators for tests: CountingStorage&lt;T&gt; and FaultInjectingStorage&lt;T&gt; (transient failures and lost responses). References the abstractions only, no test framework.</Description>
+    <PackageTags>azure;table-storage;repository;testing;conformance;contract-tests;fake;storage;nosql</PackageTags>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <!-- The scenarios pin the contract of exactly the abstractions packed beside them (a newer abstractions
+         package has members and rules these scenarios do not know): depend on exactly the same version.
+         See Directory.Build.targets. -->
+    <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
+    <!-- The capability tier exercises the experimental raw-table API (ITableStore, IRawTable). -->
+    <NoWarn>$(NoWarn);UDT0001</NoWarn>
+  </PropertyGroup>
+
+  <!-- The abstractions only: the kit runs against a store it is handed and knows no provider. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

@@ -739,6 +739,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var yielded = 0;
         await foreach (var queried in pageable.WithCancellation(ct))
         {
+            // The SDK looks at the token only when it asks for the next page: a token cancelled between two
+            // rows of one page ends the stream at the next row, as it does on every other provider.
+            ct.ThrowIfCancellationRequested();
             // Continuation rows are not entities: they never count toward take, nor reach the cache.
             if (SplitRowLayout.IsPartRow(queried))
                 continue;

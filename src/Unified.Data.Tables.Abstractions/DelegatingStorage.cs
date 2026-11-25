@@ -9,6 +9,16 @@ namespace Unified.Data.Tables;
 /// it changes.
 /// </summary>
 /// <remarks>
+/// <b>Warning: a decorator that restricts or observes writes must override
+/// <see cref="TryGetCapability{TCap}"/>.</b> Overriding the <see cref="IStorage{T}"/> members is not
+/// enough: the side interfaces write too (<see cref="IConditionalDelete{T}"/> deletes,
+/// <see cref="IAtomicBatch{T}"/> creates and replaces, <see cref="IOrphanBlobSweeper"/> deletes blobs, the
+/// experimental raw table writes rows), and by default the probe hands out the wrapped store's own
+/// implementation of them, which never calls back into the decorator. A read-only, tenant-scoping,
+/// auditing or fault-injecting decorator that overrides only <see cref="DeleteAsync"/> is bypassed by
+/// <c>DeleteIfExistsAsync</c>. Either hide those capabilities (return false for them) or stand in for
+/// them (implement the side interface on the decorator and forward); both are described below.
+/// <para>
 /// <b>Capabilities.</b> The class implements <see cref="IStorageCapabilities"/> and no side interface
 /// (<see cref="IConditionalDelete{T}"/>, <see cref="IAtomicBatch{T}"/>, <see cref="IStorageInfo"/>,
 /// <see cref="IOrphanBlobSweeper"/>, ...). <see cref="TryGetCapability{TCap}"/> answers with what the
@@ -18,6 +28,7 @@ namespace Unified.Data.Tables;
 /// side interface itself (it is then found before the wrapped store is asked) and forwards to the
 /// wrapped store's capability; one that must hide a capability overrides
 /// <see cref="TryGetCapability{TCap}"/> and returns false for it.
+/// </para>
 /// <para>
 /// A decorator that implements <see cref="IStorage{T}"/> by hand, without this class or
 /// <see cref="IStorageCapabilities"/>, keeps working; it exposes only the side interfaces its own type

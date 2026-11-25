@@ -139,6 +139,15 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         }
     }
 
+    /// <summary>The ETag and the last-write time of the stored row at these keys, continuation rows included (for tests); null when absent.</summary>
+    internal (string ETag, DateTimeOffset Timestamp)? PhysicalVersion(string partitionKey, string rowKey)
+    {
+        lock (gate)
+        {
+            return rows.TryGetValue((partitionKey, rowKey), out var row) ? (row.ETagString(), row.Timestamp) : null;
+        }
+    }
+
     /// <summary>Stores a raw row as is (for tests that stage damaged or foreign rows).</summary>
     internal void SeedPhysicalRow(TableEntity row)
     {
