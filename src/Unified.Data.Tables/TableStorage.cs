@@ -207,12 +207,48 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// Eagerly ensure the underlying table exists (it is otherwise created lazily on first use).
     /// Call from host startup for fail-fast semantics.
     /// </summary>
-    public Task EnsureCreatedAsync(CancellationToken ct = default) => EnsureTableAsync(ct);
+    public async Task EnsureCreatedAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await EnsureTableAsync(ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    // The provider-neutral exception for an SDK failure that is leaving a member of this store (see
+    // AzureStorageErrors for what maps to what). write: the member may change stored data, so a transient
+    // failure may have committed and a duplicate or conflict may be the call's own retried write.
+    private StorageException Failed(Exception ex, bool write, string? id = null) =>
+        AzureStorageErrors.Map(ex, typeName, tableName, id, write);
+
+    // A duplicate key or a lost version check the service reported for a write. The SDK may have
+    // retried the request, so either can be the call's own write (see MayBeOwnWrite).
+    private DuplicateKeyException Duplicate(string id, RequestFailedException ex) =>
+        AzureStorageErrors.Duplicate(typeName, id, ex, mayBeOwnWrite: true);
+
+    private ConcurrencyConflictException Conflict(string id, RequestFailedException? ex) =>
+        AzureStorageErrors.Conflict(typeName, id, ex, mayBeOwnWrite: ex is not null);
 
     private Task EnsureTableAsync(CancellationToken ct) => tableInitializer.EnsureAsync(ct);
 
     /// <inheritdoc />
     public async Task<T> CreateAsync(T entity, CancellationToken ct = default)
+    {
+        try
+        {
+            return await CreateCoreAsync(entity, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, entity?.Id);
+        }
+    }
+
+    private async Task<T> CreateCoreAsync(T entity, CancellationToken ct)
     {
         if (entity == null || string.IsNullOrWhiteSpace(entity.Id))
         {
@@ -248,7 +284,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // An existing key is an EXPECTED outcome of concurrent creates — surface it
             // provider-agnostically (GetOrCreateAsync/MutateOrCreateAsync absorb it entirely).
             EvictAfterFailedWrite(entity.Id, partitionKey);
-            throw new DuplicateKeyException(typeName, entity.Id, ex);
+            throw Duplicate(entity.Id, ex);
         }
         catch (Exception)
         {
@@ -281,6 +317,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task DeleteAsync(string id, CancellationToken ct = default)
     {
+        try
+        {
+            await DeleteCoreAsync(id, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, id);
+        }
+    }
+
+    private async Task DeleteCoreAsync(string id, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(id))
         {
             throw new ArgumentNullException(nameof(id));
@@ -311,6 +359,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     /// <inheritdoc />
     public async Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
+    {
+        try
+        {
+            return await DeletePartitionCoreAsync(partition, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task<int> DeletePartitionCoreAsync(string partition, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(partition))
             throw new ArgumentNullException(nameof(partition));
@@ -388,6 +448,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task<T?> OneAsync(string id, CancellationToken ct = default)
     {
+        try
+        {
+            return await OneCoreAsync(id, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false, id);
+        }
+    }
+
+    private async Task<T?> OneCoreAsync(string id, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(id))
         {
             throw new ArgumentNullException(nameof(id));
@@ -434,6 +506,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     /// <inheritdoc />
     public async Task<bool> ExistsAsync(string id, CancellationToken ct = default)
+    {
+        try
+        {
+            return await ExistsCoreAsync(id, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false, id);
+        }
+    }
+
+    private async Task<bool> ExistsCoreAsync(string id, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
@@ -486,6 +570,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     /// <inheritdoc />
     public async Task<IEnumerable<T>> QueryAsync(string? partition = null, CancellationToken ct = default)
+    {
+        try
+        {
+            return await QueryCoreAsync(partition, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
+    }
+
+    private async Task<IEnumerable<T>> QueryCoreAsync(string? partition, CancellationToken ct)
     {
         // Match stored (normalized) PartitionKeys — writes normalize the id, so a natural-form partition
         // ("My Vision") would otherwise silently match nothing. Collapse whitespace to null so a
@@ -594,7 +690,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         // to a later caller that asked for every column.
         // A projection that omits every large value is not assembled (its cells were not fetched).
         var select = BuildSelect(options);
-        return StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, select, assemble: LargeValueAware && select is null);
+        return AzureStorageErrors.GuardAsync(
+            StreamAsync(BuildFilter(partition, rowKeyPrefix), take, warmCache: false, ct, select, assemble: LargeValueAware && select is null),
+            ex => Failed(ex, write: false), ct);
     }
 
     /// <inheritdoc />
@@ -611,7 +709,8 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             ? predicateFilter
             : $"{TableClient.CreateQueryFilter($"PartitionKey eq {partition}")} and ({predicateFilter})";
 
-        return StreamAsync(filter, take, warmCache: true, ct, assemble: LargeValueAware);
+        return AzureStorageErrors.GuardAsync(
+            StreamAsync(filter, take, warmCache: true, ct, assemble: LargeValueAware), ex => Failed(ex, write: false), ct);
     }
 
 
@@ -665,6 +764,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     /// <inheritdoc />
     public async Task<EntityPage<T>> QueryPageAsync(QueryOptions options, CancellationToken ct = default)
+    {
+        try
+        {
+            return await QueryPageCoreAsync(options, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
+    }
+
+    private async Task<EntityPage<T>> QueryPageCoreAsync(QueryOptions options, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -807,6 +918,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
     {
+        try
+        {
+            return await CountCoreAsync(partition, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
+    }
+
+    private async Task<int> CountCoreAsync(string? partition, CancellationToken ct)
+    {
         if (!string.IsNullOrWhiteSpace(partition))
             partition = NormalizeId(partition); // match stored (normalized) PartitionKeys
 
@@ -831,6 +954,19 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
 
     private async Task<int> WriteBatchAsync(
+        IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
+    {
+        try
+        {
+            return await WriteBatchCoreAsync(entities, actionType, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task<int> WriteBatchCoreAsync(
         IReadOnlyCollection<T> entities, TableTransactionActionType actionType, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entities);
@@ -930,7 +1066,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
                     var duplicateId = ex.FailedTransactionActionIndex is int i && i >= 0 && i < chunk.Length
                         ? chunk[i].Id
                         : chunk[0].Partition + Separator + "?";
-                    throw new DuplicateKeyException(typeName, duplicateId, ex);
+                    throw Duplicate(duplicateId, ex);
                 }
             }
         }
@@ -974,6 +1110,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// </summary>
     /// <inheritdoc />
     public async Task<string> UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default)
+    {
+        try
+        {
+            return await UpdateCoreAsync(id, builderAction, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, id);
+        }
+    }
+
+    private async Task<string> UpdateCoreAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(id))
         {
@@ -1024,7 +1172,13 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // Conditional merge lost the race. The 412 proves a foreign writer touched the row,
             // so the cached entity AND any cached query results for its partition are stale.
             EvictAfterFailedWrite(id, partitionKey);
-            throw new ConcurrencyConflictException(typeName, id, ex);
+            throw Conflict(id, ex);
+        }
+        catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
+        {
+            // A merge needs the row: none at this id (named as it is stored, normalized).
+            EvictAfterFailedWrite(id, partitionKey);
+            throw AzureStorageErrors.NotFound(typeName, id, ex);
         }
         catch (Exception)
         {
@@ -1175,6 +1329,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public async Task<T> UpdateAsync(T entity, ConcurrencyMode mode, CancellationToken ct = default)
     {
+        try
+        {
+            return await UpdateCoreAsync(entity, mode, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, entity?.Id);
+        }
+    }
+
+    private async Task<T> UpdateCoreAsync(T entity, ConcurrencyMode mode, CancellationToken ct)
+    {
         if (entity == null || string.IsNullOrWhiteSpace(entity.Id))
         {
             throw new ArgumentNullException(nameof(entity));
@@ -1244,7 +1410,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             // and the partition's cached query results are stale, so drop both — a follow-up read
             // (e.g. MutateAsync's retry) must see the fresh row.
             EvictAfterFailedWrite(entity.Id, partitionKey);
-            throw new ConcurrencyConflictException(typeName, entity.Id, ex);
+            throw Conflict(entity.Id, ex);
         }
         catch (Exception)
         {
@@ -1258,6 +1424,18 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     /// <inheritdoc />
     public async Task<T> UpsertAsync(T entity, CancellationToken ct = default)
+    {
+        try
+        {
+            return await UpsertCoreAsync(entity, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, entity?.Id);
+        }
+    }
+
+    private async Task<T> UpsertCoreAsync(T entity, CancellationToken ct)
     {
         if (entity == null || string.IsNullOrWhiteSpace(entity.Id))
         {

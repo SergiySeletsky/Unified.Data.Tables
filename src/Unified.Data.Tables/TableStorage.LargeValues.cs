@@ -180,9 +180,11 @@ public partial class TableStorage<T> : IBlobOffloadState
             if (kind == LargeWriteKind.Replace)
             {
                 if (prior is null)
-                    throw new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}");
+                    throw AzureStorageErrors.NotFound(typeName, entity.Id, inner: null);
+                // Found by this call's own read, before it sent a write: no provider exception. Only
+                // after an attempt that failed on a continuation row can the version be this call's own.
                 if (strict && prior.ETag != ifMatch)
-                    throw new ConcurrencyConflictException(typeName, entity.Id, null);
+                    throw AzureStorageErrors.Conflict(typeName, entity.Id, inner: null, mayBeOwnWrite: attempt > 1);
             }
 
             var own = ownParts ?? (takeBack ? await OwnPartsAsync(pk, rk, ct) : null);
@@ -226,11 +228,11 @@ public partial class TableStorage<T> : IBlobOffloadState
                 if (IsPrimaryFailure(ex))
                 {
                     if (kind == LargeWriteKind.Create)
-                        throw new DuplicateKeyException(typeName, entity.Id, ex);
-                    // A strict replace may not retry its own condition; a vanished row surfaces as the
-                    // service's own 404.
+                        throw Duplicate(entity.Id, ex);
+                    // A strict replace may not retry its own condition; a vanished row surfaces as a
+                    // missing entity, with the service's own 404 inside.
                     if (strict)
-                        throw ex.Status == 404 ? ex : new ConcurrencyConflictException(typeName, entity.Id, ex);
+                        throw ex.Status == 404 ? AzureStorageErrors.NotFound(typeName, entity.Id, ex) : Conflict(entity.Id, ex);
                 }
                 // Any write plans again when a continuation row it counted on is gone or has changed.
                 lost = ex;
@@ -246,7 +248,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             return result;
         }
 
-        throw new ConcurrencyConflictException(typeName, entity.Id, lost);
+        throw Conflict(entity.Id, lost);
     }
 
     /// <summary>The row keys of the continuation rows of <paramref name="rk"/> that exist now (one range query).</summary>
@@ -425,7 +427,12 @@ public partial class TableStorage<T> : IBlobOffloadState
         large.SweepTableOrphanBlobsAsync(olderThan, typeof(T), PartitionRowsAsync, ct);
 
     // Every stored row of the partition (continuation rows included), in one query projected onto select.
-    private async IAsyncEnumerable<TableEntity> PartitionRowsAsync(
+    // An SDK failure of the listing is neutral before the large-value layer sees it: an orphan sweep
+    // collects its partitions' failures in an AggregateException, and none of them may be the SDK's own.
+    private IAsyncEnumerable<TableEntity> PartitionRowsAsync(string partition, IReadOnlyList<string>? select, CancellationToken ct) =>
+        AzureStorageErrors.GuardAsync(PartitionRowsCoreAsync(partition, select, ct), ex => Failed(ex, write: false), ct);
+
+    private async IAsyncEnumerable<TableEntity> PartitionRowsCoreAsync(
         string partition, IReadOnlyList<string>? select, [EnumeratorCancellation] CancellationToken ct)
     {
         await EnsureTableAsync(ct);
@@ -471,8 +478,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     // "EntityNotFound" is the other one it documents), or no code at all. A 404 that names anything
     // else is no lost race: when the table itself is gone ("TableNotFound") reading again cannot help,
     // and the caller must see the service's own error, not a concurrency conflict.
-    private static bool IsMissingRow(RequestFailedException ex) =>
-        ex.Status == 404 && (string.IsNullOrEmpty(ex.ErrorCode) || ex.ErrorCode is "ResourceNotFound" or "EntityNotFound");
+    private static bool IsMissingRow(RequestFailedException ex) => AzureStorageErrors.IsMissingRow(ex);
 
     // A transaction fails at one action; the primary is action 0, and a single SDK call is always the primary.
     private static bool IsPrimaryFailure(RequestFailedException ex) =>
@@ -712,7 +718,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             return;
         }
 
-        throw new ConcurrencyConflictException(typeName, $"{pk}{Separator}{rk}", lost);
+        throw Conflict($"{pk}{Separator}{rk}", lost);
     }
 
     // True when the stored row says it has no continuation rows. A part count that cannot be read (a
@@ -998,14 +1004,14 @@ public partial class TableStorage<T> : IBlobOffloadState
                     // The row in the way is gone (or the entity's own again): a lost race, planned again
                     // from the rows as they are now, after a short pause.
                     if (attempt >= MaxLargeWriteAttempts)
-                        throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
+                        throw Conflict(unit.Entity.Id, ex);
                     await large.WaitBeforeRetryAsync(attempt + 1, ct);
                     var again = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
                     await SubmitBatchUnitsAsync(again, kind, attempt + 1, takeBack, released, ct);
                     continue;
                 }
                 if (attempt >= MaxLargeWriteAttempts)
-                    throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
+                    throw Conflict(unit.Entity.Id, ex);
                 var taking = takeBack is null
                     ? new Dictionary<string, Dictionary<string, ETag>?>(StringComparer.Ordinal)
                     : new Dictionary<string, Dictionary<string, ETag>?>(takeBack, StringComparer.Ordinal);
@@ -1024,7 +1030,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             }
             catch (RequestFailedException ex) when (kind == LargeWriteKind.Create && ex.Status == 409 && IsBatchPrimaryFailure(ex, owners))
             {
-                throw new DuplicateKeyException(typeName, FailedId(ex, owners, chunk), ex);
+                throw Duplicate(FailedId(ex, owners, chunk), ex);
             }
             catch (RequestFailedException ex) when (BatchLostRace(ex, kind, owners))
             {
@@ -1032,7 +1038,7 @@ public partial class TableStorage<T> : IBlobOffloadState
                 // rows as they are now, after a short pause. A continuation row removed meanwhile (404)
                 // is not required again.
                 if (attempt >= MaxLargeWriteAttempts)
-                    throw new ConcurrencyConflictException(typeName, FailedId(ex, owners, chunk), ex);
+                    throw Conflict(FailedId(ex, owners, chunk), ex);
                 await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
                 await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, released, ct);

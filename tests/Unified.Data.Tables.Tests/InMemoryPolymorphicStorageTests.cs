@@ -255,16 +255,18 @@ public class InMemoryPolymorphicStorageTests
     }
 
     [Fact]
-    public async Task MergeColumnsAsync_MissingRow_Throws404LikeAzure()
+    public async Task MergeColumnsAsync_MissingRow_ThrowsEntityNotFoundLikeAzure()
     {
         var store = NewStore();
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => store.MergeColumnsAsync(
+        // 0.10.0 reverses the documented contract: the neutral type, not the Azure 404 the fake raised before.
+        var ex = await Assert.ThrowsAsync<EntityNotFoundException>(() => store.MergeColumnsAsync(
             new TableKey("p", "r"),
             new Dictionary<string, object>(StringComparer.Ordinal) { ["_IsPublished"] = true },
             TestContext.Current.CancellationToken));
 
-        Assert.Equal(404, ex.Status);
+        Assert.Equal("p|r", ex.Id);
+        Assert.Equal("ResourceNotFound", ex.ProviderErrorCode);
     }
 
     [Fact]

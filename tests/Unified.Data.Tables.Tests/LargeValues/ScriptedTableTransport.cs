@@ -34,7 +34,9 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
     /// <param name="Json">The JSON body, or null for none.</param>
     /// <param name="ETag">The <c>ETag</c> response header, or null for none.</param>
     /// <param name="ErrorCode">The <c>x-ms-error-code</c> response header, or null for none.</param>
-    internal sealed record Answer(int Status, string? Json = null, string? ETag = null, string? ErrorCode = null);
+    /// <param name="Headers">Further response headers (a <c>Retry-After</c>, say), or null for none.</param>
+    internal sealed record Answer(
+        int Status, string? Json = null, string? ETag = null, string? ErrorCode = null, IReadOnlyDictionary<string, string>? Headers = null);
 
     /// <summary>Every request, in the order sent.</summary>
     public List<Sent> Requests { get; } = [];
@@ -87,6 +89,8 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
             ClientRequestId = clientRequestId;
             if (answer.ETag is not null) headers["ETag"] = answer.ETag;
             if (answer.ErrorCode is not null) headers["x-ms-error-code"] = answer.ErrorCode;
+            foreach (var header in answer.Headers ?? new Dictionary<string, string>())
+                headers[header.Key] = header.Value;
             if (answer.Json is not null)
             {
                 headers["Content-Type"] = "application/json;odata=minimalmetadata;streaming=true;charset=utf-8";

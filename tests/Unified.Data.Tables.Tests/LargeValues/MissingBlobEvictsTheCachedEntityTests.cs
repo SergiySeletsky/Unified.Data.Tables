@@ -119,9 +119,12 @@ public class MissingBlobEvictsTheCachedEntityTests(ITestOutputHelper output)
         // The replace: the row write reaches the service and commits, the response does not come back.
         TableEntity? committed = null;
         h.Table.UpdateEntityAsync(Arg.Do<TableEntity>(row => committed = row), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
-            .Returns<Task<Response>>(_ => throw new TaskCanceledException("the caller's token was cancelled after the request was sent"));
+            .Returns<Task<Response>>(_ => throw new TaskCanceledException("the request timed out after it was sent"));
         first.File = TableBlobContent.FromBytes(newBytes, "application/octet-stream");
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => h.Store.UpdateAsync(first, ConcurrencyMode.LastWriterWins, Ct));
+        // 0.10.0: the SDK's timeout (the caller's token is not cancelled) is the neutral transient failure.
+        var lost = await Assert.ThrowsAsync<TransientStorageException>(() => h.Store.UpdateAsync(first, ConcurrencyMode.LastWriterWins, Ct));
+        Assert.True(lost.MayHaveCommitted);
+        Assert.IsType<TaskCanceledException>(lost.InnerException);
         Assert.NotNull(committed);
         committed.ETag = new ETag("W/\"2\"");
         h.SetupGet("p", "a", committed); // what the table holds now

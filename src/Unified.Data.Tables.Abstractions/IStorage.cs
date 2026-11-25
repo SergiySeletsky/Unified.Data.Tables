@@ -17,6 +17,25 @@ namespace Unified.Data.Tables;
 /// <see cref="ConcurrencyConflictException"/> (nothing is damaged; repeat the read), and only a row whose
 /// version did not change is reported as <see cref="TableValueIntegrityException"/>. In a query, a stream
 /// or a page that exception ends the whole call.
+/// <para>
+/// <b>Failures are provider-neutral.</b> No member throws the storage backend's own exception type (an
+/// Azure <c>RequestFailedException</c>): what the backend reports is thrown as a
+/// <see cref="StorageException"/> with the backend's exception as its
+/// <see cref="Exception.InnerException"/>. The derived types say what happened:
+/// <see cref="DuplicateKeyException"/>, <see cref="ConcurrencyConflictException"/>,
+/// <see cref="EntityNotFoundException"/>, <see cref="TableNotFoundException"/>,
+/// <see cref="StorageRequestRejectedException"/> (the backend refused the request as invalid or too
+/// large) and <see cref="TransientStorageException"/> (throttled, unavailable or timed out once the
+/// provider's own retries were used up). Any member can throw the last three and
+/// <see cref="StorageException"/> itself. A cancelled token throws <see cref="OperationCanceledException"/>.
+/// </para>
+/// <para>
+/// <b>A row that does not exist.</b> A read returns <c>null</c>, <c>false</c> or an empty result;
+/// <see cref="DeleteAsync"/> and <see cref="DeletePartitionAsync"/> are no-ops;
+/// <see cref="UpsertAsync"/> creates it. Only an update needs the row: each <c>UpdateAsync</c> overload
+/// throws <see cref="EntityNotFoundException"/> when no row has the id, whatever the
+/// <see cref="ConcurrencyMode"/>, also when the row was deleted after the caller read it.
+/// </para>
 /// </remarks>
 public interface IStorage<T> where T : class, IEntity, new()
 {
@@ -62,6 +81,7 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The persisted entity, including its populated <see cref="Entity.ETag"/>.</returns>
+    /// <exception cref="DuplicateKeyException">A row with the id already exists.</exception>
     Task<T> CreateAsync(T entity, CancellationToken ct = default);
 
     /// <summary>
@@ -92,11 +112,14 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// <see cref="ConcurrencyConflictException"/>). An entity WITHOUT an ETag throws
     /// <see cref="InvalidOperationException"/> — there is no version to check; round-trip the ETag,
     /// use <c>StorageExtensions.MutateAsync</c>, or say <see cref="ConcurrencyMode.LastWriterWins"/>
-    /// explicitly.
+    /// explicitly. A row that does not exist (it never did, or it was deleted since it was read) throws
+    /// <see cref="EntityNotFoundException"/>: an update never creates a row.
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The persisted entity, including its refreshed <see cref="Entity.ETag"/>.</returns>
+    /// <exception cref="ConcurrencyConflictException">The row is not the version the entity's ETag names.</exception>
+    /// <exception cref="EntityNotFoundException">No row has the entity's id.</exception>
     Task<T> UpdateAsync(T entity, CancellationToken ct = default);
 
     /// <summary>
@@ -109,11 +132,16 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// For a type with a <see cref="TableValueSplitAttribute"/> or <see cref="TableBlobContent"/> property,
     /// a <see cref="ConcurrencyMode.LastWriterWins"/> update reads the row first and can throw
     /// <see cref="ConcurrencyConflictException"/> after five lost races.
+    /// A row that does not exist (it never did, or it was deleted since it was read) throws
+    /// <see cref="EntityNotFoundException"/> in every mode, <see cref="ConcurrencyMode.LastWriterWins"/>
+    /// included: an update never creates a row (<see cref="UpsertAsync"/> does).
     /// </summary>
     /// <param name="entity">The entity to persist.</param>
     /// <param name="mode">The optimistic-concurrency behaviour to apply.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The persisted entity, including its refreshed <see cref="Entity.ETag"/>.</returns>
+    /// <exception cref="ConcurrencyConflictException">The concurrency check failed.</exception>
+    /// <exception cref="EntityNotFoundException">No row has the entity's id.</exception>
     Task<T> UpdateAsync(T entity, ConcurrencyMode mode, CancellationToken ct = default);
 
     /// <summary>
@@ -121,15 +149,21 @@ public interface IStorage<T> where T : class, IEntity, new()
     /// are written (server-side <c>Merge</c>); untouched columns are preserved, and no read is
     /// needed — concurrent updates to disjoint columns never conflict. When the builder carries
     /// <see cref="UpdateBuilder{T}.WithETag"/>, the merge is conditional and a lost race throws
-    /// <see cref="ConcurrencyConflictException"/>.
+    /// <see cref="ConcurrencyConflictException"/>. A row that does not exist throws
+    /// <see cref="EntityNotFoundException"/>, with or without an ETag: a merge never creates a row.
     /// </summary>
     /// <param name="id">Composite document identifier.</param>
     /// <param name="builderAction">Configures which properties to mutate.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The row's new ETag (empty when the backend did not report one).</returns>
+    /// <exception cref="ConcurrencyConflictException">The builder carries an ETag and the row is another version.</exception>
+    /// <exception cref="EntityNotFoundException">No row has the id.</exception>
     Task<string> UpdateAsync(string id, Action<UpdateBuilder<T>> builderAction, CancellationToken ct = default);
 
-    /// <summary>Get a single document by its composite id, or <c>null</c> when it does not exist.</summary>
+    /// <summary>
+    /// Get a single document by its composite id, or <c>null</c> when it does not exist (a missing row is
+    /// never an exception on a read).
+    /// </summary>
     /// <param name="id">Composite document identifier.</param>
     /// <param name="ct">Cancellation token.</param>
     Task<T?> OneAsync(string id, CancellationToken ct = default);

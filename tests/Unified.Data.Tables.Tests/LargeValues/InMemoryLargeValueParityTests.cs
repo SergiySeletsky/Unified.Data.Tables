@@ -300,8 +300,10 @@ public class InMemoryLargeValueParityTests
         await Assert.ThrowsAsync<DuplicateKeyException>(() => store.CreateAsync(Make("text", 600_000), Ct));
         var missing = Make("text", 600_000);
         missing.Id = "p|other";
-        var notFound = await Assert.ThrowsAsync<RequestFailedException>(() => store.UpdateAsync(missing, ConcurrencyMode.LastWriterWins, Ct));
-        Assert.Equal(404, notFound.Status);
+        // 0.10.0: the neutral type, as TableStorage: the store's own read found no row, so no provider exception.
+        var notFound = await Assert.ThrowsAsync<EntityNotFoundException>(() => store.UpdateAsync(missing, ConcurrencyMode.LastWriterWins, Ct));
+        Assert.Equal("p|other", notFound.Id);
+        Assert.Null(notFound.InnerException);
 
         var reserved = Make("text", 10);
         reserved.Id = "p|r~0001";

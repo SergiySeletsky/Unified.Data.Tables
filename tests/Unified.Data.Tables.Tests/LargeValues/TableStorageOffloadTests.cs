@@ -294,7 +294,9 @@ public class TableStorageOffloadTests
         rig.Table.AddEntityAsync(Arg.Any<TableEntity>(), Arg.Any<CancellationToken>())
             .ThrowsAsync(new RequestFailedException(500, "boom"));
 
-        await Assert.ThrowsAsync<RequestFailedException>(() => rig.Store.CreateAsync(new SplitTextEntity { Id = Id, Body = BigText }, Ct));
+        // 0.10.0: the row write's 500 leaves as the neutral transient failure, the SDK's inside.
+        var failed = await Assert.ThrowsAsync<TransientStorageException>(() => rig.Store.CreateAsync(new SplitTextEntity { Id = Id, Body = BigText }, Ct));
+        Assert.Equal(500, Assert.IsType<RequestFailedException>(failed.InnerException).Status);
 
         Assert.Equal(0, rig.Blobs.Count("delete"));
         Assert.Single(rig.Blobs.Inner.Names);
@@ -590,7 +592,9 @@ public class TableStorageOffloadTests
         rig.Blobs.OnGetState = _ => spoolPath = (content.Source as FileStream)?.Name;
         rig.Blobs.GetStateFailure = new RequestFailedException(500, "blob service down");
 
-        await Assert.ThrowsAsync<RequestFailedException>(() => rig.Store.CreateAsync(new FileEntity { Id = Id, File = content }, Ct));
+        // 0.10.0: the 500 the blob store double throws leaves as the neutral transient failure, the SDK's inside.
+        var failed = await Assert.ThrowsAsync<TransientStorageException>(() => rig.Store.CreateAsync(new FileEntity { Id = Id, File = content }, Ct));
+        Assert.Equal(500, Assert.IsType<RequestFailedException>(failed.InnerException).Status);
 
         Assert.NotNull(spoolPath);
         Assert.False(File.Exists(spoolPath), "the temporary copy must be deleted");

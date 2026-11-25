@@ -14,8 +14,8 @@ namespace Unified.Data.Tables.InMemory;
 /// <remarks>
 /// Semantics mirror <c>PolymorphicTableStorage&lt;TBase&gt;</c>: keys used verbatim and
 /// case-sensitively, 409 on duplicate insert AND 400 <c>InvalidDuplicateRow</c> on a key repeated
-/// within one batch both surfaced as <see cref="DuplicateKeyException"/>, 404 on merging a missing
-/// row, idempotent delete, lexical (PartitionKey, RowKey) ordering, a null
+/// within one batch both surfaced as <see cref="DuplicateKeyException"/>,
+/// <see cref="EntityNotFoundException"/> on merging a missing row, idempotent delete, lexical (PartitionKey, RowKey) ordering, a null
 /// <see cref="PolymorphicEntry{TBase}.Timestamp"/> on the write paths, cancellation observed on every
 /// operation, and byte-identical validation and duplicate-key messages (which is why the store needs
 /// a table name).
@@ -106,7 +106,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         // row building — so a buffered fake that never looked at it would let a cancelled operation
         // succeed here and fail in production.
         ct.ThrowIfCancellationRequested();
-        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey));
+        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey), tableName);
 
         lock (gate)
         {
@@ -126,7 +126,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
         Guard.NotNull(write, nameof(write));
         var row = ToRow(write);
         ct.ThrowIfCancellationRequested();
-        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey));
+        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey), tableName);
 
         lock (gate)
         {
@@ -171,7 +171,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
                     {
                         var key = groupRows[i].Key;
                         if (ServiceErrors.RefusedKey(key.PartitionKey, key.RowKey) is { } refused)
-                            throw ServiceErrors.InTransaction(refused);
+                            throw ServiceErrors.Neutral(ServiceErrors.InTransaction(refused), tableName, key.ToId());
                         if (!inTransaction.Add((key.PartitionKey, key.RowKey)))
                             throw Duplicate(key, ServiceErrors.InTransaction(ServiceErrors.DuplicateRow(key.ToId())));
                         if (rows.ContainsKey((key.PartitionKey, key.RowKey)))
@@ -204,12 +204,13 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
             ValidateSystemColumn(column.Key);
 
         ct.ThrowIfCancellationRequested();
-        ServiceErrors.ThrowIfRefusedKey((key.PartitionKey, key.RowKey));
+        ServiceErrors.ThrowIfRefusedKey((key.PartitionKey, key.RowKey), tableName);
 
         lock (gate)
         {
             if (!rows.TryGetValue((key.PartitionKey, key.RowKey), out var existing))
-                throw new RequestFailedException(404, "The specified resource does not exist.", "ResourceNotFound", null);
+                throw ServiceErrors.Neutral(
+                    new RequestFailedException(404, "The specified resource does not exist.", "ResourceNotFound", null), tableName, key.ToId());
 
             // Server-side Merge overlays the supplied cells onto a copy and leaves the rest alone.
             var merged = CopyOf(existing.Data);
@@ -379,7 +380,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     // DuplicateKeyException.Message and .EntityType diverged between the two implementations.
     // The inner failure is the service's, with its status and error code (see ServiceErrors).
     private DuplicateKeyException Duplicate(TableKey key, RequestFailedException failure) =>
-        new(tableName, key.ToId(), failure);
+        ServiceErrors.Coded(new DuplicateKeyException(tableName, key.ToId(), failure));
 
     // timestampKnown: false on the WRITE paths. A write response carries no service timestamp, so
     // PolymorphicTableStorage returns a null one; a fake that filled it in would green-light a test

@@ -22,8 +22,8 @@ namespace Unified.Data.Tables;
 /// declared as the interface, on the entity class too). A builder partial update is refused with the same
 /// exception before anything is written when the entity type, or the declared type of a property along
 /// the updated path, is or implements such an interface (<c>InMemoryStorage&lt;T&gt;</c> looks at the row
-/// first: for a missing row, or a <c>WithETag</c> that names another version, it throws the 404 or the
-/// conflict, as for every builder update). An instance held in a JSON-stored property (a collection, or a
+/// first: for a missing row, or a <c>WithETag</c> that names another version, it throws
+/// <see cref="EntityNotFoundException"/> or the conflict, as for every builder update). An instance held in a JSON-stored property (a collection, or a
 /// type stored as one JSON cell) is not checked: it is written as JSON like every other value of that
 /// cell, and a trimming <c>OversizedCellPolicy</c> can trim that cell.
 /// </para>

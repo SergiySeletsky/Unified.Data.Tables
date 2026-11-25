@@ -80,14 +80,15 @@ public class FailedWriteCacheTests
         var pointReads = table.Count(r => r.IsWholeRowPointRead);
         var queries = table.Count(r => r.IsEntityQuery);
 
-        var thrown = new TaskCanceledException("the caller's token was cancelled after the request was sent");
+        // The response is lost: the SDK's network timeout, a cancellation the caller's token did not ask for.
+        var thrown = new TaskCanceledException("the request timed out after it was sent");
         var failures = 0;
         table.Committed = _ =>
         {
             if (Interlocked.Increment(ref failures) == 1)
                 throw thrown;
         };
-        var caught = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => write switch
+        var caught = await Assert.ThrowsAsync<TransientStorageException>(() => write switch
         {
             FailedWrite.Create => store.CreateAsync(Doc<T>(2), Ct),
             FailedWrite.Update => store.UpdateAsync(Doc<T>(2), ConcurrencyMode.LastWriterWins, Ct),
@@ -96,7 +97,9 @@ public class FailedWriteCacheTests
             _ => store.DeleteAsync(Id, Ct),
         });
         table.Committed = null;
-        Assert.Same(thrown, caught);
+        // 0.10.0: a timeout of a write is the neutral transient failure that says it may have committed.
+        Assert.Same(thrown, caught.InnerException);
+        Assert.True(caught.MayHaveCommitted);
 
         var stored = StoredVersion(table);
         Assert.Equal(write == FailedWrite.Delete ? null : 2, stored); // it did commit

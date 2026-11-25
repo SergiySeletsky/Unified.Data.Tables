@@ -468,8 +468,10 @@ public class PartitionDeleteListedLeftoverCallTests
         h.SetupGet(Pk, "r", null);
         Transactions(h, actions => actions.Any(a => a.Entity.RowKey == "r~0001") ? new RequestFailedException(503, "unavailable") : null);
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.DeletePartitionAsync(Pk, Ct));
+        // 0.10.0: neutral, the service's 503 inside; a failed delete transaction may have committed.
+        var ex = await Assert.ThrowsAsync<TransientStorageException>(() => h.Store.DeletePartitionAsync(Pk, Ct));
 
-        Assert.Equal(503, ex.Status);
+        Assert.Equal(503, Assert.IsType<RequestFailedException>(ex.InnerException).Status);
+        Assert.True(ex.MayHaveCommitted);
     }
 }

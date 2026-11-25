@@ -23,8 +23,20 @@ namespace Unified.Data.Tables;
 /// The canonical recovery is re-read → re-apply → retry, which
 /// <c>StorageExtensions.MutateAsync</c> packages up; HTTP surfaces typically map this to 409.
 /// </remarks>
-public class ConcurrencyConflictException : Exception
+public class ConcurrencyConflictException : StorageException
 {
+    /// <summary>
+    /// Whether the change that failed the version check may be this very call's own write. True unless
+    /// the provider observed that no earlier attempt of this request was sent: a provider that retries
+    /// (the Azure SDK does, after a timeout or a dropped connection) can have an attempt applied whose
+    /// response was lost, and its next attempt then fails the condition against the version that attempt
+    /// wrote. False means only that no such retry was seen in this call, not that another writer is
+    /// proven: a caller's own retry of the whole call looks the same as a foreign write. False too for a
+    /// conflict a read reports, for one the store finds in its own read before it sent a write, and on a
+    /// store that never retries (the in-memory one).
+    /// </summary>
+    public bool MayBeOwnWrite { get; set; }
+
     /// <summary>The entity type name (usually the table name), when known.</summary>
     public string? EntityType { get; }
 

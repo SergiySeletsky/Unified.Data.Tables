@@ -124,7 +124,7 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
             if (kind == LargeWriteKind.Replace)
             {
                 if (prior is null)
-                    throw new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}");
+                    throw new EntityNotFoundException(typeof(T).Name, entity.Id, null);
                 // As TableStorage: the version it read is not the caller's, so nothing is sent (no inner failure).
                 if (strict && !string.Equals(ETagOf(prior.Version), ifMatch, StringComparison.Ordinal))
                     throw new ConcurrencyConflictException(typeof(T).Name, entity.Id, null);
@@ -158,13 +158,13 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
             {
                 // The service refuses the key when the row is written (the blobs are uploaded by then).
                 if (ServiceErrors.RefusedKey(keys.PartitionKey, keys.RowKey) is { } refused)
-                    throw Sent(refused);
+                    throw ServiceErrors.Neutral(Sent(refused), typeof(T).Name, entity.Id);
                 if (plan.Parts.Prepend(plan.Primary).Select(ServiceErrors.OversizedProperty).FirstOrDefault(e => e is not null) is { } oversized)
-                    throw Sent(oversized);
+                    throw ServiceErrors.Neutral(Sent(oversized), typeof(T).Name, entity.Id);
                 if (kind == LargeWriteKind.Create)
                 {
                     if (rows.ContainsKey(keys))
-                        throw new DuplicateKeyException(typeof(T).Name, entity.Id, Sent(ServiceErrors.AlreadyExists(entity.Id)));
+                        throw ServiceErrors.Coded(new DuplicateKeyException(typeof(T).Name, entity.Id, Sent(ServiceErrors.AlreadyExists(entity.Id))));
                 }
                 else if (ReadPrior(keys) is var current && current?.Version != prior?.Version)
                 {
@@ -172,8 +172,8 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
                     if (strict)
                     {
                         throw current is null
-                            ? Sent(ServiceErrors.NotFound(entity.Id))
-                            : new ConcurrencyConflictException(typeof(T).Name, entity.Id, Sent(ServiceErrors.ConditionNotSatisfied()));
+                            ? ServiceErrors.Neutral(Sent(ServiceErrors.NotFound(entity.Id)), typeof(T).Name, entity.Id)
+                            : ServiceErrors.Coded(new ConcurrencyConflictException(typeof(T).Name, entity.Id, Sent(ServiceErrors.ConditionNotSatisfied())));
                     }
                     lost = Sent(current is null
                         ? ServiceErrors.NotFound(entity.Id)
@@ -217,7 +217,7 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
             return entity;
         }
 
-        throw new ConcurrencyConflictException(typeof(T).Name, entity.Id, lost);
+        throw ServiceErrors.Coded(new ConcurrencyConflictException(typeof(T).Name, entity.Id, lost));
     }
 
     // Under the gate: the key of the first new continuation row (one the stored row does not declare, and
@@ -401,14 +401,14 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
                 foreach (var unit in chunk)
                 {
                     if (ServiceErrors.RefusedKey(unit.Keys.PartitionKey, unit.Keys.RowKey) is { } refused)
-                        throw ServiceErrors.InTransaction(refused);
+                        throw ServiceErrors.Neutral(ServiceErrors.InTransaction(refused), typeof(T).Name, unit.Entity.Id);
                     if (unit.Plan.Parts.Prepend(unit.Plan.Primary).Select(ServiceErrors.OversizedProperty).FirstOrDefault(e => e is not null) is { } oversized)
-                        throw ServiceErrors.InTransaction(oversized);
+                        throw ServiceErrors.Neutral(ServiceErrors.InTransaction(oversized), typeof(T).Name, unit.Entity.Id);
                     if (kind == LargeWriteKind.Create)
                     {
                         if (rows.ContainsKey(unit.Keys))
-                            throw new DuplicateKeyException(typeof(T).Name, unit.Entity.Id,
-                                ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(unit.Entity.Id)));
+                            throw ServiceErrors.Coded(new DuplicateKeyException(typeof(T).Name, unit.Entity.Id,
+                                ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(unit.Entity.Id))));
                     }
                     else if (ReadPrior(unit.Keys)?.Version != unit.Prior?.Version)
                     {
@@ -450,8 +450,8 @@ public sealed partial class InMemoryStorage<T> : IBlobOffloadState
             if (lost is not null)
             {
                 if (attempt >= MaxLargeWriteAttempts)
-                    throw new ConcurrencyConflictException(typeof(T).Name, lost.Entity.Id,
-                        ServiceErrors.InTransaction(ServiceErrors.ConditionNotSatisfied("The entity was modified by another writer.")));
+                    throw ServiceErrors.Coded(new ConcurrencyConflictException(typeof(T).Name, lost.Entity.Id,
+                        ServiceErrors.InTransaction(ServiceErrors.ConditionNotSatisfied("The entity was modified by another writer."))));
                 // After a lost race: the same pause as TableStorage (none when an own leftover is taken back).
                 if (lostRace)
                     await large.WaitBeforeRetryAsync(attempt + 1, ct);

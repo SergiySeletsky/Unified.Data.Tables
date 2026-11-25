@@ -153,9 +153,12 @@ public class PolymorphicStorageTests
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw new TableTransactionFailedException(
                 new RequestFailedException(413, "RequestBodyTooLarge", "RequestBodyTooLarge", null)));
 
-        await Assert.ThrowsAsync<TableTransactionFailedException>(() => harness.Store.InsertBatchAsync(
+        // 0.10.0: not swallowed and not a duplicate, but neutral: a 413 is a request the service rejects.
+        var ex = await Assert.ThrowsAsync<StorageRequestRejectedException>(() => harness.Store.InsertBatchAsync(
             [new PolymorphicWrite<TestMessage>(new TableKey("t1", "001"), new TestCreatedEvent { Id = "e1" })],
             TestContext.Current.CancellationToken));
+        Assert.Equal("RequestBodyTooLarge", ex.ProviderErrorCode);
+        Assert.IsType<TableTransactionFailedException>(ex.InnerException);
     }
 
     [Fact]

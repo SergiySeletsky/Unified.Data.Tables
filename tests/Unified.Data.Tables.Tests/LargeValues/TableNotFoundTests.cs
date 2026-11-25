@@ -59,11 +59,13 @@ public class TableNotFoundTests
         h.Table.AddEntityAsync(Arg.Any<TableEntity>(), Arg.Any<CancellationToken>()).Returns<Response>(_ => throw failure);
         var waits = RecordWaits(h);
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+        // 0.10.0: the neutral TableNotFoundException (never a missing row), the service's error inside.
+        var ex = await Assert.ThrowsAsync<TableNotFoundException>(
             () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = "small" }, Ct));
 
-        Assert.Same(failure, ex);
-        Assert.Equal("TableNotFound", ex.ErrorCode);
+        Assert.Same(failure, ex.InnerException);
+        Assert.Equal("TableNotFound", ex.ProviderErrorCode);
+        Assert.Equal(nameof(SplitTextEntity), ex.TableName);
         await h.Table.ReceivedWithAnyArgs(1).AddEntityAsync<TableEntity>(default!, default);
         Assert.Empty(waits);
     }
@@ -81,11 +83,12 @@ public class TableNotFoundTests
         var waits = RecordWaits(h);
         var entity = new SplitTextEntity { Id = "p|r", Body = "small" };
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => operation == "upsert"
+        // 0.10.0: the neutral TableNotFoundException, the service's error inside.
+        var ex = await Assert.ThrowsAsync<TableNotFoundException>(() => operation == "upsert"
             ? h.Store.UpsertAsync(entity, Ct)
             : h.Store.UpdateAsync(entity, ConcurrencyMode.LastWriterWins, Ct));
 
-        Assert.Same(failure, ex);
+        Assert.Same(failure, ex.InnerException);
         await h.Table.ReceivedWithAnyArgs(1).UpdateEntityAsync<TableEntity>(default!, default, default, default);
         Assert.Empty(waits);
     }
@@ -99,10 +102,11 @@ public class TableNotFoundTests
         h.Table.SubmitTransactionAsync(Arg.Any<IEnumerable<TableTransactionAction>>(), Arg.Any<CancellationToken>())
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
 
-        var ex = await Assert.ThrowsAsync<TableTransactionFailedException>(
+        // 0.10.0: the neutral TableNotFoundException, the transaction's failure inside.
+        var ex = await Assert.ThrowsAsync<TableNotFoundException>(
             () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = TwoRowText }, Ct));
 
-        Assert.Same(failure, ex);
+        Assert.Same(failure, ex.InnerException);
         await h.Table.ReceivedWithAnyArgs(1).SubmitTransactionAsync(default!, default);
     }
 
@@ -116,13 +120,14 @@ public class TableNotFoundTests
             .Returns<Response<IReadOnlyList<Response>>>(_ => throw failure);
         var waits = RecordWaits(h);
 
-        var ex = await Assert.ThrowsAsync<TableTransactionFailedException>(() => h.Store.UpsertBatchAsync(
+        // 0.10.0: the neutral TableNotFoundException, the transaction's failure inside.
+        var ex = await Assert.ThrowsAsync<TableNotFoundException>(() => h.Store.UpsertBatchAsync(
         [
             new SplitTextEntity { Id = "p|r1", Body = "a" },
             new SplitTextEntity { Id = "p|r2", Body = "b" },
         ], Ct));
 
-        Assert.Same(failure, ex);
+        Assert.Same(failure, ex.InnerException);
         await h.Table.ReceivedWithAnyArgs(1).SubmitTransactionAsync(default!, default);
         Assert.Empty(waits);
     }
@@ -136,10 +141,13 @@ public class TableNotFoundTests
         h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
             .Returns<Response>(_ => throw failure);
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+        // 0.10.0: a 404 that names neither a row nor the table is a plain StorageException: not a missing
+        // entity, not a missing table.
+        var ex = await Assert.ThrowsAsync<StorageException>(
             () => h.Store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = "small" }, Ct));
 
-        Assert.Same(failure, ex);
+        Assert.Same(failure, ex.InnerException);
+        Assert.Equal("SomeOtherResourceNotFound", ex.ProviderErrorCode);
         await h.Table.ReceivedWithAnyArgs(1).UpdateEntityAsync<TableEntity>(default!, default, default, default);
     }
 
@@ -189,12 +197,103 @@ public class TableNotFoundTests
         await h.Table.ReceivedWithAnyArgs(2).SubmitTransactionAsync(default!, default);
     }
 
+    // ── a strict replace does not retry: the row that is gone is a missing entity ──
+
+    [Theory]
+    [InlineData("ResourceNotFound")]
+    [InlineData("EntityNotFound")]
+    [InlineData(null)]
+    public async Task StrictReplace_RowDeletedBetweenTheReadAndTheReplace_ThrowsEntityNotFound_WithTheServices404Inside(string? code)
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", PriorPrimary("r", 0, "W/\"v1\""));
+        var failure = NotFound(code);
+        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns<Response>(_ => throw failure);
+        var waits = RecordWaits(h);
+
+        // Until 0.10.0 the service's own 404 escaped here.
+        var ex = await Assert.ThrowsAsync<EntityNotFoundException>(() => h.Store.UpdateAsync(
+            new SplitTextEntity { Id = "p|r", Body = "small", ETag = "W/\"v1\"" }, ConcurrencyMode.Strict, Ct));
+
+        Assert.Same(failure, ex.InnerException);
+        Assert.Equal("p|r", ex.Id);
+        Assert.Equal(code, ex.ProviderErrorCode);
+        await h.Table.ReceivedWithAnyArgs(1).UpdateEntityAsync<TableEntity>(default!, default, default, default);
+        Assert.Empty(waits);
+    }
+
+    [Fact]
+    public async Task StrictReplace_TableNotFound_IsNotAMissingEntity()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", PriorPrimary("r", 0, "W/\"v1\""));
+        var failure = NotFound("TableNotFound");
+        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns<Response>(_ => throw failure);
+
+        var ex = await Assert.ThrowsAsync<TableNotFoundException>(() => h.Store.UpdateAsync(
+            new SplitTextEntity { Id = "p|r", Body = "small", ETag = "W/\"v1\"" }, ConcurrencyMode.Strict, Ct));
+
+        Assert.Same(failure, ex.InnerException);
+    }
+
+    // ── a conflict: whose write it may be ──────────────────────────────────
+
+    [Fact]
+    public async Task StrictReplace_AVersionTheStoresOwnReadFinds_IsAConflictThatIsNotItsOwnWrite()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", PriorPrimary("r", 0, "W/\"v2\""));
+
+        var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(() => h.Store.UpdateAsync(
+            new SplitTextEntity { Id = "p|r", Body = "small", ETag = "W/\"v1\"" }, ConcurrencyMode.Strict, Ct));
+
+        // Nothing was sent: no provider exception, and no attempt of this call that could have written.
+        Assert.Null(ex.InnerException);
+        Assert.False(ex.MayBeOwnWrite);
+        await h.Table.DidNotReceiveWithAnyArgs().UpdateEntityAsync<TableEntity>(default!, default, default, default);
+    }
+
+    [Fact]
+    public async Task StrictReplace_AConditionTheServiceRefuses_IsAConflictThatMayBeItsOwnWrite()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+        h.SetupGet("p", "r", PriorPrimary("r", 0, "W/\"v1\""));
+        var failure = new RequestFailedException(412, "failed", "UpdateConditionNotSatisfied", null);
+        h.Table.UpdateEntityAsync(Arg.Any<TableEntity>(), Arg.Any<ETag>(), Arg.Any<TableUpdateMode>(), Arg.Any<CancellationToken>())
+            .Returns<Response>(_ => throw failure);
+
+        var ex = await Assert.ThrowsAsync<ConcurrencyConflictException>(() => h.Store.UpdateAsync(
+            new SplitTextEntity { Id = "p|r", Body = "small", ETag = "W/\"v1\"" }, ConcurrencyMode.Strict, Ct));
+
+        // The SDK may have sent the replace twice: the version in the way can be the one it wrote.
+        Assert.Same(failure, ex.InnerException);
+        Assert.True(ex.MayBeOwnWrite);
+        Assert.Equal("UpdateConditionNotSatisfied", ex.ProviderErrorCode);
+    }
+
+    [Fact]
+    public async Task CreateBatch_AKeyRepeatedInTheBatch_IsADuplicateFoundBeforeAnythingIsSent_NotItsOwnWrite()
+    {
+        using var h = new StorageHarness<SplitTextEntity>();
+
+        var ex = await Assert.ThrowsAsync<DuplicateKeyException>(() => h.Store.CreateBatchAsync(
+        [
+            new SplitTextEntity { Id = "p|r", Body = "a" },
+            new SplitTextEntity { Id = "p|r", Body = "b" },
+        ], Ct));
+
+        Assert.False(ex.MayBeOwnWrite);
+        await h.Table.DidNotReceiveWithAnyArgs().SubmitTransactionAsync(default!, default);
+    }
+
     // ── what the real SDK reports (scripted transport) ─────────────────────
 
     private static string Error(string code) => "{\"odata.error\":{\"code\":\"" + code + "\",\"message\":{\"lang\":\"en-US\",\"value\":\"" + code + "\"}}}";
 
     [Fact]
-    public async Task OnTheWire_TableNotFound_IsOnePut_AndTheSdksOwnException()
+    public async Task OnTheWire_TableNotFound_IsOnePut_AndTheSdksOwnExceptionInside()
     {
         var transport = new ScriptedTableTransport(sent => sent.Method switch
         {
@@ -204,11 +303,14 @@ public class TableNotFoundTests
         using var cache = new MemoryCache(new MemoryCacheOptions());
         var store = new TableStorage<SplitTextEntity>(transport.Service(), cache, NullLogger<TableStorage<SplitTextEntity>>.Instance);
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+        // 0.10.0: the neutral TableNotFoundException, with what the real SDK throws inside.
+        var ex = await Assert.ThrowsAsync<TableNotFoundException>(
             () => store.UpsertAsync(new SplitTextEntity { Id = "p|r", Body = "small" }, Ct));
 
-        Assert.Equal(404, ex.Status);
-        Assert.Equal("TableNotFound", ex.ErrorCode);
+        var sdk = Assert.IsType<RequestFailedException>(ex.InnerException);
+        Assert.Equal(404, sdk.Status);
+        Assert.Equal("TableNotFound", sdk.ErrorCode);
+        Assert.Equal("TableNotFound", ex.ProviderErrorCode);
         Assert.Single(transport.EntityRequests, r => r.Method == "PUT");
         Assert.Single(transport.EntityRequests, r => r.Method == "GET");
     }
@@ -254,20 +356,22 @@ public sealed class AzuriteTableNotFoundTests : AzuriteCleanupTestBase
 
         try
         {
-            var small = await Assert.ThrowsAsync<RequestFailedException>(
+            // 0.10.0: the neutral TableNotFoundException each time, the service's 404 inside.
+            var small = await Assert.ThrowsAsync<TableNotFoundException>(
                 () => store.UpsertAsync(new SplitTextEntity { Id = Id("r"), Body = "two" }, Ct));
-            Assert.Equal(404, small.Status);
-            Assert.Equal("TableNotFound", small.ErrorCode);
+            Assert.Equal(404, Assert.IsType<RequestFailedException>(small.InnerException).Status);
+            Assert.Equal("TableNotFound", small.ProviderErrorCode);
+            Assert.Equal(tableName, small.TableName);
 
             // A value with a continuation row goes through a transaction: the same answer.
-            var large = await Assert.ThrowsAnyAsync<RequestFailedException>(
+            var large = await Assert.ThrowsAsync<TableNotFoundException>(
                 () => store.UpsertAsync(new SplitTextEntity { Id = Id("r"), Body = new string('a', 600_000) }, Ct));
-            Assert.Equal(404, large.Status);
-            Assert.Equal("TableNotFound", large.ErrorCode);
+            Assert.Equal(404, Assert.IsType<RequestFailedException>(large.InnerException, exactMatch: false).Status);
+            Assert.Equal("TableNotFound", large.ProviderErrorCode);
 
-            var batch = await Assert.ThrowsAnyAsync<RequestFailedException>(
+            var batch = await Assert.ThrowsAsync<TableNotFoundException>(
                 () => store.UpsertBatchAsync([new SplitTextEntity { Id = Id("r"), Body = "three" }], Ct));
-            Assert.Equal("TableNotFound", batch.ErrorCode);
+            Assert.Equal("TableNotFound", batch.ProviderErrorCode);
 
             // A delete of a row in a table that is not there is a no-op, as for a type without large values.
             await store.DeleteAsync(Id("r"), Ct);

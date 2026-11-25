@@ -320,9 +320,11 @@ public class OpenReadDuringWriteTests
         rig.Script.Add(rig.FailingAfter(0, Status(412, "ConditionNotMet"))); // every open: refused at once
 
         await using var stream = await rig.Store.OpenReadAsync("File", Name, Ct);
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => ReadToEndAsync(stream, kind));
+        // 0.10.0: a blob's 412 is a plain StorageException (never a row's concurrency conflict), the SDK's inside.
+        var ex = await Assert.ThrowsAsync<StorageException>(() => ReadToEndAsync(stream, kind));
 
-        Assert.Equal(412, ex.Status);
+        Assert.Equal(412, Assert.IsType<RequestFailedException>(ex.InnerException).Status);
+        Assert.Equal("ConditionNotMet", ex.ProviderErrorCode);
         Assert.Equal(1 + AzureOffloadBlobStore.MaxReadReopens, rig.Opens.Count);
     }
 
@@ -346,16 +348,18 @@ public class OpenReadDuringWriteTests
     [Theory]
     [InlineData(ReadKind.Sync)]
     [InlineData(ReadKind.Async)]
-    public async Task AnyOtherFailure_IsNotRetried_AndSurfacesAsIs(ReadKind kind)
+    public async Task AnyOtherFailure_IsNotRetried_AndSurfacesWithTheServicesErrorInside(ReadKind kind)
     {
         var rig = new Rig(RandomBytes(Size, seed: 128));
         var failure = Status(500, "InternalError");
         rig.Script.Add(rig.FailingAfter(30_000, failure));
 
         await using var stream = await rig.Store.OpenReadAsync("File", Name, Ct);
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => ReadToEndAsync(stream, kind));
+        // 0.10.0: neutral (a 500 is transient; a read commits nothing), the SDK's own failure inside.
+        var ex = await Assert.ThrowsAsync<TransientStorageException>(() => ReadToEndAsync(stream, kind));
 
-        Assert.Same(failure, ex);
+        Assert.Same(failure, ex.InnerException);
+        Assert.False(ex.MayHaveCommitted);
         Assert.Equal([0L], rig.Opens);
     }
 

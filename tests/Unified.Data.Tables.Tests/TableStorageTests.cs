@@ -66,7 +66,9 @@ public class TableStorageTests
                 : Task.FromResult<Response<Azure.Data.Tables.Models.TableItem>>(null!));
         h.SetupAdd();
 
-        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.CreateAsync(new TestEntity { Id = "a|1" }));
+        // 0.10.0: the 503 of the table create leaves as the neutral transient failure, the SDK's inside.
+        var failed = await Assert.ThrowsAsync<TransientStorageException>(() => h.Store.CreateAsync(new TestEntity { Id = "a|1" }));
+        Assert.Equal(503, Assert.IsType<RequestFailedException>(failed.InnerException).Status);
         var recovered = await h.Store.CreateAsync(new TestEntity { Id = "a|2" });
 
         Assert.NotNull(recovered);
@@ -1025,7 +1027,10 @@ public class TableStorageTests
                 : throw new RequestFailedException(503, "storage unavailable"));
         var entities = Enumerable.Range(0, 150).Select(i => new TestEntity { Id = $"p|r{i:D3}" }).ToList();
 
-        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.UpsertBatchAsync(entities));
+        // 0.10.0: the second transaction's 503 leaves as the neutral transient failure of a write.
+        var failed = await Assert.ThrowsAsync<TransientStorageException>(() => h.Store.UpsertBatchAsync(entities));
+        Assert.Equal(503, Assert.IsType<RequestFailedException>(failed.InnerException).Status);
+        Assert.True(failed.MayHaveCommitted);
         await h.Store.QueryAsync("p");                                     // must MISS — first chunk committed
 
         h.Table.Received(2).QueryAsync<TableEntity>(

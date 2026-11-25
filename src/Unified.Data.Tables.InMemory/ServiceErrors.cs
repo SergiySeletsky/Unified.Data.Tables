@@ -1,3 +1,4 @@
+using System.Globalization;
 using Azure;
 using Azure.Data.Tables;
 
@@ -7,7 +8,9 @@ namespace Unified.Data.Tables.InMemory;
 /// The failures the Table service reports, as the in-memory stores raise them: the same status and
 /// <see cref="RequestFailedException.ErrorCode"/> the SDK surfaces through <c>TableStorage&lt;T&gt;</c>, and a
 /// failure inside an entity-group transaction wrapped in <see cref="TableTransactionFailedException"/> as the
-/// SDK wraps it, so code that inspects either sees the same thing on both stores.
+/// SDK wraps it. None of them leaves a store as it is: like <c>TableStorage&lt;T&gt;</c>, the stores throw the
+/// provider-neutral <see cref="StorageException"/> types (<see cref="Neutral"/>) and keep the service's
+/// failure as the inner exception, so code that inspects either sees the same thing on both stores.
 /// </summary>
 internal static class ServiceErrors
 {
@@ -34,6 +37,53 @@ internal static class ServiceErrors
     internal static TableTransactionFailedException InTransaction(RequestFailedException failure) => new(failure);
 
     /// <summary>
+    /// <paramref name="neutral"/> with the code of the service failure it carries as its
+    /// <see cref="StorageException.ProviderErrorCode"/>, as <c>TableStorage&lt;T&gt;</c> sets it on a duplicate
+    /// key or a conflict the service reported. <c>MayBeOwnWrite</c> stays false: this store never sends a
+    /// request twice.
+    /// </summary>
+    internal static TException Coded<TException>(TException neutral) where TException : StorageException
+    {
+        neutral.ProviderErrorCode = (neutral.InnerException as RequestFailedException)?.ErrorCode;
+        return neutral;
+    }
+
+    /// <summary>
+    /// The provider-neutral exception <c>TableStorage&lt;T&gt;</c> throws for <paramref name="failure"/>, with
+    /// the same message: a missing row (404) is <see cref="EntityNotFoundException"/>, a request the service
+    /// refuses (400, 413) is <see cref="StorageRequestRejectedException"/>. <paramref name="failure"/> is the
+    /// inner exception and its code the <see cref="StorageException.ProviderErrorCode"/>. This store never
+    /// sends a request twice, so a duplicate or a conflict is never its own write
+    /// (<see cref="DuplicateKeyException.MayBeOwnWrite"/> stays false).
+    /// </summary>
+    /// <param name="failure">The failure, as the service reports it.</param>
+    /// <param name="entityType">The entity type name (the table name of a polymorphic store).</param>
+    /// <param name="id">The id of the row the call addressed, when it addressed one.</param>
+    internal static StorageException Neutral(RequestFailedException failure, string entityType, string? id)
+    {
+        var code = failure.ErrorCode;
+        var described = string.IsNullOrEmpty(code)
+            ? failure.Status.ToString(CultureInfo.InvariantCulture)
+            : $"{failure.Status.ToString(CultureInfo.InvariantCulture)} {code}";
+        return failure.Status switch
+        {
+            404 => id is null
+                ? new EntityNotFoundException($"{entityType}: a row the request needs does not exist.", failure) { ProviderErrorCode = code }
+                : new EntityNotFoundException(entityType, id, failure) { ProviderErrorCode = code },
+            409 => id is null
+                ? new DuplicateKeyException($"Duplicate key creating {entityType}: a row with this id already exists.", failure) { ProviderErrorCode = code }
+                : new DuplicateKeyException(entityType, id, failure) { ProviderErrorCode = code },
+            412 => id is null
+                ? new ConcurrencyConflictException(
+                    $"Concurrency conflict updating {entityType}: the row was modified by another writer since it was read.", failure) { ProviderErrorCode = code }
+                : new ConcurrencyConflictException(entityType, id, failure) { ProviderErrorCode = code },
+            400 or 413 => new StorageRequestRejectedException(
+                $"{entityType}: the storage service rejected the request ({described}). Sending it again fails the same way.", code, failure),
+            _ => new StorageException($"{entityType}: the storage request failed ({described}).", code, failure),
+        };
+    }
+
+    /// <summary>
     /// 400 <c>InvalidInput</c> when <paramref name="partitionKey"/> or <paramref name="rowKey"/> holds a
     /// character the service refuses in a key: <c>/</c>, <c>\</c>, <c>#</c>, <c>?</c>, or a control character
     /// (U+0000 to U+001F, U+007F to U+009F); null when both keys are accepted.
@@ -48,11 +98,11 @@ internal static class ServiceErrors
                 "InvalidInput", null);
     }
 
-    /// <summary>Throws <see cref="RefusedKey"/> for a single-entity write.</summary>
-    internal static void ThrowIfRefusedKey((string PartitionKey, string RowKey) keys)
+    /// <summary>Throws <see cref="RefusedKey"/>, as the neutral exception, for a single-entity write.</summary>
+    internal static void ThrowIfRefusedKey((string PartitionKey, string RowKey) keys, string entityType)
     {
         if (RefusedKey(keys.PartitionKey, keys.RowKey) is { } refused)
-            throw refused;
+            throw Neutral(refused, entityType, id: null);
     }
 
     /// <summary>The largest property value the service accepts: 64 KiB (a string is UTF-16, so 32 K characters).</summary>
@@ -84,11 +134,11 @@ internal static class ServiceErrors
         return null;
     }
 
-    /// <summary>Throws <see cref="OversizedProperty"/> for a single-entity write.</summary>
-    internal static void ThrowIfOversizedProperty(TableEntity row)
+    /// <summary>Throws <see cref="OversizedProperty"/>, as the neutral exception, for a single-entity write.</summary>
+    internal static void ThrowIfOversizedProperty(TableEntity row, string entityType)
     {
         if (OversizedProperty(row) is { } refused)
-            throw refused;
+            throw Neutral(refused, entityType, id: null);
     }
 
     private static bool HasRefusedCharacter(string key)

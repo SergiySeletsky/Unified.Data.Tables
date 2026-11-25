@@ -19,7 +19,7 @@ public readonly struct BatchRange(int start, int count, long bytes)
 /// alternative is discovering it partway through a bulk write that has already committed.
 /// </summary>
 public sealed class BatchPayloadTooLargeException(int index, long bytes, long limit)
-    : Exception($"entity at index {index} serializes to {bytes:N0} B, which exceeds the {limit:N0} B "
+    : StorageException($"entity at index {index} serializes to {bytes:N0} B, which exceeds the {limit:N0} B "
         + "transaction budget on its own. It cannot be batched at any chunk size — model it as "
         + "multiple rows, or move the payload to Blob storage and keep a reference here.")
 {

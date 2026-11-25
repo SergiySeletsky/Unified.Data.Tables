@@ -42,6 +42,18 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     {
         try
         {
+            return await GetStateCoreAsync(name, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
+    }
+
+    private async Task<BlobState?> GetStateCoreAsync(string name, CancellationToken ct)
+    {
+        try
+        {
             var properties = (await Blob(name).GetPropertiesAsync(conditions: null, ct).ConfigureAwait(false)).Value;
             return ToState(name, properties);
         }
@@ -53,6 +65,18 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
 
     /// <inheritdoc />
     public async Task UploadCreateOnlyAsync(string name, Stream content, BlobReference reference, string? contentEncoding, CancellationToken ct)
+    {
+        try
+        {
+            await UploadCreateOnlyCoreAsync(name, content, reference, contentEncoding, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task UploadCreateOnlyCoreAsync(string name, Stream content, BlobReference reference, string? contentEncoding, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(content);
         ArgumentNullException.ThrowIfNull(reference);
@@ -90,6 +114,18 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     /// <inheritdoc />
     public async Task TouchAsync(string name, CancellationToken ct)
     {
+        try
+        {
+            await TouchCoreAsync(name, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task TouchCoreAsync(string name, CancellationToken ct)
+    {
         var blob = Blob(name);
         try
         {
@@ -117,7 +153,14 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     public async Task<Stream> OpenReadAsync(string column, string name, CancellationToken ct)
     {
         var blob = Blob(name);
-        return new BlobReadStream(blob, column, name, await OpenAsync(blob, column, name, 0, pinned: true, ct).ConfigureAwait(false));
+        try
+        {
+            return new BlobReadStream(blob, column, name, await OpenAsync(blob, column, name, 0, pinned: true, ct).ConfigureAwait(false), container.Name);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
     }
 
     // pinned (allowModifications: false): every range the stream reads is conditional on the ETag the
@@ -159,9 +202,10 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     /// its bytes are the same), the read goes on through an unpinned stream opened at the position
     /// reached, so no later change of the ETag interrupts it again. A blob that was deleted (404, from a
     /// range or from that open) fails the read with <see cref="TableValueIntegrityException"/>. Any other
-    /// failure surfaces as it is.
+    /// failure of the service leaves as a provider-neutral <see cref="StorageException"/> (the SDK's
+    /// exception inside), also when the caller reads the stream after the storage call returned.
     /// </summary>
-    private sealed class BlobReadStream(BlobClient blob, string column, string name, Stream opened) : Stream
+    private sealed class BlobReadStream(BlobClient blob, string column, string name, Stream opened, string? containerName) : Stream
     {
         private Stream inner = opened;
         private long position;
@@ -204,9 +248,21 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
                 catch (RequestFailedException ex) when (ex.Status == 412 && reopened < MaxReadReopens)
                 {
                     // The ETag moved on (or, for some services, the blob is gone: the open says so).
-                    var next = Open(blob, column, name, position, pinned: false);
+                    Stream next;
+                    try
+                    {
+                        next = Open(blob, column, name, position, pinned: false);
+                    }
+                    catch (Exception failed) when (AzureStorageErrors.IsProviderFailure(failed, CancellationToken.None))
+                    {
+                        throw AzureStorageErrors.MapBlob(failed, containerName, write: false);
+                    }
                     inner.Dispose();
                     Continue(next);
+                }
+                catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, CancellationToken.None))
+                {
+                    throw AzureStorageErrors.MapBlob(ex, containerName, write: false);
                 }
             }
         }
@@ -233,9 +289,21 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
                 catch (RequestFailedException ex) when (ex.Status == 412 && reopened < MaxReadReopens)
                 {
                     // The ETag moved on (or, for some services, the blob is gone: the open says so).
-                    var next = await OpenAsync(blob, column, name, position, pinned: false, cancellationToken).ConfigureAwait(false);
+                    Stream next;
+                    try
+                    {
+                        next = await OpenAsync(blob, column, name, position, pinned: false, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception failed) when (AzureStorageErrors.IsProviderFailure(failed, cancellationToken))
+                    {
+                        throw AzureStorageErrors.MapBlob(failed, containerName, write: false);
+                    }
                     await inner.DisposeAsync().ConfigureAwait(false);
                     Continue(next);
+                }
+                catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, cancellationToken))
+                {
+                    throw AzureStorageErrors.MapBlob(ex, containerName, write: false);
                 }
             }
         }
@@ -277,6 +345,18 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     {
         try
         {
+            return await DeleteIfUnmodifiedCoreAsync(name, unmodifiedSince, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task<bool> DeleteIfUnmodifiedCoreAsync(string name, DateTimeOffset? unmodifiedSince, CancellationToken ct)
+    {
+        try
+        {
             await Blob(name).DeleteAsync(
                 DeleteSnapshotsOption.IncludeSnapshots,
                 new BlobRequestConditions { IfUnmodifiedSince = unmodifiedSince },
@@ -293,6 +373,18 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
     /// <remarks>The <c>Date</c> header of a container properties request (the 404 of a container not yet
     /// created carries one too); null when the service sent none.</remarks>
     public async Task<DateTimeOffset?> GetServiceTimeAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await GetServiceTimeCoreAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
+    }
+
+    private async Task<DateTimeOffset?> GetServiceTimeCoreAsync(CancellationToken ct)
     {
         try
         {
@@ -323,6 +415,10 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
                 // No container yet: nothing was ever offloaded.
                 yield break;
             }
+            catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+            {
+                throw Failed(ex, write: false);
+            }
             if (!more) yield break;
             var item = pages.Current;
             // The service always lists Last-Modified. An item without one cannot be deleted conditionally
@@ -350,11 +446,19 @@ internal sealed class AzureOffloadBlobStore(BlobContainerClient container) : IOf
             {
                 yield break;
             }
+            catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+            {
+                throw Failed(ex, write: false);
+            }
             if (!more) yield break;
             if (pages.Current is { IsPrefix: true, Prefix: { } listed })
                 yield return listed;
         }
     }
+
+    // The provider-neutral exception for an SDK failure that is leaving this store. A blob's 404, 409 or
+    // 412 never says a row or a table is missing or in conflict (AzureStorageErrors.MapBlob).
+    private StorageException Failed(Exception ex, bool write) => AzureStorageErrors.MapBlob(ex, container.Name, write);
 
     // The client of the blob named exactly name: the SDK collapses '.' and '..' segments of the URI it
     // builds, which would address another blob than the one a row references.

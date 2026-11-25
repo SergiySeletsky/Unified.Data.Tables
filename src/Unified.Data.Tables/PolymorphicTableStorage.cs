@@ -61,11 +61,39 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     }
 
     /// <inheritdoc />
-    public Task EnsureCreatedAsync(CancellationToken ct = default) => initializer.EnsureAsync(ct);
+    public async Task EnsureCreatedAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await initializer.EnsureAsync(ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    // The provider-neutral exception for an SDK failure that is leaving a member of this store (see
+    // AzureStorageErrors for what maps to what). write: the member may change stored data, so a transient
+    // failure may have committed and a duplicate may be the call's own retried write.
+    private StorageException Failed(Exception ex, bool write, string? id = null) =>
+        AzureStorageErrors.Map(ex, tableName, tableName, id, write);
 
     /// <inheritdoc />
     public async Task<PolymorphicEntry<TBase>> InsertAsync(
         PolymorphicWrite<TBase> write, CancellationToken ct = default)
+    {
+        try
+        {
+            return await InsertCoreAsync(write, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, write.Key.ToId());
+        }
+    }
+
+    private async Task<PolymorphicEntry<TBase>> InsertCoreAsync(PolymorphicWrite<TBase> write, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(write);
         var row = ToRow(write);
@@ -78,7 +106,8 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
         }
         catch (RequestFailedException ex) when (ex.Status == 409)
         {
-            throw new DuplicateKeyException(tableName, write.Key.ToId(), ex);
+            // The SDK may have retried the insert, so the row in the way can be this call's own.
+            throw AzureStorageErrors.Duplicate(tableName, write.Key.ToId(), ex, mayBeOwnWrite: true);
         }
 
         row.ETag = ETagOf(response, row);
@@ -88,6 +117,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task<PolymorphicEntry<TBase>> UpsertAsync(
         PolymorphicWrite<TBase> write, CancellationToken ct = default)
+    {
+        try
+        {
+            return await UpsertCoreAsync(write, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, write.Key.ToId());
+        }
+    }
+
+    private async Task<PolymorphicEntry<TBase>> UpsertCoreAsync(PolymorphicWrite<TBase> write, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(write);
         var row = ToRow(write);
@@ -100,6 +141,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task<int> InsertBatchAsync(
         IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default)
+    {
+        try
+        {
+            return await InsertBatchCoreAsync(writes, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task<int> InsertBatchCoreAsync(IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(writes);
         if (writes.Count == 0)
@@ -148,7 +201,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
                             groupRows[range.Start + i].RowKey).ToId()
                         : new TableKey(group.Key, "?").ToId();
 
-                    throw new DuplicateKeyException(tableName, duplicate, ex);
+                    throw AzureStorageErrors.Duplicate(tableName, duplicate, ex, mayBeOwnWrite: true);
                 }
 
                 written += actions.Count;
@@ -161,6 +214,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task MergeColumnsAsync(
         TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default)
+    {
+        try
+        {
+            await MergeColumnsCoreAsync(key, columns, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, key.ToId());
+        }
+    }
+
+    private async Task MergeColumnsCoreAsync(TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct)
     {
         ValidateKey(key);
         ArgumentNullException.ThrowIfNull(columns);
@@ -189,6 +254,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task<PolymorphicEntry<TBase>?> GetAsync(TableKey key, CancellationToken ct = default)
     {
+        try
+        {
+            return await GetCoreAsync(key, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false, key.ToId());
+        }
+    }
+
+    private async Task<PolymorphicEntry<TBase>?> GetCoreAsync(TableKey key, CancellationToken ct)
+    {
         ValidateKey(key);
         await initializer.EnsureAsync(ct);
 
@@ -210,10 +287,12 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     }
 
     /// <inheritdoc />
-    public async IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
-        string? partition = null,
-        int? take = null,
-        [EnumeratorCancellation] CancellationToken ct = default)
+    public IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
+        string? partition = null, int? take = null, CancellationToken ct = default) =>
+        AzureStorageErrors.GuardAsync(StreamAsync(partition, take, ct), ex => Failed(ex, write: false), ct);
+
+    private async IAsyncEnumerable<PolymorphicEntry<TBase>> StreamAsync(
+        string? partition, int? take, [EnumeratorCancellation] CancellationToken ct)
     {
         if (take is <= 0)
             yield break;
@@ -238,6 +317,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task DeleteAsync(TableKey key, CancellationToken ct = default)
     {
+        try
+        {
+            await DeleteCoreAsync(key, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, key.ToId());
+        }
+    }
+
+    private async Task DeleteCoreAsync(TableKey key, CancellationToken ct)
+    {
         ValidateKey(key);
         await initializer.EnsureAsync(ct);
 
@@ -254,6 +345,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
 
     /// <inheritdoc />
     public async Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
+    {
+        try
+        {
+            return await DeletePartitionCoreAsync(partition, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task<int> DeletePartitionCoreAsync(string partition, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(partition);
         await initializer.EnsureAsync(ct);
@@ -286,6 +389,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
 
     /// <inheritdoc />
     public async Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
+    {
+        try
+        {
+            return await CountCoreAsync(partition, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
+    }
+
+    private async Task<int> CountCoreAsync(string? partition, CancellationToken ct)
     {
         await initializer.EnsureAsync(ct);
 

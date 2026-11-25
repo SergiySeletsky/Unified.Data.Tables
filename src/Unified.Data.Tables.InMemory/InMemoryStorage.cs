@@ -14,9 +14,12 @@ namespace Unified.Data.Tables.InMemory;
 /// production serialization behaviour (decimal-as-double, enum-as-string, <c>Parent_Child</c>
 /// flattening, <c>__Json</c>/<c>__GZip</c> cells, 64&#160;KB handling) instead of hiding it.
 /// Semantics mirror <c>TableStorage&lt;T&gt;</c>: identical id normalization and first-<c>'|'</c>
-/// key splitting, 409 <see cref="RequestFailedException"/> on duplicate create, 404 on updating a
-/// missing row, ETag simulation with 412 conflicts, idempotent delete, and lexical
-/// (PartitionKey, RowKey) result ordering.
+/// key splitting, <see cref="DuplicateKeyException"/> on duplicate create,
+/// <see cref="EntityNotFoundException"/> on updating a missing row, ETag simulation with
+/// <see cref="ConcurrencyConflictException"/> on a lost version check, idempotent delete, and lexical
+/// (PartitionKey, RowKey) result ordering. Like <c>TableStorage&lt;T&gt;</c> it throws only the
+/// provider-neutral <see cref="StorageException"/> types for what the service would refuse; it never
+/// sends a request twice, so <see cref="DuplicateKeyException.MayBeOwnWrite"/> is always false here.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
 public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
@@ -230,11 +233,11 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         if (LargeValueAware)
             return WriteLargeAsync(entity, LargeWriteKind.Create, ifMatch: null, ct);
 
-        ServiceErrors.ThrowIfRefusedKey(keys);
+        ServiceErrors.ThrowIfRefusedKey(keys, typeof(T).Name);
         lock (gate)
         {
             if (rows.ContainsKey(keys))
-                throw new DuplicateKeyException(typeof(T).Name, entity.Id, ServiceErrors.AlreadyExists(entity.Id));
+                throw ServiceErrors.Coded(new DuplicateKeyException(typeof(T).Name, entity.Id, ServiceErrors.AlreadyExists(entity.Id)));
             entity.ETag = Store(keys, entity).ETagString();
         }
 
@@ -260,7 +263,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         entity.Id = NormalizeId(entity.Id);
         ct.ThrowIfCancellationRequested();
         var keys = EntityId.Split(entity.Id);
-        ServiceErrors.ThrowIfRefusedKey(keys);
+        ServiceErrors.ThrowIfRefusedKey(keys, typeof(T).Name);
 
         lock (gate)
         {
@@ -303,12 +306,12 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         entity.Id = NormalizeId(entity.Id);
         ct.ThrowIfCancellationRequested();
         var keys = EntityId.Split(entity.Id);
-        ServiceErrors.ThrowIfRefusedKey(keys);
+        ServiceErrors.ThrowIfRefusedKey(keys, typeof(T).Name);
 
         lock (gate)
         {
             if (!rows.TryGetValue(keys, out var existing))
-                throw ServiceErrors.NotFound(entity.Id);
+                throw ServiceErrors.Neutral(ServiceErrors.NotFound(entity.Id), typeof(T).Name, entity.Id);
 
             // Strict — and Auto with a caller-round-tripped ETag — enforce the row version; a
             // mismatch surfaces as a conflict with no retry, exactly like TableStorage<T>. Auto
@@ -317,7 +320,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
             if (mode != ConcurrencyMode.LastWriterWins && callerSuppliedETag
                 && !string.Equals(existing.ETagString(), suppliedETag, StringComparison.Ordinal))
             {
-                throw new ConcurrencyConflictException(typeof(T).Name, entity.Id, ServiceErrors.ConditionNotSatisfied());
+                throw ServiceErrors.Coded(new ConcurrencyConflictException(typeof(T).Name, entity.Id, ServiceErrors.ConditionNotSatisfied()));
             }
 
             entity.ETag = Store(keys, entity).ETagString();
@@ -346,18 +349,22 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
         // A continuation row is not an entity: merging cells into one would surface them on the primary.
         RefuseReservedRowKey(id);
         ct.ThrowIfCancellationRequested();
-        ServiceErrors.ThrowIfRefusedKey(keys);
+        ServiceErrors.ThrowIfRefusedKey(keys, typeof(T).Name);
 
         lock (gate)
         {
             if (!rows.TryGetValue(keys, out var existing))
-                throw ServiceErrors.NotFound(id);
+            {
+                // Named as the row is stored (normalized), as TableStorage names it.
+                var normalizedId = NormalizeId(id);
+                throw ServiceErrors.Neutral(ServiceErrors.NotFound(normalizedId), typeof(T).Name, normalizedId);
+            }
 
             // Conditional merge (WithETag): the merge only applies to the version that was read.
             if (builder.ETag is not null
                 && !string.Equals(existing.ETagString(), builder.ETag, StringComparison.Ordinal))
             {
-                throw new ConcurrencyConflictException(typeof(T).Name, id, ServiceErrors.ConditionNotSatisfied());
+                throw ServiceErrors.Coded(new ConcurrencyConflictException(typeof(T).Name, id, ServiceErrors.ConditionNotSatisfied()));
             }
 
             // Server-side Merge: only the declared (flattened) columns change; the rest survive.
@@ -372,7 +379,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
                 }
             }
             merged[nameof(Entity.UpdatedAt)] = DateTimeOffset.UtcNow;
-            ServiceErrors.ThrowIfOversizedProperty(merged);
+            ServiceErrors.ThrowIfOversizedProperty(merged, typeof(T).Name);
 
             var stored = new StoredRow(merged, ++versionCounter, DateTimeOffset.UtcNow);
             rows[keys] = stored;
@@ -768,17 +775,20 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
                     {
                         var (keys, entity) = prepared[members[j]];
                         if (ServiceErrors.RefusedKey(keys.Item1, keys.Item2) is { } refused)
-                            throw ServiceErrors.InTransaction(refused);
+                            throw ServiceErrors.Neutral(ServiceErrors.InTransaction(refused), typeof(T).Name, entity.Id);
                         if (ServiceErrors.OversizedProperty(serialized[members[j]]) is { } oversized)
-                            throw ServiceErrors.InTransaction(oversized);
+                            throw ServiceErrors.Neutral(ServiceErrors.InTransaction(oversized), typeof(T).Name, entity.Id);
                         if (!inTransaction.Add(keys))
                         {
                             var repeated = ServiceErrors.InTransaction(ServiceErrors.DuplicateRow(entity.Id));
-                            throw upsert ? repeated : new DuplicateKeyException(typeof(T).Name, entity.Id, repeated);
+                            // An upsert transaction that names a row twice is a request the service refuses.
+                            throw upsert
+                                ? ServiceErrors.Neutral(repeated, typeof(T).Name, entity.Id)
+                                : ServiceErrors.Coded(new DuplicateKeyException(typeof(T).Name, entity.Id, repeated));
                         }
                         if (!upsert && rows.ContainsKey(keys))
-                            throw new DuplicateKeyException(typeof(T).Name, entity.Id,
-                                ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(entity.Id)));
+                            throw ServiceErrors.Coded(new DuplicateKeyException(typeof(T).Name, entity.Id,
+                                ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(entity.Id))));
                     }
                     for (var j = range.Start; j < range.Start + range.Count; j++)
                         Store(prepared[members[j]].Keys, serialized[members[j]]);
@@ -821,7 +831,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     private StoredRow Store((string PartitionKey, string RowKey) keys, TableEntity serialized)
     {
         // The service refuses a cell above 64 KiB (a plain byte[] reaches it uncompressed).
-        ServiceErrors.ThrowIfOversizedProperty(serialized);
+        ServiceErrors.ThrowIfOversizedProperty(serialized, typeof(T).Name);
         // A copy: the serialized cells may be arrays the writer still holds.
         var row = new StoredRow(CopyOf(serialized), ++versionCounter, DateTimeOffset.UtcNow);
         rows[keys] = row;

@@ -24,7 +24,9 @@ public interface IOrphanBlobSweeper
     /// <remarks>
     /// An orphan whose delete fails does not stop the others. Once every orphan was tried, the failures
     /// are thrown together as an <see cref="AggregateException"/> (one inner exception per blob) whose
-    /// message says how many blobs were deleted; the next sweep retries the rest. An empty or whitespace
+    /// message says how many blobs were deleted; the next sweep retries the rest. What the blob store or
+    /// the table reports is a provider-neutral <see cref="StorageException"/>, inside the aggregate too,
+    /// with the backend's own exception as its inner exception. An empty or whitespace
     /// key is a partition like any other (a write of <c>"|r"</c>, or of <c>"   |r"</c> under
     /// <c>IdNormalization.AsWritten</c>, stores one) and is normalized as ids are on write.
     /// </remarks>
