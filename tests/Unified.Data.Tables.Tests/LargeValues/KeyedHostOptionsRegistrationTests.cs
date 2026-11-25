@@ -121,7 +121,7 @@ public class KeyedHostOptionsRegistrationTests
             services.AddUnifiedInMemoryStorage(o => o.OversizedCells = OversizedCellPolicy.TrimWithMarker);
             using var provider = services.BuildServiceProvider();
 
-            Assert.Equal(OversizedCellPolicy.TrimWithMarker, provider.GetRequiredService<UnifiedTableStorageOptions>().OversizedCells);
+            Assert.Equal(OversizedCellPolicy.TrimWithMarker, provider.GetRequiredService<StorageOptions>().OversizedCells);
             Assert.Equal(OversizedCellPolicy.TrimWithMarker, TableEntitySerializer.OversizedCellPolicy);
             Assert.IsType<InMemoryStorage<PlainEntity>>(provider.GetRequiredService<IStorage<PlainEntity>>());
         }

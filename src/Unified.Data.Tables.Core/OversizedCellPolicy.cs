@@ -4,7 +4,7 @@ namespace Unified.Data.Tables;
 /// What the serializer does when a property's serialized payload exceeds the Azure Tables 64 KB
 /// cell cap even after GZip compression. An oversized cell fails the WHOLE entity write
 /// (<c>PropertyValueTooLarge</c>), so something has to give — this policy decides what, and how
-/// loudly. Configure via <see cref="UnifiedTableStorageOptions.OversizedCells"/> or
+/// loudly. Configure via <see cref="StorageOptions.OversizedCells"/> or
 /// <see cref="TableEntitySerializer.OversizedCellPolicy"/>.
 /// </summary>
 public enum OversizedCellPolicy
@@ -18,7 +18,7 @@ public enum OversizedCellPolicy
 
     /// <summary>
     /// Fail the write with <see cref="System.Runtime.Serialization.SerializationException"/> —
-    /// The default (<see cref="UnifiedTableStorageOptions.OversizedCells"/>). For data where silent loss is never acceptable and the caller wants to remodel instead
+    /// The default (<see cref="StorageOptions.OversizedCells"/>). For data where silent loss is never acceptable and the caller wants to remodel instead
     /// (e.g. row-per-item).
     /// </summary>
     Throw,

@@ -289,7 +289,7 @@ public class RegisteredOptionsOffloadClientTests
     public void LaterTableCall_AfterAnInMemoryRegistrationWithBlobOffload_ValidatesTheBlobEndpointOfItsString()
     {
         var services = new ServiceCollection();
-        services.AddUnifiedInMemoryStorage(o => o.BlobOffload = new BlobOffloadOptions());
+        services.AddUnifiedInMemoryStorage(o => o.Offload = new BlobOffloadOptions());
 
         var failure = Assert.Throws<ArgumentException>(() => services.AddUnifiedTableStorage(MalformedBlobEndpoint));
 

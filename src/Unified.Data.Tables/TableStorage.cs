@@ -193,7 +193,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
     /// <summary>
     /// The table this store reads and writes. Defaults to <c>typeof(T).Name</c>; see
-    /// <see cref="UnifiedTableStorageOptions.TableNameResolver"/> for why an override exists.
+    /// <see cref="StorageOptions.TableNameResolver"/> for why an override exists.
     /// A resolver returning null or whitespace falls back to the default rather than producing an
     /// unusable client — a silently wrong table name is far worse than ignoring a broken resolver.
     /// </summary>
@@ -616,41 +616,10 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
 
 
     /// <summary>
-    /// Expands a caller's <see cref="QueryOptions.Select"/> with the columns deserialization cannot
-    /// work without, and returns <c>null</c> (meaning every column) when no projection was asked for.
-    ///
-    /// The trap this closes: a projection of <c>["Content"]</c> is a perfectly valid Tables query
-    /// that comes back with no PartitionKey, no RowKey, no Timestamp and no type discriminator, and
-    /// deserializes into a silently wrong entity. Projection is a transfer optimisation, never a
-    /// change to what an entity IS, so the system columns are not the caller's to omit.
-    ///
-    /// The row's version is not one of them: <c>odata.etag</c> is not a column. The service returns it
-    /// with every entity, selected or not, and a <c>$select</c> that names it may be refused (other Azure
-    /// SDKs strip the token), so it is never sent, and one a caller named is dropped.
+    /// The columns a projected query of <typeparamref name="T"/> selects, or <c>null</c> for every column
+    /// (<see cref="ProjectedRows.BuildSelect{T}"/>, shared with the other providers).
     /// </summary>
-    internal static IEnumerable<string>? BuildSelect(QueryOptions? options)
-    {
-        if (options?.Select is not { Count: > 0 } requested) return null;
-        // A large value spans cells and continuation rows: naming it fetches (and assembles) the whole row.
-        if (LargeValueAware && SelectsLargeValue(requested)) return null;
-
-        var columns = new List<string>(requested.Count + SystemColumns.Length + SplitSystemColumns.Length);
-        columns.AddRange(SystemColumns);
-        if (LargeValueAware) columns.AddRange(SplitSystemColumns);
-        foreach (var column in requested)
-        {
-            if (!string.Equals(column, ETagToken, StringComparison.Ordinal) && !columns.Contains(column, StringComparer.Ordinal))
-                columns.Add(column);
-        }
-
-        return columns;
-    }
-
-    /// <summary>Columns every projection carries whether the caller asked for them or not.</summary>
-    private static readonly string[] SystemColumns = ["PartitionKey", "RowKey", "Timestamp", "_TypeName"];
-
-    /// <summary>The name under which the service returns a row's version; never part of a <c>$select</c>.</summary>
-    private const string ETagToken = "odata.etag";
+    internal static IEnumerable<string>? BuildSelect(QueryOptions? options) => ProjectedRows.BuildSelect<T>(options);
 
     // Shared server-side streaming iterator. Validation lives in the public methods so it throws
     // eagerly rather than being deferred to the first MoveNext of the returned sequence.

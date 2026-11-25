@@ -356,15 +356,15 @@ public class OffloadLaterRegistrationTests
         // The in-memory store needs no blob client, so a second call has nothing to contribute; like the
         // Azure store, a large-value type resolves and offloads under the first call's options.
         var services = new ServiceCollection();
-        services.AddUnifiedInMemoryStorage(o => o.BlobOffload = new BlobOffloadOptions { ThresholdBytes = 1_000 });
-        services.AddUnifiedInMemoryStorage(o => o.BlobOffload = new BlobOffloadOptions { ServiceClient = Recording() });
+        services.AddUnifiedInMemoryStorage(o => o.Offload = new BlobOffloadOptions { ThresholdBytes = 1_000 });
+        services.AddUnifiedInMemoryStorage(o => o.Offload = new BlobOffloadOptions { ServiceClient = Recording() });
         using var provider = services.BuildServiceProvider();
         var body = Ascii(40_000);
 
         var store = Assert.IsType<InMemoryStorage<SplitTextEntity>>(provider.GetRequiredService<IStorage<SplitTextEntity>>());
         await store.CreateAsync(new SplitTextEntity { Id = "p|r", Body = body }, TestContext.Current.CancellationToken);
 
-        Assert.Equal(1_000, provider.GetRequiredService<UnifiedTableStorageOptions>().BlobOffload!.ThresholdBytes);
+        Assert.Equal(1_000, provider.GetRequiredService<StorageOptions>().Offload!.ThresholdBytes);
         Assert.Single(store.Blobs.Names);
         Assert.Equal(body, (await store.OneAsync("p|r", TestContext.Current.CancellationToken))!.Body, StringComparer.Ordinal);
     }

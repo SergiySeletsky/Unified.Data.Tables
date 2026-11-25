@@ -28,7 +28,7 @@ namespace Unified.Data.Tables;
 /// host startup, before any store touches it, and treat it as frozen from then on. The registrations
 /// live in plain <see cref="Dictionary{TKey,TValue}"/> instances with no synchronization, while the
 /// instance itself is shared process-wide through the singleton
-/// <see cref="UnifiedTableStorageOptions.TypeDiscriminator"/> and read by <see cref="Resolve"/> and
+/// <see cref="StorageOptions.TypeDiscriminator"/> and read by <see cref="Resolve"/> and
 /// <see cref="ToDiscriminator"/> on <em>every row</em>. Calling <see cref="Map{T}"/> or
 /// <see cref="MapAssignableTo{TBase}"/> once the host is serving traffic races those reads: the
 /// failure is a corrupted dictionary or an infinite loop inside a lookup, not a clean exception, and

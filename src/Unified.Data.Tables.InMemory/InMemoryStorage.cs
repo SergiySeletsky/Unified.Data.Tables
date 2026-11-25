@@ -71,22 +71,22 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     /// <summary>
     /// Creates a store, optionally gating <see cref="ProtectedPropertyAttribute"/>-decorated
     /// properties through <paramref name="authorizer"/> and honouring
-    /// <see cref="UnifiedTableStorageOptions.IdNormalization"/>, mirroring <c>TableStorage&lt;T&gt;</c>
+    /// <see cref="StorageOptions.IdNormalization"/>, mirroring <c>TableStorage&lt;T&gt;</c>
     /// so a green fake test holds against Azure. The trailing defaults let the DI container select
     /// this constructor even when neither optional service is registered.
     /// </summary>
-    public InMemoryStorage(IProtectedPropertyAuthorizer? authorizer = null, UnifiedTableStorageOptions? options = null)
+    public InMemoryStorage(IProtectedPropertyAuthorizer? authorizer = null, StorageOptions? options = null)
     {
         this.authorizer = authorizer;
-        var opts = options ?? new UnifiedTableStorageOptions();
+        var opts = options ?? new StorageOptions();
         idNormalization = opts.IdNormalization;
         implicitLastWriterWins = opts.ImplicitLastWriterWins;
         // Blob offload gets this store's own in-memory container (no BlobServiceClient), named under the
         // table name TableStorage<T> would resolve, so blob names match the real store's.
         var tableName = opts.TableNameResolver?.Invoke(typeof(T));
-        hasBlobOffload = opts.BlobOffload is not null;
+        hasBlobOffload = opts.Offload is not null;
         large = new LargeValueTable(string.IsNullOrWhiteSpace(tableName) ? typeof(T).Name : tableName,
-            opts.BlobOffload, hasBlobOffload ? Blobs : null, typeof(T));
+            opts.Offload, hasBlobOffload ? Blobs : null, typeof(T));
     }
 
     /// <summary>The offloaded-value blobs of this store (for tests); empty when blob offload is not configured.</summary>
@@ -176,7 +176,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     /// <summary>
     /// Names of the blobs that currently hold offloaded values (ordinal order), for assertions; empty
     /// when blob offload is not configured. A blob a replace or delete released stays listed until its
-    /// cleanup grace (<see cref="BlobOffloadOptions.CleanupGrace"/>) has passed.
+    /// cleanup grace (<see cref="OffloadOptions.CleanupGrace"/>) has passed.
     /// </summary>
     public IReadOnlyList<string> OffloadedBlobNames() =>
         Blobs.Names.OrderBy(n => n, StringComparer.Ordinal).ToList();

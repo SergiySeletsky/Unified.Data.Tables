@@ -137,7 +137,7 @@ public class OffloadRegistrationOrderMatrixTests
         if (hostHasAClient)
             services.AddSingleton(host);
         var explicitClients = calls.Select(_ => Recording()).ToArray();
-        UnifiedTableStorageOptions? firstOptions = null;
+        StorageOptions? firstOptions = null;
         var what = Describe(calls, hostHasAClient, inMemoryAt < 0 ? "" : $", in-memory registered at position {inMemoryAt}");
 
         try
@@ -183,10 +183,14 @@ public class OffloadRegistrationOrderMatrixTests
 
         using var provider = services.BuildServiceProvider();
 
-        // The first registration's options are the registered ones, registered once.
-        if (!ReferenceEquals(firstOptions, provider.GetRequiredService<UnifiedTableStorageOptions>()))
+        // The first registration's options are the registered ones, registered once. The in-memory
+        // registration's are a StorageOptions (it no longer references the Azure package), so that is the
+        // type both providers resolve them by; a table call's are the Azure type's registration too.
+        if (!ReferenceEquals(firstOptions, provider.GetRequiredService<StorageOptions>()))
             wrong.Add($"{what}: the registered options are not the first call's");
-        foreach (var (type, name) in new[] { (typeof(UnifiedTableStorageOptions), "options"), (typeof(IStorage<>), "IStorage<>"), (typeof(TableServiceClient), "TableServiceClient"), (typeof(IMemoryCache), "IMemoryCache") })
+        if (inMemoryAt != 0 && !ReferenceEquals(firstOptions, provider.GetRequiredService<UnifiedTableStorageOptions>()))
+            wrong.Add($"{what}: the registered Azure options are not the first call's");
+        foreach (var (type, name) in new[] { (typeof(UnifiedTableStorageOptions), "options"), (typeof(StorageOptions), "neutral options"), (typeof(IStorage<>), "IStorage<>"), (typeof(TableServiceClient), "TableServiceClient"), (typeof(IMemoryCache), "IMemoryCache") })
         {
             var count = services.Count(d => !d.IsKeyedService && d.ServiceType == type);
             if (count > 1)

@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>Unified.Data.Tables.Core</PackageId>
+    <RootNamespace>Unified.Data.Tables</RootNamespace>
+    <AssemblyName>Unified.Data.Tables.Core</AssemblyName>
+    <Description>Shared core of the Unified.Data.Tables storage providers: the reflection-based object-graph serializer (nested types, JSON/GZip fallback, an oversized-cell policy), the lossless large-value layout ([TableValueSplit] cells, continuation rows, blob offload behind IOffloadBlobStore), the row and request size planners, the filter translator, the type discriminators, the cache policy and the provider-neutral StorageOptions. Every provider (Azure Table Storage, in-memory) builds on it, so they store and read exactly the same rows. Uses the Azure.Data.Tables row types, but has no network or Azure.Storage.Blobs dependency. Not meant to be referenced directly: reference a provider package.</Description>
+    <PackageTags>azure;table-storage;repository;storage;serialization;nosql</PackageTags>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <!-- The abstractions share internal plumbing with this assembly (InternalsVisibleTo), so the package depends on exactly the same version of them. See Directory.Build.targets. -->
+    <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- The row types only (TableEntity, ETag): nothing here opens a connection. -->
+  <ItemGroup>
+    <PackageReference Include="Azure.Data.Tables" Version="12.11.0" />
+  </ItemGroup>
+
+  <!-- The Azure provider is built on this assembly's internals (the split codec and row layout, the value
+       offload coordinator, the serializer's metadata) and the in-memory one on its hidden provider SPI
+       (Unified.Data.Tables.Providers), which is why each of them pins this package to exactly its own
+       version. The test project exercises the same internals directly. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables" />
+    <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
+  </ItemGroup>
+
+</Project>

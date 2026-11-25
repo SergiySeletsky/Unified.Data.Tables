@@ -14,7 +14,7 @@ namespace Unified.Data.Tables;
 /// <param name="blobs">The blob store; null when blob offload is not configured.</param>
 /// <param name="options">The offload settings; null when blob offload is not configured.</param>
 /// <param name="tableName">The store's resolved table name, the first segment of every blob name.</param>
-internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, BlobOffloadOptions? options, string tableName)
+internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, OffloadOptions? options, string tableName)
 {
     /// <summary>The service limit on a blob name.</summary>
     internal const int MaxBlobNameLength = 1_024;

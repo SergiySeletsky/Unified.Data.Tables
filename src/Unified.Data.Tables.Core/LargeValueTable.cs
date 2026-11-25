@@ -93,7 +93,7 @@ public sealed class LargeValueTable
     /// <param name="blobs">The blob store; ignored (treated as null) when <paramref name="options"/> is null.</param>
     /// <exception cref="ArgumentException"><paramref name="tableName"/> is null or whitespace.</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public LargeValueTable(string tableName, BlobOffloadOptions? options, IOffloadBlobStore? blobs)
+    public LargeValueTable(string tableName, OffloadOptions? options, IOffloadBlobStore? blobs)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
         this.tableName = tableName;
@@ -126,7 +126,7 @@ public sealed class LargeValueTable
     /// <exception cref="ArgumentException"><paramref name="tableName"/> is null or whitespace.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="entityType"/> is null.</exception>
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public LargeValueTable(string tableName, BlobOffloadOptions? options, IOffloadBlobStore? blobs, Type entityType)
+    public LargeValueTable(string tableName, OffloadOptions? options, IOffloadBlobStore? blobs, Type entityType)
         : this(tableName, options, blobs)
     {
         ArgumentNullException.ThrowIfNull(entityType);
@@ -546,7 +546,7 @@ public sealed class LargeValueTable
     /// table, or to another row key, still references the source row's blobs; such a path belongs to the
     /// source row, so it goes to <paramref name="onForeign"/> and is left alone. Each delete is
     /// conditional on the blob not having been modified within
-    /// <see cref="BlobOffloadOptions.CleanupGrace"/> before <paramref name="serviceNow"/>, so a blob a
+    /// <see cref="OffloadOptions.CleanupGrace"/> before <paramref name="serviceNow"/>, so a blob a
     /// concurrent writer has just touched survives; a grace that reaches back beyond the start of the
     /// calendar (<see cref="TimeSpan.MaxValue"/>) makes no blob old enough, so nothing is deleted. Best
     /// effort: a failure goes to <paramref name="onFailure"/>.
@@ -800,7 +800,7 @@ public sealed class LargeValueTable
     /// blobs stored under it that no row of the partition references NOW: a row another writer created
     /// while the partition was being deleted survives the delete, and keeps its blobs however long the
     /// delete took. A blob is a candidate when it was not modified within
-    /// <see cref="BlobOffloadOptions.CleanupGrace"/> (younger ones are left for the orphan sweep; a grace
+    /// <see cref="OffloadOptions.CleanupGrace"/> (younger ones are left for the orphan sweep; a grace
     /// that reaches back beyond the start of the calendar leaves them all) and its name has the exact
     /// offload shape (<see cref="OffloadBlobNames.IsOffloadBlobName"/>). The blobs are listed first; the
     /// rows are read (once, through <paramref name="partitionRows"/>) only when some blob is old enough;
@@ -883,7 +883,7 @@ public sealed class LargeValueTable
     /// is older than <paramref name="olderThan"/>, each on condition that it was not modified since it
     /// was listed. The blobs are listed first; the rows are read (once, through
     /// <paramref name="partitionRows"/>) only when some blob is old enough. Rows are never changed.
-    /// <see cref="BlobOffloadOptions.CleanupGrace"/> does not apply: <paramref name="olderThan"/> is the age.
+    /// <see cref="OffloadOptions.CleanupGrace"/> does not apply: <paramref name="olderThan"/> is the age.
     /// </summary>
     /// <param name="partitionKey">The partition, already normalized as the store stores it.</param>
     /// <param name="olderThan">The minimum age of a deleted blob; not negative.</param>

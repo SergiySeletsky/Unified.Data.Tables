@@ -2,92 +2,47 @@ namespace Unified.Data.Tables;
 
 /// <summary>
 /// Behavioural options for the unified table-storage layer, configured at registration time via
-/// <c>AddUnifiedTableStorage(o =&gt; ...)</c>. Cache policy is a DEPLOYMENT concern, not an entity
-/// concern — the same entity type may be cached in one host and uncached in another process that
-/// shares its tables — which is why it lives here and not in an attribute on the entity.
+/// <c>AddUnifiedTableStorage(o =&gt; ...)</c>. The provider-neutral settings (cache policy, oversized
+/// cells, id normalization, table names, the type discriminator) are declared on
+/// <see cref="StorageOptions"/>, which the other providers take as it is; this type adds what only the
+/// Azure provider has.
 /// </summary>
-public sealed class UnifiedTableStorageOptions
+public sealed class UnifiedTableStorageOptions : StorageOptions
 {
-    private readonly Dictionary<Type, CachePolicy> overrides = [];
-
-    /// <summary>
-    /// Default cache policy for all entity types. Defaults to <c>CachePolicy.Sliding(1h)</c> —
-    /// the historical 0.2.x behaviour.
-    /// </summary>
-    public CachePolicy Cache { get; set; } = CachePolicy.Sliding(TimeSpan.FromHours(1));
-
-    /// <summary>
-    /// What happens when a serialized payload exceeds the 64 KB cell cap even compressed —
-    /// see <see cref="OversizedCellPolicy"/>. Default: <see cref="OversizedCellPolicy.Throw"/>.
-    /// For lossless storage of large values, opt a property in with <see cref="TableValueSplitAttribute"/>
-    /// and configure <see cref="BlobOffload"/>; nothing is trimmed. Applied to the (static) serializer at registration time.
-    /// </summary>
-    public OversizedCellPolicy OversizedCells { get; set; } = OversizedCellPolicy.Throw;
-
-    /// <summary>
-    /// How ids and partition/prefix arguments are treated before hitting the table — see
-    /// <see cref="IdNormalization"/>. Default: <see cref="IdNormalization.Normalized"/> (trim,
-    /// spaces to '-', lower-case). Use <see cref="IdNormalization.AsWritten"/> for tables whose
-    /// keys are case-sensitive payloads or pre-existing data written by another layer.
-    /// </summary>
-    public IdNormalization IdNormalization { get; set; } = IdNormalization.Normalized;
-
-    /// <summary>
-    /// Pre-0.6.0 compatibility switch. Since 0.6.0, <see cref="ConcurrencyMode.Auto"/> with no
-    /// caller-supplied ETag throws — there is no version to check, and silently writing
-    /// unconditionally is lost-update territory. Setting this to <c>true</c> restores the 0.5.x
-    /// fallback (unconditional last-writer-wins replace, with a warning log) as a migration
-    /// cushion. Prefer spelling the intent explicitly with
-    /// <see cref="ConcurrencyMode.LastWriterWins"/> and leaving this off.
-    /// </summary>
-    public bool ImplicitLastWriterWins { get; set; }
-
     /// <summary>
     /// Blob offload for large values (<see cref="TableValueSplitAttribute"/> values too large for table
     /// rows, and every <see cref="TableBlobContent"/>). <c>null</c> (the default) disables it: such a
     /// value throws <see cref="OversizedValueException"/> instead. Types with neither are unaffected.
+    /// It is the same instance as <see cref="StorageOptions.Offload"/>, under its Azure type.
     /// </summary>
-    public BlobOffloadOptions? BlobOffload { get; set; }
-
-    /// <summary>
-    /// Overrides the table name, which otherwise defaults to <c>typeof(T).Name</c>.
-    ///
-    /// Two cases the default cannot serve. A multi-tenant host that wants a table per tenant has no
-    /// seam to express it — every <c>IStorage&lt;T&gt;</c> for the same <c>T</c> lands in one table
-    /// regardless of who is asking. And "delete everything for tenant X" becomes O(n) delete
-    /// transactions rather than a single <c>DeleteTableAsync</c>, which is both far slower and, for
-    /// anyone with an erasure obligation, far harder to prove complete.
-    ///
-    /// Return a valid Azure table name (alphanumeric, 3-63 chars, starting with a letter); the
-    /// service rejects anything else. <c>null</c> keeps the existing behaviour exactly.
-    /// </summary>
-    public Func<Type, string>? TableNameResolver { get; set; }
+    public BlobOffloadOptions? BlobOffload
+    {
+        get => (BlobOffloadOptions?)Offload;
+        set => Offload = value;
+    }
 
     /// <summary>
     /// Override the cache policy for one entity type (e.g. disable for high-churn types or
     /// huge partitions).
     /// </summary>
-    public UnifiedTableStorageOptions CacheFor<T>(CachePolicy policy) where T : class, IEntity, new()
+    public new UnifiedTableStorageOptions CacheFor<T>(CachePolicy policy) where T : class, IEntity, new()
     {
-        ArgumentNullException.ThrowIfNull(policy);
-        overrides[typeof(T)] = policy;
+        base.CacheFor<T>(policy);
         return this;
     }
 
-    internal CachePolicy ResolveCachePolicy(Type entityType) =>
-        overrides.TryGetValue(entityType, out var policy) ? policy : Cache;
-
     /// <summary>
-    /// How <see cref="IPolymorphicStorage{TBase}"/> maps types to the stored discriminator. Null
-    /// selects <see cref="AssemblyQualifiedTypeDiscriminator"/>, which writes exactly what
-    /// <c>persistType: true</c> has always written — so an existing table is readable with no
-    /// migration. Prefer a <see cref="TypeDiscriminatorMap"/> for new tables; see
-    /// <see cref="ITypeDiscriminator"/> for why.
+    /// The Azure provider reads its offload settings as <see cref="BlobOffloadOptions"/> (they carry the
+    /// blob service client), so a plain <see cref="OffloadOptions"/> is refused here instead of being
+    /// silently ignored.
     /// </summary>
-    public ITypeDiscriminator? TypeDiscriminator { get; set; }
-
-    // Null means "the legacy-compatible default", not "no discriminator" — a polymorphic store
-    // without one could not read or write a type at all.
-    internal ITypeDiscriminator ResolveTypeDiscriminator() =>
-        TypeDiscriminator ?? AssemblyQualifiedTypeDiscriminator.Instance;
+    /// <param name="value">The value being assigned; null disables offload.</param>
+    /// <exception cref="ArgumentException"><paramref name="value"/> is not a <see cref="BlobOffloadOptions"/>.</exception>
+    private protected override void ValidateOffload(OffloadOptions? value)
+    {
+        if (value is not (null or BlobOffloadOptions))
+            throw new ArgumentException(
+                $"{nameof(UnifiedTableStorageOptions)}.{nameof(Offload)} takes a {nameof(BlobOffloadOptions)} (set {nameof(BlobOffload)}): a plain {nameof(OffloadOptions)} does not say which blob service holds the values.",
+                nameof(value));
+    }
 }

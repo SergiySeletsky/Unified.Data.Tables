@@ -18,9 +18,11 @@
     <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
-  <!-- Internal paging-cursor plumbing is shared with the two implementation assemblies. The test
-       project also needs PolymorphicMessages for the fake/real message-parity assertion. -->
+  <!-- Internal paging-cursor plumbing is shared with the two implementation assemblies, and the core
+       they are built on uses the same internal helpers. The test project also needs PolymorphicMessages
+       for the fake/real message-parity assertion. -->
   <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables.Core" />
     <InternalsVisibleTo Include="Unified.Data.Tables" />
     <InternalsVisibleTo Include="Unified.Data.Tables.InMemory" />
     <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />

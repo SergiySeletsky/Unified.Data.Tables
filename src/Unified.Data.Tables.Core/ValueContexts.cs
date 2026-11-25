@@ -11,7 +11,7 @@ namespace Unified.Data.Tables;
 /// <param name="ForceOffload">Flattened base columns that must be offloaded whatever their size.</param>
 /// <param name="IsClone">(Named IsClone because a record cannot declare a member called Clone.) True for an in-process copy: no thresholds, values stay an unbounded logical bag.</param>
 internal sealed record ValueWriteContext(
-    BlobOffloadOptions? Offload,
+    OffloadOptions? Offload,
     string? TableName,
     IReadOnlySet<string> ForceOffload,
     bool IsClone)

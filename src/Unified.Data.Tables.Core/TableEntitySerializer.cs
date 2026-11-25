@@ -39,7 +39,7 @@ public static class TableEntitySerializer
     /// Process-wide policy for payloads that exceed the 64 KB cell cap even compressed — see
     /// <see cref="Unified.Data.Tables.OversizedCellPolicy"/>. The serializer is static, so this is
     /// static too; <c>AddUnifiedTableStorage</c> applies
-    /// <see cref="UnifiedTableStorageOptions.OversizedCells"/> here.
+    /// <see cref="StorageOptions.OversizedCells"/> here.
     /// </summary>
     public static OversizedCellPolicy OversizedCellPolicy { get; set; } = OversizedCellPolicy.Throw;
 

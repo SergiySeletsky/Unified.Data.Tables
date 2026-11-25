@@ -11,12 +11,19 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
-    <!-- Binds to the main package's hidden provider SPI (Unified.Data.Tables.Providers) and the abstractions' internals, which may change in any minor version: depend on exactly the same version. See Directory.Build.targets. -->
+    <!-- Binds to the core package's hidden provider SPI (Unified.Data.Tables.Providers) and internals, and to the abstractions' internals, which may change in any minor version: depend on exactly the same version. See Directory.Build.targets. -->
     <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
   </PropertyGroup>
 
+  <!-- The core, not the Azure provider: the fake stores the same rows through the same serializer, with
+       no Azure.Storage.Blobs and no Azure provider package in its closure. -->
   <ItemGroup>
-    <ProjectReference Include="..\Unified.Data.Tables\Unified.Data.Tables.csproj" />
+    <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
+    <ProjectReference Include="..\Unified.Data.Tables.Core\Unified.Data.Tables.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
   </ItemGroup>
 
   <!-- InMemoryOffloadBlobStore's Seed/Tamper/Remove/Names let the tests stage blob states directly. -->

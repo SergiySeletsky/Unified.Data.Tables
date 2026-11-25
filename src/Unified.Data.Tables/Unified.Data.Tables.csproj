@@ -11,12 +11,13 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
-    <!-- The abstractions share internal plumbing with this assembly (InternalsVisibleTo), so the package depends on exactly the same version of them. See Directory.Build.targets. -->
+    <!-- The abstractions and the core share internal plumbing with this assembly (InternalsVisibleTo), so the package depends on exactly the same version of them. See Directory.Build.targets. -->
     <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
+    <ProjectReference Include="..\Unified.Data.Tables.Core\Unified.Data.Tables.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -12,22 +12,22 @@ public static class InMemoryServiceCollectionExtensions
     /// Registers the open-generic <see cref="IStorage{T}"/> → <see cref="InMemoryStorage{T}"/>
     /// mapping as singletons — a drop-in replacement for <c>AddUnifiedTableStorage</c> in tests,
     /// dev mode, or offline scenarios. No Azure connection is required. Pass
-    /// <paramref name="configure"/> to apply the same <see cref="UnifiedTableStorageOptions"/> the
+    /// <paramref name="configure"/> to apply the same <see cref="StorageOptions"/> the
     /// production registration uses (id normalization, oversized-cell policy), so the fake stays
     /// behaviourally in step with <c>TableStorage&lt;T&gt;</c>.
     /// </summary>
     public static IServiceCollection AddUnifiedInMemoryStorage(
-        this IServiceCollection services, Action<UnifiedTableStorageOptions>? configure = null)
+        this IServiceCollection services, Action<StorageOptions>? configure = null)
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        var options = new UnifiedTableStorageOptions();
+        var options = new StorageOptions();
         configure?.Invoke(options);
 
         // First-registration-wins, mirroring AddUnifiedTableStorage: the fake round-trips through
         // the same (static) serializer, so it applies the same process-wide policy. Only an unkeyed
         // registration counts, as for TryAddSingleton: a keyed one of the host is never what a store receives.
-        var optionsAlreadyRegistered = services.Any(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions));
+        var optionsAlreadyRegistered = KeepRegisteredOptions(services);
         if (!optionsAlreadyRegistered)
             TableEntitySerializer.OversizedCellPolicy = options.OversizedCells;
 
@@ -44,8 +44,8 @@ public static class InMemoryServiceCollectionExtensions
     /// </summary>
     /// <remarks>
     /// Pass <paramref name="configure"/> whenever production configures an
-    /// <see cref="UnifiedTableStorageOptions.TypeDiscriminator"/>. Without it the fake resolves the
-    /// registered <see cref="UnifiedTableStorageOptions"/>, and a test host that registers ONLY this
+    /// <see cref="StorageOptions.TypeDiscriminator"/>. Without it the fake resolves the
+    /// registered <see cref="StorageOptions"/>, and a test host that registers ONLY this
     /// (no <see cref="AddUnifiedInMemoryStorage"/>) has none — so it silently falls back to
     /// <c>AssemblyQualifiedTypeDiscriminator</c> while production uses a
     /// <c>TypeDiscriminatorMap</c>. Nothing fails; the tokens simply differ, in the one place no
@@ -56,38 +56,56 @@ public static class InMemoryServiceCollectionExtensions
     /// <param name="tableName">The logical table name; also the DI key.</param>
     /// <param name="configure">
     /// Options for this table only. Null resolves the registered
-    /// <see cref="UnifiedTableStorageOptions"/>, or the defaults when none is registered.
+    /// <see cref="StorageOptions"/>, or the defaults when none is registered.
     /// </param>
     /// <returns>The service collection, for chaining.</returns>
     public static IServiceCollection AddUnifiedInMemoryPolymorphicTable<TBase>(
         this IServiceCollection services,
         string tableName,
-        Action<UnifiedTableStorageOptions>? configure = null)
+        Action<StorageOptions>? configure = null)
         where TBase : class
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
 
         var local = Configured(configure);
+        if (local is null)
+            KeepRegisteredOptions(services);
 
         // The table name reaches the store, not just the DI key: it is what DuplicateKeyException
         // names, and the fake must name the same string the Azure store would.
         services.TryAddKeyedSingleton<IPolymorphicStorage<TBase>>(tableName, (sp, _) =>
             new InMemoryPolymorphicStorage<TBase>(
-                tableName, local ?? sp.GetService<UnifiedTableStorageOptions>()));
+                tableName, local ?? sp.GetService<StorageOptions>()));
 
         return services;
+    }
+
+    // True when options are already registered (unkeyed), so the caller's own are not the ones the stores
+    // are given. Options the host or another provider registered under a type of their own that derives
+    // from StorageOptions (the Azure provider's UnifiedTableStorageOptions, which this package can no
+    // longer name) count, as they did while that was the one options type: they are then also registered
+    // as StorageOptions, the type the in-memory stores resolve, so the stores still receive them.
+    private static bool KeepRegisteredOptions(IServiceCollection services)
+    {
+        if (services.Any(d => !d.IsKeyedService && d.ServiceType == typeof(StorageOptions)))
+            return true;
+        var derived = services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType.IsSubclassOf(typeof(StorageOptions)))?.ServiceType;
+        if (derived is null)
+            return false;
+        services.AddSingleton(sp => (StorageOptions)sp.GetRequiredService(derived));
+        return true;
     }
 
     // A per-table options instance rather than a registration: the discriminator is the only setting
     // a polymorphic store reads, and one table's type map has no business becoming the process-wide
     // default that every IStorage<T> also resolves.
-    private static UnifiedTableStorageOptions? Configured(Action<UnifiedTableStorageOptions>? configure)
+    private static StorageOptions? Configured(Action<StorageOptions>? configure)
     {
         if (configure is null)
             return null;
 
-        var options = new UnifiedTableStorageOptions();
+        var options = new StorageOptions();
         configure(options);
         return options;
     }

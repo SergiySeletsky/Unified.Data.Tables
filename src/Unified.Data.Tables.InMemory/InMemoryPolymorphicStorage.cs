@@ -12,7 +12,7 @@ namespace Unified.Data.Tables.InMemory;
 /// production serialization rather than object identity.
 /// </summary>
 /// <remarks>
-/// Semantics mirror <see cref="PolymorphicTableStorage{TBase}"/>: keys used verbatim and
+/// Semantics mirror <c>PolymorphicTableStorage&lt;TBase&gt;</c>: keys used verbatim and
 /// case-sensitively, 409 on duplicate insert AND 400 <c>InvalidDuplicateRow</c> on a key repeated
 /// within one batch both surfaced as <see cref="DuplicateKeyException"/>, 404 on merging a missing
 /// row, idempotent delete, lexical (PartitionKey, RowKey) ordering, a null
@@ -40,7 +40,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
 
     /// <summary>Creates a store with explicit options and a <typeparamref name="TBase"/>-derived name.</summary>
     /// <param name="options">Options; null selects the defaults.</param>
-    public InMemoryPolymorphicStorage(UnifiedTableStorageOptions? options)
+    public InMemoryPolymorphicStorage(StorageOptions? options)
         : this(typeof(TBase).Name, options)
     {
     }
@@ -49,7 +49,7 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     /// <remarks>
     /// The name is not used to route anything — this store holds one dictionary — but it IS what
     /// <see cref="DuplicateKeyException.EntityType"/> and the duplicate-key message report, and
-    /// <see cref="PolymorphicTableStorage{TBase}"/> reports its table name there. Without it the two
+    /// <c>PolymorphicTableStorage&lt;TBase&gt;</c> reports its table name there. Without it the two
     /// could never agree: a polymorphic table name is always explicit and
     /// <typeparamref name="TBase"/> is always a base type, so <c>typeof(TBase).Name</c> is guaranteed
     /// to be the wrong string. The two nameless overloads fall back to it for tests that never
@@ -58,13 +58,13 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     /// <param name="tableName">The table this store stands in for; also what its errors name.</param>
     /// <param name="options">Options; null selects the defaults.</param>
     /// <exception cref="ArgumentException"><paramref name="tableName"/> is null, empty or whitespace.</exception>
-    public InMemoryPolymorphicStorage(string tableName, UnifiedTableStorageOptions? options = null)
+    public InMemoryPolymorphicStorage(string tableName, StorageOptions? options = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
 
         this.tableName = tableName;
 
-        // UnifiedTableStorageOptions.ResolveTypeDiscriminator() is internal to Unified.Data.Tables,
+        // StorageOptions.ResolveTypeDiscriminator() is internal to Unified.Data.Tables.Core,
         // which does not (and per the design must not) grant this project InternalsVisibleTo — so
         // the null-coalescing default is duplicated here against the public TypeDiscriminator
         // property instead of calling the internal helper.

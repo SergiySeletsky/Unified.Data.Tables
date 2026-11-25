@@ -138,7 +138,8 @@ public static partial class ServiceCollectionExtensions
         // register also applies the policy, so a later bare AddUnifiedTableStorage() from another
         // module cannot silently reset an explicitly configured policy. Only an unkeyed registration
         // counts, as for TryAddSingleton: a keyed one of the host is never what a store receives.
-        var optionsAlreadyRegistered = services.Any(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions));
+        // The options another provider registered first (as StorageOptions, the in-memory one) count too.
+        var optionsAlreadyRegistered = RegisteredOptions(services) is not null;
         if (!optionsAlreadyRegistered)
         {
             TableEntitySerializer.OversizedCellPolicy = options.OversizedCells;
@@ -154,13 +155,14 @@ public static partial class ServiceCollectionExtensions
             // blob offload and choose no client does this call supply one, by its own rule (dropping it
             // left every large-value store unresolvable).
             var registered = RegisteredOptions(services);
-            if (registered?.ImplementationInstance is UnifiedTableStorageOptions known)
+            if (registered?.ImplementationInstance is StorageOptions known)
             {
                 // Options registered as an instance can be read now. Their ServiceClient needs no
                 // registration (TableStorage<T> takes it from them); UseRegisteredServiceClient means the
-                // host's client and no other one, so this call derives nothing.
-                if (known.BlobOffload is { ServiceClient: null } offload)
-                    RegisterOffloadClient(services, offload.UseRegisteredServiceClient
+                // host's client and no other one, so this call derives nothing. Offload options without
+                // the Azure part (another provider's) name no client and do not ask for the host's.
+                if (known.Offload is { } asked && asked is not BlobOffloadOptions { ServiceClient: not null })
+                    RegisterOffloadClient(services, asked is BlobOffloadOptions { UseRegisteredServiceClient: true }
                         ? HostsClient
                         : SuppliedClient(options.BlobOffload, derivedBlobClient));
             }
@@ -175,15 +177,22 @@ public static partial class ServiceCollectionExtensions
 
         services.AddMemoryCache();
         services.TryAddSingleton(options);
+        // The same options under their provider-neutral type, which is the one a provider that does not
+        // reference this package (the in-memory one) registers and resolves: registered after this call,
+        // it keeps these options, as it did while both providers shared one options type.
+        services.TryAddSingleton<StorageOptions>(sp => sp.GetRequiredService<UnifiedTableStorageOptions>());
         services.TryAddSingleton(typeof(IStorage<>), typeof(TableStorage<>));
         return services;
     }
 
     // The registration of the options TableStorage<T> will be given: the last unkeyed one, as the
     // container resolves it. Its instance is null when the host registered them as a type or a factory,
-    // which cannot be read before the container is built.
+    // which cannot be read before the container is built. Without one, the options a provider that
+    // does not reference this package registered before this call (as StorageOptions): they were the
+    // first registration while the providers shared one options type, and still are.
     private static ServiceDescriptor? RegisteredOptions(IServiceCollection services) =>
-        services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions));
+        services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions))
+        ?? services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(StorageOptions));
 
     // Whether a call has already registered the offload client (an instance, or the factory that
     // resolves the host's client): that choice is kept, so a later call never replaces it.
