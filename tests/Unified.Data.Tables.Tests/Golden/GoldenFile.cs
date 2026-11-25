@@ -60,11 +60,13 @@ internal static class GoldenFile
     /// <summary>The checked-in file <paramref name="name"/> with <c>\n</c> line ends, or null when there is none.</summary>
     internal static string? ReadOrNull(string name)
     {
-        // The copy next to the test assembly; while a new case is being generated, the source tree,
-        // where the other target framework may just have written it.
-        var path = Path.Combine(AppContext.BaseDirectory, "Golden", "Data", name.Replace('/', Path.DirectorySeparatorChar));
-        if (!File.Exists(path) && Writing)
-            path = SourcePath(name);
+        // The checked-in file in the source tree, not the copy next to the test assembly: a build copies
+        // new files there but never removes one, so a golden file deleted from the tree would keep passing
+        // from a stale copy. Only a run without the source tree (a published test folder) reads the copy.
+        var relative = name.Replace('/', Path.DirectorySeparatorChar);
+        var path = SourceDataDirectory() is { } source
+            ? Path.Combine(source, relative)
+            : Path.Combine(AppContext.BaseDirectory, "Golden", "Data", relative);
         // A checkout may turn line ends into CRLF; no value holds a raw line break (they are JSON-escaped).
         return File.Exists(path) ? File.ReadAllText(path, Utf8NoBom).Replace("\r\n", "\n", StringComparison.Ordinal) : null;
     }
@@ -85,15 +87,21 @@ internal static class GoldenFile
         }
     }
 
-    private static string SourcePath(string name)
+    private static string SourcePath(string name) =>
+        Path.Combine(
+            SourceDataDirectory() ?? throw new InvalidOperationException("The source tree was not found above " + AppContext.BaseDirectory + "."),
+            name.Replace('/', Path.DirectorySeparatorChar));
+
+    /// <summary><c>Golden/Data</c> in the source tree this test assembly was built from, or null when it is not there.</summary>
+    internal static string? SourceDataDirectory()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
         {
             var project = Path.Combine(dir.FullName, "tests", "Unified.Data.Tables.Tests");
             if (Directory.Exists(project) && File.Exists(Path.Combine(dir.FullName, "Unified.Data.Tables.slnx")))
-                return Path.Combine(project, "Golden", "Data", name.Replace('/', Path.DirectorySeparatorChar));
+                return Path.Combine(project, "Golden", "Data");
         }
-        throw new InvalidOperationException("The source tree was not found above " + AppContext.BaseDirectory + ".");
+        return null;
     }
 
     private static string FirstDifference(string expected, string actual)

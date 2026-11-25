@@ -18,8 +18,10 @@ internal sealed class OrphanBlobSweepTarget<T> : IOrphanBlobSweepTarget where T 
 {
     public Type EntityType => typeof(T);
 
+    // Through the capability probe: a decorator registered as the IStorage<T> is swept through the
+    // store it wraps, and never claims a sweep that store lacks.
     public IOrphanBlobSweeper? Resolve(IServiceProvider services) =>
-        services.GetRequiredService<IStorage<T>>() as IOrphanBlobSweeper;
+        services.GetRequiredService<IStorage<T>>().TryGetCapability<T, IOrphanBlobSweeper>(out var sweeper) ? sweeper : null;
 }
 
 /// <summary>

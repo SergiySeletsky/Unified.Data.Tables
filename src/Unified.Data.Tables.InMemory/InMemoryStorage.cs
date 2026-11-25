@@ -527,6 +527,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
     public Task<EntityPage<T>> QueryPageAsync(QueryOptions options, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(options);
+        options.ThrowIfRowKeyRangeNotImplemented(nameof(InMemoryStorage<T>));
 
         var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition); // match stored (normalized) PartitionKeys
         var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : NormalizeId(options.RowKeyPrefix); // stored RowKeys are normalized too
@@ -799,6 +800,7 @@ public sealed partial class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper
 
     private IEnumerable<KeyValuePair<(string PartitionKey, string RowKey), StoredRow>> Bounded(QueryOptions options)
     {
+        options.ThrowIfRowKeyRangeNotImplemented(nameof(InMemoryStorage<T>));
         var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition); // match stored (normalized) PartitionKeys
         var rowKeyPrefix = string.IsNullOrWhiteSpace(options.RowKeyPrefix) ? null : NormalizeId(options.RowKeyPrefix); // stored RowKeys are normalized too
 

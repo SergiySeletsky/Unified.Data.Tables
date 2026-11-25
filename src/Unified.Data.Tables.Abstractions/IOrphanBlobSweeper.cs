@@ -63,7 +63,8 @@ public interface IOrphanBlobSweeper
 
 /// <summary>
 /// <see cref="IOrphanBlobSweeper"/> on an <see cref="IStorage{T}"/>: forwards to the store when it
-/// implements the capability and throws <see cref="NotSupportedException"/> otherwise.
+/// implements the capability (or, for a decorator that answers <see cref="IStorageCapabilities"/>, when
+/// the store it wraps does) and throws <see cref="NotSupportedException"/> otherwise.
 /// </summary>
 public static class OrphanBlobSweeperExtensions
 {
@@ -103,8 +104,11 @@ public static class OrphanBlobSweeperExtensions
     private static IOrphanBlobSweeper Sweeper<T>(IStorage<T> storage) where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
-        return storage as IOrphanBlobSweeper
-            ?? throw new NotSupportedException($"{storage.GetType().FullName} does not implement {nameof(IOrphanBlobSweeper)}.");
+        // Through the capability probe, so a decorator (DelegatingStorage<T>) sweeps the store it wraps
+        // and one over a store without the capability does not claim it.
+        return storage.TryGetCapability<T, IOrphanBlobSweeper>(out var sweeper)
+            ? sweeper
+            : throw new NotSupportedException($"{storage.GetType().FullName} does not implement {nameof(IOrphanBlobSweeper)}.");
     }
 }
 

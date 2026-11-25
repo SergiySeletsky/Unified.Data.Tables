@@ -23,6 +23,82 @@ public sealed record QueryOptions
     public string? RowKeyPrefix { get; init; }
 
     /// <summary>
+    /// Lower bound of a RowKey range within <see cref="Partition"/>: only rows whose RowKey is at or after
+    /// it (after it, when <see cref="FromInclusive"/> is false) are returned. <c>null</c> (the default)
+    /// means no lower bound; any other value, the empty string included, is a bound.
+    /// </summary>
+    /// <remarks>
+    /// A range (this property or <see cref="ToRowKey"/>) needs <see cref="Partition"/> and cannot be
+    /// combined with <see cref="RowKeyPrefix"/>; either mistake throws <see cref="ArgumentException"/>
+    /// (see <see cref="ValidateRowKeyRange"/>). A bound is normalized the way the store normalizes ids
+    /// (see <see cref="RowKeyPrefix"/>; used as written under <c>IdNormalization.AsWritten</c>) and
+    /// compared with the stored RowKeys in the table's key order, so pick bounds that are already in
+    /// stored form when the order matters. A range whose lower bound is above its upper bound is empty.
+    /// <para>
+    /// Every provider of this library honors the bounds. An <see cref="IStorage{T}"/> implementation
+    /// compiled against 0.9.2 or earlier does not know them and ignores them: it returns the whole
+    /// partition (or the <see cref="Take"/> first rows of it).
+    /// </para>
+    /// </remarks>
+    public string? FromRowKey { get; init; }
+
+    /// <summary>
+    /// Whether a row whose RowKey equals <see cref="FromRowKey"/> is returned. Default <c>true</c>;
+    /// ignored while <see cref="FromRowKey"/> is <c>null</c>.
+    /// </summary>
+    public bool FromInclusive { get; init; } = true;
+
+    /// <summary>
+    /// Upper bound of a RowKey range within <see cref="Partition"/>: only rows whose RowKey is before it
+    /// (at or before it, when <see cref="ToInclusive"/> is true) are returned. <c>null</c> (the default)
+    /// means no upper bound. The rules of <see cref="FromRowKey"/> apply.
+    /// </summary>
+    public string? ToRowKey { get; init; }
+
+    /// <summary>
+    /// Whether a row whose RowKey equals <see cref="ToRowKey"/> is returned. Default <c>false</c>, so
+    /// consecutive ranges <c>[a, b)</c>, <c>[b, c)</c> never overlap; ignored while
+    /// <see cref="ToRowKey"/> is <c>null</c>.
+    /// </summary>
+    public bool ToInclusive { get; init; }
+
+    /// <summary>Whether a RowKey range is asked for: <see cref="FromRowKey"/> or <see cref="ToRowKey"/> is set.</summary>
+    public bool HasRowKeyRange => FromRowKey is not null || ToRowKey is not null;
+
+    /// <summary>
+    /// Checks the RowKey range the way every provider must before it runs the query: a range needs a
+    /// <see cref="Partition"/> and cannot be combined with <see cref="RowKeyPrefix"/>. Does nothing when
+    /// no bound is set.
+    /// </summary>
+    /// <exception cref="ArgumentException">
+    /// A bound is set and <see cref="Partition"/> is null or whitespace, or <see cref="RowKeyPrefix"/> is set too.
+    /// </exception>
+    public void ValidateRowKeyRange()
+    {
+        if (!HasRowKeyRange)
+            return;
+        if (string.IsNullOrWhiteSpace(Partition))
+            throw new ArgumentException(
+                "FromRowKey/ToRowKey require Partition — a cross-partition RowKey range is a full table scan wearing a filter.",
+                "options");
+        if (!string.IsNullOrWhiteSpace(RowKeyPrefix))
+            throw new ArgumentException(
+                "FromRowKey/ToRowKey cannot be combined with RowKeyPrefix: a prefix is itself a RowKey range. " +
+                "Express the prefix as bounds, or drop the bounds.",
+                "options");
+    }
+
+    // Until a provider implements the range (0.10.0 work in progress), it refuses a bounded query instead
+    // of returning the whole partition for it. Removed with the last provider's implementation.
+    internal void ThrowIfRowKeyRangeNotImplemented(string provider)
+    {
+        ValidateRowKeyRange();
+        if (HasRowKeyRange)
+            throw new NotSupportedException(
+                $"{provider} does not implement QueryOptions.FromRowKey/ToRowKey yet; the query was not run.");
+    }
+
+    /// <summary>
     /// Stop after this many entities. Bounds data transfer (page-size hinted), but note Azure
     /// Tables has no server-side "top N of the whole set" — results are always in lexical
     /// RowKey order, so "most recent N" requires order-encoding RowKeys. For
@@ -34,7 +110,7 @@ public sealed record QueryOptions
     /// <summary>
     /// Resume cursor from a prior <see cref="EntityPage{T}"/> — set only for
     /// <see cref="IStorage{T}.QueryPageAsync(QueryOptions, System.Threading.CancellationToken)"/>.
-    /// The token is opaque and bound to the query bounds (partition, RowKey prefix, page size) it was
+    /// The token is opaque and bound to the query bounds (partition, RowKey prefix or range, page size) it was
     /// issued for; replaying it against a different query throws. Leave <c>null</c> for the first page.
     /// </summary>
     public string? ContinuationToken { get; init; }

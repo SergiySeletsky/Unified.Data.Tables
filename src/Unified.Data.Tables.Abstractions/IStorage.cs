@@ -187,7 +187,7 @@ public interface IStorage<T> where T : class, IEntity, new()
     Task<IEnumerable<T>> QueryAsync(string? partition = null, CancellationToken ct = default);
 
     /// <summary>
-    /// Bounded query — partition scope, RowKey-prefix range, and/or Take. Unlike
+    /// Bounded query — partition scope, a RowKey prefix or a RowKey range (see <see cref="QueryOptions.FromRowKey"/>), and/or Take. Unlike
     /// <see cref="QueryAsync(string?, CancellationToken)"/>, results are never cached.
     /// </summary>
     /// <param name="options">The query bounds.</param>

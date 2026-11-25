@@ -667,6 +667,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     /// <inheritdoc />
     public IAsyncEnumerable<T> QueryStreamAsync(QueryOptions? options = null, CancellationToken ct = default)
     {
+        options?.ThrowIfRowKeyRangeNotImplemented(nameof(TableStorage<T>));
         var partition = string.IsNullOrWhiteSpace(options?.Partition) ? null : NormalizeId(options!.Partition);
         // Normalize the RowKey prefix too: writes normalize the whole id, so stored RowKeys are
         // normalized — a natural-form prefix would otherwise silently match nothing, exactly like an
@@ -778,6 +779,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     private async Task<EntityPage<T>> QueryPageCoreAsync(QueryOptions options, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(options);
+        options.ThrowIfRowKeyRangeNotImplemented(nameof(TableStorage<T>));
 
         var partition = string.IsNullOrWhiteSpace(options.Partition) ? null : NormalizeId(options.Partition);
         // Normalize the prefix to the stored form (see QueryStreamAsync); done BEFORE the fingerprint so
