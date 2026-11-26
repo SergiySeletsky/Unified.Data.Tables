@@ -14,6 +14,11 @@ namespace Unified.Data.Tables.Tests.Capabilities;
 /// refusal of the serializer that has nothing to do with size. The Azure provider and the row-store
 /// engine keep the same rule: anything thrown before the rows are sent restores the entities.
 /// </summary>
+/// <remarks>
+/// The oversized-cell row relies on the process-wide <c>TableEntitySerializer.OversizedCellPolicy</c>
+/// being <c>Throw</c>, so the class shares the collection of the tests that change it.
+/// </remarks>
+[Collection("OversizedCellPolicy")]
 public class AtomicBatchRefusalTests
 {
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
