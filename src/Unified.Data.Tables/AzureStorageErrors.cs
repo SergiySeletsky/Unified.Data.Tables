@@ -171,6 +171,56 @@ internal static class AzureStorageErrors
         ex.Status == 404 && (string.IsNullOrEmpty(ex.ErrorCode) || ex.ErrorCode is "ResourceNotFound" or "EntityNotFound");
 
     /// <summary>
+    /// Throws the service's 404 <c>TableNotFound</c> as a <see cref="RequestFailedException"/> (which
+    /// <see cref="Map"/> turns into <see cref="TableNotFoundException"/>) when <paramref name="response"/>
+    /// is one. The SDK returns, rather than throws, the 404 of a point read
+    /// (<c>GetEntityIfExistsAsync</c>) and of a delete (<c>DeleteEntityAsync</c>), whatever its code, so
+    /// without this check a table deleted behind the store reads as a missing row.
+    /// </summary>
+    internal static void ThrowIfTableMissing(Response? response)
+    {
+        if (IsTableMissing(response))
+            throw new RequestFailedException(response!);
+    }
+
+    /// <summary>The same check for a point read's answer: only an answer without a value can be the table's 404.</summary>
+    internal static void ThrowIfTableMissing<TValue>(NullableResponse<TValue>? response)
+    {
+        if (response is null || response.HasValue)
+            return;
+        Response? raw;
+#pragma warning disable CA1031 // an answer whose raw response cannot be read (a test double) names no table
+        try
+        {
+            raw = response.GetRawResponse();
+        }
+        catch (Exception)
+        {
+            return;
+        }
+#pragma warning restore CA1031
+        ThrowIfTableMissing(raw);
+    }
+
+    /// <summary>True for a 404 whose <c>x-ms-error-code</c> is <c>TableNotFound</c>; tolerates the responses of test doubles.</summary>
+    internal static bool IsTableMissing(Response? response)
+    {
+#pragma warning disable CA1031 // a response that cannot be read (a test double) is not a 404, and names no table
+        try
+        {
+            return response is not null
+                && response.Status == 404
+                && response.Headers.TryGetValue("x-ms-error-code", out var code)
+                && string.Equals(code, "TableNotFound", StringComparison.Ordinal);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+#pragma warning restore CA1031
+    }
+
+    /// <summary>
     /// <paramref name="source"/>, with every SDK failure its enumeration throws mapped by
     /// <paramref name="map"/>. The caller's token is the one the enumeration is cancelled with (the
     /// method's own, or the one given to <c>WithCancellation</c>): a cancellation under it is left as it is.

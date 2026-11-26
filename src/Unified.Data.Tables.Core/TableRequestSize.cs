@@ -41,7 +41,12 @@ public static class TableRequestSize
     /// </summary>
     public const long MaxTransactionEntityBytes = BatchPlanner.DefaultMaxBytes;
 
-    /// <summary>The service limit on one entity's stored size (1 MB), as <see cref="EstimateEntityBytes"/> measures it.</summary>
+    /// <summary>
+    /// The library's budget for one entity's stored size: 1,000,000 bytes as <see cref="EstimateEntityBytes"/>
+    /// measures it, a margin below the service's limit of 1 MiB (1,048,576 bytes). The providers plan split
+    /// rows within it, and the local providers refuse a row above it (400 <c>EntityTooLarge</c>), so they
+    /// are stricter than the service; the Azure provider sends a plain row as it is and the service decides.
+    /// </summary>
     public const long MaxEntityBytes = 1_000_000;
 
     /// <summary>The service limit on one entity's custom properties (252, besides PartitionKey, RowKey and Timestamp).</summary>

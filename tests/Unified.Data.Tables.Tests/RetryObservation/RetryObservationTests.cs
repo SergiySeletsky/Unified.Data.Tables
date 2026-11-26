@@ -181,12 +181,18 @@ public class RetryObservationTests
     }
 
     [Fact]
-    public async Task DeleteIfExists_OfARowInATableThatIsGone_IsNotFound_WhateverWasSent()
+    public async Task DeleteIfExists_OfARowInATableThatIsGone_IsTableNotFound_WhateverWasSent()
     {
+        // The SDK returns the 404 instead of throwing it; a table that is gone is still not a missing row
+        // (0.10.0, as on the local providers): TableNotFoundException, never NotFound or Indeterminate.
         Answer TableGone() => Failure(404, "TableNotFound");
 
-        Assert.Equal(DeleteStatus.NotFound, await Store(Scripted(Lost, TableGone)).DeleteIfExistsAsync("p|r", Ct));
-        Assert.Equal(DeleteStatus.NotFound, await Store(Scripted(TableGone), observe: false).DeleteIfExistsAsync("p|r", Ct));
+        var afterARetry = await Assert.ThrowsAsync<TableNotFoundException>(() => Store(Scripted(Lost, TableGone)).DeleteIfExistsAsync("p|r", Ct));
+        Assert.Equal("TableNotFound", afterARetry.ProviderErrorCode);
+        Assert.Equal(404, Assert.IsType<Azure.RequestFailedException>(afterARetry.InnerException).Status);
+        await Assert.ThrowsAsync<TableNotFoundException>(() => Store(Scripted(TableGone), observe: false).DeleteIfExistsAsync("p|r", Ct));
+        await Assert.ThrowsAsync<TableNotFoundException>(() => Store(Scripted(TableGone)).DeleteIfMatchAsync("p|r", V1, Ct));
+        await Assert.ThrowsAsync<TableNotFoundException>(() => Store(Scripted(TableGone)).DeleteAsync("p|r", Ct));
     }
 
     [Fact]

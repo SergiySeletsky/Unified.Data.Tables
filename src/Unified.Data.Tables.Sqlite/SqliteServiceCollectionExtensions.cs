@@ -56,6 +56,9 @@ public static class SqliteServiceCollectionExtensions
                 services.AddSingleton(sp => (StorageOptions)sp.GetRequiredService(derived));
         }
 
+        // This call's own options, never the host's: an in-memory registration made before this call does
+        // not take them for options the host registered for every store.
+        ProviderRegisteredOptions.MarkProviderOwned(options);
         services.TryAddSingleton(options);
         // The base type, for whatever resolves the provider-neutral options (a store given none of its
         // own, the Identity stores' registration).

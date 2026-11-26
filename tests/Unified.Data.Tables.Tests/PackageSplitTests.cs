@@ -411,6 +411,127 @@ public class PackageSplitTests
         Assert.Equal("created", entry.Discriminator);
     }
 
+    // The host registers its production options AFTER the in-memory call. On 0.9.2 the in-memory stores
+    // took that type, so the container handed them the host's options in any order; they still get them.
+    [Fact]
+    public async Task InMemoryRegistration_KeepsTheAzureOptionsTheHostRegisteredItself_AfterTheCall()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var before = TableEntitySerializer.OversizedCellPolicy;
+        try
+        {
+            var hosts = new UnifiedTableStorageOptions { IdNormalization = IdNormalization.AsWritten, ImplicitLastWriterWins = true };
+            var services = new ServiceCollection();
+            services.AddUnifiedInMemoryStorage();
+            services.AddSingleton(hosts);
+            using var provider = services.BuildServiceProvider();
+
+            Assert.Same(hosts, provider.GetRequiredService<StorageOptions>());
+            var store = provider.GetRequiredService<IStorage<TestEntity>>();
+            await store.CreateAsync(new TestEntity { Id = "Part|Row Key" }, ct);
+            var read = (await store.OneAsync("Part|Row Key", ct))!;
+            Assert.Null(await store.OneAsync("part|row-key", ct));
+            read.ETag = null;
+            await store.UpdateAsync(read, ct); // implicit last-writer-wins: no InvalidOperationException
+        }
+        finally
+        {
+            TableEntitySerializer.OversizedCellPolicy = before;
+        }
+    }
+
+    [Fact]
+    public async Task InMemoryPolymorphicTable_ResolvesTheDiscriminatorOfTheAzureOptionsTheHostRegistered_AfterTheCall()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var services = new ServiceCollection();
+        services.AddUnifiedInMemoryPolymorphicTable<TestMessage>("StateEventStore");
+        services.AddSingleton(new UnifiedTableStorageOptions { TypeDiscriminator = new TypeDiscriminatorMap().Map<TestCreatedEvent>("created") });
+        using var provider = services.BuildServiceProvider();
+
+        var store = provider.GetRequiredKeyedService<IPolymorphicStorage<TestMessage>>("StateEventStore");
+        var entry = await store.InsertAsync(new TableKey("p", "r"), new TestCreatedEvent { Id = "e1" }, ct);
+
+        Assert.Equal("created", entry.Discriminator);
+    }
+
+    [Fact]
+    public async Task InMemoryRegistrations_AfterTheHostsOptions_BothResolveThem()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var before = TableEntitySerializer.OversizedCellPolicy;
+        try
+        {
+            var hosts = new UnifiedTableStorageOptions
+            {
+                IdNormalization = IdNormalization.AsWritten,
+                TypeDiscriminator = new TypeDiscriminatorMap().Map<TestCreatedEvent>("created"),
+            };
+            var services = new ServiceCollection();
+            services.AddUnifiedInMemoryStorage();
+            services.AddUnifiedInMemoryPolymorphicTable<TestMessage>("StateEventStore");
+            services.AddSingleton(hosts);
+            using var provider = services.BuildServiceProvider();
+
+            var entry = await provider.GetRequiredKeyedService<IPolymorphicStorage<TestMessage>>("StateEventStore")
+                .InsertAsync(new TableKey("p", "r"), new TestCreatedEvent { Id = "e1" }, ct);
+            Assert.Equal("created", entry.Discriminator);
+            Assert.Same(hosts, provider.GetRequiredService<StorageOptions>());
+        }
+        finally
+        {
+            TableEntitySerializer.OversizedCellPolicy = before;
+        }
+    }
+
+    // A store registered by hand (no in-memory registration call) is constructed by the container, which
+    // passes the StorageOptions it has: the host registers its options under that type too (CHANGELOG B4).
+    [Fact]
+    public async Task AHandRegisteredInMemoryStore_GetsTheHostsOptions_WhenTheyAreAlsoRegisteredAsStorageOptions()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var hosts = new UnifiedTableStorageOptions
+        {
+            IdNormalization = IdNormalization.AsWritten,
+            TypeDiscriminator = new TypeDiscriminatorMap().Map<TestCreatedEvent>("created"),
+        };
+        var services = new ServiceCollection();
+        services.AddSingleton(hosts);
+        services.AddSingleton<StorageOptions>(sp => sp.GetRequiredService<UnifiedTableStorageOptions>());
+        services.AddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>));
+        services.AddSingleton<IPolymorphicStorage<TestMessage>, InMemoryPolymorphicStorage<TestMessage>>();
+        using var provider = services.BuildServiceProvider();
+
+        var store = provider.GetRequiredService<IStorage<TestEntity>>();
+        await store.CreateAsync(new TestEntity { Id = "Part|Row Key" }, ct);
+        Assert.NotNull(await store.OneAsync("Part|Row Key", ct));
+        Assert.Null(await store.OneAsync("part|row-key", ct));
+        var entry = await provider.GetRequiredService<IPolymorphicStorage<TestMessage>>()
+            .InsertAsync(new TableKey("p", "r"), new TestCreatedEvent { Id = "e1" }, ct);
+        Assert.Equal("created", entry.Discriminator);
+    }
+
+    [Fact]
+    public void InMemoryRegistrationFirst_ALaterTableCallsOwnOptions_AreNotTakenForTheHosts()
+    {
+        var before = TableEntitySerializer.OversizedCellPolicy;
+        try
+        {
+            var services = TableServices();
+            services.AddUnifiedInMemoryStorage(o => o.IdNormalization = IdNormalization.AsWritten);
+            services.AddUnifiedTableStorage();
+            using var provider = services.BuildServiceProvider();
+
+            var options = provider.GetRequiredService<StorageOptions>();
+            Assert.Equal(typeof(StorageOptions), options.GetType());
+            Assert.Equal(IdNormalization.AsWritten, options.IdNormalization);
+        }
+        finally
+        {
+            TableEntitySerializer.OversizedCellPolicy = before;
+        }
+    }
+
     // ── the provider SPI on the neutral offload type ──────────────────────
 
     [Fact]

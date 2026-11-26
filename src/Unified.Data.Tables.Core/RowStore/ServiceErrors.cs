@@ -135,16 +135,38 @@ internal static class ServiceErrors
     }
 
     /// <summary>
-    /// 400 <c>EntityTooLarge</c> when <paramref name="row"/> is larger than the service stores as one entity
-    /// (1 MB, by the estimate the library plans rows with); null when it fits.
+    /// 400 <c>EntityTooLarge</c> when <paramref name="row"/> is larger than the library's budget for one
+    /// entity (<see cref="TableRequestSize.MaxEntityBytes"/>, 1,000,000 bytes by the estimate the library
+    /// plans rows with, a margin below the service's 1 MiB); null when it fits.
     /// </summary>
     internal static RequestFailedException? OversizedRow(TableEntity row) =>
         TableRowSize.Estimate(row) > TableRequestSize.MaxEntityBytes
             ? new RequestFailedException(400, "The entity is larger than the maximum allowed size (1MB).", "EntityTooLarge", null)
             : null;
 
-    /// <summary>What the service refuses about a row's content: <see cref="OversizedProperty"/>, then <see cref="OversizedRow"/>; null when it accepts the row.</summary>
-    internal static RequestFailedException? RefusedRow(TableEntity row) => OversizedProperty(row) ?? OversizedRow(row);
+    /// <summary>What the service refuses about a row's content: <see cref="OversizedProperty"/>, then <see cref="OversizedRow"/>, then <see cref="TooManyProperties"/>; null when it accepts the row.</summary>
+    internal static RequestFailedException? RefusedRow(TableEntity row) => OversizedProperty(row) ?? OversizedRow(row) ?? TooManyProperties(row);
+
+    /// <summary>
+    /// 400 <c>TooManyProperties</c> when <paramref name="row"/> has more than
+    /// <see cref="TableRequestSize.MaxEntityProperties"/> (252) properties besides PartitionKey, RowKey and
+    /// Timestamp, as the service refuses the write; null when it has no more. A null cell is not sent, so
+    /// it is not counted.
+    /// </summary>
+    internal static RequestFailedException? TooManyProperties(TableEntity row)
+    {
+        var properties = 0;
+        foreach (var cell in row)
+        {
+            if (cell.Value is not null && cell.Key is not ("PartitionKey" or "RowKey" or "Timestamp" or "odata.etag"))
+                properties++;
+        }
+        return properties > TableRequestSize.MaxEntityProperties
+            ? new RequestFailedException(400,
+                $"The entity has {properties} properties; at most {TableRequestSize.MaxEntityProperties} are allowed besides PartitionKey, RowKey and Timestamp.",
+                "TooManyProperties", null)
+            : null;
+    }
 
     /// <summary>Throws <see cref="RefusedRow"/>, as the neutral exception, for a single-entity write.</summary>
     internal static void ThrowIfRefusedRow(TableEntity row, string entityType)

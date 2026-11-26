@@ -184,6 +184,8 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
     {
         ArgumentNullException.ThrowIfNull(write);
         var row = ToRow(write);
+        // The upsert names the key in its URL (RefusedKeyCharacters); an insert or a batch carries it in its body.
+        RefusedKeyCharacters.ThrowIfIn(row.PartitionKey, row.RowKey);
         await initializer.EnsureAsync(ct);
         var response = await client.UpsertEntityAsync(row, TableUpdateMode.Replace, ct);
         row.ETag = ETagOf(response, row);
@@ -350,6 +352,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
             ValidateSystemColumn(column.Key);
             patch[column.Key] = column.Value;
         }
+        RefusedKeyCharacters.ThrowIfIn(key.PartitionKey, key.RowKey);
 
         await initializer.EnsureAsync(ct);
 
@@ -376,9 +379,13 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
     {
         ValidateKey(key);
         await initializer.EnsureAsync(ct);
+        // No row has a key the service refuses; the request would only change its URL (RefusedKeyCharacters).
+        if (RefusedKeyCharacters.In(key.PartitionKey, key.RowKey))
+            return null;
 
         var response = await client.GetEntityIfExistsAsync<TableEntity>(
             key.PartitionKey, key.RowKey, cancellationToken: ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
 
         return response.HasValue ? ToEntry(response.Value!) : null;
     }
@@ -443,18 +450,24 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
     {
         ValidateKey(key);
         await initializer.EnsureAsync(ct);
+        if (RefusedKeyCharacters.In(key.PartitionKey, key.RowKey))
+            return; // no row has such a key: nothing to delete (see GetAsync)
 
+        Response? response;
         try
         {
-            await client.DeleteEntityAsync(key.PartitionKey, key.RowKey, ETag.All, ct);
+            response = await client.DeleteEntityAsync(key.PartitionKey, key.RowKey, ETag.All, ct);
         }
         catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
         {
-            // Idempotent by contract: deleting what is already gone is the caller's desired state. Only
-            // a missing ROW: a 404 that names the table (TableNotFound) is the table's failure and leaves
-            // as TableNotFoundException. (The SDK itself returns a delete's 404 instead of throwing it.)
+            // Idempotent by contract: deleting what is already gone is the caller's desired state.
             logger.LogDebug("Delete of missing row {Key} in {Table} treated as a no-op.", key, tableName);
+            return;
         }
+        // Only a missing ROW is a no-op. The SDK returns a delete's 404 instead of throwing it, whatever
+        // its code: a 404 that names the table (TableNotFound) is the table's failure and leaves as
+        // TableNotFoundException.
+        AzureStorageErrors.ThrowIfTableMissing(response);
     }
 
     /// <inheritdoc />

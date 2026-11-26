@@ -761,7 +761,10 @@ domain, a proxy and Cosmos DB's Table API are `Unknown`. A host that knows bette
 `UnifiedTableStorageOptions.DeclaredDurability`.
 
 The limits are **what the library plans and refuses by**, not a measurement of the endpoint: an emulator
-may accept more. Every property is nullable or has an "unknown" value, and the record is sealed with
+may accept more, and so may the service. `MaxRowBytes` is 1,000,000 bytes by the library's estimate, a
+margin below the service's 1 MiB: the providers plan split rows within it and the local providers refuse
+a row above it, but the Azure provider sends a plain row as it is, so a row between the two is stored by
+Azure and refused locally.. Every property is nullable or has an "unknown" value, and the record is sealed with
 `init` properties, so a field added later breaks no implementer; a mock or a third-party store simply
 returns `StorageInfo.Unknown`.
 
@@ -2139,7 +2142,8 @@ asserts the neutral one). The exception's `ProviderErrorCode` is the service's c
 `InnerException` carries the service's status wherever the Azure provider's does (a conflict the store
 finds by its own read has none on either; see [Failures](#failures)). Batches are atomic per
 transaction only, `QueryOptions.Select` projects the row, a cancelled token commits nothing, a key the
-service refuses is refused, and so is a row above 1 MB. The fake implements every side interface
+service refuses is refused, and so is a row above 252 properties or the library's 1,000,000-byte row
+budget (stricter than the service's 1 MiB). The fake implements every side interface
 (conditional delete, all-or-nothing batches, RowKey ranges, `GetInfo()` with `Durability.Volatile`, raw
 tables); `MayBeOwnWrite` is always false there. A differential suite (`InMemoryFidelityTests`) runs each
 scenario on both stores, the service side on Azurite, and the [conformance kit](#conformance-kit) holds
@@ -2160,6 +2164,19 @@ var options = provider.GetRequiredService<StorageOptions>();          // not Uni
 
 A configuration method shared by production and tests is typed to the base, which every provider's
 registration accepts: `static void Configure(StorageOptions o)`.
+
+A host that registers its production `UnifiedTableStorageOptions` itself keeps them: the stores of
+`AddUnifiedInMemoryStorage` and `AddUnifiedInMemoryPolymorphicTable` receive them, registered before or
+after those calls. A store registered **by hand**
+(`services.AddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>))`) is built by the container from
+the `StorageOptions` it holds, so register them under the neutral type too, or the store silently runs
+on the defaults:
+
+```csharp
+services.AddSingleton(productionOptions);                                   // UnifiedTableStorageOptions
+services.AddSingleton<StorageOptions>(sp => sp.GetRequiredService<UnifiedTableStorageOptions>());
+services.AddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>));
+```
 
 The polymorphic store has the same mirror, keyed the same way:
 
@@ -2205,7 +2222,8 @@ What holds, so that **a table that works here works on Azure Table Storage**:
 - The same serializer and large-value layout: rows written here read back cell for cell as the Azure
   provider writes them, and offloaded values live in a `__blobs` table of the same database.
 - The service's limits are enforced: its key rules, 100 rows and the payload budget per transaction, one
-  partition per transaction, 64 KiB per cell, 1 MB per row.
+  partition per transaction, 64 KiB per cell, 252 properties per row, and 1,000,000 bytes per row by
+  the library's estimate (stricter than the service's 1 MiB; see below).
 - Results arrive in the same ordinal (PartitionKey, RowKey) order; keys are stored as UTF-16BE bytes so
   that SQLite's byte order is that order. (The kit asserts the order for characters of the Basic
   Multilingual Plane; Azure's own order for the rest has not been verified by anyone.)
@@ -2215,7 +2233,8 @@ What holds, so that **a table that works here works on Azure Table Storage**:
   `SqliteException` inside.
 - The read cache has the **Azure provider's default** (a sliding hour), on purpose: a row that another
   store instance or another process changed is served stale exactly as an Azure deployment would serve
-  it. A local run that hides that would hide the bug.
+  it. A local run that hides that would hide the bug. (One staleness of the store's own writes is not
+  reproduced: see the ETag after a partial update, below.)
 - ETags come from a database-wide counter raised inside the write transaction: never reused, across
   tables, processes and restarts.
 
@@ -2233,6 +2252,23 @@ What it does **not** emulate: throttling, latency, the SDK's retries (so `MayBeO
 false and a conditional delete is never `Indeterminate`), short pages, credentials and network failures.
 Use the [conformance kit](#conformance-kit)'s `FaultInjectingStorage<T>` for the failures, and Azurite or
 a real account for the rest.
+
+Two limits and one cache behaviour differ from Azure on the local providers (SQLite and in-memory):
+
+- **Row size.** A row whose estimate (`TableRequestSize.EstimateEntityBytes`) is above 1,000,000 bytes
+  is refused with `StorageRequestRejectedException` (400 `EntityTooLarge`). That is the library's
+  planning budget, not the service's limit of 1 MiB (1,048,576 bytes): a plain row in between is stored
+  by Azure. (Azurite enforces neither on an insert.) A row with more than 252 properties besides
+  PartitionKey, RowKey and Timestamp is refused on every path (400 `TooManyProperties`), as the service
+  refuses it.
+- **The ETag after an unconditional partial update.** On Azure, after `UpdateAsync(id, builder)`
+  without `WithETag`, the read cache keeps the entity with the update applied and its **previous**
+  ETag (see [the cache notes](#2-register-it)), so `UpdateAsync(entity)` or `MutateAsync` with the
+  entity `OneAsync` then returns meets `ConcurrencyConflictException`, also with one writer in one
+  process. The local providers evict the entry on every write, so the same sequence reads the current
+  ETag and the save succeeds: a patch-then-save path never fails locally. Remedies that hold on every
+  provider: make the partial update conditional (`WithETag` with the version you read), use the ETag
+  string the builder update returns, or retry on the conflict (`MutateAsync` reads again).
 
 ## Conformance kit
 

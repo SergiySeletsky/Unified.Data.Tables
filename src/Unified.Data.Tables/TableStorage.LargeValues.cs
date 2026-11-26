@@ -92,6 +92,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     private async Task<StoredRow?> ReadStoredAsync(string pk, string rk, CancellationToken ct)
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, PriorSelect, ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
         if (!response.HasValue || response.Value is not { } row)
             return null;
         if (SplitRowLayout.IsPartRow(row))
@@ -363,6 +364,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     private async Task<bool> HeldByForeignRowAsync(string pk, string rk, string partKey, CancellationToken ct)
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, partKey, PartKeys, ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
         if (!response.HasValue || response.Value is not { } row)
             return false;
         return !(row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is string owner && string.Equals(owner, rk, StringComparison.Ordinal));
@@ -577,6 +579,16 @@ public partial class TableStorage<T> : IBlobOffloadState
     }
 
     /// <summary>
+    /// For a write whose request may name the key in its URL (an upsert, an update), refuses a key that
+    /// would change the address of that request (see <see cref="RefusedKeyCharacters"/>) before any SDK call.
+    /// </summary>
+    private void RefuseUrlBreakingKey(string id)
+    {
+        var (pk, rk) = GetEntityKeys(NormalizeId(id));
+        RefusedKeyCharacters.ThrowIfIn(pk, rk);
+    }
+
+    /// <summary>
     /// Stamps the outcome of a split-aware write on <paramref name="entity"/> and keeps the caches
     /// coherent. The entity gets the version the write itself produced, or null when that is unknown
     /// (re-read before an optimistic update, as after a batch). Only a single call's result is cached; a
@@ -639,6 +651,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             catch (TableValueIntegrityException failure)
             {
                 var current = await client.GetEntityIfExistsAsync<TableEntity>(primary.PartitionKey, primary.RowKey, cancellationToken: ct);
+                AzureStorageErrors.ThrowIfTableMissing(current);
                 if (!current.HasValue || current.Value is null || SplitRowLayout.IsPartRow(current.Value))
                     return null;
                 if (current.Value.ETag == primary.ETag)
@@ -792,8 +805,8 @@ public partial class TableStorage<T> : IBlobOffloadState
     /// <summary>
     /// The continuation rows of an entity that has no primary row: what a writer that does not know
     /// continuation rows, an interrupted partition delete or a delete that raced a write left of it. A
-    /// table that is not there has none (the point read of a missing table reads as "no row"; only the
-    /// query says the table is gone), so deleting from it is a no-op, as for any other type.
+    /// table that is not there has none. (The point read before this one already reported a table deleted
+    /// behind the store as <see cref="TableNotFoundException"/>; a 404 here is one that came after it.)
     /// </summary>
     private async Task<List<TableEntity>> LeftoverPartsAsync(string pk, string rk, CancellationToken ct)
     {
@@ -870,6 +883,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     private async Task DeleteListedLeftoversAsync(string pk, string primaryRowKey, IReadOnlyList<TableEntity> rows, CancellationToken ct)
     {
         var primary = await client.GetEntityIfExistsAsync<TableEntity>(pk, primaryRowKey, PartKeys, ct);
+        AzureStorageErrors.ThrowIfTableMissing(primary);
         if (primary.HasValue && primary.Value is { } row && !SplitRowLayout.IsPartRow(row))
             return;
 

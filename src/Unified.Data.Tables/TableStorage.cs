@@ -354,6 +354,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         await EnsureTableAsync(ct);
 
         var (partitionKey, rowKey) = GetEntityKeys(id);
+        // No row has a key the service refuses: nothing to delete, and nothing sent (RefusedKeyCharacters).
+        if (RefusedKeyCharacters.In(partitionKey, rowKey))
+            return DeleteStatus.NotFound;
         DeleteStatus status;
         try
         {
@@ -398,12 +401,15 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     // rejected: throttled, refused as busy); when the request was sent again after an attempt that may
     // have been applied (the SDK retried after a timeout or a dropped connection), or the attempts could
     // not be observed, that attempt may have been the one that removed it, and the answer is
-    // Indeterminate. A table that does not exist holds no row whatever was sent.
+    // Indeterminate. A 404 that names the table (TableNotFound: the table was deleted behind the store) is
+    // not a missing row: it is thrown, and leaves the member as TableNotFoundException, as on every provider.
     private static DeleteStatus DeleteOutcome(Response? response, int sent)
     {
         if (!IsNotFound(response, out var tableMissing))
             return DeleteStatus.Deleted;
-        return !tableMissing && RequestAttempts.MayBeOwnWriteSince(sent) ? DeleteStatus.Indeterminate : DeleteStatus.NotFound;
+        if (tableMissing)
+            throw new RequestFailedException(response!);
+        return RequestAttempts.MayBeOwnWriteSince(sent) ? DeleteStatus.Indeterminate : DeleteStatus.NotFound;
     }
 
     // True for a 404 the SDK returned instead of throwing; tolerates the responses of test doubles.
@@ -574,7 +580,11 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var mark = BeginRead(id);
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
+        // No row has a key the service refuses; the request would only change its URL (RefusedKeyCharacters).
+        if (RefusedKeyCharacters.In(partitionKey, rowKey))
+            return null;
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
 
         if (!response.HasValue || SplitRowLayout.IsPartRow(response.Value!))
             return null;
@@ -631,7 +641,10 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         var mark = BeginRead(id); // before the first storage call, as in OneAsync
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
+        if (RefusedKeyCharacters.In(partitionKey, rowKey))
+            return false; // no row has such a key (see OneAsync)
         var response = await client.GetEntityIfExistsAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
 
         if (response.HasValue && SplitRowLayout.IsPartRow(response.Value!))
             return false;
@@ -1278,6 +1291,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         id = NormalizeId(id);
         // A continuation row is not an entity: merging cells into one would surface them on the primary.
         RefuseReservedRowKey(id);
+        RefuseUrlBreakingKey(id);
         await EnsureTableAsync(ct);
         var (partitionKey, rowKey) = GetEntityKeys(id);
 
@@ -1493,6 +1507,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         // ConcurrencyMode.LastWriterWins (which never looks at the ETag, so "*" is harmless there).
         if (mode != ConcurrencyMode.LastWriterWins && entity.ETag == "*")
             throw new ArgumentException(ConcurrencyMessages.WildcardETagOnUpdate(typeName), nameof(entity));
+        RefuseUrlBreakingKey(entity.Id);
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 
@@ -1591,6 +1606,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
             throw new ArgumentNullException(nameof(entity));
         }
         RefuseReservedRowKey(entity.Id);
+        RefuseUrlBreakingKey(entity.Id);
 
         await EnforceProtectedPropertiesAsync(entity, ct);
 

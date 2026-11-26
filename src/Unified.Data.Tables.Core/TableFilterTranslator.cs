@@ -333,8 +333,8 @@ public static class TableFilterTranslator
         if (t == typeof(double)) return Convert.ToDouble(value, CultureInfo.InvariantCulture);
         if (t == typeof(decimal)) return (double)Convert.ToDecimal(value, CultureInfo.InvariantCulture); // stored as double
         if (t == typeof(Guid)) return AsGuid(value);
-        if (t == typeof(DateTimeOffset)) return AsDateTimeOffset(value);
-        if (t == typeof(DateTime)) return AsDateTimeOffsetFromDateTime(value);
+        if (t == typeof(DateTimeOffset)) return AsStoredDate(AsDateTimeOffset(value));
+        if (t == typeof(DateTime)) return AsStoredDate(AsDateTimeOffsetFromDateTime(value));
 
         throw new NotSupportedException(
             $"Filtering on type '{t.Name}' is not supported. Supported leaf types: string, bool, int, uint, " +
@@ -360,6 +360,28 @@ public static class TableFilterTranslator
 
     private static DateTimeOffset AsDateTimeOffset(object value) =>
         value is DateTimeOffset dto ? dto : new DateTimeOffset(Convert.ToDateTime(value, CultureInfo.InvariantCulture), TimeSpan.Zero);
+
+    // The earliest date the service stores, and the cell the serializer writes for an unset date (a
+    // default DateTime or DateTimeOffset), which it reads back as the default again.
+    private static readonly DateTimeOffset MinStoredDate = new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+    // A date compared with a column as the column holds it. An unset date is stored as 1601-01-01, so a
+    // default constant is compared as 1601-01-01: `x.When == default` finds the rows whose date is unset,
+    // and an ordering compare with default orders them as the local providers do (they compare the value
+    // read back, the default). A constant after the default and up to 1601-01-01 cannot be compared
+    // faithfully: the service holds no date below 1601-01-01, and a stored 1601-01-01 reads back as the
+    // default, so the cell and the value read back order differently against it. It is refused.
+    private static DateTimeOffset AsStoredDate(DateTimeOffset value)
+    {
+        if (value.UtcTicks == 0)
+            return MinStoredDate;
+        if (value <= MinStoredDate)
+            throw new NotSupportedException(
+                $"A date filter value from 0001-01-01 (exclusive) to 1601-01-01T00:00:00Z (inclusive) is not supported ('{value:O}'): " +
+                "Azure Tables stores no date below 1601-01-01, and 1601-01-01 is the stored form of an unset date. " +
+                "Compare with default(DateTime) / default(DateTimeOffset) to find unset dates.");
+        return value;
+    }
 
     private static DateTimeOffset AsDateTimeOffsetFromDateTime(object value) =>
         value is DateTime dt

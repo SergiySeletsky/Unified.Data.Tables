@@ -137,15 +137,31 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   - **Registration order between the two providers.** "The first registered options win" still
     decides which options the first-registered `IStorage<>` receives and which call sets the
     process-wide oversized-cell policy. What differs is what the container holds afterwards. When
-    `AddUnifiedTableStorage` runs first, or the host registered a `UnifiedTableStorageOptions` itself,
-    a later `AddUnifiedInMemoryStorage` keeps those options and resolves the same instance as
-    `StorageOptions`, as before. When `AddUnifiedInMemoryStorage` runs first, its options are
+    `AddUnifiedTableStorage` runs first, a later `AddUnifiedInMemoryStorage` keeps those options and
+    resolves the same instance as `StorageOptions`, as before. A `UnifiedTableStorageOptions` (or any
+    type derived from `StorageOptions`) **the host registers itself** is what the stores of
+    `AddUnifiedInMemoryStorage` and `AddUnifiedInMemoryPolymorphicTable<TBase>` receive, registered
+    before or after those calls, as before: the in-memory registration chooses its options when the
+    container resolves them. When `AddUnifiedInMemoryStorage` runs first, its options are
     registered as `StorageOptions` and stay the ones the in-memory stores are given, and a later
     `AddUnifiedTableStorage` registers its own `UnifiedTableStorageOptions` **beside** them: on 0.9.2
     that second call's options were dropped, since there was one options type, so
     `GetRequiredService<UnifiedTableStorageOptions>()` returned the first call's options and now
     returns the second call's. A host that registers both and reads the options back should register
     the provider whose settings it means first and resolve `StorageOptions`.
+  - **An in-memory store registered by hand no longer receives the host's
+    `UnifiedTableStorageOptions`. This one is silent.** With
+    `services.AddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>))`,
+    `AddSingleton<IStorage<Doc>, InMemoryStorage<Doc>>()` or
+    `AddSingleton<IPolymorphicStorage<TBase>, InMemoryPolymorphicStorage<TBase>>()` and no in-memory
+    registration call, the container constructs the store with the `StorageOptions` it holds; a host
+    that registered only `UnifiedTableStorageOptions` has none, so the store runs on the defaults:
+    `IdNormalization`, `ImplicitLastWriterWins`, `TypeDiscriminator`, `Offload` and
+    `TableNameResolver` are ignored, and a polymorphic store writes the assembly-qualified type name
+    where production writes the mapped token. Nothing fails to compile or resolve. *Migration:* register
+    the options under the neutral type too,
+    `services.AddSingleton<StorageOptions>(sp => sp.GetRequiredService<UnifiedTableStorageOptions>())`,
+    or use `AddUnifiedInMemoryStorage` / `AddUnifiedInMemoryPolymorphicTable<TBase>`, which find them.
   - Binary: the five members whose parameter was `UnifiedTableStorageOptions`
     (`InMemoryStorage<T>(IProtectedPropertyAuthorizer?, ...)`, the two
     `InMemoryPolymorphicStorage<TBase>` constructors, `AddUnifiedInMemoryStorage`,
@@ -177,16 +193,29 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     overloads, and the polymorphic one) handed out the rest of the current page after cancellation,
     because the SDK looks at the token only when it requests a page. It now throws
     `OperationCanceledException` before the next row, as the in-memory store always did.
-  - **`PolymorphicTableStorage<TBase>.DeleteAsync` no longer swallows a missing table.** A delete of a
-    row that is not there is still a no-op; a table deleted behind the store is
-    `TableNotFoundException`.
+  - **A point read or a delete of a table deleted behind the store is `TableNotFoundException` (Azure).**
+    The Azure SDK returns, rather than throws, the 404 of a point read and of a delete, whatever its
+    error code, so on 0.9.2 a table deleted behind a live store read as a missing row: `OneAsync` and
+    `PolymorphicTableStorage<TBase>.GetAsync` returned null, `ExistsAsync` false, `DeleteAsync` (typed
+    and polymorphic) succeeded, and `DeleteIfExistsAsync` / `DeleteIfMatchAsync` answered `NotFound`.
+    They now read the 404's error code and throw `TableNotFoundException` for `TableNotFound`, as the
+    scans, counts and writes already did and as the in-memory and SQLite stores do for every member. A
+    row that is not there in a table that is (404 `ResourceNotFound`) is unchanged: null, false, a no-op,
+    `NotFound`. *Who is hit:* code that deletes a table with `TableServiceClient` while stores over it
+    keep running, and relied on their reads answering "no row". *Migration:* catch
+    `TableNotFoundException` there.
   - **`DeletePartitionAsync` survives a lost race (Azure).** A delete transaction that fails because a
     listed row is already gone used to fail the call. The rows of that transaction are now deleted one
     by one and the call goes on; a row another writer removed is not counted, a row this call's own
     lost-response attempt removed is.
-  - **The in-memory stores enforce 1 MB per row.** A row above the service's entity limit was accepted
+  - **The in-memory stores enforce a row limit.** A row above the service's entity limit was accepted
     by the fake and refused by Azure; the fake now refuses it with `StorageRequestRejectedException`
     (400 `EntityTooLarge`). A test that stored a larger row in the fake fails where production would.
+    The limit is the library's planning budget, 1,000,000 bytes by `TableRequestSize.EstimateEntityBytes`
+    (`StorageInfo.MaxRowBytes`), a margin below the service's 1 MiB, so a plain row between the two is
+    refused locally and stored by Azure. A row with more than 252 properties besides PartitionKey, RowKey
+    and Timestamp is refused too (400 `TooManyProperties`, as the service refuses it): a raw or
+    polymorphic row of 253 cells was stored locally.
   - **The orphan sweep finds its store through the capability probe.** `SweepOrphanBlobsAsync` and the
     hosted sweep used a cast; a `DelegatingStorage<T>` over a sweeping store is now swept, where a
     hand-written decorator was skipped with a warning (and still is).
@@ -202,6 +231,27 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     message needs a look; code that matched the Azure option name does not.
   - **Identity: user `DeleteAsync` and `RemoveLoginAsync` can throw `ConcurrencyConflictException`.**
     See the Identity entry under Fixed.
+  - **A key with a `/` is answered before a request is sent (Azure).** The service refuses `/` in a
+    `PartitionKey` or `RowKey`, so no row has one, but in the URL of a point request it changes the
+    address: Azurite answered such reads, deletes, upserts and updates with a 500, which surfaced as
+    `TransientStorageException` (with `MayHaveCommitted` set on the writes, which invites a retry loop).
+    `OneAsync`, `ExistsAsync` and `PolymorphicTableStorage<TBase>.GetAsync` now answer null / false
+    without a request, `DeleteAsync` (typed and polymorphic) is a no-op and `DeleteIfExistsAsync` /
+    `DeleteIfMatchAsync` answer `NotFound`; `UpsertAsync`, `UpdateAsync` (whole entity and builder) and
+    the polymorphic `UpsertAsync` and `MergeColumnsAsync` throw `StorageRequestRejectedException` (400
+    `InvalidInput`), as the service refuses a create of such a key and as the local providers answer. A
+    create and a batch carry the key in the body and were already refused by the service the same way;
+    the other refused characters (`\`, `#`, `?`, control characters) already answered alike. The raw
+    table store (experimental) still sends the request.
+  - **A LINQ filter that compares a date with its default finds the unset dates (Azure).** An unset
+    `DateTime` / `DateTimeOffset` is stored as 1601-01-01 and read back as the default. The translator
+    sent `default` as 0001-01-01, so on Azure `x.When == default` matched nothing (the local providers,
+    which evaluate the value read back, matched the unset rows) and `x.When > default` matched them all.
+    A default constant is now compared as 1601-01-01, on every provider the same rows. A date constant
+    after the default and up to 1601-01-01T00:00:00Z (inclusive) cannot be compared faithfully (the
+    service holds no earlier date, and a stored 1601-01-01 reads back as the default): it is refused with
+    `NotSupportedException` on every provider. *Who is hit:* a filter with such a constant, which
+    disagreed between the providers before.
 - **Not broken, with one caveat.** `IStorage<T>` and `IPolymorphicStorage<TBase>` have exactly the
   members of 0.9.2: a hand-written implementer, a decorator or a mock compiled against 0.9.2 loads and
   runs on 0.10.0 (checked by a probe before the release, see Tests and CI). **The caveat: such an
@@ -297,7 +347,9 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   machine; ETags from a database-wide counter; large values in the same split layout with offloaded
   values in a `__blobs` table; durability read back from the database (`Fsynced` under
   `Synchronous = Full`, the default; `OsBuffered` under `Normal`; `Volatile` for `:memory:`); the
-  Azure provider's read-cache default, so a local run shows the staleness production would. It does
+  Azure provider's read-cache default, so a local run shows the staleness another process's writes
+  cause in production (not the older ETag the Azure cache keeps after an unconditional partial update
+  of this process's own: see the README, SQLite provider). It does
   not emulate throttling, latency, SDK retries, short pages or credentials, and network shares are
   unsupported.
 - **`Unified.Data.Tables.Conformance`** (new package, no test framework): 161 named scenarios in five
@@ -361,8 +413,8 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     again within one millisecond carries the ETag that was checked.
 - **Azure: a stream handed out rows after its token was cancelled** (see BREAKING, further behaviour
   changes).
-- **Azure: `DeletePartitionAsync` failed when a listed row was already gone**, and
-  `PolymorphicTableStorage<TBase>.DeleteAsync` treated a missing table as a missing row (same list).
+- **Azure: `DeletePartitionAsync` failed when a listed row was already gone**, and the point reads and
+  deletes of both stores treated a missing table as a missing row (same list).
 - **A projected scan of a plain type returned another type's continuation rows** (B6).
 - **A decorator over a sweeping store was not swept**: the orphan sweep now asks the capability probe.
 - **`"*"` as the ETag of a whole-entity update meant different things on Azure and on the fake** (B5).

@@ -175,7 +175,9 @@ public static partial class ServiceCollectionExtensions
             // blob offload and choose no client does this call supply one, by its own rule (dropping it
             // left every large-value store unresolvable).
             var registered = RegisteredOptions(services);
-            if (registered?.ImplementationInstance is StorageOptions known)
+            // (The in-memory registration's options are chosen when the container resolves them, so the
+            // host's can still win; until then they are its own instance, read the same way.)
+            if ((registered?.ImplementationInstance as StorageOptions ?? ProviderRegisteredOptions.FallbackOf(registered)) is { } known)
             {
                 // Options registered as an instance can be read now. Their ServiceClient needs no
                 // registration (TableStorage<T> takes it from them); UseRegisteredServiceClient means the
@@ -196,6 +198,9 @@ public static partial class ServiceCollectionExtensions
         }
 
         services.AddMemoryCache();
+        // This call's own options, never the host's: an in-memory registration made before this call does
+        // not take them for options the host registered for every store.
+        ProviderRegisteredOptions.MarkProviderOwned(options);
         services.TryAddSingleton(options);
         // The same options under their provider-neutral type, which is the one a provider that does not
         // reference this package (the in-memory one) registers and resolves: registered after this call,

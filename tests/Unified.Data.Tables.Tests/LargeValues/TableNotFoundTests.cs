@@ -373,8 +373,10 @@ public sealed class AzuriteTableNotFoundTests : AzuriteCleanupTestBase
                 () => store.UpsertBatchAsync([new SplitTextEntity { Id = Id("r"), Body = "three" }], Ct));
             Assert.Equal("TableNotFound", batch.ProviderErrorCode);
 
-            // A delete of a row in a table that is not there is a no-op, as for a type without large values.
-            await store.DeleteAsync(Id("r"), Ct);
+            // 0.10.0: so is a delete (it was a no-op), as on every provider and for a type without large
+            // values: a table that is not there is not a missing row.
+            var delete = await Assert.ThrowsAsync<TableNotFoundException>(() => store.DeleteAsync(Id("r"), Ct));
+            Assert.Equal("TableNotFound", delete.ProviderErrorCode);
         }
         finally
         {

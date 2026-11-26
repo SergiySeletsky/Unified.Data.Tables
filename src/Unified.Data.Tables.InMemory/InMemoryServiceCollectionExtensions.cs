@@ -29,9 +29,17 @@ public static class InMemoryServiceCollectionExtensions
         // registration counts, as for TryAddSingleton: a keyed one of the host is never what a store receives.
         var optionsAlreadyRegistered = KeepRegisteredOptions(services);
         if (!optionsAlreadyRegistered)
+        {
             TableEntitySerializer.OversizedCellPolicy = options.OversizedCells;
+            // Chosen when the container resolves them, not now: options the host registers itself under a
+            // type derived from StorageOptions (UnifiedTableStorageOptions) AFTER this call are still the
+            // ones the stores receive, as they were while the stores took that type. A provider's own
+            // options registered beside these later (a second provider's call) are not.
+            var registration = ServiceDescriptor.Singleton<StorageOptions>(sp => HostRegisteredOptions(services, sp) ?? options);
+            ProviderRegisteredOptions.NoteFallback(registration, options);
+            services.Add(registration);
+        }
 
-        services.TryAddSingleton(options);
         services.TryAddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>));
         return services;
     }
@@ -45,8 +53,10 @@ public static class InMemoryServiceCollectionExtensions
     /// <remarks>
     /// Pass <paramref name="configure"/> whenever production configures an
     /// <see cref="StorageOptions.TypeDiscriminator"/>. Without it the fake resolves the
-    /// registered <see cref="StorageOptions"/>, and a test host that registers ONLY this
-    /// (no <see cref="AddUnifiedInMemoryStorage"/>) has none — so it silently falls back to
+    /// registered <see cref="StorageOptions"/> (or, when none is registered, the options the host
+    /// registered under a type derived from it, such as <c>UnifiedTableStorageOptions</c>, in any order),
+    /// and a test host that registers ONLY this (no options, no <see cref="AddUnifiedInMemoryStorage"/>)
+    /// has none — so it silently falls back to
     /// <c>AssemblyQualifiedTypeDiscriminator</c> while production uses a
     /// <c>TypeDiscriminatorMap</c>. Nothing fails; the tokens simply differ, in the one place no
     /// assertion looks.
@@ -76,7 +86,7 @@ public static class InMemoryServiceCollectionExtensions
         // names, and the fake must name the same string the Azure store would.
         services.TryAddKeyedSingleton<IPolymorphicStorage<TBase>>(tableName, (sp, _) =>
             new InMemoryPolymorphicStorage<TBase>(
-                tableName, local ?? sp.GetService<StorageOptions>()));
+                tableName, local ?? sp.GetService<StorageOptions>() ?? HostRegisteredOptions(services, sp)));
 
         return services;
     }
@@ -95,6 +105,18 @@ public static class InMemoryServiceCollectionExtensions
             return false;
         services.AddSingleton(sp => (StorageOptions)sp.GetRequiredService(derived));
         return true;
+    }
+
+    // At resolve time: the options the host registered itself (unkeyed) under a type derived from
+    // StorageOptions, the last of them as the container resolves it, whenever that was registered. Options
+    // a provider's registration call created are not the host's and are skipped (see ProviderRegisteredOptions).
+    private static StorageOptions? HostRegisteredOptions(IServiceCollection services, IServiceProvider sp)
+    {
+        var derived = services.LastOrDefault(d =>
+            !d.IsKeyedService
+            && d.ServiceType.IsSubclassOf(typeof(StorageOptions))
+            && !ProviderRegisteredOptions.IsProviderOwned(d.ImplementationInstance))?.ServiceType;
+        return derived is null ? null : (StorageOptions?)sp.GetService(derived);
     }
 
     // A per-table options instance rather than a registration: the discriminator is the only setting
