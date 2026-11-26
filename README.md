@@ -108,7 +108,9 @@ it. The packages that share internals pin each other exactly (`[x.y.z]`, not NuG
 later"): the core pins the abstractions, each provider (`Unified.Data.Tables`,
 `Unified.Data.Tables.InMemory`, `Unified.Data.Tables.Sqlite`) pins the abstractions and the core, the
 kit pins the abstractions whose contract it states, and its adapter pins the kit. So upgrade them
-together; a mixed set fails at restore. **Since 0.10.0 the in-memory package no longer depends on
+together. NuGet refuses a mixed set at restore only when the conflict is between transitive
+constraints: an older sibling referenced directly in the same project wins with warning NU1608 and
+fails at run time (see [Upgrading from 0.9.x](#upgrading-from-09x), step 1). **Since 0.10.0 the in-memory package no longer depends on
 `Unified.Data.Tables`**: a test project that used `TableStorage<T>` or a blob type through it references
 the Azure provider itself. Neither the in-memory nor the SQLite package brings `Azure.Storage.Blobs` or
 the Azure provider. Blob offload on Azure needs `Azure.Storage.Blobs` 12.29.2 or later; the optional
@@ -738,8 +740,10 @@ A batch that cannot be one transaction is refused **before anything is sent**, w
 `BatchNotAtomicException`, and the entities are left as you passed them: more than 100 rows, more than
 one partition, a row named twice, a payload over the budget the library plans by, or (for a type with
 large values) a value that would go to blob storage, since a blob is written outside the transaction.
-An entity the serializer refuses (`OversizedCellException`, `OversizedValueException`) fails the batch
-the same way: nothing sent, the entities as you passed them.
+Anything else that fails the batch before its transaction is sent leaves them the same way: an entity
+the serializer refuses, for its size (`OversizedCellException`, `OversizedValueException`) or for anything
+else (a reference cycle, a property named with the path delimiter), or a cancelled token. Once the
+transaction is sent, the entities are stamped as after any batch, whether or not it committed.
 An entity's continuation rows count as rows. A transaction the backend refuses applies nothing and
 throws the failure of the row that caused it (`DuplicateKeyException` for `CreateAtomicAsync`).
 `GetInfo().MaxBatchRows` and `MaxBatchBytes` state the limits.
@@ -2483,27 +2487,69 @@ issued by 0.9.2 still resume, and `IStorage<T>` has no new member, so implemente
 keep compiling. What changes is which exceptions you see and what the in-memory package brings. The
 CHANGELOG has the full list with who is hit; this is the order of work.
 
-**1. Bump every `Unified.Data.Tables.*` package together.** They pin each other exactly.
+**1. Bump every `Unified.Data.Tables.*` package together.** They pin each other exactly, but NuGet
+refuses a mixed set (NU1107) only when the conflict is between transitive constraints. An older sibling
+the project references **directly**, as a per-package bump of a dependency bot or a half-updated
+`Directory.Packages.props` leaves it, restores with warning NU1608 and fails at run time:
+`Unified.Data.Tables` 0.10.0 beside `Unified.Data.Tables.InMemory` 0.9.2 builds, and the first
+`new InMemoryStorage<T>()` throws `MissingMethodException`. Treat the warning as an error while you
+upgrade, and group the packages in your dependency bot:
+
+```xml
+<WarningsAsErrors>$(WarningsAsErrors);NU1608</WarningsAsErrors>
+```
+
+`Unified.Data.Tables.Identity` is not held to the set: it depends on the abstractions with a minimum
+version, so Identity 0.9.2 beside the 0.10.0 providers restores with no diagnostic. Bump it too.
 
 **2. Fix the compile errors. They are all in test and registration code (B4).**
 
 - A test project that reached `TableStorage<T>`, `AddUnifiedTableStorage` or a blob type through
-  `Unified.Data.Tables.InMemory` now references `Unified.Data.Tables` itself.
+  `Unified.Data.Tables.InMemory` now references `Unified.Data.Tables` itself. The in-memory package no
+  longer brings `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.Logging.Abstractions` or
+  `Microsoft.Extensions.Hosting.Abstractions` either: a project that used `MemoryCache`, `ILogger`,
+  `NullLogger` or `IHostedService` through it references those packages directly (to stay free of the
+  Azure provider) or references `Unified.Data.Tables`.
 - `AddUnifiedInMemoryStorage(o => o.BlobOffload = ...)` becomes `o.Offload = new OffloadOptions { ... }`.
 - A method or delegate typed `Action<UnifiedTableStorageOptions>` that is passed to an in-memory
   registration is retyped to `StorageOptions`.
 - `GetRequiredService<UnifiedTableStorageOptions>()` after an in-memory-only registration becomes
   `GetRequiredService<StorageOptions>()`.
 
-**3. Find every catch of an Azure exception around a storage call (B1). The compiler will not.** A
-`catch (RequestFailedException)` around `IStorage<T>` still compiles and no longer catches anything:
+**3. Find every use of the Azure exception types around a storage call (B1). The compiler will not.** A
+`catch (RequestFailedException)` around `IStorage<T>` still compiles and no longer catches anything.
+Start from the superset and look at every hit near a storage call, in production code and in tests:
+
+```bash
+git grep -nE "RequestFailedException|TableTransactionFailedException|TableErrorCode" -- "*.cs"
+git grep -nE "TaskCanceledException|OperationCanceledException" -- "*.cs"
+```
+
+The second finds the handlers of the SDK's timeout, which is a `TransientStorageException` now. These
+narrower searches sort the hits (catches, filters and pattern matches, status checks); they do not
+replace the superset, and the third also finds a status check on a variable whose type is not spelled
+out:
 
 ```bash
 git grep -nE "catch *\((Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
-git grep -nE "(is|as) +(Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
+git grep -nE "(is( +not)?|as) +(Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
 git grep -nE "\.Status *(==|!=|is) *(404|409|412|429|503)|TableErrorCode\.|\.ErrorCode *==" -- "*.cs"
-git grep -nE "Throws(Async|AnyAsync)?<(Azure\.)?(RequestFailedException|TableTransactionFailedException)>" -- "*.cs"
 ```
+
+The shapes that keep compiling and fail **silently**, besides the plain catch:
+
+- an exception filter or pattern match: `when (ex is RequestFailedException { Status: 404 })`;
+- a negated test, such as an ASP.NET Core `IExceptionHandler` that starts with
+  `if (exception is not RequestFailedException rfe) return false;`: it now declines every storage failure;
+- a `switch` arm (`RequestFailedException { Status: 404 } => ...`) or a `case RequestFailedException`;
+- a retry policy: Polly's `Handle<RequestFailedException>()`, `.Or<RequestFailedException>()` or
+  `new PredicateBuilder().Handle<RequestFailedException>()` silently stops retrying;
+- an exception-to-status map keyed on `typeof(RequestFailedException)`;
+- a test double of a storage interface that throws the Azure type
+  (`.ThrowsAsync(new RequestFailedException(404, "..."))`): the handler's test stays green while no
+  provider raises that type any more.
+
+Assertions on the Azure type (xUnit, NUnit, MSTest, FluentAssertions) fail loudly in step 4.
 
 Convert each hit that guards a storage call, by the table under [Failures](#failures):
 

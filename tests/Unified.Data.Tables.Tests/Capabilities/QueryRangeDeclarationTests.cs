@@ -8,9 +8,9 @@ namespace Unified.Data.Tables.Tests.Capabilities;
 
 /// <summary>
 /// 0.10.0 declares a RowKey range on <see cref="QueryOptions"/> (<c>FromRowKey</c>, <c>ToRowKey</c> and
-/// their inclusivity) and the rule every provider checks it by. The providers implement the range in
-/// their own work packages; until then each refuses a bounded query instead of returning the whole
-/// partition for it, and the paging cursor already binds the bounds.
+/// their inclusivity) and the rule every provider checks it by. Every provider honours the bounds in
+/// each of its query members, and the paging cursor binds them: a cursor issued for one range does not
+/// resume a query over another.
 /// </summary>
 public class QueryRangeDeclarationTests
 {
@@ -191,8 +191,7 @@ public class QueryRangeDeclarationTests
     [InlineData(2)]
     public async Task InMemory_AnswersABoundedQuery_WithTheRowKeysBetweenTheBounds(int query)
     {
-        // Until the in-memory provider implemented the range it refused these with NotSupportedException
-        // rather than return the whole partition; now each of the three query members honours the bounds.
+        // Each of the three query members honours the bounds; none returns the whole partition.
         var options = BoundedQueries[query];
         var storage = new InMemoryStorage<TestEntity>();
         await storage.CreateBatchAsync([new() { Id = "p|a" }, new() { Id = "p|b" }, new() { Id = "p|c" }, new() { Id = "q|b" }], Ct);

@@ -1041,12 +1041,12 @@ public partial class TableStorage<T> : IBlobOffloadState
 
     private async Task SubmitBatchUnitsAsync(
         List<BatchUnit> units, LargeWriteKind kind, int attempt, Dictionary<string, Dictionary<string, ETag>?>? takeBack,
-        List<ReleasedBlobs> released, CancellationToken ct, bool atomic = false)
+        List<ReleasedBlobs> released, CancellationToken ct, AtomicSend? atomic = null)
     {
         var transactions = LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList());
         // An all-or-nothing batch (IAtomicBatch) is one transaction or it is refused, before anything is
         // uploaded or sent, for this plan as for every one made again below.
-        if (atomic)
+        if (atomic is not null)
             RequireOneLargeTransaction(units, transactions);
         foreach (var range in transactions)
         {
@@ -1061,6 +1061,8 @@ public partial class TableStorage<T> : IBlobOffloadState
             // A duplicate key is about this transaction alone; a conflict after the last attempt is
             // about every attempt of the call (sent: 0), any of which may have been sent twice.
             var sent = RequestAttempts.MarkCurrent();
+            if (atomic is not null)
+                atomic.Sent = true;
             try
             {
                 committedAt = HeaderDate(RawResponse(await client.SubmitTransactionAsync(actions, ct)));

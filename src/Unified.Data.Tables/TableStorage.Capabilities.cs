@@ -175,19 +175,19 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
             entity.Id = ids[index++];
         }
 
+        var atomic = new AtomicSend();
         try
         {
             if (LargeValueAware)
-                await WriteAtomicLargeAsync([.. entities], actionType, ct);
+                await WriteAtomicLargeAsync([.. entities], actionType, atomic, ct);
             else
-                await WriteAtomicRowsAsync([.. entities], keys, actionType, ct);
+                await WriteAtomicRowsAsync([.. entities], keys, actionType, atomic, ct);
         }
-        catch (Exception ex) when (ex is BatchNotAtomicException or BatchPayloadTooLargeException
-            or OversizedCellException or OversizedValueException or BlobOffloadNotConfiguredException)
+        catch (Exception) when (!atomic.Sent)
         {
-            // Refused before anything was sent (a batch that is not one transaction, an entity the
-            // serializer refuses; a plan made again after a lost race follows a transaction that wrote
-            // nothing): the caller's entities are as they were, as on the row-store providers.
+            // Refused or failed before the transaction was sent (a batch that is not one transaction, an
+            // entity the serializer refuses for its size or for anything else, a cancelled token): nothing
+            // was written, and the caller's entities are as they were, as on the row-store providers.
             foreach (var (entity, id, createdAt, updatedAt, timestamp, etag) in before)
             {
                 entity.Id = id;
@@ -213,7 +213,8 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
 
     // A type without large values: one row an entity, sized as the batch writes size it.
     private async Task WriteAtomicRowsAsync(
-        List<T> entities, List<(string PartitionKey, string RowKey)> keys, TableTransactionActionType actionType, CancellationToken ct)
+        List<T> entities, List<(string PartitionKey, string RowKey)> keys, TableTransactionActionType actionType, AtomicSend atomic,
+        CancellationToken ct)
     {
         var rows = new List<TableEntity>(entities.Count);
         for (var i = 0; i < entities.Count; i++)
@@ -222,6 +223,7 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
 
         var actions = rows.Select(row => new TableTransactionAction(actionType, row, ETag.All));
         var sent = RequestAttempts.MarkCurrent();
+        atomic.Sent = true;
         try
         {
             await client.SubmitTransactionAsync(actions, ct);
@@ -239,7 +241,7 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
     // A type with large values: each entity's rows (primary, continuation rows, stale-part deletes) are
     // one unit, and every unit must fit the one transaction (SubmitBatchUnitsAsync refuses otherwise,
     // also when a lost race makes it plan again). Nothing is uploaded: a plan that needs a blob is refused.
-    private async Task WriteAtomicLargeAsync(List<T> entities, TableTransactionActionType actionType, CancellationToken ct)
+    private async Task WriteAtomicLargeAsync(List<T> entities, TableTransactionActionType actionType, AtomicSend atomic, CancellationToken ct)
     {
         var kind = actionType == TableTransactionActionType.Add ? LargeWriteKind.Create : LargeWriteKind.Upsert;
         var enlisted = new List<T>(entities.Count);
@@ -252,7 +254,7 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
             }
             var released = new List<ReleasedBlobs>();
             var units = await PlanBatchUnitsAsync(entities, kind, takeBack: null, ct);
-            await SubmitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, released, ct, atomic: true);
+            await SubmitBatchUnitsAsync(units, kind, attempt: 1, takeBack: null, released, ct, atomic);
 
             // Committed: the blobs only the replaced rows referenced can go (best effort, as after a batch).
             foreach (var row in released)
@@ -263,6 +265,13 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
             foreach (var entity in enlisted)
                 LargeValueTable.ReleasePrepared(entity);
         }
+    }
+
+    // Whether an all-or-nothing batch has handed its transaction to the client: set just before the
+    // first SubmitTransactionAsync, and never cleared (a failure after it may have committed).
+    private sealed class AtomicSend
+    {
+        public bool Sent { get; set; }
     }
 
     // The all-or-nothing rule of a large-value batch, applied to every plan of it before its transaction

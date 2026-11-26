@@ -36,7 +36,8 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     `RequestFailedException`. So write `ex.InnerException as RequestFailedException` with a null
     check, or read `ProviderErrorCode`.
   - *Who is hit:* every `catch (RequestFailedException)` and `catch (TableTransactionFailedException)`
-    around a storage call, and every exception filter or middleware that reads `ex.Status` from one.
+    around a storage call, every exception filter, pattern match, `switch` arm, middleware or retry
+    policy that tests for one or reads `ex.Status` from one, and every test double that throws one.
     Such code still compiles and no longer catches anything: a missing row or a throttled request
     becomes an unhandled exception instead of the handled branch.
   - *Migration:* catch the neutral type. 404 for a row is `EntityNotFoundException`; 404
@@ -47,22 +48,42 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     `StorageException`. `StorageException.ProviderErrorCode` carries the service's error code
     (`"EntityAlreadyExists"`, `"TableNotFound"`, `"InvalidDuplicateRow"`), so most handlers need no
     `InnerException` at all.
-  - *Search recipe.* Run these from the repository root and look at every hit that sits around a call
-    on an `IStorage<T>`, an `IPolymorphicStorage<TBase>` or one of the verbs (`MutateAsync`,
-    `TryMutateAsync`, `GetOrCreateAsync`, `AppendAsync`, ...):
+  - *Search recipe.* Start from the superset, run from the repository root, and look at every hit that
+    sits near a call on an `IStorage<T>`, an `IPolymorphicStorage<TBase>` or one of the verbs
+    (`MutateAsync`, `TryMutateAsync`, `GetOrCreateAsync`, `AppendAsync`, ...), in production code and in
+    tests alike:
+
+    ```bash
+    git grep -nE "RequestFailedException|TableTransactionFailedException|TableErrorCode" -- "*.cs"
+    git grep -nE "TaskCanceledException|OperationCanceledException" -- "*.cs"
+    ```
+
+    The first finds every line that names the Azure types or codes, the second the handlers of the
+    SDK's timeout (see the next item). The narrower searches below sort the hits of the first (catches,
+    filters and pattern matches, status checks) and do not replace it, since no pattern list covers
+    every shape; the third also finds a status check on a variable whose type is not spelled out:
 
     ```bash
     git grep -nE "catch *\((Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
-    git grep -nE "(is|as) +(Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
+    git grep -nE "(is( +not)?|as) +(Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
     git grep -nE "\.Status *(==|!=|is) *(404|409|412|429|503)|TableErrorCode\.|\.ErrorCode *==" -- "*.cs"
-    git grep -nE "Throws(Async|AnyAsync)?<(Azure\.)?(RequestFailedException|TableTransactionFailedException)>" -- "*.cs"
     ```
 
-    The first finds the catches, the second the filters and pattern matches (`when (ex is ...)`,
-    exception-handling middleware), the third status checks whatever the variable is typed as, the
-    fourth test assertions. A catch around a call the code makes on a `TableClient` or a
-    `BlobContainerClient` of its own is still right and stays. The optional
-    `Unified.Data.Tables.Analyzers` package (see Added) marks the first kind in the IDE.
+    The shapes that keep compiling and fail **silently** in production, besides the plain catch: an
+    exception filter or pattern match (`when (ex is RequestFailedException ...)`); a negated test,
+    such as an ASP.NET Core `IExceptionHandler` or middleware that starts with
+    `if (exception is not RequestFailedException rfe) return false;`, which now declines every storage
+    failure; a `switch` arm (`RequestFailedException { Status: 404 } => ...`) or a
+    `case RequestFailedException`; a retry policy, Polly's `Handle<RequestFailedException>()`,
+    `.Or<RequestFailedException>()` or `new PredicateBuilder().Handle<RequestFailedException>()`,
+    which silently stops retrying; an exception-to-status map keyed on
+    `typeof(RequestFailedException)`; and a test double of a storage interface that throws the Azure
+    type (`.ThrowsAsync(new RequestFailedException(404, ...))`), which keeps a handler's test green
+    while production never raises that type any more. Assertions on the Azure type (xUnit, NUnit,
+    MSTest, FluentAssertions) fail loudly when the tests run (B3). A catch around a call the code
+    makes on a `TableClient` or a `BlobContainerClient` of its own is still right and stays. The
+    optional `Unified.Data.Tables.Analyzers` package (see Added) marks only a `catch` clause, in the
+    IDE.
 - **B1, further consequences of the same switch.**
   - **A cancellation the caller did not ask for is `TransientStorageException`.** The Azure SDK reports
     its network timeout, once its retries are used up, as an `OperationCanceledException` (a
@@ -116,7 +137,12 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   - A project that got `TableStorage<T>`, `AddUnifiedTableStorage`, `BlobServiceClient` or any other
     `Azure.Storage.Blobs` type **transitively through the in-memory package** stops compiling.
     *Migration:* reference `Unified.Data.Tables` (and `Azure.Storage.Blobs`, if used directly).
-    `Azure.Data.Tables` still comes with the core (the row types only).
+    `Azure.Data.Tables` still comes with the core (the row types only). The in-memory package no
+    longer brings `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.Logging.Abstractions`
+    or `Microsoft.Extensions.Hosting.Abstractions` either, so `MemoryCache`/`IMemoryCache`,
+    `ILogger`/`NullLogger` and `IHostedService` used through it stop compiling (CS0234): reference
+    those packages directly to stay free of the Azure provider, or reference `Unified.Data.Tables`,
+    which brings them.
   - **`o.BlobOffload` on an in-memory registration does not compile** (CS1061): the lambda of
     `AddUnifiedInMemoryStorage` and `AddUnifiedInMemoryPolymorphicTable<TBase>` receives a
     `StorageOptions`, which has no such property. *Migration:* set the neutral one,
@@ -167,7 +193,12 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     `InMemoryPolymorphicStorage<TBase>` constructors, `AddUnifiedInMemoryStorage`,
     `AddUnifiedInMemoryPolymorphicTable<TBase>`) have a new signature. An assembly compiled against
     InMemory 0.9.2 that calls one of them fails with `MissingMethodException`; recompile it. The
-    packages pin each other exactly, so NuGet does not let the two versions mix in one project.
+    packages pin each other exactly, but that stops a mix only between constraints NuGet resolves
+    transitively: an older sibling that the project references **directly** (a per-package bump of a
+    dependency bot, a half-updated `Directory.Packages.props`) wins, and restore only warns, NU1608.
+    `Unified.Data.Tables` 0.10.0 beside a direct `Unified.Data.Tables.InMemory` 0.9.2 builds, and the
+    first `new InMemoryStorage<T>()` throws `MissingMethodException` (the `LargeValueTable` SPI
+    constructor below). See Upgrade notes.
   - **The hidden provider SPI changed with it.** The two `LargeValueTable` constructors in
     `Unified.Data.Tables.Providers` take `OffloadOptions` where they took `BlobOffloadOptions`
     (source-compatible, since the Azure type derives from the neutral one; a binary break for an
@@ -263,8 +294,15 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
 
 ### Upgrade notes
 
-- Upgrade every `Unified.Data.Tables.*` package in one step: the providers, the core and the kit pin
-  their siblings exactly (`[0.10.0]`), so a mixed set fails at restore, not at run time.
+- Upgrade every `Unified.Data.Tables.*` package in one step. The providers, the core and the kit pin
+  their siblings exactly (`[0.10.0]`), but NuGet refuses a mixed set at restore (NU1107) only when the
+  conflict is between transitive constraints. An older sibling referenced **directly** in the same
+  project restores with warning NU1608 and fails at run time with `MissingMethodException` (B4). Treat
+  the warning as an error for the upgrade (`<WarningsAsErrors>$(WarningsAsErrors);NU1608</WarningsAsErrors>`)
+  and have a dependency bot (Dependabot, Renovate) bump the `Unified.Data.Tables*` packages as one
+  group. `Unified.Data.Tables.Identity` is not held to the set: it depends on the abstractions with a
+  minimum version (`0.10.0` or later), so Identity 0.9.2 beside the 0.10.0 providers restores with no
+  diagnostic. Bump it with the others.
 - Stored rows, split values, offloaded blobs and issued cursors are unchanged. A corpus of what 0.9.2
   puts on the wire (rows, cursor tokens, `$filter` strings) is asserted byte for byte by this release's
   tests. As far as what is stored goes, a deploy can roll forward and back between 0.9.2 and 0.10.0; a
@@ -310,8 +348,11 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   `IAtomicInsert<TBase>` (`InsertAtomicAsync`). One transaction or nothing: a batch that cannot be one
   transaction (more than 100 rows, more than one partition, a repeated row, over the payload budget, a
   value that would go to blob storage) throws `BatchNotAtomicException` before any write and leaves
-  the caller's entities as they were, and so does an entity the serializer refuses
-  (`OversizedCellException`, `OversizedValueException`), on every provider. The splitting
+  the caller's entities as they were, and so does anything else that fails the batch before its
+  transaction is sent, on every provider: an entity the serializer refuses for its size
+  (`OversizedCellException`, `OversizedValueException`) or for anything else (a reference cycle, a
+  property named with the path delimiter: `SerializationException`), a cancelled token. Once the
+  transaction is sent, the entities are stamped as after any batch, whether or not it committed. The splitting
   `CreateBatchAsync` / `UpsertBatchAsync` are unchanged and never throw it.
 - **RowKey range**: `QueryOptions.FromRowKey`, `FromInclusive` (default true), `ToRowKey`, `ToInclusive`
   (default false), on `QueryAsync(QueryOptions)`, `QueryStreamAsync` and `QueryPageAsync`. A range
