@@ -57,6 +57,31 @@ public sealed class SqliteMultiProcessTests : IDisposable
         return process;
     }
 
+    /// <summary>
+    /// Opens the file the killed helper left behind. Opening it recovers the write-ahead log, which
+    /// truncates the log files. On Windows a handle to them can outlive the killed process for a
+    /// moment: the process exits before every handle is released, and the virus scanner opens a file
+    /// that was just written. Recovery then fails with SQLITE_IOERR (truncate) after SQLite's own short
+    /// retries. That is the platform releasing the file, not the crash recovery under test, so the open
+    /// is retried on an I/O error for a bounded time and every other failure is reported at once.
+    /// </summary>
+    private async Task<SqliteStorageAccount> ReopenAfterKillAsync()
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return database.Open(o => o.Cache = CachePolicy.Disabled);
+            }
+            catch (StorageException ex) when (ex.InnerException is Microsoft.Data.Sqlite.SqliteException { SqliteErrorCode: 10 } && DateTime.UtcNow < deadline)
+            {
+                TestContext.Current.TestOutputHelper?.WriteLine($"Reopen attempt {attempt} hit an I/O error while the file was still held: {ex.Message}");
+                await Task.Delay(TimeSpan.FromMilliseconds(250), Ct);
+            }
+        }
+    }
+
     private static async Task<string> ExitedAsync(Process process)
     {
         var output = process.StandardOutput.ReadToEndAsync(Ct);
@@ -186,7 +211,7 @@ public sealed class SqliteMultiProcessTests : IDisposable
             acknowledged = int.Parse(line["COMMITTED ".Length..], CultureInfo.InvariantCulture);
 
         // Reopened by a process that knows nothing of the dead one: SQLite recovers from the log it left.
-        var account = database.Open(o => o.Cache = CachePolicy.Disabled);
+        var account = await ReopenAfterKillAsync();
         var store = new SqliteStorage<HelperBatchRow>(account);
         var rows = await store.QueryAsync(new QueryOptions { Partition = Partition }, Ct);
         var batches = rows.GroupBy(r => r.Batch).OrderBy(g => g.Key).ToList();
