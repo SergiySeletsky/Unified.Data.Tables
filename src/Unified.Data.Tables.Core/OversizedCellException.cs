@@ -22,7 +22,8 @@ public sealed class OversizedCellException : SerializationException
             + $"{limitBytes:N0} B Azure Tables cell limit even after compression "
             + "(OversizedCellPolicy.Throw). Model it as multiple rows, or move the payload to Blob "
             + "storage and keep a reference here. To trim instead — which loses data silently — set "
-            + "UnifiedTableStorageOptions.OversizedCells to TrimWithMarker or TrimSilently.")
+            + "StorageOptions.OversizedCells (UnifiedTableStorageOptions.OversizedCells on the Azure provider) to "
+            + "TrimWithMarker or TrimSilently.")
     {
         ColumnName = columnName;
         ActualBytes = actualBytes;

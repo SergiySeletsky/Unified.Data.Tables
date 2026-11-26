@@ -8,6 +8,7 @@
     <Project Path="src/Unified.Data.Tables.Identity/Unified.Data.Tables.Identity.csproj" />
     <Project Path="src/Unified.Data.Tables.Conformance/Unified.Data.Tables.Conformance.csproj" />
     <Project Path="src/Unified.Data.Tables.Conformance.Xunit/Unified.Data.Tables.Conformance.Xunit.csproj" />
+    <Project Path="src/Unified.Data.Tables.Analyzers/Unified.Data.Tables.Analyzers.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Unified.Data.Tables.Tests/Unified.Data.Tables.Tests.csproj" />

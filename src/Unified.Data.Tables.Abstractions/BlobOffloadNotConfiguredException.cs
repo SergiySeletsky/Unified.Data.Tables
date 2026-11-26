@@ -16,7 +16,8 @@ public sealed class BlobOffloadNotConfiguredException : InvalidOperationExceptio
     /// <param name="columnName">The column whose value is stored in blob storage.</param>
     public BlobOffloadNotConfiguredException(string tableName, string columnName)
         : base($"Column '{columnName}' of table '{tableName}' is stored in blob storage, but blob offload is not configured. "
-            + "Set UnifiedTableStorageOptions.BlobOffload (with the container the value was written to) to read or write it.")
+            + "Set UnifiedTableStorageOptions.BlobOffload (with the container the value was written to) to read or write it; "
+            + "on the in-memory and SQLite providers the same setting is StorageOptions.Offload.")
     {
         TableName = tableName;
         ColumnName = columnName;

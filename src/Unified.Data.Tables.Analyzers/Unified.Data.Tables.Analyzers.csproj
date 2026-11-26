@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- What the compiler loads an analyzer as, on every host (dotnet build, Visual Studio, Rider). -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>Unified.Data.Tables.Analyzers</PackageId>
+    <RootNamespace>Unified.Data.Tables.Analyzers</RootNamespace>
+    <AssemblyName>Unified.Data.Tables.Analyzers</AssemblyName>
+    <Description>Optional upgrade analyzer for Unified.Data.Tables 0.10.0. UDT1001 (severity Info, never a warning) marks a catch of Azure.RequestFailedException whose try block calls a Unified.Data.Tables storage member and no Azure SDK member: since 0.10.0 storage members throw the provider-neutral StorageException family and the provider exception is the InnerException, so that catch no longer sees a storage failure. Reference it while upgrading from 0.9.x and remove it afterwards; no library package depends on it.</Description>
+    <PackageTags>azure;table-storage;repository;analyzer;roslyn;upgrade;storage;nosql</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <!-- An analyzer package: the assembly goes under analyzers/, not lib/, the package brings no
+         dependency, and a project that references it does not pass it on to its own consumers. -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IsRoslynComponent>true</IsRoslynComponent>
+  </PropertyGroup>
+
+  <!-- The lowest compiler the analyzer loads in: Roslyn 4.8 (.NET 8 SDK, Visual Studio 2022 17.8). The
+       provider packages need the .NET 10 SDK, whose compiler is newer. Compile-time only. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AdditionalFiles Include="AnalyzerReleases.Shipped.md" />
+    <AdditionalFiles Include="AnalyzerReleases.Unshipped.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="$(OutputPath)\$(AssemblyName).dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

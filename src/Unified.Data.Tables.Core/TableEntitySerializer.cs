@@ -167,8 +167,8 @@ public static class TableEntitySerializer
     internal static string UnresolvedOffloadMessage(string column) =>
         $"Column '{column}' holds a value offloaded to blob storage ('{column}{SplitCodec.BlobSuffix}'), and this read " +
         "cannot fetch it. Read the row through an IStorage<T> whose entity type marks the property " +
-        "[TableValueSplit] (or declares it as TableBlobContent), with UnifiedTableStorageOptions.BlobOffload " +
-        "configured. Returning the property empty would let the next write drop the reference.";
+        "[TableValueSplit] (or declares it as TableBlobContent), with StorageOptions.Offload " +
+        "(UnifiedTableStorageOptions.BlobOffload on the Azure provider) configured. Returning the property empty would let the next write drop the reference.";
 
     /// <summary>The message for a polymorphic write of an item that needs large-value cells.</summary>
     internal static string PolymorphicWriteRefusal(Type itemType) =>

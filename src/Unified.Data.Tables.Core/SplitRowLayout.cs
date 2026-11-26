@@ -210,8 +210,9 @@ internal static class SplitRowLayout
                 $"; {movable} more [TableValueSplit] value(s) on that row fit one cell each and stay there");
         var remedy = string.Create(CultureInfo.InvariantCulture,
             $"Store fewer properties in one entity, or have the value offloaded to blob storage, where it takes one cell: with "
-            + $"UnifiedTableStorageOptions.BlobOffload configured and the property's Offload not BlobOffload.Never, set "
-            + $"BlobOffloadOptions.ThresholdBytes below {overflow.LargestSplitBytes:N0} B (the encoded size of '{column}').");
+            + $"StorageOptions.Offload configured (UnifiedTableStorageOptions.BlobOffload on the Azure provider) and the "
+            + $"property's Offload not BlobOffload.Never, set OffloadOptions.ThresholdBytes (BlobOffloadOptions.ThresholdBytes "
+            + $"on the Azure provider) below {overflow.LargestSplitBytes:N0} B (the encoded size of '{column}').");
         return new OversizedValueException(column, overflow.LargestSplitBytes, reason, remedy);
     }
 
