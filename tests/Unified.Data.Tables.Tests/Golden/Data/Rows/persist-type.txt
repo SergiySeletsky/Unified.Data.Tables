@@ -1,0 +1,8 @@
+# ToTableEntity(persistType: true): the assembly-qualified type name in _TypeName; FromTableEntity() creates that type.
+row PartitionKey="golden" RowKey="persist-type"
+	Created	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"order-7"
+	Reason	Edm.String	"out of stock"
+	Severity	Edm.String	"Green"
+	_TypeName	Edm.String	"Unified.Data.Tables.Tests.Golden.GoldenOrderCancelled, Unified.Data.Tables.Tests, Version={version of the test assembly}, Culture=neutral, PublicKeyToken=null"
+read	Unified.Data.Tables.Tests.Golden.GoldenOrderCancelled	{"Reason":"out of stock","Severity":5,"Id":"order-7","Created":"2025-03-14T15:09:26.5358979\u002B00:00"}

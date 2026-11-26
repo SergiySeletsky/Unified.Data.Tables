@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net10.0</TargetFrameworks>
+    <PackageId>Unified.Data.Tables.Conformance.Xunit</PackageId>
+    <RootNamespace>Unified.Data.Tables.Conformance.Xunit</RootNamespace>
+    <AssemblyName>Unified.Data.Tables.Conformance.Xunit</AssemblyName>
+    <Description>xUnit v3 adapter for the Unified.Data.Tables conformance kit: derive from StorageConformanceTests (or one of the per-tier classes), return your store factory, and every scenario of Unified.Data.Tables.Conformance runs as its own test case. A capability the store does not expose and a declared leniency are reported as skipped tests with the reason. For xUnit v2, MSTest or NUnit, loop over the scenarios of the neutral package instead.</Description>
+    <PackageTags>azure;table-storage;repository;testing;conformance;contract-tests;xunit;storage;nosql</PackageTags>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <!-- A thin shell over the scenario list of exactly the kit packed beside it. See Directory.Build.targets. -->
+    <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
+    <!-- A library of test classes, not a test project: nothing here is run by `dotnet test`. -->
+    <IsTestProject>false</IsTestProject>
+    <!-- xUnit's own analyzers assume a test project; public abstract test classes are the point here. -->
+    <NoWarn>$(NoWarn);CA1515;xUnit1051</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Unified.Data.Tables.Conformance\Unified.Data.Tables.Conformance.csproj" />
+  </ItemGroup>
+
+  <!-- The attribute and test-context assembly only: no assertion library and no runner. The lowest xUnit v3
+       line the adapter is built against; a test project brings its own (newer) xunit.v3. -->
+  <ItemGroup>
+    <PackageReference Include="xunit.v3.extensibility.core" Version="3.2.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

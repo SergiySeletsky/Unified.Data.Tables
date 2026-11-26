@@ -1,4 +1,3 @@
-using System.Diagnostics.CodeAnalysis;
 
 namespace Unified.Data.Tables;
 
@@ -22,6 +21,15 @@ namespace Unified.Data.Tables;
 /// Rows are immutable facts plus mutable system columns. There is no whole-row update, no
 /// <see cref="ConcurrencyMode"/>, no <see cref="ProtectedPropertyAttribute"/> enforcement and no
 /// caching — see <see cref="MergeColumnsAsync"/> for the one supported mutation.
+/// </para>
+/// <para>
+/// <b>Failures are provider-neutral</b>, as on <see cref="IStorage{T}"/>: no member throws the storage
+/// backend's own exception type. What the backend reports is thrown as a <see cref="StorageException"/>
+/// (<see cref="DuplicateKeyException"/>, <see cref="EntityNotFoundException"/>,
+/// <see cref="TableNotFoundException"/>, <see cref="StorageRequestRejectedException"/>,
+/// <see cref="TransientStorageException"/>, or the base type) with the backend's exception as its
+/// <see cref="Exception.InnerException"/>. A row that does not exist reads as null or an empty result,
+/// deletes as a no-op, and fails only <see cref="MergeColumnsAsync"/>.
 /// </para>
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
@@ -96,13 +104,12 @@ public interface IPolymorphicStorage<TBase>
     /// <see cref="SystemColumnNames.TypeName"/> is rejected: re-typing a row would strand the
     /// previous type's data columns on it.
     /// <para>
-    /// <b>Merging a row that does not exist throws <c>Azure.RequestFailedException</c> with
-    /// <c>Status == 404</c></b> — on the in-memory implementation too, which raises the same type so
-    /// a test written against the fake still describes production. This is the one place a provider
-    /// type surfaces through an otherwise provider-agnostic contract: there is no read to turn the
-    /// miss into a null, and inventing a provider-neutral exception here would make the two
-    /// implementations disagree with every other 404 in the library. Documented rather than wrapped;
-    /// catching it means referencing <c>Azure.Core</c>.
+    /// <b>Merging a row that does not exist throws <see cref="EntityNotFoundException"/></b>, on every
+    /// implementation: there is no read to turn the miss into a null, and a merge never creates a row.
+    /// Until 0.10.0 this was the one place a provider type surfaced through the contract (an
+    /// <c>Azure.RequestFailedException</c> with <c>Status == 404</c>, from the in-memory implementation
+    /// too). That exception is no longer thrown; on Azure it is the
+    /// <see cref="Exception.InnerException"/> of the neutral one.
     /// </para>
     /// </remarks>
     /// <param name="key">The row to patch.</param>
@@ -110,17 +117,7 @@ public interface IPolymorphicStorage<TBase>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A task that completes when the merge is applied.</returns>
     /// <exception cref="ArgumentException">A column name is not a system column, or is the discriminator.</exception>
-    /// <exception cref="T:Azure.RequestFailedException">
-    /// No row exists at <paramref name="key"/> (<c>Status == 404</c>). Referenced by documentation ID
-    /// because this assembly deliberately takes no Azure dependency.
-    /// </exception>
-    // The "T:" prefix is the only way to put an <exception> element on the XML docs for a type this
-    // assembly cannot reference: an ordinary cref would be CS1574. CA1200 exists to catch a prefix
-    // used by accident, where the compiler would otherwise have validated the target — here there is
-    // deliberately nothing to validate against, and the alternative (dropping the tag) would hide the
-    // one provider exception that escapes this contract from every IntelliSense exception list.
-    [SuppressMessage("Documentation", "CA1200:Avoid using cref tags with a prefix",
-        Justification = "Azure.RequestFailedException is not referenceable from this dependency-free assembly.")]
+    /// <exception cref="EntityNotFoundException">No row exists at <paramref name="key"/>.</exception>
     Task MergeColumnsAsync(TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default);
 
     /// <summary>Read one row, or null when it does not exist.</summary>

@@ -94,7 +94,7 @@ public class BuilderUpdateWhileTheConstructorFailsTests
     [Fact]
     public void ProjectionOfAColumnWhoseResolutionFails_IsNotNarrowed()
     {
-        var isKnownOrdinary = typeof(TableStorage<ProjectionFlakyHolder>).GetMethod(
+        var isKnownOrdinary = typeof(Unified.Data.Tables.Providers.ProjectionColumns<ProjectionFlakyHolder>).GetMethod(
             "IsKnownOrdinaryColumn", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
         bool Ordinary(string name) => (bool)isKnownOrdinary.Invoke(null, [name])!;
 

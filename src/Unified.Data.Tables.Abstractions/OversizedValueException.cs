@@ -27,8 +27,9 @@ public sealed class OversizedValueException : SerializationException
     public OversizedValueException(string columnName, long encodedBytes, string reason, bool offloadForbiddenByProperty = false)
         : base($"Property '{columnName}' encodes to {encodedBytes:N0} B and cannot be stored: {reason}. "
             + (offloadForbiddenByProperty
-                ? "Set the property's Offload to BlobOffload.AboveThreshold and configure UnifiedTableStorageOptions.BlobOffload."
-                : "Configure UnifiedTableStorageOptions.BlobOffload so large values can be stored in blob storage."))
+                ? "Set the property's Offload to BlobOffload.AboveThreshold and configure UnifiedTableStorageOptions.BlobOffload"
+                : "Configure UnifiedTableStorageOptions.BlobOffload so large values can be stored in blob storage")
+            + " (StorageOptions.Offload on the in-memory and SQLite providers).")
     {
         ColumnName = columnName;
         EncodedBytes = encodedBytes;

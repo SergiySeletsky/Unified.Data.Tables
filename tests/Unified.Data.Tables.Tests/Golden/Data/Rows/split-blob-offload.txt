@@ -1,0 +1,17 @@
+# [TableValueSplit] values with blob offload configured (threshold 50,000 bytes): a value whose stored form is larger leaves a __blob reference cell and a blob named {table}/{partition}/{row}/{column}/{sha256}; a smaller one stays in cells.
+row PartitionKey="golden" RowKey="split-offload"
+	Body__blob	Edm.String	"{\u0022path\u0022:\u0022GoldenSplit/golden/split-offload/Body/23dd755d9ac53b824ef63b1d17bd781e627ee70362b6cb56911aa1ee09a5195f\u0022,\u0022sha256\u0022:\u002223dd755d9ac53b824ef63b1d17bd781e627ee70362b6cb56911aa1ee09a5195f\u0022,\u0022length\u0022:66759,\u0022contentType\u0022:\u0022text/plain; charset=utf-8\u0022,\u0022encoding\u0022:\u0022text\u0022}"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|split-offload"
+	Image__blob	Edm.String	"{\u0022path\u0022:\u0022GoldenSplit/golden/split-offload/Image/960d52d76b41e72227ab209c9de073f068b305cd5288900061b925d698a1ef6e\u0022,\u0022sha256\u0022:\u0022960d52d76b41e72227ab209c9de073f068b305cd5288900061b925d698a1ef6e\u0022,\u0022length\u0022:70000,\u0022contentType\u0022:\u0022application/octet-stream\u0022,\u0022encoding\u0022:\u0022binary\u0022}"
+	Items__c0	Edm.String	sha256=ecff691165119c04f0e39adf3d255eb61e67ca4021e9b71433d86d38a0091e99,utf8-bytes=46212,head="[\u0022qkRGC\u00DF s7o861rpwy9k9yQ\u00DFgtDYltk
+	Items__c1	Edm.String	sha256=66db1421b2d2401a321ce83d8505c01e31455ad7d7501e1edb961cd1f58f82b2,utf8-bytes=11898,head="dbwu\u04164Gz\u4E2Dia\u044F VGOKM0N0k1\u6587 MU
+	Items__chunks	Edm.Int32	2
+	Items__enc	Edm.String	"text"
+	Items__len	Edm.Int64	"44817"
+	Items__sha256	Edm.String	"cc1759c65a6d63cb87667b834ea15dc84e7a264d88dfc13ff30c5890356e36e0"
+	Title	Edm.String	"offload"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+blob	GoldenSplit/golden/split-offload/Body/23dd755d9ac53b824ef63b1d17bd781e627ee70362b6cb56911aa1ee09a5195f	sha256=23dd755d9ac53b824ef63b1d17bd781e627ee70362b6cb56911aa1ee09a5195f,bytes=66759
+blob	GoldenSplit/golden/split-offload/Image/960d52d76b41e72227ab209c9de073f068b305cd5288900061b925d698a1ef6e	sha256=960d52d76b41e72227ab209c9de073f068b305cd5288900061b925d698a1ef6e,bytes=70000
+read	Unified.Data.Tables.Tests.Golden.GoldenSplit	{"Title":"offload","Body":"sha256-of-utf16le=0bf20de6a0fc6b861bb8bf87737a6c7f53622e8f7a7598dee959801268e0e541,chars=60000","Image":"sha256-of-utf16le=fc85ae70c2972c9386f7b96da88cad88d28f0ab25f774badd9cc3c90ed3f332f,chars=93336","Items":"sha256-of-json=24c65ca0e7694aa11ed803e42e4792b93f9ee3e1cd56cbc834168f2f09660af5,items=40","Zipped":null,"Id":"golden|split-offload","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

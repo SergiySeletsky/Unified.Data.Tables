@@ -1,0 +1,20 @@
+# The nullable form of every scalar, each holding a value: the cells of the non-nullable form.
+row PartitionKey="golden" RowKey="nullable-set"
+	Bytes	Edm.Binary	"Kg=="
+	Colour	Edm.String	"Blue"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	DateTime	Edm.DateTime	"2000-01-01T00:00:00.0000000Z"
+	DateTimeOffset	Edm.DateTime	"2025-03-15T16:10:27.1234567Z"
+	Decimal	Edm.Double	0.5
+	Double	Edm.Double	-2.5
+	Flag	Edm.Boolean	false
+	Guid	Edm.Guid	"7c9e6679-7425-40de-944b-e07fc1f90ae7"
+	Id	Edm.String	"golden|nullable-set"
+	Int32	Edm.Int32	0
+	Int64	Edm.Int64	"-1"
+	Text	Edm.String	"text"
+	TimeSpan	Edm.String	"01:30:00"
+	UInt32	Edm.Int64	"7"
+	UInt64	Edm.Int64	"8"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenNullableScalars	{"Text":"text","Flag":false,"Int32":0,"Int64":-1,"Double":-2.5,"Decimal":0.5,"Guid":"7c9e6679-7425-40de-944b-e07fc1f90ae7","DateTime":"2000-01-01T00:00:00","DateTimeOffset":"2025-03-15T16:10:27.1234567\u002B00:00","TimeSpan":"01:30:00","Bytes":"Kg==","Colour":9,"UInt32":7,"UInt64":8,"Id":"golden|nullable-set","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

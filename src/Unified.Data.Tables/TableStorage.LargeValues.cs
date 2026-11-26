@@ -11,8 +11,9 @@ namespace Unified.Data.Tables;
 // the value before deserializing. Every branch here is reached only for a split-aware T (one with a
 // [TableValueSplit] member), except the IsPartRow skip on reads: OneAsync, ExistsAsync and the queries
 // that fetch whole rows skip a row that carries a _SplitOf cell for every type (a plain type never
-// writes one, but it can share a table with a split-aware type). CountAsync and a projected query of a
-// plain type do not select _SplitOf, so they still count or return such rows, as 0.8.3 does.
+// writes one, but it can share a table with a split-aware type). A projected query selects _SplitOf for
+// every type too (since 0.10.0), so it skips them as well; CountAsync of a plain type does not select
+// it and still counts such rows, as 0.8.3 does.
 //
 // Whose row is it? A continuation row is the entity's own when the stored primary declares it, or when
 // its _SplitOf cell names the entity (a leftover: the primary was deleted or replaced by a writer that
@@ -91,6 +92,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     private async Task<StoredRow?> ReadStoredAsync(string pk, string rk, CancellationToken ct)
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, rk, PriorSelect, ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
         if (!response.HasValue || response.Value is not { } row)
             return null;
         if (SplitRowLayout.IsPartRow(row))
@@ -168,6 +170,9 @@ public partial class TableStorage<T> : IBlobOffloadState
         var takeBack = false;
         Dictionary<string, ETag>? ownParts = null;
         var lostRace = false;
+        // Every write request of this call is noted from here on: a conflict reported after several
+        // attempts may be the call's own write when any of them was sent twice (or none was observed).
+        var began = RequestAttempts.MarkCurrent();
 
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
@@ -179,10 +184,19 @@ public partial class TableStorage<T> : IBlobOffloadState
             var prior = kind == LargeWriteKind.Create ? null : await ReadPriorAsync(pk, rk, ct);
             if (kind == LargeWriteKind.Replace)
             {
+                // Found missing by this call's own read, so no request was refused. The 404 the service
+                // answers an update of a missing row with is attached all the same, as a type without
+                // large values carries it (and as 0.9.x threw it here): a handler reads the status and
+                // the code from the same place on every path.
                 if (prior is null)
-                    throw new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}");
+                    throw AzureStorageErrors.NotFound(typeName, entity.Id,
+                        new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}", "ResourceNotFound", null));
+                // Found by this call's own read, before it sent a write: no provider exception. Only
+                // after an attempt that failed on a continuation row can the version be this call's own,
+                // and then only when a request of it was sent twice (or its attempts were not observed).
                 if (strict && prior.ETag != ifMatch)
-                    throw new ConcurrencyConflictException(typeName, entity.Id, null);
+                    throw AzureStorageErrors.Conflict(typeName, entity.Id, inner: null,
+                        mayBeOwnWrite: attempt > 1 && RequestAttempts.MayBeOwnWriteSince(began));
             }
 
             var own = ownParts ?? (takeBack ? await OwnPartsAsync(pk, rk, ct) : null);
@@ -197,6 +211,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             var actions = TransactionActions(plan, condition, own, pk);
 
             LargeWriteResult result;
+            var sent = RequestAttempts.MarkCurrent();
             try
             {
                 result = actions is null ? await WriteRowAsync(plan.Primary, condition, ct) : await SubmitAsync(actions, ct);
@@ -226,11 +241,11 @@ public partial class TableStorage<T> : IBlobOffloadState
                 if (IsPrimaryFailure(ex))
                 {
                     if (kind == LargeWriteKind.Create)
-                        throw new DuplicateKeyException(typeName, entity.Id, ex);
-                    // A strict replace may not retry its own condition; a vanished row surfaces as the
-                    // service's own 404.
+                        throw Duplicate(entity.Id, ex, sent);
+                    // A strict replace may not retry its own condition; a vanished row surfaces as a
+                    // missing entity, with the service's own 404 inside.
                     if (strict)
-                        throw ex.Status == 404 ? ex : new ConcurrencyConflictException(typeName, entity.Id, ex);
+                        throw ex.Status == 404 ? AzureStorageErrors.NotFound(typeName, entity.Id, ex) : Conflict(entity.Id, ex, sent);
                 }
                 // Any write plans again when a continuation row it counted on is gone or has changed.
                 lost = ex;
@@ -246,7 +261,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             return result;
         }
 
-        throw new ConcurrencyConflictException(typeName, entity.Id, lost);
+        throw Conflict(entity.Id, lost, began);
     }
 
     /// <summary>The row keys of the continuation rows of <paramref name="rk"/> that exist now (one range query).</summary>
@@ -349,6 +364,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     private async Task<bool> HeldByForeignRowAsync(string pk, string rk, string partKey, CancellationToken ct)
     {
         var response = await client.GetEntityIfExistsAsync<TableEntity>(pk, partKey, PartKeys, ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
         if (!response.HasValue || response.Value is not { } row)
             return false;
         return !(row.TryGetValue(SystemColumnNames.SplitOf, out var of) && of is string owner && string.Equals(owner, rk, StringComparison.Ordinal));
@@ -425,7 +441,12 @@ public partial class TableStorage<T> : IBlobOffloadState
         large.SweepTableOrphanBlobsAsync(olderThan, typeof(T), PartitionRowsAsync, ct);
 
     // Every stored row of the partition (continuation rows included), in one query projected onto select.
-    private async IAsyncEnumerable<TableEntity> PartitionRowsAsync(
+    // An SDK failure of the listing is neutral before the large-value layer sees it: an orphan sweep
+    // collects its partitions' failures in an AggregateException, and none of them may be the SDK's own.
+    private IAsyncEnumerable<TableEntity> PartitionRowsAsync(string partition, IReadOnlyList<string>? select, CancellationToken ct) =>
+        AzureStorageErrors.GuardAsync(PartitionRowsCoreAsync(partition, select, ct), ex => Failed(ex, write: false), ct);
+
+    private async IAsyncEnumerable<TableEntity> PartitionRowsCoreAsync(
         string partition, IReadOnlyList<string>? select, [EnumeratorCancellation] CancellationToken ct)
     {
         await EnsureTableAsync(ct);
@@ -471,8 +492,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     // "EntityNotFound" is the other one it documents), or no code at all. A 404 that names anything
     // else is no lost race: when the table itself is gone ("TableNotFound") reading again cannot help,
     // and the caller must see the service's own error, not a concurrency conflict.
-    private static bool IsMissingRow(RequestFailedException ex) =>
-        ex.Status == 404 && (string.IsNullOrEmpty(ex.ErrorCode) || ex.ErrorCode is "ResourceNotFound" or "EntityNotFound");
+    private static bool IsMissingRow(RequestFailedException ex) => AzureStorageErrors.IsMissingRow(ex);
 
     // A transaction fails at one action; the primary is action 0, and a single SDK call is always the primary.
     private static bool IsPrimaryFailure(RequestFailedException ex) =>
@@ -559,6 +579,16 @@ public partial class TableStorage<T> : IBlobOffloadState
     }
 
     /// <summary>
+    /// For a write whose request may name the key in its URL (an upsert, an update), refuses a key that
+    /// would change the address of that request (see <see cref="RefusedKeyCharacters"/>) before any SDK call.
+    /// </summary>
+    private void RefuseUrlBreakingKey(string id)
+    {
+        var (pk, rk) = GetEntityKeys(NormalizeId(id));
+        RefusedKeyCharacters.ThrowIfIn(pk, rk);
+    }
+
+    /// <summary>
     /// Stamps the outcome of a split-aware write on <paramref name="entity"/> and keeps the caches
     /// coherent. The entity gets the version the write itself produced, or null when that is unknown
     /// (re-read before an optimistic update, as after a batch). Only a single call's result is cached; a
@@ -621,6 +651,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             catch (TableValueIntegrityException failure)
             {
                 var current = await client.GetEntityIfExistsAsync<TableEntity>(primary.PartitionKey, primary.RowKey, cancellationToken: ct);
+                AzureStorageErrors.ThrowIfTableMissing(current);
                 if (!current.HasValue || current.Value is null || SplitRowLayout.IsPartRow(current.Value))
                     return null;
                 if (current.Value.ETag == primary.ETag)
@@ -645,11 +676,31 @@ public partial class TableStorage<T> : IBlobOffloadState
     /// row key is accepted. Once the entity is deleted, the blobs the read before the delete found it
     /// referencing are deleted (best effort; see <see cref="BlobPaths"/>), the others are left for the
     /// orphan sweep.
+    /// <para>
+    /// With <paramref name="ifMatch"/> (a conditional delete on a caller's version) the row is deleted
+    /// only while it is that version: another version found by the read, or by the delete (412), throws
+    /// <see cref="ConcurrencyConflictException"/> and is never retried. Only a continuation row that
+    /// vanished while the entity was the caller's version is read again.
+    /// </para>
+    /// <para>
+    /// Returns what was found. <see cref="DeleteStatus.Deleted"/>: a delete request of this call removed
+    /// the entity. <see cref="DeleteStatus.NotFound"/>: no entity was there, and no delete request of this
+    /// call can have removed it. <see cref="DeleteStatus.Indeterminate"/>: the entity was read, its delete
+    /// was answered 404 (the single delete returns it, the transaction throws it), and an earlier attempt
+    /// of that request was sent or the attempts could not be observed, so the lost attempt may be what
+    /// removed it.
+    /// </para>
     /// </summary>
-    private async Task DeleteLargeAsync(string pk, string rk, CancellationToken ct)
+    private async Task<DeleteStatus> DeleteLargeAsync(string pk, string rk, ETag? ifMatch, CancellationToken ct)
     {
         // No row-key check: a row written before the type opted in may carry any key and stays deletable.
         RequestFailedException? lost = null;
+        var id = $"{pk}{Separator}{rk}";
+        var began = RequestAttempts.MarkCurrent();
+        // Set once a delete of the entity was answered "not found" although the read before it found the
+        // entity, on a request that may have been applied by an earlier attempt of itself.
+        var ownDeleteMayHaveLanded = false;
+        DeleteStatus Gone() => ownDeleteMayHaveLanded ? DeleteStatus.Indeterminate : DeleteStatus.NotFound;
         for (var attempt = 1; attempt <= MaxLargeWriteAttempts; attempt++)
         {
             // Every retry here follows a lost race: a short, growing, jittered pause first.
@@ -663,7 +714,7 @@ public partial class TableStorage<T> : IBlobOffloadState
                 // declares (one range query, in this case only). When there are none, nothing to do.
                 leftovers = await LeftoverPartsAsync(pk, rk, ct);
                 if (leftovers.Count == 0)
-                    return;
+                    return Gone();
                 // They are leftovers only if there is still no primary now that they are listed: a
                 // writer may have created the entity after the first read, and the rows listed are then
                 // that entity's own. With no primary after the listing, a writer that creates the entity
@@ -672,23 +723,35 @@ public partial class TableStorage<T> : IBlobOffloadState
             }
             // A continuation row addressed by its own id is not an entity: nothing is deleted.
             if (stored is { } found && SplitRowLayout.IsPartRow(found.Row))
-                return;
+                return DeleteStatus.NotFound;
 
             IReadOnlyList<string> blobs = [];
             DateTimeOffset? committedAt = null;
+            var status = DeleteStatus.Deleted;
+            var sent = RequestAttempts.MarkCurrent();
             try
             {
                 if (stored is not { } row)
                 {
                     await DeleteLeftoverPartsAsync(pk, leftovers, ct);
-                    return;
+                    return Gone();
                 }
+
+                // Another version than the caller's, found by this call's own read before it sent a
+                // delete: no provider exception, and never this call's own write (a delete leaves no version).
+                if (ifMatch is { } version && row.ETag != version)
+                    throw AzureStorageErrors.Conflict(typeName, id, inner: null, mayBeOwnWrite: false);
 
                 blobs = BlobPaths(row.Row, pk, rk);
                 var parts = DeclaresNoParts(row.Row) ? [] : await QueryPartsAsync(pk, rk, PartKeys, ct);
+                sent = RequestAttempts.MarkCurrent();
                 if (parts.Count == 0)
                 {
-                    committedAt = HeaderDate(await client.DeleteEntityAsync(pk, rk, row.ETag, ct));
+                    // The SDK returns a 404 instead of throwing it: the row went between the read and
+                    // the delete (another writer's delete, or an earlier attempt of this request).
+                    var response = await client.DeleteEntityAsync(pk, rk, row.ETag, ct);
+                    status = DeleteOutcome(response, sent);
+                    committedAt = HeaderDate(response);
                 }
                 else
                 {
@@ -703,16 +766,25 @@ public partial class TableStorage<T> : IBlobOffloadState
             }
             catch (RequestFailedException ex) when (ex.Status is 412 or 404)
             {
+                // A caller's version is never retried: the row is another version now.
+                if (ifMatch is not null && ex.Status == 412)
+                    throw Conflict(id, ex, sent);
+                // A transaction throws its 404: a row it deletes is gone. When that request deleted the
+                // entity (not leftover rows without a primary) and may have been applied by an earlier
+                // attempt of itself, the entity the next read no longer finds may have been removed by
+                // this very call.
+                if (ex.Status == 404 && stored is not null && RequestAttempts.MayBeOwnWriteSince(sent))
+                    ownDeleteMayHaveLanded = true;
                 lost = ex;
                 continue;
             }
 
             // The entity is gone: the blobs it referenced follow (best effort; a cancelled token only bounds it).
             await DeleteBlobsAsync(pk, rk, blobs, committedAt, ct);
-            return;
+            return status;
         }
 
-        throw new ConcurrencyConflictException(typeName, $"{pk}{Separator}{rk}", lost);
+        throw Conflict(id, lost, began);
     }
 
     // True when the stored row says it has no continuation rows. A part count that cannot be read (a
@@ -733,8 +805,8 @@ public partial class TableStorage<T> : IBlobOffloadState
     /// <summary>
     /// The continuation rows of an entity that has no primary row: what a writer that does not know
     /// continuation rows, an interrupted partition delete or a delete that raced a write left of it. A
-    /// table that is not there has none (the point read of a missing table reads as "no row"; only the
-    /// query says the table is gone), so deleting from it is a no-op, as for any other type.
+    /// table that is not there has none. (The point read before this one already reported a table deleted
+    /// behind the store as <see cref="TableNotFoundException"/>; a 404 here is one that came after it.)
     /// </summary>
     private async Task<List<TableEntity>> LeftoverPartsAsync(string pk, string rk, CancellationToken ct)
     {
@@ -800,7 +872,7 @@ public partial class TableStorage<T> : IBlobOffloadState
             logger.LogDebug(ex, "{Type} partition {Partition}: an entity changed after the listing; its transaction's entities are deleted one by one",
                 typeName, pk);
             foreach (var rk in batch.Select(UnitKeyOf).Distinct(StringComparer.Ordinal))
-                await DeleteLargeAsync(pk, rk, ct);
+                await DeleteLargeAsync(pk, rk, ifMatch: null, ct);
         }
     }
 
@@ -811,6 +883,7 @@ public partial class TableStorage<T> : IBlobOffloadState
     private async Task DeleteListedLeftoversAsync(string pk, string primaryRowKey, IReadOnlyList<TableEntity> rows, CancellationToken ct)
     {
         var primary = await client.GetEntityIfExistsAsync<TableEntity>(pk, primaryRowKey, PartKeys, ct);
+        AzureStorageErrors.ThrowIfTableMissing(primary);
         if (primary.HasValue && primary.Value is { } row && !SplitRowLayout.IsPartRow(row))
             return;
 
@@ -839,75 +912,6 @@ public partial class TableStorage<T> : IBlobOffloadState
             }
         }
     }
-
-    /// <summary>
-    /// True when a projection of a split-aware <typeparamref name="T"/> must fetch the whole row: when
-    /// one of the requested names is not known to be an ordinary column. A large value spans cells and
-    /// continuation rows (or a blob), so a projection that names it, an object that owns it, or one of
-    /// its storage cells (<c>{Prop}__c0</c>, <c>__chunks</c>, <c>__sha256</c>, <c>__enc</c>, <c>__len</c>,
-    /// or the <c>{Prop}__Json</c> / <c>{Prop}__GZip</c> cell of an opted-in property) fetches and
-    /// assembles the whole row and returns the whole value; so does a name that cannot be resolved,
-    /// because it may be a large value the type's column list does not hold (below a repeated type, or a
-    /// runtime subtype). Only a projection whose every name is a system column or resolves, through the
-    /// declared types and the read-side resolution of runtime owners, to an ordinary member is narrowed.
-    /// The blob reference cell <c>{Prop}__blob</c> named alone is narrowed as before and leaves the
-    /// property at its default.
-    /// </summary>
-    private static bool SelectsLargeValue(IReadOnlyCollection<string> requested)
-    {
-        foreach (var name in requested)
-        {
-            if (!IsKnownOrdinaryColumn(name))
-                return true;
-        }
-        return false;
-    }
-
-    /// <summary>See <see cref="SelectsLargeValue"/>: true only for a name known to be an ordinary column.</summary>
-    private static bool IsKnownOrdinaryColumn(string name)
-    {
-        if (Array.IndexOf(SystemColumns, name) >= 0 || Array.IndexOf(SplitSystemColumns, name) >= 0
-            || string.Equals(name, ETagToken, StringComparison.Ordinal))
-            return true;
-        // A storage cell names its value; the reference cell alone is the one exception, kept as it was.
-        if (SplitCodec.TryParseLargeValueColumn(name, out _, out var kind, out _))
-            return kind == LargeValueCellKind.BlobReference;
-        foreach (var column in TypeMetadataCache.LargeValueColumns(typeof(T)))
-        {
-            if (string.Equals(name, column, StringComparison.Ordinal)
-                || column.StartsWith(name + TableEntityValue.PathDelimiter, StringComparison.Ordinal))
-                return false;
-        }
-
-        // Not on the list: resolved as a read resolves it (the type is split-aware, so a default instance
-        // may be constructed, ruling R3). A name that resolves to no member, to a large-value member, to an
-        // object that may own one, or whose resolution fails, is not known to be ordinary.
-#pragma warning disable CA1031 // a name that cannot be resolved is simply not known to be ordinary
-        try
-        {
-            if (TypeMetadataCache.IsLargeValueOnRead(typeof(T), name))
-                return false;
-            return TypeMetadataCache.ReadTarget(typeof(T), name) is { } leaf && !MayOwnColumns(leaf.PropertyType);
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-#pragma warning restore CA1031
-    }
-
-    /// <summary>True when a member of <paramref name="type"/> may be stored as columns of its own (an object the serializer flattens).</summary>
-    private static bool MayOwnColumns(Type type)
-    {
-        var underlying = Nullable.GetUnderlyingType(type) ?? type;
-        if (type == typeof(string) || type == typeof(byte[]) || TableEntityValue.IsPrimitive(type) || underlying.IsEnum)
-            return false;
-        return TableEntitySerializer.FlattensToColumns(type);
-    }
-
-    /// <summary>Columns a split-aware projection adds so continuation rows can be recognised and skipped.</summary>
-    private static readonly string[] SplitSystemColumns =
-        [SystemColumnNames.SplitOf, SystemColumnNames.SplitIndex, SystemColumnNames.SplitParts];
 
     /// <summary>
     /// One entity of a split-aware batch: the stored row it was planned against, its rows and, when it was
@@ -1037,9 +1041,14 @@ public partial class TableStorage<T> : IBlobOffloadState
 
     private async Task SubmitBatchUnitsAsync(
         List<BatchUnit> units, LargeWriteKind kind, int attempt, Dictionary<string, Dictionary<string, ETag>?>? takeBack,
-        List<ReleasedBlobs> released, CancellationToken ct)
+        List<ReleasedBlobs> released, CancellationToken ct, AtomicSend? atomic = null)
     {
-        foreach (var range in LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList()))
+        var transactions = LargeValueTable.PlanTransactions(units.Select(u => u.Plan).ToList());
+        // An all-or-nothing batch (IAtomicBatch) is one transaction or it is refused, before anything is
+        // uploaded or sent, for this plan as for every one made again below.
+        if (atomic is not null)
+            RequireOneLargeTransaction(units, transactions);
+        foreach (var range in transactions)
         {
             var chunk = units.GetRange(range.Start, range.Count);
             // Every blob exists (uploaded, or touched when already there) before the rows that reference
@@ -1049,6 +1058,11 @@ public partial class TableStorage<T> : IBlobOffloadState
                 await large.UploadAsync(unit.Plan, ct);
             var (actions, owners) = BatchActions(chunk);
             DateTimeOffset? committedAt;
+            // A duplicate key is about this transaction alone; a conflict after the last attempt is
+            // about every attempt of the call (sent: 0), any of which may have been sent twice.
+            var sent = RequestAttempts.MarkCurrent();
+            if (atomic is not null)
+                atomic.Sent = true;
             try
             {
                 committedAt = HeaderDate(RawResponse(await client.SubmitTransactionAsync(actions, ct)));
@@ -1067,14 +1081,14 @@ public partial class TableStorage<T> : IBlobOffloadState
                     // The row in the way is gone (or the entity's own again): a lost race, planned again
                     // from the rows as they are now, after a short pause.
                     if (attempt >= MaxLargeWriteAttempts)
-                        throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
+                        throw Conflict(unit.Entity.Id, ex, sent: 0);
                     await large.WaitBeforeRetryAsync(attempt + 1, ct);
                     var again = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
-                    await SubmitBatchUnitsAsync(again, kind, attempt + 1, takeBack, released, ct);
+                    await SubmitBatchUnitsAsync(again, kind, attempt + 1, takeBack, released, ct, atomic);
                     continue;
                 }
                 if (attempt >= MaxLargeWriteAttempts)
-                    throw new ConcurrencyConflictException(typeName, unit.Entity.Id, ex);
+                    throw Conflict(unit.Entity.Id, ex, sent: 0);
                 var taking = takeBack is null
                     ? new Dictionary<string, Dictionary<string, ETag>?>(StringComparer.Ordinal)
                     : new Dictionary<string, Dictionary<string, ETag>?>(takeBack, StringComparer.Ordinal);
@@ -1088,12 +1102,12 @@ public partial class TableStorage<T> : IBlobOffloadState
                         taking.TryAdd(other.Rk, null);
                 }
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, taking, ct);
-                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, released, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, taking, released, ct, atomic);
                 continue;
             }
             catch (RequestFailedException ex) when (kind == LargeWriteKind.Create && ex.Status == 409 && IsBatchPrimaryFailure(ex, owners))
             {
-                throw new DuplicateKeyException(typeName, FailedId(ex, owners, chunk), ex);
+                throw Duplicate(FailedId(ex, owners, chunk), ex, sent);
             }
             catch (RequestFailedException ex) when (BatchLostRace(ex, kind, owners))
             {
@@ -1101,10 +1115,10 @@ public partial class TableStorage<T> : IBlobOffloadState
                 // rows as they are now, after a short pause. A continuation row removed meanwhile (404)
                 // is not required again.
                 if (attempt >= MaxLargeWriteAttempts)
-                    throw new ConcurrencyConflictException(typeName, FailedId(ex, owners, chunk), ex);
+                    throw Conflict(FailedId(ex, owners, chunk), ex, sent: 0);
                 await large.WaitBeforeRetryAsync(attempt + 1, ct);
                 var replanned = await PlanBatchUnitsAsync(chunk.ConvertAll(u => u.Entity), kind, takeBack, ct);
-                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, released, ct);
+                await SubmitBatchUnitsAsync(replanned, kind, attempt + 1, takeBack, released, ct, atomic);
                 continue;
             }
 

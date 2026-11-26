@@ -1,0 +1,7 @@
+# An id without a separator: PartitionKey and RowKey are both the id.
+row PartitionKey="solo" RowKey="solo"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"solo"
+	Text	Edm.String	"solo"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenNullableScalars	{"Text":"solo","Flag":null,"Int32":null,"Int64":null,"Double":null,"Decimal":null,"Guid":null,"DateTime":null,"DateTimeOffset":null,"TimeSpan":null,"Bytes":null,"Colour":null,"UInt32":null,"UInt64":null,"Id":"solo","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

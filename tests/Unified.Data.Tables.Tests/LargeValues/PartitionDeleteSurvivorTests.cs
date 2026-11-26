@@ -420,7 +420,10 @@ public class PartitionDeleteSurvivorTests
         Assert.Equal([BlobOf(d1)], inner.Names);
         Assert.Equal(0, rig.Blobs.Count("delete"));
         var warning = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
-        Assert.IsType<RequestFailedException>(warning.Error);
+        // The listing's failure is neutral before it is logged (0.10.0), the service's 503 inside.
+        var failure = Assert.IsType<TransientStorageException>(warning.Error);
+        Assert.False(failure.MayHaveCommitted); // a listing writes nothing
+        Assert.Equal(503, Assert.IsType<RequestFailedException>(failure.InnerException).Status);
         Assert.Contains("orphan sweep", warning.Message, StringComparison.Ordinal);
     }
 

@@ -763,7 +763,7 @@ public class MarkedLeafGeneratorMatrixTests
             return;
         }
         // The service refuses a cell it cannot store (a binary cell over 64 KiB); the in-memory store stores it.
-        if (thrown is RequestFailedException)
+        if (thrown is StorageRequestRejectedException)
         {
             Assert.True(Same(rowBefore!, row!), $"{label}: the service refused the update, and the row changed");
             Outcome("builder update by Updates as on 0.8.3: the service refused the cell");

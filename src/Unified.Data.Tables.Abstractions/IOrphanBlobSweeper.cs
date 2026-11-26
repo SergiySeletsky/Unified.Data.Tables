@@ -24,7 +24,9 @@ public interface IOrphanBlobSweeper
     /// <remarks>
     /// An orphan whose delete fails does not stop the others. Once every orphan was tried, the failures
     /// are thrown together as an <see cref="AggregateException"/> (one inner exception per blob) whose
-    /// message says how many blobs were deleted; the next sweep retries the rest. An empty or whitespace
+    /// message says how many blobs were deleted; the next sweep retries the rest. What the blob store or
+    /// the table reports is a provider-neutral <see cref="StorageException"/>, inside the aggregate too,
+    /// with the backend's own exception as its inner exception. An empty or whitespace
     /// key is a partition like any other (a write of <c>"|r"</c>, or of <c>"   |r"</c> under
     /// <c>IdNormalization.AsWritten</c>, stores one) and is normalized as ids are on write.
     /// </remarks>
@@ -61,7 +63,8 @@ public interface IOrphanBlobSweeper
 
 /// <summary>
 /// <see cref="IOrphanBlobSweeper"/> on an <see cref="IStorage{T}"/>: forwards to the store when it
-/// implements the capability and throws <see cref="NotSupportedException"/> otherwise.
+/// implements the capability (or, for a decorator that answers <see cref="IStorageCapabilities"/>, when
+/// the store it wraps does) and throws <see cref="NotSupportedException"/> otherwise.
 /// </summary>
 public static class OrphanBlobSweeperExtensions
 {
@@ -101,8 +104,11 @@ public static class OrphanBlobSweeperExtensions
     private static IOrphanBlobSweeper Sweeper<T>(IStorage<T> storage) where T : class, IEntity, new()
     {
         Guard.NotNull(storage, nameof(storage));
-        return storage as IOrphanBlobSweeper
-            ?? throw new NotSupportedException($"{storage.GetType().FullName} does not implement {nameof(IOrphanBlobSweeper)}.");
+        // Through the capability probe, so a decorator (DelegatingStorage<T>) sweeps the store it wraps
+        // and one over a store without the capability does not claim it.
+        return storage.TryGetCapability<T, IOrphanBlobSweeper>(out var sweeper)
+            ? sweeper
+            : throw new NotSupportedException($"{storage.GetType().FullName} does not implement {nameof(IOrphanBlobSweeper)}.");
     }
 }
 

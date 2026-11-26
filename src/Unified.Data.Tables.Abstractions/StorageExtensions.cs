@@ -54,7 +54,10 @@ public static class StorageExtensions
     /// <param name="maxAttempts">Total attempts before the conflict propagates.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The persisted entity, including its refreshed <see cref="Entity.ETag"/>.</returns>
-    /// <exception cref="InvalidOperationException">The entity does not exist.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The entity does not exist: the read found no row, or the row was deleted between the read and the
+    /// write (the store's <see cref="EntityNotFoundException"/> is then the inner exception).
+    /// </exception>
     /// <exception cref="ConcurrencyConflictException">Still conflicted after <paramref name="maxAttempts"/> attempts.</exception>
     public static async Task<T> MutateAsync<T>(
         this IStorage<T> storage, string id, Action<T> mutate,
@@ -86,6 +89,12 @@ public static class StorageExtensions
             try
             {
                 return await storage.UpdateAsync(entity, ConcurrencyMode.Strict, ct).ConfigureAwait(false);
+            }
+            catch (EntityNotFoundException ex)
+            {
+                // Deleted between this attempt's read and its write: the same outcome as a row the read
+                // did not find, with the store's own failure inside.
+                throw new InvalidOperationException($"Cannot mutate '{id}': the entity does not exist.", ex);
             }
             catch (ConcurrencyConflictException) when (attempt < maxAttempts)
             {
@@ -140,7 +149,8 @@ public static class StorageExtensions
     /// supplies the initial state; <paramref name="mutate"/> is then applied EXACTLY ONCE per
     /// attempt — to the fresh initial state or to the current row — so a delta like
     /// <c>e =&gt; e.Count++</c> behaves identically on first insert and on every later call.
-    /// Create races and update conflicts are absorbed and retried against fresh state.
+    /// Create races and update conflicts are absorbed and retried against fresh state, and so is a row
+    /// deleted between the read and the update: the next attempt finds none and creates it.
     /// </summary>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
@@ -153,8 +163,9 @@ public static class StorageExtensions
     /// <exception cref="ConcurrencyConflictException">
     /// Still racing after <paramref name="maxAttempts"/> attempts — whether the last race lost was
     /// an update conflict, a create race (a last-attempt <see cref="DuplicateKeyException"/> is
-    /// wrapped, never leaked) or a read whose row kept changing (a read's conflict is retried as an
-    /// attempt, like the write's).
+    /// wrapped, never leaked), a row deleted between the read and the update (a last-attempt
+    /// <see cref="EntityNotFoundException"/> is wrapped the same way) or a read whose row kept changing
+    /// (a read's conflict is retried as an attempt, like the write's).
     /// </exception>
     public static async Task<T> MutateOrCreateAsync<T>(
         this IStorage<T> storage, string id, Func<T> create, Action<T> mutate,
@@ -201,6 +212,15 @@ public static class StorageExtensions
                     throw new ConcurrencyConflictException(typeof(T).Name, id, ex);
                 await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
             }
+            catch (EntityNotFoundException ex)
+            {
+                // Deleted between the read and the update: a lost race like the others. The loop reads
+                // again, finds no row and creates it. When the budget is spent, surface the documented
+                // conflict type; the missing row rides along as the inner exception.
+                if (attempt >= maxAttempts)
+                    throw new ConcurrencyConflictException(typeof(T).Name, id, ex);
+                await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
+            }
             catch (ConcurrencyConflictException) when (attempt < maxAttempts)
             {
                 await Task.Delay((attempt * BackoffBaseMs) + NextJitterMs(), ct).ConfigureAwait(false);
@@ -212,7 +232,9 @@ public static class StorageExtensions
     /// Outcome-returning variant of <see cref="MutateAsync{T}"/> for flows where a missing row or
     /// a lost race is an EXPECTED branch, not an error: nothing is thrown for either — the caller
     /// switches on <see cref="MutationResult{T}.Status"/> instead of catching. A lost race is a write's
-    /// conflict or a read's (a read of a large value whose row kept changing); both are retried.
+    /// conflict or a read's (a read of a large value whose row kept changing); both are retried. A row
+    /// deleted between the read and the write is <see cref="MutationStatus.NotFound"/>, like one the read
+    /// did not find. Any other failure of the store (a <see cref="StorageException"/> that is neither) is thrown.
     /// </summary>
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="storage">The storage to operate on.</param>
@@ -254,6 +276,11 @@ public static class StorageExtensions
                 var persisted = await storage.UpdateAsync(entity, ConcurrencyMode.Strict, ct).ConfigureAwait(false);
                 return new MutationResult<T>(MutationStatus.Updated, persisted);
             }
+            catch (EntityNotFoundException)
+            {
+                // Deleted between the read and the write: the row is gone, as if the read had not found it.
+                return new MutationResult<T>(MutationStatus.NotFound, null);
+            }
             catch (ConcurrencyConflictException)
             {
                 if (attempt >= maxAttempts)
@@ -273,7 +300,8 @@ public static class StorageExtensions
     ///   <item><description><see cref="MutationStatus.Updated"/> — this caller performed the transition;</description></item>
     ///   <item><description><see cref="MutationStatus.PreconditionFailed"/> — the fresh row no longer satisfies
     ///   <paramref name="when"/> (typically: another writer already transitioned it); the result carries that row;</description></item>
-    ///   <item><description><see cref="MutationStatus.NotFound"/> / <see cref="MutationStatus.Conflicted"/>.</description></item>
+    ///   <item><description><see cref="MutationStatus.NotFound"/> (the read found no row, or the row was deleted
+    ///   between the read and the write) / <see cref="MutationStatus.Conflicted"/>.</description></item>
     /// </list>
     /// </summary>
     /// <remarks>
@@ -328,6 +356,11 @@ public static class StorageExtensions
             {
                 var persisted = await storage.UpdateAsync(entity, ConcurrencyMode.Strict, ct).ConfigureAwait(false);
                 return new MutationResult<T>(MutationStatus.Updated, persisted);
+            }
+            catch (EntityNotFoundException)
+            {
+                // Deleted between the read and the write: the row is gone, as if the read had not found it.
+                return new MutationResult<T>(MutationStatus.NotFound, null);
             }
             catch (ConcurrencyConflictException)
             {

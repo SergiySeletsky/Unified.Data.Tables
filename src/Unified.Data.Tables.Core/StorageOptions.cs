@@ -1,0 +1,149 @@
+namespace Unified.Data.Tables;
+
+/// <summary>
+/// Behavioural options every storage provider honours, configured at registration time. Cache policy is
+/// a DEPLOYMENT concern, not an entity concern — the same entity type may be cached in one host and
+/// uncached in another process that shares its tables — which is why it lives here and not in an
+/// attribute on the entity. The Azure provider's <c>UnifiedTableStorageOptions</c> derives from this
+/// type and adds what only Azure has (the blob service client of its offload options); the in-memory
+/// provider takes this type as it is, so it needs no Azure provider package.
+/// </summary>
+public class StorageOptions
+{
+    private readonly Dictionary<Type, CachePolicy> overrides = [];
+    private OffloadOptions? offload;
+    private TimeProvider timeProvider = TimeProvider.System;
+
+    /// <summary>
+    /// The clock a store reads when it stamps <see cref="IEntity.CreatedAt"/> and
+    /// <see cref="IEntity.UpdatedAt"/> on a write, and when it falls back to the client's time for the
+    /// cleanup grace of offloaded values. Defaults to <see cref="System.TimeProvider.System"/>; set a
+    /// fake one in tests that assert on stamps.
+    /// </summary>
+    /// <remarks>
+    /// It does not reach what the store does not set: the service's own <see cref="IEntity.Timestamp"/>,
+    /// a value an entity's property initializer assigns when the entity is constructed (the
+    /// <see cref="Entity"/> base class initializes <c>CreatedAt</c> and <c>UpdatedAt</c> from the system
+    /// clock), and the <c>CreatedAt</c> an upsert keeps because the entity already carries one. Read cache
+    /// expiry of the Azure provider is timed by the <c>IMemoryCache</c> the host registers, which has a
+    /// clock of its own. The in-memory stores stamp with this clock as the Azure provider does.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The value is null.</exception>
+    public TimeProvider TimeProvider
+    {
+        get => timeProvider;
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            timeProvider = value;
+        }
+    }
+
+    /// <summary>
+    /// Default cache policy for all entity types. Defaults to <c>CachePolicy.Sliding(1h)</c> —
+    /// the historical 0.2.x behaviour.
+    /// </summary>
+    /// <remarks>
+    /// Read by the providers that have a read cache: the Azure provider, and a local provider that shares
+    /// its rows with other writers. The in-memory stores have none (every row of an in-memory table is
+    /// written through its one store) and ignore this.
+    /// </remarks>
+    public CachePolicy Cache { get; set; } = CachePolicy.Sliding(TimeSpan.FromHours(1));
+
+    /// <summary>
+    /// What happens when a serialized payload exceeds the 64 KB cell cap even compressed —
+    /// see <see cref="OversizedCellPolicy"/>. Default: <see cref="OversizedCellPolicy.Throw"/>.
+    /// For lossless storage of large values, opt a property in with <see cref="TableValueSplitAttribute"/>
+    /// and configure <see cref="Offload"/>; nothing is trimmed. Applied to the (static) serializer at registration time.
+    /// </summary>
+    public OversizedCellPolicy OversizedCells { get; set; } = OversizedCellPolicy.Throw;
+
+    /// <summary>
+    /// How ids and partition/prefix arguments are treated before hitting the table — see
+    /// <see cref="IdNormalization"/>. Default: <see cref="IdNormalization.Normalized"/> (trim,
+    /// spaces to '-', lower-case). Use <see cref="IdNormalization.AsWritten"/> for tables whose
+    /// keys are case-sensitive payloads or pre-existing data written by another layer.
+    /// </summary>
+    public IdNormalization IdNormalization { get; set; } = IdNormalization.Normalized;
+
+    /// <summary>
+    /// Pre-0.6.0 compatibility switch. Since 0.6.0, <see cref="ConcurrencyMode.Auto"/> with no
+    /// caller-supplied ETag throws — there is no version to check, and silently writing
+    /// unconditionally is lost-update territory. Setting this to <c>true</c> restores the 0.5.x
+    /// fallback (unconditional last-writer-wins replace, with a warning log) as a migration
+    /// cushion. Prefer spelling the intent explicitly with
+    /// <see cref="ConcurrencyMode.LastWriterWins"/> and leaving this off.
+    /// </summary>
+    public bool ImplicitLastWriterWins { get; set; }
+
+    /// <summary>
+    /// Offload for large values (<see cref="TableValueSplitAttribute"/> values too large for table
+    /// rows, and every <see cref="TableBlobContent"/>). <c>null</c> (the default) disables it: such a
+    /// value throws <see cref="OversizedValueException"/> instead. Types with neither are unaffected.
+    /// On the Azure provider's options this is the same instance as <c>BlobOffload</c>.
+    /// </summary>
+    /// <exception cref="ArgumentException">
+    /// The provider these options belong to needs its own offload options type (the Azure provider's
+    /// <c>UnifiedTableStorageOptions</c> accepts only a <c>BlobOffloadOptions</c>).
+    /// </exception>
+    public OffloadOptions? Offload
+    {
+        get => offload;
+        set
+        {
+            ValidateOffload(value);
+            offload = value;
+        }
+    }
+
+    /// <summary>
+    /// Lets a provider's options refuse an <see cref="Offload"/> value it could not honour, before it is
+    /// stored. The base accepts every value.
+    /// </summary>
+    /// <param name="value">The value being assigned; null disables offload.</param>
+    private protected virtual void ValidateOffload(OffloadOptions? value)
+    {
+    }
+
+    /// <summary>
+    /// Overrides the table name, which otherwise defaults to <c>typeof(T).Name</c>.
+    ///
+    /// Two cases the default cannot serve. A multi-tenant host that wants a table per tenant has no
+    /// seam to express it — every <c>IStorage&lt;T&gt;</c> for the same <c>T</c> lands in one table
+    /// regardless of who is asking. And "delete everything for tenant X" becomes O(n) delete
+    /// transactions rather than a single <c>DeleteTableAsync</c>, which is both far slower and, for
+    /// anyone with an erasure obligation, far harder to prove complete.
+    ///
+    /// Return a valid Azure table name (alphanumeric, 3-63 chars, starting with a letter); the
+    /// service rejects anything else. <c>null</c> keeps the existing behaviour exactly.
+    /// </summary>
+    public Func<Type, string>? TableNameResolver { get; set; }
+
+    /// <summary>
+    /// Override the cache policy for one entity type (e.g. disable for high-churn types or
+    /// huge partitions).
+    /// </summary>
+    public StorageOptions CacheFor<T>(CachePolicy policy) where T : class, IEntity, new()
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        overrides[typeof(T)] = policy;
+        return this;
+    }
+
+    internal CachePolicy ResolveCachePolicy(Type entityType) =>
+        overrides.TryGetValue(entityType, out var policy) ? policy : Cache;
+
+    /// <summary>
+    /// How <see cref="IPolymorphicStorage{TBase}"/> maps types to the stored discriminator. Null
+    /// selects <see cref="AssemblyQualifiedTypeDiscriminator"/>, which writes exactly what
+    /// <c>persistType: true</c> has always written — so an existing table is readable with no
+    /// migration. Prefer a <see cref="TypeDiscriminatorMap"/> for new tables; see
+    /// <see cref="ITypeDiscriminator"/> for why.
+    /// </summary>
+    public ITypeDiscriminator? TypeDiscriminator { get; set; }
+
+    // Null means "the legacy-compatible default", not "no discriminator" — a polymorphic store
+    // without one could not read or write a type at all.
+    internal ITypeDiscriminator ResolveTypeDiscriminator() =>
+        TypeDiscriminator ?? AssemblyQualifiedTypeDiscriminator.Instance;
+}

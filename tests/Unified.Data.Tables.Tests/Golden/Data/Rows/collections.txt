@@ -1,0 +1,14 @@
+# Collections and dictionaries: one __Json cell each, an empty one included; a null one stores nothing.
+row PartitionKey="golden" RowKey="collections"
+	Colours__Json	Edm.String	"[\u0022Red\u0022,\u0022Blue\u0022]"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|collections"
+	Labels__Json	Edm.String	"{\u0022env\u0022:\u0022prod\u0022,\u0022tier\u0022:\u0022gold\u0022}"
+	NoTags__Json	Edm.String	"[]"
+	Numbers__Json	Edm.String	"[3,1,4,1,5,9,2,6]"
+	Places__Json	Edm.String	"{\u0022origin\u0022:{\u0022lat\u0022:0,\u0022lng\u0022:0},\u0022north\u0022:{\u0022lat\u0022:89.5,\u0022lng\u0022:-0.25}}"
+	Scores__Json	Edm.String	"{\u0022first\u0022:1,\u0022second\u0022:-2,\u0022Third Key\u0022:3}"
+	Streets__Json	Edm.String	"[{\u0022name\u0022:\u0022A\u0022,\u0022number\u0022:1},{\u0022name\u0022:\u0022B\u0022,\u0022number\u0022:2}]"
+	Tags__Json	Edm.String	"[\u0022alpha\u0022,\u0022beta\u0022,\u0022with \\u0022quotes\\u0022\u0022,\u0022\u00FC\u00F1\u00ED\u00A9\u00F8d\u00E9\u0022,\u0022\u0022]"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenCollections	{"Tags":["alpha","beta","with \u0022quotes\u0022","\u00FC\u00F1\u00ED\u00A9\u00F8d\u00E9",""],"NoTags":[],"NullTags":null,"Numbers":[3,1,4,1,5,9,2,6],"Scores":{"first":1,"second":-2,"Third Key":3},"Streets":[{"Name":"A","Number":1},{"Name":"B","Number":2}],"Places":{"origin":{"Lat":0,"Lng":0},"north":{"Lat":89.5,"Lng":-0.25}},"Colours":[0,9],"Labels":{"env":"prod","tier":"gold"},"Id":"golden|collections","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

@@ -1,5 +1,4 @@
-using System.Globalization;
-using Azure;
+using System.Diagnostics.CodeAnalysis;
 using Azure.Data.Tables;
 using Unified.Data.Tables.Providers;
 
@@ -12,25 +11,23 @@ namespace Unified.Data.Tables.InMemory;
 /// production serialization rather than object identity.
 /// </summary>
 /// <remarks>
-/// Semantics mirror <see cref="PolymorphicTableStorage{TBase}"/>: keys used verbatim and
+/// Semantics mirror <c>PolymorphicTableStorage&lt;TBase&gt;</c>: keys used verbatim and
 /// case-sensitively, 409 on duplicate insert AND 400 <c>InvalidDuplicateRow</c> on a key repeated
-/// within one batch both surfaced as <see cref="DuplicateKeyException"/>, 404 on merging a missing
-/// row, idempotent delete, lexical (PartitionKey, RowKey) ordering, a null
+/// within one batch both surfaced as <see cref="DuplicateKeyException"/>,
+/// <see cref="EntityNotFoundException"/> on merging a missing row, idempotent delete, lexical (PartitionKey, RowKey) ordering, a null
 /// <see cref="PolymorphicEntry{TBase}.Timestamp"/> on the write paths, cancellation observed on every
 /// operation, and byte-identical validation and duplicate-key messages (which is why the store needs
-/// a table name).
+/// a table name). It is the engine every local provider runs (Unified.Data.Tables.Core) over rows held
+/// in memory, with the side interfaces <c>PolymorphicTableStorage&lt;TBase&gt;</c> has (see
+/// <see cref="TryGetCapability{TCap}"/>) and the service's limits (100 rows and the payload budget a
+/// transaction, 64&#160;KiB a cell, 1&#160;MB a row).
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
-public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBase>
+public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
     where TBase : class
 {
-    private static readonly string[] ReservedCells = ["PartitionKey", "RowKey", "Timestamp", "odata.etag"];
-
-    private readonly Dictionary<(string PartitionKey, string RowKey), StoredRow> rows = [];
-    private readonly object gate = new();
-    private readonly ITypeDiscriminator discriminator;
-    private readonly string tableName;
-    private long versionCounter;
+    private readonly InMemoryTable table;
+    private readonly RowStorePolymorphicStorage<TBase> engine;
 
     /// <summary>Creates a store with the default options and a <typeparamref name="TBase"/>-derived name.</summary>
     public InMemoryPolymorphicStorage()
@@ -40,16 +37,16 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
 
     /// <summary>Creates a store with explicit options and a <typeparamref name="TBase"/>-derived name.</summary>
     /// <param name="options">Options; null selects the defaults.</param>
-    public InMemoryPolymorphicStorage(UnifiedTableStorageOptions? options)
+    public InMemoryPolymorphicStorage(StorageOptions? options)
         : this(typeof(TBase).Name, options)
     {
     }
 
     /// <summary>Creates a store over one named table.</summary>
     /// <remarks>
-    /// The name is not used to route anything — this store holds one dictionary — but it IS what
+    /// The name is not used to route anything (this store holds one table of its own) but it IS what
     /// <see cref="DuplicateKeyException.EntityType"/> and the duplicate-key message report, and
-    /// <see cref="PolymorphicTableStorage{TBase}"/> reports its table name there. Without it the two
+    /// <c>PolymorphicTableStorage&lt;TBase&gt;</c> reports its table name there. Without it the two
     /// could never agree: a polymorphic table name is always explicit and
     /// <typeparamref name="TBase"/> is always a base type, so <c>typeof(TBase).Name</c> is guaranteed
     /// to be the wrong string. The two nameless overloads fall back to it for tests that never
@@ -58,408 +55,92 @@ public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBas
     /// <param name="tableName">The table this store stands in for; also what its errors name.</param>
     /// <param name="options">Options; null selects the defaults.</param>
     /// <exception cref="ArgumentException"><paramref name="tableName"/> is null, empty or whitespace.</exception>
-    public InMemoryPolymorphicStorage(string tableName, UnifiedTableStorageOptions? options = null)
+    public InMemoryPolymorphicStorage(string tableName, StorageOptions? options = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
 
-        this.tableName = tableName;
-
-        // UnifiedTableStorageOptions.ResolveTypeDiscriminator() is internal to Unified.Data.Tables,
-        // which does not (and per the design must not) grant this project InternalsVisibleTo — so
-        // the null-coalescing default is duplicated here against the public TypeDiscriminator
-        // property instead of calling the internal helper.
-        discriminator = options?.TypeDiscriminator ?? AssemblyQualifiedTypeDiscriminator.Instance;
+        var account = new InMemoryAccount();
+        engine = new RowStorePolymorphicStorage<TBase>(account, tableName, options);
+        table = account.Table(tableName);
+        table.Create();
     }
 
     /// <summary>How many rows the store holds. For assertions.</summary>
-    public int Count
-    {
-        get
-        {
-            lock (gate)
-            {
-                return rows.Count;
-            }
-        }
-    }
+    public int Count => table.RowCount;
 
     /// <summary>Removes every row. For test isolation.</summary>
-    public void Clear()
-    {
-        lock (gate)
-        {
-            rows.Clear();
-        }
-    }
+    public void Clear() => table.Clear();
 
     /// <inheritdoc />
-    public Task EnsureCreatedAsync(CancellationToken ct = default) => Task.CompletedTask;
+    public Task EnsureCreatedAsync(CancellationToken ct = default) => engine.EnsureCreatedAsync(ct);
 
     /// <inheritdoc />
-    public Task<PolymorphicEntry<TBase>> InsertAsync(
-        PolymorphicWrite<TBase> write, CancellationToken ct = default)
-    {
-        Guard.NotNull(write, nameof(write));
-        var row = ToRow(write);
-
-        // The Azure store observes the token on its lazy table-create, AFTER argument validation and
-        // row building — so a buffered fake that never looked at it would let a cancelled operation
-        // succeed here and fail in production.
-        ct.ThrowIfCancellationRequested();
-        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey));
-
-        lock (gate)
-        {
-            var key = (write.Key.PartitionKey, write.Key.RowKey);
-            if (rows.ContainsKey(key))
-                throw Duplicate(write.Key, ServiceErrors.AlreadyExists(write.Key.ToId()));
-
-            rows[key] = Store(row);
-            return Task.FromResult(ToEntry(rows[key], timestampKnown: false));
-        }
-    }
+    public Task<PolymorphicEntry<TBase>> InsertAsync(PolymorphicWrite<TBase> write, CancellationToken ct = default) =>
+        engine.InsertAsync(write, ct);
 
     /// <inheritdoc />
-    public Task<PolymorphicEntry<TBase>> UpsertAsync(
-        PolymorphicWrite<TBase> write, CancellationToken ct = default)
-    {
-        Guard.NotNull(write, nameof(write));
-        var row = ToRow(write);
-        ct.ThrowIfCancellationRequested();
-        ServiceErrors.ThrowIfRefusedKey((write.Key.PartitionKey, write.Key.RowKey));
-
-        lock (gate)
-        {
-            var key = (write.Key.PartitionKey, write.Key.RowKey);
-            rows[key] = Store(row);
-            return Task.FromResult(ToEntry(rows[key], timestampKnown: false));
-        }
-    }
+    public Task<PolymorphicEntry<TBase>> UpsertAsync(PolymorphicWrite<TBase> write, CancellationToken ct = default) =>
+        engine.UpsertAsync(write, ct);
 
     /// <inheritdoc />
-    public Task<int> InsertBatchAsync(
-        IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default)
-    {
-        Guard.NotNull(writes, nameof(writes));
-        if (writes.Count == 0)
-            return Task.FromResult(0);
-
-        // Build every row before the first transaction, so a validation failure costs nothing.
-        var built = new List<(TableKey Key, TableEntity Row)>(writes.Count);
-        foreach (var write in writes)
-            built.Add((write.Key, ToRow(write)));
-
-        ct.ThrowIfCancellationRequested();
-
-        // As PolymorphicTableStorage sends it: per partition (in the order the partitions first appear),
-        // the rows packed into the same entity-group transactions (BatchPlanner), each applied atomically
-        // under the gate; a transaction that fails applies nothing, and the ones before it stay committed.
-        // The same key twice in one transaction is the service's 400 InvalidDuplicateRow, a stored key its
-        // 409 EntityAlreadyExists, both surfaced as DuplicateKeyException over the transaction failure; a
-        // key the service refuses is its raw 400 InvalidInput.
-        foreach (var group in built.GroupBy(b => b.Key.PartitionKey, StringComparer.Ordinal))
-        {
-            var groupRows = group.ToList();
-            var plan = BatchPlanner.Plan([.. groupRows.Select(b => TableRequestSize.EstimateEntityBytes(b.Row))]);
-            foreach (var range in plan)
-            {
-                ct.ThrowIfCancellationRequested();
-                lock (gate)
-                {
-                    var inTransaction = new HashSet<(string, string)>();
-                    for (var i = range.Start; i < range.Start + range.Count; i++)
-                    {
-                        var key = groupRows[i].Key;
-                        if (ServiceErrors.RefusedKey(key.PartitionKey, key.RowKey) is { } refused)
-                            throw ServiceErrors.InTransaction(refused);
-                        if (!inTransaction.Add((key.PartitionKey, key.RowKey)))
-                            throw Duplicate(key, ServiceErrors.InTransaction(ServiceErrors.DuplicateRow(key.ToId())));
-                        if (rows.ContainsKey((key.PartitionKey, key.RowKey)))
-                            throw Duplicate(key, ServiceErrors.InTransaction(ServiceErrors.AlreadyExists(key.ToId())));
-                    }
-
-                    for (var i = range.Start; i < range.Start + range.Count; i++)
-                        rows[(groupRows[i].Key.PartitionKey, groupRows[i].Key.RowKey)] = Store(groupRows[i].Row);
-                }
-            }
-        }
-
-        return Task.FromResult(built.Count);
-    }
+    public Task<int> InsertBatchAsync(IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default) =>
+        engine.InsertBatchAsync(writes, ct);
 
     /// <inheritdoc />
-    public Task MergeColumnsAsync(
-        TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default)
-    {
-        ValidateKey(key);
-        Guard.NotNull(columns, nameof(columns));
-        if (columns.Count == 0)
-        {
-            throw new ArgumentException(
-                "A merge with no columns would be a network round trip that changes nothing.",
-                nameof(columns));
-        }
-
-        foreach (var column in columns)
-            ValidateSystemColumn(column.Key);
-
-        ct.ThrowIfCancellationRequested();
-        ServiceErrors.ThrowIfRefusedKey((key.PartitionKey, key.RowKey));
-
-        lock (gate)
-        {
-            if (!rows.TryGetValue((key.PartitionKey, key.RowKey), out var existing))
-                throw new RequestFailedException(404, "The specified resource does not exist.", "ResourceNotFound", null);
-
-            // Server-side Merge overlays the supplied cells onto a copy and leaves the rest alone.
-            var merged = CopyOf(existing.Data);
-            foreach (var column in columns)
-                merged[column.Key] = column.Value;
-
-            rows[(key.PartitionKey, key.RowKey)] = Store(merged);
-        }
-
-        return Task.CompletedTask;
-    }
+    public Task MergeColumnsAsync(TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default) =>
+        engine.MergeColumnsAsync(key, columns, ct);
 
     /// <inheritdoc />
-    public Task<PolymorphicEntry<TBase>?> GetAsync(TableKey key, CancellationToken ct = default)
-    {
-        ValidateKey(key);
-        ct.ThrowIfCancellationRequested();
-
-        lock (gate)
-        {
-            return Task.FromResult(
-                rows.TryGetValue((key.PartitionKey, key.RowKey), out var stored) ? ToEntry(stored) : null);
-        }
-    }
+    public Task<PolymorphicEntry<TBase>?> GetAsync(TableKey key, CancellationToken ct = default) => engine.GetAsync(key, ct);
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<PolymorphicEntry<TBase>>> QueryAsync(
-        string? partition = null, int? take = null, CancellationToken ct = default)
-    {
-        // take <= 0 short-circuits BEFORE the token is looked at, because PolymorphicTableStorage's
-        // QueryStreamAsync yields break before its first (cancellable) service call on that path.
-        if (take is <= 0)
-            return Task.FromResult<IReadOnlyList<PolymorphicEntry<TBase>>>([]);
-
-        ct.ThrowIfCancellationRequested();
-        return Task.FromResult<IReadOnlyList<PolymorphicEntry<TBase>>>(Snapshot(partition, take));
-    }
+    public Task<IReadOnlyList<PolymorphicEntry<TBase>>> QueryAsync(string? partition = null, int? take = null, CancellationToken ct = default) =>
+        engine.QueryAsync(partition, take, ct);
 
     /// <inheritdoc />
-    public async IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
-        string? partition = null,
-        int? take = null,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
-    {
-        if (take is <= 0)
-            yield break;
-
-        // Azure observes the token on its lazy table-create, before the first row. The per-item check
-        // below never runs for an empty result, so without this an empty read ignores cancellation.
-        ct.ThrowIfCancellationRequested();
-
-        foreach (var entry in Snapshot(partition, take))
-        {
-            ct.ThrowIfCancellationRequested();
-            yield return entry;
-        }
-
-        await Task.CompletedTask;
-    }
+    public IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(string? partition = null, int? take = null, CancellationToken ct = default) =>
+        engine.QueryStreamAsync(partition, take, ct);
 
     /// <inheritdoc />
-    public Task DeleteAsync(TableKey key, CancellationToken ct = default)
-    {
-        ValidateKey(key);
-        ct.ThrowIfCancellationRequested();
-
-        lock (gate)
-        {
-            rows.Remove((key.PartitionKey, key.RowKey));
-        }
-
-        return Task.CompletedTask;
-    }
+    public Task DeleteAsync(TableKey key, CancellationToken ct = default) => engine.DeleteAsync(key, ct);
 
     /// <inheritdoc />
-    public Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
-    {
-        // Not Guard.NotNull: PolymorphicTableStorage uses ArgumentException.ThrowIfNullOrEmpty, so an
-        // EMPTY partition threw on Azure and silently deleted nothing here. Same API, same message.
-        ArgumentException.ThrowIfNullOrEmpty(partition);
-        ct.ThrowIfCancellationRequested();
-
-        lock (gate)
-        {
-            var doomed = rows.Keys
-                .Where(k => string.Equals(k.PartitionKey, partition, StringComparison.Ordinal))
-                .ToList();
-
-            foreach (var key in doomed)
-                rows.Remove(key);
-
-            return Task.FromResult(doomed.Count);
-        }
-    }
+    public Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default) => engine.DeletePartitionAsync(partition, ct);
 
     /// <inheritdoc />
-    public Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
-    {
-        ct.ThrowIfCancellationRequested();
+    public Task<int> CountAsync(string? partition = null, CancellationToken ct = default) => engine.CountAsync(partition, ct);
 
-        lock (gate)
-        {
-            return Task.FromResult(partition is null
-                ? rows.Count
-                : rows.Keys.Count(k => string.Equals(k.PartitionKey, partition, StringComparison.Ordinal)));
-        }
+    // ── Side interfaces (0.10.0) ────────────────────────────────────────────
+
+    /// <summary>
+    /// The store's implementation of the side interface <typeparamref name="TCap"/>: the store itself for
+    /// <see cref="IAtomicInsert{TBase}"/> and <see cref="IStorageInfo"/>; the untyped view of its table
+    /// for the experimental <see cref="IRawTable"/>; the tables of its in-memory account for the
+    /// experimental <see cref="ITableStore"/>.
+    /// </summary>
+    /// <typeparam name="TCap">The side interface asked for.</typeparam>
+    /// <param name="capability">The implementation to call, or null when the store does not support it.</param>
+    /// <returns>True when the store supports <typeparamref name="TCap"/>.</returns>
+    public bool TryGetCapability<TCap>([NotNullWhen(true)] out TCap? capability) where TCap : class
+    {
+        capability = this as TCap;
+        return capability is not null || engine.TryGetCapability(out capability);
     }
 
-    private List<PolymorphicEntry<TBase>> Snapshot(string? partition, int? take)
-    {
-        if (take is <= 0)
-            return [];
+    /// <summary>
+    /// What the store states about itself: the provider (<c>"InMemory"</c>), its table, the limits it
+    /// plans and refuses by (the service's), no read cache, and <see cref="Durability.Volatile"/>. Calls
+    /// nothing and never throws.
+    /// </summary>
+    /// <returns>The store's info; the same value on every call.</returns>
+    public StorageInfo GetInfo() => engine.GetInfo();
 
-        lock (gate)
-        {
-            var query = rows
-                .Where(kv => partition is null
-                             || string.Equals(kv.Key.PartitionKey, partition, StringComparison.Ordinal))
-                .OrderBy(kv => kv.Key.PartitionKey, StringComparer.Ordinal)
-                .ThenBy(kv => kv.Key.RowKey, StringComparer.Ordinal)
-                .Select(kv => ToEntry(kv.Value));
-
-            if (take is { } limit)
-                query = query.Take(limit);
-
-            return query.ToList();
-        }
-    }
-
-    private StoredRow Store(TableEntity row) =>
-        new(CopyOf(row), ++versionCounter, DateTimeOffset.UtcNow);
-
-    private TableEntity ToRow(PolymorphicWrite<TBase> write)
-    {
-        ValidateKey(write.Key);
-
-        // Parity with PolymorphicTableStorage: a TableBlobContent is refused before serializing.
-        if (write.Item is not null && LargeValueRows.CarriesBlobContent(write.Item))
-            throw new NotSupportedException(LargeValueRows.PolymorphicWriteRefusal(write.Item.GetType()));
-
-        var row = write.Item is null
-            ? new TableEntity(write.Key.PartitionKey, write.Key.RowKey)
-            : write.Item.ToTableEntity(write.Key.PartitionKey, write.Key.RowKey);
-
-        // Parity with PolymorphicTableStorage: split values are refused, not stored half. Check and
-        // message come from the main package's provider SPI (no InternalsVisibleTo across packages).
-        if (write.Item is not null && LargeValueRows.HasLargeValueCells(row))
-            throw new NotSupportedException(LargeValueRows.PolymorphicWriteRefusal(write.Item.GetType()));
-
-        if (write.Item is not null)
-            row[SystemColumnNames.TypeName] = discriminator.ToDiscriminator(write.Item.GetType());
-
-        if (write.SystemColumns is null)
-            return row;
-
-        foreach (var column in write.SystemColumns)
-        {
-            ValidateSystemColumn(column.Key);
-            row[column.Key] = column.Value;
-        }
-
-        return row;
-    }
-
-    // Duplicate-key errors name the TABLE, exactly as PolymorphicTableStorage does — the fake used
-    // typeof(TBase).Name, which can never coincide with a real polymorphic table name, so every
-    // DuplicateKeyException.Message and .EntityType diverged between the two implementations.
-    // The inner failure is the service's, with its status and error code (see ServiceErrors).
-    private DuplicateKeyException Duplicate(TableKey key, RequestFailedException failure) =>
-        new(tableName, key.ToId(), failure);
-
-    // timestampKnown: false on the WRITE paths. A write response carries no service timestamp, so
-    // PolymorphicTableStorage returns a null one; a fake that filled it in would green-light a test
-    // asserting on a value Azure never sends.
-    private PolymorphicEntry<TBase> ToEntry(StoredRow stored, bool timestampKnown = true)
-    {
-        var row = CopyOf(stored.Data);
-        row.Timestamp = stored.Timestamp;
-
-        string? storedDiscriminator = null;
-        if (row.TryGetValue(SystemColumnNames.TypeName, out var raw)
-            && raw is string token
-            && token.Length > 0)
-        {
-            storedDiscriminator = token;
-        }
-
-        var item = row.TryFromTableEntity<TBase>(discriminator, out var materialized) ? materialized : null;
-
-        var columns = new Dictionary<string, object>(StringComparer.Ordinal);
-        foreach (var cell in row)
-        {
-            if (Array.IndexOf(ReservedCells, cell.Key) >= 0)
-                continue;
-
-            columns[cell.Key] = cell.Value;
-        }
-
-        return new PolymorphicEntry<TBase>(
-            new TableKey(row.PartitionKey, row.RowKey),
-            item,
-            storedDiscriminator,
-            stored.ETagString(),
-            timestampKnown ? stored.Timestamp : null,
-            columns);
-    }
-
-    // Isolation: a caller mutating a returned row must not reach into the store, and a stored row
-    // must not change under a caller who is still holding the object they wrote. A byte[] cell is the
-    // one mutable cell value, so each array is copied too, on the way in and on the way out.
-    private static TableEntity CopyOf(TableEntity source)
-    {
-        var copy = new TableEntity(source.PartitionKey, source.RowKey);
-        foreach (var cell in source)
-        {
-            if (Array.IndexOf(ReservedCells, cell.Key) >= 0)
-                continue;
-
-            copy[cell.Key] = cell.Value is byte[] bytes ? bytes.Clone() : cell.Value;
-        }
-
-        return copy;
-    }
-
-    // Duplicated verbatim from PolymorphicTableStorage<TBase>.ValidateKey — this project cannot see
-    // the Azure package's internals, and the repo's parity doctrine (ConcurrencyMessages,
-    // PolymorphicMessages) requires the fake and the real store to throw byte-identical messages, so
-    // the two copies must be kept in lockstep by hand rather than shared.
-    private static void ValidateKey(TableKey key)
-    {
-        if (string.IsNullOrEmpty(key.PartitionKey))
-            throw new ArgumentException(PolymorphicMessages.EmptyKey(nameof(TableKey.PartitionKey)), nameof(key));
-        if (string.IsNullOrEmpty(key.RowKey))
-            throw new ArgumentException(PolymorphicMessages.EmptyKey(nameof(TableKey.RowKey)), nameof(key));
-    }
-
-    // Duplicated verbatim from PolymorphicTableStorage<TBase>.ValidateSystemColumn — see the note on
-    // ValidateKey above; the paramName is deliberately nameof(columnName) in both copies so a caller
-    // comparing ex.ParamName (not just ex.Message) still sees the fake and the real store agree.
-    private static void ValidateSystemColumn(string columnName)
-    {
-        if (!SystemColumnNames.IsSystemColumn(columnName))
-            throw new ArgumentException(PolymorphicMessages.NotSystemColumn(columnName), nameof(columnName));
-
-        if (string.Equals(columnName, SystemColumnNames.TypeName, StringComparison.Ordinal))
-            throw new ArgumentException(PolymorphicMessages.TypeNameNotMergeable(), nameof(columnName));
-    }
-
-    private sealed record StoredRow(TableEntity Data, long Version, DateTimeOffset Timestamp)
-    {
-        public string ETagString() => $"W/\"{Version.ToString(CultureInfo.InvariantCulture)}\"";
-    }
+    /// <inheritdoc />
+    /// <remarks>
+    /// One atomic step, planned as <c>PolymorphicTableStorage&lt;TBase&gt;</c> plans its one transaction:
+    /// one partition, at most 100 rows, each key once, and the payload budget of <see cref="BatchPlanner"/>.
+    /// A batch that does not fit is refused with <see cref="BatchNotAtomicException"/>; it is never split.
+    /// </remarks>
+    public Task InsertAtomicAsync(IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default) =>
+        engine.InsertAtomicAsync(writes, ct);
 }

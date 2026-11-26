@@ -10,8 +10,22 @@ namespace Unified.Data.Tables;
 /// <c>StorageExtensions.GetOrCreateAsync</c> / <c>MutateOrCreateAsync</c>, which absorb this
 /// exception and converge on the winner's row.
 /// </remarks>
-public class DuplicateKeyException : Exception
+public class DuplicateKeyException : StorageException
 {
+    /// <summary>
+    /// Whether the row that is in the way may be this very call's own write. True unless the provider
+    /// observed that no earlier attempt of this request can have been applied (the request was sent once,
+    /// or every earlier attempt was definitely refused by the service: throttled, or turned away as
+    /// busy): a provider that retries (the Azure SDK does, after a timeout or a dropped connection) can
+    /// have an attempt applied whose response was lost,
+    /// and its next attempt then finds the row that attempt created. False means only that no such retry
+    /// was seen in this call, not that another writer is proven: a caller's own retry of the whole call
+    /// (after a <see cref="TransientStorageException"/>, a redelivered message, a restart) looks the same
+    /// as a foreign row. False too for a duplicate found before anything was sent (a key repeated within
+    /// one batch) and on a store that never retries (the in-memory one).
+    /// </summary>
+    public bool MayBeOwnWrite { get; set; }
+
     /// <summary>The entity type name (usually the table name), when known.</summary>
     public string? EntityType { get; }
 

@@ -59,7 +59,8 @@ public class FailedWriteKeepsItsExceptionWhenEvictionFailsTests
             await store.UpsertAsync(new T { Id = Id, Body = "v1", Version = 1 }, Ct);
         cache.Dispose();
 
-        var cancelled = new TaskCanceledException("the request was cancelled after it was sent");
+        // The SDK's network timeout: a cancellation the caller did not ask for (its token is not cancelled).
+        var cancelled = new TaskCanceledException("the request timed out after it was sent");
         table.Committed = _ => throw cancelled;
         var thrown = await Record.ExceptionAsync(() => write switch
         {
@@ -71,7 +72,10 @@ public class FailedWriteKeepsItsExceptionWhenEvictionFailsTests
         });
         table.Committed = null;
 
-        Assert.Same(cancelled, thrown);
+        // The storage failure, as the store reports a timeout of a write (0.10.0: neutral, the SDK's inside).
+        var transient = Assert.IsType<TransientStorageException>(thrown);
+        Assert.Same(cancelled, transient.InnerException);
+        Assert.True(transient.MayHaveCommitted);
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Error is ObjectDisposedException);
     }
 

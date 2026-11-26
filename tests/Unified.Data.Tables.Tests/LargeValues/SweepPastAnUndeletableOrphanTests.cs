@@ -193,7 +193,9 @@ public sealed class SweepPastAnUndeletableOrphanAzuriteTests : AzuriteCleanupTes
 
         var ex = await Assert.ThrowsAsync<AggregateException>(() => store.SweepOrphanBlobsAsync(Pk, TimeSpan.Zero, Ct));
 
-        Assert.Equal(409, Assert.IsType<RequestFailedException>(Assert.Single(ex.InnerExceptions)).Status);
+        // 0.10.0: the blob store's failure is neutral inside the aggregate (a blob's 409 is no duplicate key).
+        var failure = Assert.IsType<StorageException>(Assert.Single(ex.InnerExceptions));
+        Assert.Equal(409, Assert.IsType<RequestFailedException>(failure.InnerException).Status);
         Assert.Contains("deleted 2 blob(s)", ex.Message, StringComparison.Ordinal);
         Assert.Equal([stuck], await BlobNamesAsync());
     }
@@ -210,7 +212,9 @@ public sealed class SweepPastAnUndeletableOrphanAzuriteTests : AzuriteCleanupTes
         var ex = await Assert.ThrowsAsync<AggregateException>(() => store.SweepOrphanBlobsAsync(TimeSpan.Zero, Ct));
 
         var partition = Assert.IsType<AggregateException>(Assert.Single(ex.InnerExceptions));
-        Assert.Equal(409, Assert.IsType<RequestFailedException>(Assert.Single(partition.InnerExceptions)).Status);
+        // 0.10.0: the blob store's failure is neutral inside the aggregate (a blob's 409 is no duplicate key).
+        var failure = Assert.IsType<StorageException>(Assert.Single(partition.InnerExceptions));
+        Assert.Equal(409, Assert.IsType<RequestFailedException>(failure.InnerException).Status);
         Assert.Contains("deleted 1 blob(s)", ex.Message, StringComparison.Ordinal);
         Assert.Equal([stuck], await BlobNamesAsync());
     }

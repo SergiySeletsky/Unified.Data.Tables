@@ -107,15 +107,17 @@ public class InMemoryStorageTests
     // ── Update (modes + ETag simulation) ────────────────────────────────────
 
     [Fact]
-    public async Task UpdateAsync_MissingRow_Throws404()
+    public async Task UpdateAsync_MissingRow_ThrowsEntityNotFound()
     {
         var store = new InMemoryStorage<TestEntity>();
 
         // ETag supplied so Auto proceeds to the row lookup instead of the 0.6.0 Auto-requires-ETag throw.
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+        // 0.10.0: the neutral type TableStorage throws, where the fake raised an Azure 404 before.
+        var ex = await Assert.ThrowsAsync<EntityNotFoundException>(
             () => store.UpdateAsync(new TestEntity { Id = "p|r", ETag = "W/\"1\"" }));
 
-        Assert.Equal(404, ex.Status);
+        Assert.Equal("p|r", ex.Id);
+        Assert.Equal("ResourceNotFound", ex.ProviderErrorCode);
     }
 
     [Fact]
@@ -191,14 +193,16 @@ public class InMemoryStorageTests
     }
 
     [Fact]
-    public async Task UpdateAsync_Builder_MissingRow_Throws404()
+    public async Task UpdateAsync_Builder_MissingRow_ThrowsEntityNotFound()
     {
         var store = new InMemoryStorage<TestEntity>();
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(
+        // 0.10.0: the neutral type TableStorage throws, where the fake raised an Azure 404 before.
+        var ex = await Assert.ThrowsAsync<EntityNotFoundException>(
             () => store.UpdateAsync("p|r", b => b.SetProperty(x => x.Name, "x")));
 
-        Assert.Equal(404, ex.Status);
+        Assert.Equal("p|r", ex.Id);
+        Assert.Equal("ResourceNotFound", ex.ProviderErrorCode);
     }
 
     // ── Upsert ──────────────────────────────────────────────────────────────

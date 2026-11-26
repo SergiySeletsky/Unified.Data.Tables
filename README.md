@@ -10,7 +10,9 @@ A small, reusable **Azure Table Storage** data layer for .NET: a generic `IStora
 configurable in-memory caching, optimistic concurrency, upserts and batch transactions, bounded
 prefix queries, builder-driven partial updates, role-gated properties, legacy-column aliases, and a
 reflection-based object-graph serializer that transparently handles nested types and the 64&nbsp;KB
-per-cell limit — plus a semantically faithful in-memory backend for tests.
+per-cell limit — plus a semantically faithful in-memory backend for tests, a SQLite provider for
+local development and single-machine hosts, provider-neutral failures, and a conformance kit that holds
+any store to the same contract.
 
 It exists so the same battle-tested storage primitives can be shared across projects instead of being
 copy-pasted into each one.
@@ -56,8 +58,22 @@ copy-pasted into each one.
   the canonical column is absent; writes stay canonical, so rows converge without a migration job.
 - **Protected properties** — mark a property `[ProtectedProperty("admin,...")]` and role-gate writes through
   a pluggable `IProtectedPropertyAuthorizer` (the package itself has **no** ASP.NET Core dependency).
+- **Provider-neutral failures** — no storage member throws an Azure SDK type. A missing row is
+  `EntityNotFoundException`, a throttled or timed-out request `TransientStorageException`, a refused
+  one `StorageRequestRejectedException`, all under `StorageException`, on every provider; the
+  provider's own exception is the `InnerException` whenever it raised one. See [Failures](#failures).
+- **Conditional delete, all-or-nothing batches, RowKey ranges, store information** — side interfaces
+  reached through extension methods (`DeleteIfMatchAsync`, `CreateAtomicAsync`, `GetInfo()`, ...) and
+  `QueryOptions.FromRowKey` / `ToRowKey`; `IStorage<T>` itself gained no member.
 - **Faithful in-memory backend** — `Unified.Data.Tables.InMemory` round-trips rows through the REAL
-  serializer with 409/412/404 and ETag semantics, so tests exercise production behaviour.
+  serializer with the service's duplicate, conflict, not-found and ETag semantics, so tests exercise
+  production behaviour. No Azure provider package and no `Azure.Storage.Blobs` in its closure.
+- **SQLite provider** — `Unified.Data.Tables.Sqlite` is the same engine over one database file: durable,
+  multi-process on one machine, and bound by the Table service's limits, so a table that works locally
+  works on Azure.
+- **Conformance kit** — `Unified.Data.Tables.Conformance` runs 164 named scenarios against any
+  `IStorage<T>` (a provider, a decorator, your own fake) from any test framework, with an xUnit v3
+  adapter.
 - **ASP.NET Core Identity stores** — `Unified.Data.Tables.Identity` implements Identity's
   `IUserStore`/`IRoleStore` family (users, roles, claims, logins, tokens, two-factor and lockout) on top
   of `IStorage<T>`, registered with one `AddUnifiedIdentityStores()` call — and, because it is just
@@ -73,22 +89,38 @@ copy-pasted into each one.
 dotnet add package Unified.Data.Tables
 ```
 
-This is shipped as four packages:
+This is shipped as nine packages, all with one version:
 
-| Package | Contents | Use it in |
-| --- | --- | --- |
-| **Unified.Data.Tables** | `TableStorage<T>`, the serializer, cache policies, DI helpers (Azure dependencies) | server / host projects |
-| **Unified.Data.Tables.Abstractions** | `Entity`, `IStorage<T>`, `QueryOptions`, `ConcurrencyMode`, `UpdateBuilder<T>`, `EntityId`, `[ColumnAlias]`, `[ProtectedProperty]` — no Azure/hosting deps | shared/domain & Blazor WebAssembly projects |
-| **Unified.Data.Tables.InMemory** | `InMemoryStorage<T>` — serializer-faithful in-memory `IStorage<T>` | test projects, dev/offline mode |
-| **Unified.Data.Tables.Identity** | ASP.NET Core Identity `IUserStore`/`IRoleStore` persisted through `IStorage<T>` | hosts using ASP.NET Core Identity |
+| Package | Contents | Depends on (siblings) | Use it in |
+| --- | --- | --- | --- |
+| **Unified.Data.Tables** | The Azure Table Storage provider: `TableStorage<T>`, `PolymorphicTableStorage<TBase>`, blob offload, the read cache, DI helpers | Abstractions `[x.y.z]`, Core `[x.y.z]` | server / host projects |
+| **Unified.Data.Tables.Abstractions** | `Entity`, `IStorage<T>`, `QueryOptions`, `ConcurrencyMode`, `UpdateBuilder<T>`, `EntityId`, the `StorageException` family, the side interfaces, `[ColumnAlias]`, `[ProtectedProperty]` — no Azure/hosting deps (`netstandard2.0` and `net10.0`) | none | shared/domain & Blazor WebAssembly projects |
+| **Unified.Data.Tables.Core** | What every provider shares: the serializer, the large-value layout, the planners, the filter translator, `StorageOptions`, the row-store engine of the local providers. Uses the `Azure.Data.Tables` row types; no network, no `Azure.Storage.Blobs` | Abstractions `[x.y.z]` | nowhere directly: a provider brings it |
+| **Unified.Data.Tables.InMemory** | `InMemoryStorage<T>`, `InMemoryPolymorphicStorage<TBase>` — serializer-faithful in-memory stores | Abstractions `[x.y.z]`, Core `[x.y.z]` | test projects, dev/offline mode |
+| **Unified.Data.Tables.Sqlite** | `SqliteStorage<T>`, `SqlitePolymorphicStorage<TBase>` over one database file or `:memory:` | Abstractions `[x.y.z]`, Core `[x.y.z]` | local development, single-machine hosts, durable tests |
+| **Unified.Data.Tables.Identity** | ASP.NET Core Identity `IUserStore`/`IRoleStore` persisted through `IStorage<T>` | Abstractions `x.y.z` or later | hosts using ASP.NET Core Identity |
+| **Unified.Data.Tables.Conformance** | The conformance kit: named scenarios for any `IStorage<T>`, plus `CountingStorage<T>` and `FaultInjectingStorage<T>`. No test framework | Abstractions `[x.y.z]` | test projects, any framework |
+| **Unified.Data.Tables.Conformance.Xunit** | The xUnit v3 adapter of the kit: one test case per scenario | Conformance `[x.y.z]` | xUnit v3 test projects |
+| **Unified.Data.Tables.Analyzers** | Optional upgrade hint UDT1001 (Info): a `catch (RequestFailedException)` around a storage call | none | temporarily, while upgrading from 0.9.x |
 
-`Unified.Data.Tables` references the abstractions transitively, so most apps just install it. The
-implementation packages pin each other exactly: `Unified.Data.Tables` depends on
-`Unified.Data.Tables.Abstractions` `[x.y.z]` and `Unified.Data.Tables.InMemory` on `Unified.Data.Tables`
-`[x.y.z]` (they share internals), so upgrade them together. Blob offload needs `Azure.Storage.Blobs`
-12.29.2 or later; the optional hosted sweep uses `Microsoft.Extensions.Hosting.Abstractions`. In a **browser-safe** shared library that only defines entities and repository contracts, reference the abstractions alone.
+`Unified.Data.Tables` references the abstractions and the core transitively, so most apps just install
+it. The packages that share internals pin each other exactly (`[x.y.z]`, not NuGet's default "x.y.z or
+later"): the core pins the abstractions, each provider (`Unified.Data.Tables`,
+`Unified.Data.Tables.InMemory`, `Unified.Data.Tables.Sqlite`) pins the abstractions and the core, the
+kit pins the abstractions whose contract it states, and its adapter pins the kit. So upgrade them
+together. NuGet refuses a mixed set at restore only when the conflict is between transitive
+constraints: an older sibling referenced directly in the same project wins with warning NU1608 and
+fails at run time (see [Upgrading from 0.9.x](#upgrading-from-09x), step 1). **Since 0.10.0 the in-memory package no longer depends on
+`Unified.Data.Tables`**: a test project that used `TableStorage<T>` or a blob type through it references
+the Azure provider itself. Neither the in-memory nor the SQLite package brings `Azure.Storage.Blobs` or
+the Azure provider. Blob offload on Azure needs `Azure.Storage.Blobs` 12.29.2 or later; the optional
+hosted sweep uses `Microsoft.Extensions.Hosting.Abstractions`. In a **browser-safe** shared library that
+only defines entities and repository contracts, reference the abstractions alone.
 
-Requires **.NET 10** and an Azure Storage account (or the local [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator).
+Requires **.NET 10**. The Azure provider needs an Azure Storage account (or the local
+[Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator); the in-memory
+and SQLite providers need nothing else. Upgrading from 0.9.x? Read
+[Upgrading from 0.9.x](#upgrading-from-09x) first: 0.10.0 changes which exceptions storage members throw.
 
 ---
 
@@ -260,7 +292,7 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `OneAsync(id)` | Fetch one row by composite id, or `null`. |
 | `ExistsAsync(id)` | Whether a row exists (cache-aware). It never assembles or downloads a large value: a row with continuation rows or an offloaded value, or one whose part count or in-row value is damaged, answers `true` and is not cached by this call. |
 | `QueryAsync(partition?)` | All rows, or just one partition (the cached read path). |
-| `QueryAsync(options)` | Bounded query: partition + RowKey prefix + Take. Never cached. |
+| `QueryAsync(options)` | Bounded query: partition + RowKey prefix or RowKey range + Take. Never cached. |
 | `QueryStreamAsync(options?)` | Streaming variant — never caches, never buffers. |
 | `QueryPageAsync(options)` | One server page + an opaque, query-bound cursor for the next (`Take` = page size, default 100). Resumable grid / infinite-scroll paging. |
 | `QueryAsync(predicate, partition?, take?)` | **Server-side** LINQ filter translated to an OData `$filter` — not a client-side scan. |
@@ -277,12 +309,23 @@ var euOnes  = await storage.QueryAsync("eu");  // scope to a partition (omit for
 | `TryMutateAsync(id, e => …)` | Extension: outcome-returning CAS — `Updated` / `NotFound` / `Conflicted`, nothing thrown for expected branches. |
 | `TryTransitionAsync(id, when, apply)` | Extension: exactly-once transition as a result — the race-loser gets `PreconditionFailed` with the winner's row. |
 | `CreateBatchAsync(entities)` | Transactional inserts, grouped by partition, 100 per transaction, atomic per transaction (`DuplicateKeyException` on an existing or repeated key). Types with large values too: an entity's continuation rows ride in its transaction. A failed transaction applies nothing; the partitions and transactions before it stay committed, on `InMemoryStorage<T>` as on Azure. |
-| `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking; returns the number of entities passed. A plain type sends the rows as they are: a key named twice in one transaction fails it with the service's 400 `InvalidDuplicateRow` (a `TableTransactionFailedException`), and transactions already sent stay committed. A type with large values writes the last occurrence of a repeated key (it counts twice and is written once), reads each row first and replaces it conditionally; `ConcurrencyConflictException` after five lost races. |
+| `UpsertBatchAsync(entities)` | Transactional insert-or-replace, same chunking; returns the number of entities passed. A plain type sends the rows as they are: a key named twice in one transaction fails it with the service's 400 `InvalidDuplicateRow` (a `StorageRequestRejectedException` with that `ProviderErrorCode`), and transactions already sent stay committed. A type with large values writes the last occurrence of a repeated key (it counts twice and is written once), reads each row first and replaces it conditionally; `ConcurrencyConflictException` after five lost races. |
 | `CountAsync(partition?)` | Row count via keys-only projection (Tables has no server-side count). |
 | `DeleteAsync(id)` | Delete one row (idempotent). For a type with large values it reads the row first and deletes it, with its continuation rows and blobs, on condition of the version read; `ConcurrencyConflictException` after five lost races. |
 | `DeletePartitionAsync(partition)` | Batch-delete a whole partition in transactions of up to 100 rows; returns the number of entities deleted (continuation rows are not counted). Atomic per transaction only: call it again to finish one that failed. A write that races the delete leaves its entity gone, never a continuation row without its main row. |
 | `SweepOrphanBlobsAsync(partition, olderThan)` | Extension (`IOrphanBlobSweeper`): delete offloaded blobs of the partition that no row references and that are older than `olderThan`; returns the count. See [Large values](#large-values-split-and-blob-offload). |
 | `SweepOrphanBlobsAsync(olderThan)` | Extension (`IOrphanBlobSweeper`): the same for every partition of the table. |
+| `DeleteIfMatchAsync(id, etag)` / `DeleteIfExistsAsync(id)` | Extension (`IConditionalDelete<T>`): delete one version, or delete and learn whether the row was there. See [Conditional delete](#conditional-delete). |
+| `CreateAtomicAsync(entities)` / `UpsertAtomicAsync(entities)` | Extension (`IAtomicBatch<T>`): one transaction or `BatchNotAtomicException` before any write. See [All-or-nothing batches](#all-or-nothing-batches). |
+| `GetInfo()` | Extension (`IStorageInfo`): what the store is and the limits it plans by; never throws. See [Store information](#store-information-storageinfo). |
+| `TryGetCapability<T, TCap>(out cap)` | Extension: the probe for a side interface, answered for the wrapped store by a decorator. |
+
+The rows from `DeleteIfMatchAsync` down are extension methods over **side interfaces**: `IStorage<T>`
+has no member for them, so a hand-written implementer, a decorator or a mock written for 0.9 still
+compiles. The providers of this library
+implement all of them. On a store that does not, the extension method throws `NotSupportedException`
+(`GetInfo()` returns `StorageInfo.Unknown` instead); ask `TryGetCapability` first when the store may be
+someone else's. Failures of every member are described under [Failures](#failures).
 
 ### Bounded queries
 
@@ -304,6 +347,35 @@ Results arrive in lexical (PartitionKey, RowKey) order — encode any other orde
 `RowKeys.InvertedTicks(now)` makes later timestamps sort FIRST, so "most recent N" is just
 `QueryAsync(new QueryOptions { Partition = p, Take = n })` with no client-side sorting.
 `RowKeyPrefix` requires `Partition` (a cross-partition RowKey range would be a full table scan).
+
+#### RowKey ranges
+
+`FromRowKey` and `ToRowKey` bound a scan to the RowKeys between them, on `QueryAsync(QueryOptions)`,
+`QueryStreamAsync` and `QueryPageAsync`:
+
+```csharp
+// Everything from "2026-01" up to, not including, "2026-02":
+var january = await storage.QueryAsync(new QueryOptions
+{
+    Partition = accountId,
+    FromRowKey = "2026-01",   // inclusive by default (FromInclusive = true)
+    ToRowKey = "2026-02",     // exclusive by default (ToInclusive = false)
+});
+```
+
+The defaults make consecutive ranges `[a, b)`, `[b, c)` never overlap. A range needs `Partition` and
+cannot be combined with `RowKeyPrefix` (`ArgumentException`: a prefix is itself a range). Bounds are
+normalized the way ids are (`trim → spaces to '-' → lower-case`, or as written under
+`IdNormalization.AsWritten`), so a bound compares against the keys as they are stored. An upper bound
+never truncates an entity with large values: its continuation rows are fetched with it. A page cursor is
+bound to the bounds it was issued for. Every provider of this library honours the bounds, in the same
+ordinal key order.
+
+> **A store that predates 0.10.0 ignores the bounds.** `QueryOptions` gained the properties, not
+> `IStorage<T>` a member, so a hand-written `IStorage<T>` implementation or fake compiled before 0.10.0
+> never reads them and returns the whole partition, silently. The conformance kit's `Capabilities.Range.*`
+> scenarios fail on such a store; an implementer calls `options.ValidateRowKeyRange()` and honours
+> `options.HasRowKeyRange`.
 
 ### Server-side LINQ filters
 
@@ -445,6 +517,12 @@ await storage.UpdateAsync(c);   // ConcurrencyConflictException if the row chang
 > `UnifiedTableStorageOptions.ImplicitLastWriterWins = true` to temporarily restore the pre-0.6.0
 > fallback (unconditional replace + a warning log) while you convert call sites.
 
+> **Since 0.10.0, `"*"` is not a version.** `UpdateAsync(entity)` and
+> `UpdateAsync(entity, ConcurrencyMode.Strict)` with `entity.ETag == "*"` throw `ArgumentException` on
+> every provider, before anything is read or sent. Until 0.9.2 the Azure provider passed the wildcard to
+> the service, which made the update a silent last-writer-wins, while the in-memory store compared it as
+> a version and conflicted. Say what you mean: `UpdateAsync(entity, ConcurrencyMode.LastWriterWins)`.
+
 For values *derived* from the current row (counters, unions, merges), use the packaged
 compare-and-swap loop — it re-reads and re-applies on conflict, so no increment is ever lost:
 
@@ -494,6 +572,11 @@ Losing the race to the *same* transition reports `PreconditionFailed` (the retry
 the precondition no longer holds, and returns the winner's row) — `Conflicted` is reserved for a
 genuinely hot row whose precondition still held every attempt.
 
+A row deleted between a verb's read and its write is a result too (since 0.10.0; a provider 404 used to
+escape): `TryMutateAsync` and `TryTransitionAsync` return `NotFound`, `MutateOrCreateAsync` goes back to
+its create branch, and `MutateAsync` throws its `InvalidOperationException` ("the entity does not
+exist") with the `EntityNotFoundException` inside.
+
 For a type with [large values](#large-values-split-and-blob-offload), a read whose row kept changing
 throws `ConcurrencyConflictException` (see [Ordering and integrity](#ordering-and-integrity)).
 `MutateAsync`, `MutateOrCreateAsync`, `TryMutateAsync` and `TryTransitionAsync` count such a read as a
@@ -519,6 +602,208 @@ cancelled token) leaves the helper at once. `GetOrCreateAsync` has no attempt bu
 `Entity.Timestamp` mirrors the service-managed last-write time: populated on every read, reset to
 `null` on writes (write responses don't carry it), never stored as a column. Unlike `UpdatedAt` it is
 bumped by ANY storage write — including migrations — and cannot be set by clients.
+
+---
+
+## Failures
+
+Since 0.10.0 **no storage member throws a provider type**. Whatever the provider is (Azure Table
+Storage, in-memory, SQLite), a failure the store reports is a `StorageException` or one of its subtypes
+from `Unified.Data.Tables.Abstractions`, and whenever the provider raised an exception of its own, that
+exception is the `InnerException`:
+
+| Exception | Meaning | Azure status |
+| --- | --- | --- |
+| `EntityNotFoundException` (`EntityType`, `Id`) | The row a write needed is not there (`UpdateAsync`, a builder update, `MergeColumnsAsync`). Reads return `null`, deletes are no-ops. | 404 for a row |
+| `TableNotFoundException` (`TableName`) | The table was deleted behind the store. Never reported as a missing row. | 404 `TableNotFound` |
+| `DuplicateKeyException` (`MayBeOwnWrite`) | An insert of a key that is stored. | 409 `EntityAlreadyExists` |
+| `ConcurrencyConflictException` (`MayBeOwnWrite`) | The row is another version than the write was conditional on. | 412 |
+| `StorageRequestRejectedException` | The request itself is refused; sending it again fails the same way (a key the service does not accept, a row or cell too large, a key named twice in one transaction). | 400, 413 |
+| `TransientStorageException` (`MayHaveCommitted`, `RetryAfter`) | Throttled, unavailable, timed out, connection lost, after the provider's own retries; SQLite's `SQLITE_BUSY`. The same call may succeed later. | 408, 429, 500, 502, 503, 504, no response |
+| `BatchNotAtomicException` | An all-or-nothing batch cannot be one transaction; nothing was written. | none: refused before a request |
+| `BatchPayloadTooLargeException` | One entity of a batch is larger than a transaction's payload. | none |
+| `StorageException` | Anything else the store reported, including every failure of the offload blob store that is not transient or a rejected request. | any other |
+
+`StorageException.ProviderErrorCode` carries the backend's code (`"EntityAlreadyExists"`,
+`"TableNotFound"`, `"InvalidDuplicateRow"`, `"SQLITE_BUSY"`), so most handlers never open
+`InnerException`. A missing row always has one: the 404, a `RequestFailedException` on Azure and, built
+as the service would answer, on the in-memory and SQLite stores. A failure the library detects itself,
+with no request refused, has **none**: a `ConcurrencyConflictException` found by the library's own read
+before it sent a write (an update or a conditional delete of a type with large values whose stored
+version is not the caller's), `BatchNotAtomicException` and `BatchPayloadTooLargeException`, and what
+SQLite reports about its own database (a schema version it does not read). For a timeout or a
+cancellation that was not the caller's, the inner exception is that one, not a
+`RequestFailedException`. So a handler that opens `InnerException` checks it for null.
+
+Not wrapped, on purpose: the caller's own cancellation (`OperationCanceledException`
+under the caller's token), argument and usage errors (`ArgumentException`, `InvalidOperationException`,
+`NotSupportedException`), and the serializer's and large-value exceptions (`OversizedCellException`,
+`OversizedValueException`, `TableValueIntegrityException`, `BlobOffloadNotConfiguredException`).
+
+```csharp
+try
+{
+    await storage.UpdateAsync(id, b => b.SetProperty(x => x.Status, "done"));
+}
+catch (EntityNotFoundException)        { return NotFound(); }           // the row is gone
+catch (ConcurrencyConflictException)   { return Conflict(); }           // another version: re-read
+catch (TransientStorageException ex)   { return Unavailable(ex.RetryAfter); }
+// StorageException last: it is the base of the three above.
+```
+
+Two rules worth knowing on the Azure provider:
+
+- A cancellation that leaves a storage call while **your** token is not cancelled is a
+  `TransientStorageException` with the cancellation inside. That is how the SDK reports its network
+  timeout once its retries are used up. The rule is by the token alone: a cancellation raised by code
+  the call runs on your behalf (a stream you handed in that is cancelled by a token of its own) is
+  reported the same way.
+- Only a 409 about a row (`EntityAlreadyExists`, or no code) is `DuplicateKeyException`. A 409 with
+  another code (`TableBeingDeleted`) is a plain `StorageException` with that code.
+
+### `MayBeOwnWrite` and `MayHaveCommitted`: signals, not proof
+
+A request can be applied by the service and its response lost. The SDK then retries, and the retry finds
+the row the first attempt wrote: a duplicate, or a conflict, **caused by the call itself**. The library
+does not resolve that for you (comparing rows cannot tell two writers of identical content apart). It
+tells you what it saw:
+
+- **`DuplicateKeyException.MayBeOwnWrite` / `ConcurrencyConflictException.MayBeOwnWrite`.** True when an
+  earlier attempt of this request was sent and may have been applied, and true when the attempts could
+  not be observed. False when exactly one attempt was sent, or every earlier one was definitely refused
+  (429, the service's 503 `ServerBusy`). **False means only "no SDK retry was seen inside this call".**
+  It is not proof of another writer: your own retry of the whole call after a
+  `TransientStorageException`, a redelivered queue message and a restarted process all look exactly
+  like a foreign row. Always false on the in-memory and SQLite providers, which never send a request
+  twice.
+- **`TransientStorageException.MayHaveCommitted`.** False for a read, and for a write only when every
+  attempt of every write request of the call was definitely rejected. True otherwise, which is the
+  default: before repeating a write that is not idempotent, read the row.
+
+When the answer matters (a uniqueness claim, a payment), read the row and compare something only your
+write carries, such as an operation id you stored in it.
+
+The signals need the library's retry observation in the client's pipeline. The clients
+`AddUnifiedTableStorage` builds from a connection string or a credential have it. A
+`TableServiceClient` you register yourself needs it added, or the signals stay at their conservative
+values and a conditional delete of a missing row answers `Indeterminate`:
+
+```csharp
+services.AddSingleton(_ => new TableServiceClient(connectionString, new TableClientOptions().AddRetryObservation()));
+services.AddUnifiedTableStorage();
+```
+
+To change the client the library builds (retry counts, a transport, diagnostics), set
+`UnifiedTableStorageOptions.ConfigureTableClient`; it runs before the library adds its policy.
+
+## Conditional delete
+
+`DeleteAsync(id)` is idempotent and says nothing. Two extension methods say more
+(`IConditionalDelete<T>`):
+
+```csharp
+var order = await storage.OneAsync(id);
+switch (await storage.DeleteIfMatchAsync(id, order!.ETag!))    // only the version that was read
+{
+    case DeleteStatus.Deleted:       break;   // this call removed it
+    case DeleteStatus.NotFound:      break;   // it was already gone
+    case DeleteStatus.Indeterminate: break;   // gone, and an earlier attempt of THIS request may have removed it
+}
+
+var existed = await storage.DeleteIfExistsAsync(id) == DeleteStatus.Deleted;   // unconditional, but tells
+```
+
+- A row that is another version throws `ConcurrencyConflictException`. `DeleteIfMatchAsync` never
+  retries on it; re-read and decide.
+- `"*"`, null or an empty ETag throws `ArgumentException`: an unconditional delete is `DeleteAsync` or
+  `DeleteIfExistsAsync`.
+- `Indeterminate` exists because a `bool` cannot say "the row is gone and I may be the one who removed
+  it": after a lost response the SDK's retry gets a 404 for the row its first attempt deleted. Treat it
+  as "gone"; treat it as "deleted by me" only where doing the follow-up twice is harmless. Only the
+  Azure provider returns it (and always, for a missing row, on a client without
+  [retry observation](#maybeownwrite-and-mayhavecommitted-signals-not-proof)); the in-memory and SQLite
+  providers never do.
+- For a type with large values the row's continuation rows and blobs go with it.
+
+## All-or-nothing batches
+
+`CreateBatchAsync` and `UpsertBatchAsync` split a large batch into transactions, each atomic, and keep
+the ones that were committed when a later one fails. When a batch must be all or nothing:
+
+```csharp
+await storage.CreateAtomicAsync(rows);    // one transaction, or BatchNotAtomicException before any write
+await storage.UpsertAtomicAsync(rows);
+await events.InsertAtomicAsync(writes);   // IPolymorphicStorage<TBase>
+```
+
+A batch that cannot be one transaction is refused **before anything is sent**, with
+`BatchNotAtomicException`, and the entities are left as you passed them: more than 100 rows, more than
+one partition, a row named twice, a payload over the budget the library plans by, or (for a type with
+large values) a value that would go to blob storage, since a blob is written outside the transaction.
+Anything else that fails the batch before its transaction is sent leaves them the same way: an entity
+the serializer refuses, for its size (`OversizedCellException`, `OversizedValueException`) or for anything
+else (a reference cycle, a property named with the path delimiter), or a cancelled token. Once the
+transaction is sent, the entities are stamped as after any batch, whether or not it committed.
+An entity's continuation rows count as rows. A transaction the backend refuses applies nothing and
+throws the failure of the row that caused it (`DuplicateKeyException` for `CreateAtomicAsync`).
+`GetInfo().MaxBatchRows` and `MaxBatchBytes` state the limits.
+
+## Store information: `StorageInfo`
+
+```csharp
+StorageInfo info = storage.GetInfo();   // never throws; StorageInfo.Unknown for a store that states nothing
+// info.ProviderName  "AzureTables" | "InMemory" | "Sqlite"
+// info.TableName, info.Durability, info.MaxBatchRows, info.MaxBatchBytes, info.MaxCellBytes, info.MaxRowBytes
+// info.ReadCacheMayServeStaleRows, info.SinglePartitionTransactions
+```
+
+`Durability` says what an acknowledged write survives: `Volatile` (the in-memory provider, SQLite
+`:memory:`), `OsBuffered` (SQLite with `Synchronous = Normal`: a process crash, not a power loss),
+`Fsynced` (SQLite's default), `Replicated` (Azure Storage) or `Unknown`. The Azure provider reports
+`Replicated` only when the client's host is positively Azure Storage's table service; Azurite, a custom
+domain, a proxy and Cosmos DB's Table API are `Unknown`. A host that knows better sets
+`UnifiedTableStorageOptions.DeclaredDurability`.
+
+The limits are **what the library plans and refuses by**, not a measurement of the endpoint: an emulator
+may accept more, and so may the service. `MaxRowBytes` is 1,000,000 bytes by the library's estimate, a
+margin below the service's 1 MiB: the providers plan split rows within it and the local providers refuse
+a row above it, but the Azure provider sends a plain row as it is, so a row between the two is stored by
+Azure and refused locally. Every property is nullable or has an "unknown" value, and the record is sealed with
+`init` properties, so a field added later breaks no implementer; a mock or a third-party store simply
+returns `StorageInfo.Unknown`.
+
+## Raw tables (experimental)
+
+For backup, restore, copy and index rows there is an untyped view of a table: `ITableStore` (the
+account: list, exists, create, delete, `GetTable`) and `IRawTable` (one table: `GetAsync`,
+`QueryAsync(RawQuery)`, `SubmitAsync`), over `RawRow` and typed `RawCell`s, with no Azure type in a
+signature. `AddUnifiedTableStorage` and `AddUnifiedSqliteStorage` register an `ITableStore` for the
+account; an in-memory store hands out its own through the capability probe
+(`store.TryGetCapability<T, ITableStore>(out var tables)`), since each in-memory store is an account of
+its own. The probe of any store of this library also answers `IRawTable` for the store's own table.
+
+```csharp
+#pragma warning disable UDT0001   // experimental: the shape may change before 1.0
+public sealed class Backup(ITableStore tables)
+{
+    public async Task CopyPartitionAsync(string table, string partition, IRawTable target, CancellationToken ct)
+    {
+        await foreach (var row in tables.GetTable(table).QueryAsync(new RawQuery(partition), ct))
+            await target.SubmitAsync([RawOperation.Insert(row)], ct);
+    }
+}
+```
+
+- **Rows are physical.** A raw read returns what is stored: the `{RowKey}~NNNN` continuation rows of a
+  large value, the system columns (`_TypeName`, `_SplitOf`), cells as written. Nothing is assembled,
+  normalized or cached, and a raw write bypasses the typed store's stamps, protected properties and
+  cache. Copy an entity's main row, its continuation rows and its blobs together.
+- **`SubmitAsync` is one single-partition transaction, all or nothing, never split.** It is sized before
+  it is sent; one that cannot be a transaction throws `BatchNotAtomicException`. Insert, replace, merge
+  and delete, each optionally on an ETag. A delete of a missing row fails the transaction with
+  `EntityNotFoundException`: it is not the idempotent delete of the typed store.
+- **`[Experimental("UDT0001")]`.** Using the types is a compile error until you suppress `UDT0001`,
+  which is the point: three codebases wrote this shape by hand, and it is still new.
 
 ---
 
@@ -741,7 +1026,7 @@ serializer's column name (`Extra_Notes`, with no `Value` segment) and under the 
 (`x => x.Extra!.Value.Notes`, column `Extra_Value_Notes`), whether the property holds a value or not. The
 message then also names declaring that property as `S`, because a member marked `[TableValueSplit]` of a
 nullable struct is refused in turn ("... and declare Order.Extra as S."). `InMemoryStorage<T>`
-looks at the row first: when the row does not exist it throws `RequestFailedException` (404), and when
+looks at the row first: when the row does not exist it throws `EntityNotFoundException`, and when
 `WithETag` names another version `ConcurrencyConflictException`, as for every builder update;
 `TableStorage<T>` reports the misuse in both cases. The misuse is reported first; a path the declared
 types lead to a correctly marked member or a `TableBlobContent` is then refused with
@@ -1796,9 +2081,12 @@ and a resolver is not a security boundary.
 **The store owns its table.** There is no server-side type filter, so every enumerating operation
 sees every row in scope. Point two stores at one table and each sees the other's rows.
 
-**Not supported here:** caching, LINQ predicates, `QueryPageAsync` cursors, `UpdateBuilder`,
-`ConcurrencyMode`, and `[ProtectedProperty]`. Rows are immutable facts plus mutable `_`-prefixed
-system columns; `MergeColumnsAsync` is the one mutation.
+**Not supported here:** caching, LINQ predicates, `QueryPageAsync` cursors, RowKey ranges, conditional
+delete, `UpdateBuilder`, `ConcurrencyMode`, and `[ProtectedProperty]`. Rows are immutable facts plus
+mutable `_`-prefixed system columns; `MergeColumnsAsync` is the one mutation, and it throws
+`EntityNotFoundException` for a row that is not there (a `RequestFailedException` with status 404 until
+0.9.2). `InsertAtomicAsync` inserts a batch as [one transaction or nothing](#all-or-nothing-batches),
+and `GetInfo()` works as on a typed store.
 
 ---
 
@@ -1831,12 +2119,13 @@ Assert.Equal(1, store.Count);                  // + Clear(), Snapshot() convenie
 
 The fake is deliberately faithful: rows round-trip through the REAL serializer (decimal-as-double,
 enum-as-string, flattening, `__Json`/`__GZip`, 64&nbsp;KB handling), duplicate `CreateAsync` throws
-`DuplicateKeyException`, updating a missing row throws 404, stale ETags throw
+`DuplicateKeyException`, updating a missing row throws `EntityNotFoundException`, stale ETags throw
 `ConcurrencyConflictException` per `ConcurrencyMode`, deletes are idempotent,
 and results arrive in lexical key order — so a green test against the fake means the same code holds
 against Azure Tables. `[TableValueSplit]` and `TableBlobContent` work too: the fake keeps offloaded blobs in
 an in-memory dictionary, with the same integrity checks and `SweepOrphanBlobsAsync` support (it needs no
-`BlobServiceClient` and ignores `BlobOffloadOptions.ServiceClient`). It plans the same rows and
+`BlobServiceClient`: set `StorageOptions.Offload` to an `OffloadOptions`, and a `BlobOffloadOptions`
+passed there is read for its container, threshold and grace only). It plans the same rows and
 transactions, refuses the same keys and shapes, takes back leftover continuation rows, cleans up only a
 row's own blobs and releases the same blobs at once, retries a write that lost a race with the same five
 attempts and pauses (and a read whose blobs a concurrent replace released, with the same
@@ -1846,16 +2135,52 @@ before it stores the first, so a batch in which one entity cannot be serialized 
 in-memory store kept the entities before it). Three differences are worth knowing: it has no read cache;
 a stream opened on a `TableBlobContent` holds the bytes it was opened with, so a blob deleted meanwhile
 does not fail that read; and a builder partial update checks that the row exists and that its
-`WithETag` matches before it looks at its paths, so for a missing row or a stale ETag it throws the 404
-or the conflict where `TableStorage<T>` throws the refusal of the path (a large property, a member
-marked on an interface).
+`WithETag` matches before it looks at its paths, so for a missing row or a stale ETag it throws
+`EntityNotFoundException` or the conflict where `TableStorage<T>` throws the refusal of the path (a large
+property, a member marked on an interface).
 
 `InMemoryStorage<T>` and `InMemoryPolymorphicStorage<TBase>` succeed and fail where `TableStorage<T>` and
-`PolymorphicTableStorage<TBase>` do over the service. Failures carry the service's `Status` and
-`ErrorCode`, batches are atomic per transaction only, `QueryOptions.Select` projects the row, a cancelled
-token commits nothing, and a key the service refuses is refused. A differential suite
-(`InMemoryFidelityTests`) runs each scenario on both stores, the service side on Azurite. The CHANGELOG's
-0.9.0 "InMemory fidelity" list names each behaviour that changed for tests written against the fake.
+`PolymorphicTableStorage<TBase>` do over the service, with the same [neutral exceptions](#failures):
+since 0.10.0 the fake no longer throws `RequestFailedException` (a test that asserted the Azure type
+asserts the neutral one). The exception's `ProviderErrorCode` is the service's code, and its
+`InnerException` carries the service's status wherever the Azure provider's does (a conflict the store
+finds by its own read has none on either; see [Failures](#failures)). Batches are atomic per
+transaction only, `QueryOptions.Select` projects the row, a cancelled token commits nothing, a key the
+service refuses is refused, and so is a row above 252 properties or the library's 1,000,000-byte row
+budget (stricter than the service's 1 MiB). The fake implements every side interface
+(conditional delete, all-or-nothing batches, RowKey ranges, `GetInfo()` with `Durability.Volatile`, raw
+tables); `MayBeOwnWrite` is always false there. A differential suite (`InMemoryFidelityTests`) runs each
+scenario on both stores, the service side on Azurite, and the [conformance kit](#conformance-kit) holds
+both to one contract. The CHANGELOG's 0.9.0 "InMemory fidelity" list names each behaviour that changed
+for tests written against the fake.
+
+The package references `Unified.Data.Tables.Core`, not the Azure provider, and its registrations take
+the provider-neutral `StorageOptions`:
+
+```csharp
+services.AddUnifiedInMemoryStorage(o =>
+{
+    o.IdNormalization = IdNormalization.AsWritten;
+    o.Offload = new OffloadOptions { ThresholdBytes = 64 * 1024 };   // was o.BlobOffload until 0.9.2
+});
+var options = provider.GetRequiredService<StorageOptions>();          // not UnifiedTableStorageOptions
+```
+
+A configuration method shared by production and tests is typed to the base, which every provider's
+registration accepts: `static void Configure(StorageOptions o)`.
+
+A host that registers its production `UnifiedTableStorageOptions` itself keeps them: the stores of
+`AddUnifiedInMemoryStorage` and `AddUnifiedInMemoryPolymorphicTable` receive them, registered before or
+after those calls. A store registered **by hand**
+(`services.AddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>))`) is built by the container from
+the `StorageOptions` it holds, so register them under the neutral type too, or the store silently runs
+on the defaults:
+
+```csharp
+services.AddSingleton(productionOptions);                                   // UnifiedTableStorageOptions
+services.AddSingleton<StorageOptions>(sp => sp.GetRequiredService<UnifiedTableStorageOptions>());
+services.AddSingleton(typeof(IStorage<>), typeof(InMemoryStorage<>));
+```
 
 The polymorphic store has the same mirror, keyed the same way:
 
@@ -1865,11 +2190,205 @@ services.AddUnifiedInMemoryPolymorphicTable<IEvent>("StateEventStore",
 ```
 
 Pass the **same discriminator configuration production uses**. Without it the fake resolves whatever
-`UnifiedTableStorageOptions` the container happens to hold — and a test host that registers only this
+`StorageOptions` the container happens to hold — and a test host that registers only this
 line holds none, so it would quietly fall back to assembly-qualified tokens while production writes
 short ones. Nothing fails; the tokens simply differ, in the one place no assertion looks. The table
 name is passed through to the store too, not just used as the DI key, so `DuplicateKeyException`
 names the same table the Azure store would.
+
+---
+
+## SQLite provider
+
+`Unified.Data.Tables.Sqlite` stores the same rows in one SQLite database file. It is the engine the
+in-memory provider runs, over a durable row store: for local development without an emulator, for a
+single-machine deployment, and for tests that need the data to outlive the process.
+
+```csharp
+services.AddUnifiedSqliteStorage("data/app.db");                     // or ":memory:"
+services.AddUnifiedSqlitePolymorphicTable<IEvent>("StateEventStore");
+
+// With options: the shared ones production sets, and SQLite's own.
+services.AddUnifiedSqliteStorage("data/app.db", o =>
+{
+    o.Cache = CachePolicy.Disabled;                      // default: the Azure provider's sliding hour
+    o.Synchronous = SqliteSynchronousMode.Normal;        // default Full
+    o.BusyTimeout = TimeSpan.FromSeconds(10);
+});
+
+// Or without DI: one account per database, any number of stores over it.
+using var account = new SqliteStorageAccount("data/app.db");
+var customers = new SqliteStorage<Customer>(account);
+```
+
+What holds, so that **a table that works here works on Azure Table Storage**:
+
+- The same serializer and large-value layout: rows written here read back cell for cell as the Azure
+  provider writes them, and offloaded values live in a `__blobs` table of the same database.
+- The service's limits are enforced: its key rules, 100 rows and the payload budget per transaction, one
+  partition per transaction, 64 KiB per cell, 252 properties per row, and 1,000,000 bytes per row by
+  the library's estimate (stricter than the service's 1 MiB; see below).
+- Results arrive in the same ordinal (PartitionKey, RowKey) order; keys are stored as UTF-16BE bytes so
+  that SQLite's byte order is that order. (The kit asserts the order for characters of the Basic
+  Multilingual Plane; Azure's own order for the rest has not been verified by anyone.)
+- The same [neutral failures](#failures) and every side interface. A locked database (`SQLITE_BUSY`,
+  `SQLITE_LOCKED`) is `TransientStorageException` with `MayHaveCommitted == false`; any other SQLite
+  failure is a `StorageException` with the SQLite result code in `ProviderErrorCode` and the
+  `SqliteException` inside.
+- The read cache has the **Azure provider's default** (a sliding hour), on purpose: a row that another
+  store instance or another process changed is served stale exactly as an Azure deployment would serve
+  it. A local run that hides that would hide the bug. (One staleness of the store's own writes is not
+  reproduced: see the ETag after a partial update, below.)
+- ETags come from a database-wide counter raised inside the write transaction: never reused, across
+  tables, processes and restarts.
+
+Concurrency and durability:
+
+- Write-ahead logging; one writer at a time and any number of readers that never wait for it. Several
+  processes on **one machine** may share a file; a writer waits up to `BusyTimeout` for the lock.
+  **A network share is not supported** (SQLite's locking is not reliable there).
+- `GetInfo().Durability` is read back from the database: `Fsynced` under `Synchronous = Full` (every
+  commit is flushed before it is acknowledged), `OsBuffered` under `Normal` (survives a process crash,
+  not a power loss; about ten times the write throughput), `Volatile` for `:memory:`.
+- A `:memory:` database lives in one connection and is gone when the account is disposed.
+
+What it does **not** emulate: throttling, latency, the SDK's retries (so `MayBeOwnWrite` is always
+false and a conditional delete is never `Indeterminate`), short pages, credentials and network failures.
+Use the [conformance kit](#conformance-kit)'s `FaultInjectingStorage<T>` for the failures, and Azurite or
+a real account for the rest.
+
+Two limits and one cache behaviour differ from Azure on the local providers (SQLite and in-memory):
+
+- **Row size.** A row whose estimate (`TableRequestSize.EstimateEntityBytes`) is above 1,000,000 bytes
+  is refused with `StorageRequestRejectedException` (400 `EntityTooLarge`). That is the library's
+  planning budget, not the service's limit of 1 MiB (1,048,576 bytes): a plain row in between is stored
+  by Azure. (Azurite enforces neither on an insert.) A row with more than 252 properties besides
+  PartitionKey, RowKey and Timestamp is refused on every path (400 `TooManyProperties`), as the service
+  refuses it.
+- **The ETag after an unconditional partial update.** On Azure, after `UpdateAsync(id, builder)`
+  without `WithETag`, the read cache keeps the entity with the update applied and its **previous**
+  ETag (see [the cache notes](#2-register-it)), so `UpdateAsync(entity)` or `MutateAsync` with the
+  entity `OneAsync` then returns meets `ConcurrencyConflictException`, also with one writer in one
+  process. The local providers evict the entry on every write, so the same sequence reads the current
+  ETag and the save succeeds: a patch-then-save path never fails locally. Remedies that hold on every
+  provider: make the partial update conditional (`WithETag` with the version you read), use the ETag
+  string the builder update returns, or retry on the conflict (`MutateAsync` reads again).
+
+### Known differences from Azure (SQLite and in-memory)
+
+The local providers (the SQLite provider and `Unified.Data.Tables.InMemory`, one engine) refuse what the
+service refuses wherever that can be checked before a write. These differences remain, each measured
+against Azurite; keep away from them in code that must behave the same on every provider.
+
+- **Key length.** A key longer than `TableKeyRules.MaxKeyLength` (512 characters) is refused with
+  `StorageRequestRejectedException`. Azurite refuses 513; the service documents 1 KiB without naming the
+  encoding, so it may accept up to 1,024 characters there.
+- **Unpaired UTF-16 surrogates** are kept as written, in keys, string values and query bounds. The
+  Azure path replaces each with U+FFFD, so two keys that differ only in an unpaired surrogate are two
+  rows locally and one row on Azure, and a `RowKeyPrefix` ending in half a surrogate pair matches locally
+  and not on Azure. (A large-value-aware type refuses such a key on every provider.) Keep keys and
+  text well-formed.
+- **ETags are compared, not parsed.** An ETag the store did not issue is a
+  `ConcurrencyConflictException` locally (`NotFound` for a conditional delete of a missing row); the
+  service validates the `If-Match` header first and answers `StorageRequestRejectedException`, and an
+  ETag with non-ASCII characters fails on Azure inside the HTTP client, as a
+  `TransientStorageException` with `MayHaveCommitted == true` although nothing was sent. Local ETags
+  (`W/"<counter>"`) are small numbers, so a guessed one can match. An ETag belongs to the store that
+  issued it and does not move with the data.
+- **Non-finite numbers in a filter.** A write of positive or negative infinity throws
+  `ArgumentException` on every provider (the SDK cannot write it), and NaN is stored on all of them; but
+  a LINQ filter with a NaN or infinite constant (`x.D != double.NaN`, `x.D < double.PositiveInfinity`) is
+  evaluated with .NET semantics locally and matches nothing on Azure.
+- **Polymorphic system column values.** Locally a system column holds one of the eight cell types; a UTC
+  `DateTime` is stored as the `DateTimeOffset` a read returns, a `BinaryData` as a `byte[]`, and any
+  other value (a local or unspecified `DateTime`, `decimal`, `float`, `ulong`, `TimeSpan`, an enum, an
+  array) is refused with `NotSupportedException`. The Azure provider converts some of those instead
+  (`decimal` and `float` to a double, `ulong` to a long, `TimeSpan` to an ISO 8601 string) and reads them
+  back as the converted type.
+- **Which failure is reported first** when a write fails for two reasons: a cell above 64 KiB in a
+  create of a stored key, or in an update or merge of a missing row or of another version, is reported
+  locally as the row's failure (`DuplicateKeyException`, `EntityNotFoundException`,
+  `ConcurrencyConflictException`); Azurite reports the cell (`StorageRequestRejectedException`, 400
+  `PropertyValueTooLarge`). Neither stores anything.
+
+## Conformance kit
+
+`Unified.Data.Tables.Conformance` is the contract of a store as 164 named scenarios in five tiers:
+**logical** (74: what is read back, counted, ordered, paged), **failures** (16), **capabilities** (27:
+the side interfaces and RowKey ranges), **polymorphic** (24) and **large values** (23). It references the
+abstractions only and no test framework. Run it against a provider, a decorator, or the fake a codebase
+wrote for itself; this repository runs it against the in-memory provider, SQLite and Azurite.
+
+Describe the store with a factory. Every call returns a store no other call shares rows with:
+
+```csharp
+public sealed class MyStoreFactory : IConformanceStoreFactory
+{
+    public string Name => "MyStore";
+
+    // Rules this store knowingly does not keep yet: ConformanceLeniencies names, or single scenario names.
+    public IReadOnlyCollection<string> Leniencies => [];
+
+    public Task<ConformanceStore<T>> CreateStoreAsync<T>(ConformanceStoreSettings settings, CancellationToken ct = default)
+        where T : class, IEntity, new() =>
+        Task.FromResult(new ConformanceStore<T>(new MyStorage<T>(settings.IdNormalization)));
+
+    public Task<ConformancePolymorphicStore<TBase>> CreatePolymorphicStoreAsync<TBase>(CancellationToken ct = default)
+        where TBase : class =>
+        throw new NotSupportedException("MyStore has no polymorphic store.");   // reported as NotSupported
+}
+```
+
+**xUnit v3**: reference `Unified.Data.Tables.Conformance.Xunit`, derive, and every scenario is a test
+case. Derive `StorageConformanceTests` for all tiers, or `LogicalConformanceTests`,
+`FailureConformanceTests`, `CapabilityConformanceTests`, `PolymorphicConformanceTests`,
+`LargeValueConformanceTests` for one:
+
+```csharp
+public sealed class MyStoreConformanceTests : StorageConformanceTests
+{
+    protected override IConformanceStoreFactory Factory { get; } = new MyStoreFactory();
+}
+```
+
+**Any other framework** (xUnit v2, NUnit, MSTest): loop over the scenarios of the neutral package. A
+scenario returns a result; nothing of the kit depends on an assertion library.
+
+```csharp
+// xUnit v2
+public static IEnumerable<object[]> Scenarios() => ConformanceSuite.All.Select(s => new object[] { s.Name });
+
+[Theory, MemberData(nameof(Scenarios))]
+public async Task Conforms(string name)
+{
+    var result = await ConformanceSuite.Get(name).RunAsync(new MyStoreFactory());
+    Assert.True(result.IsAcceptable, result.ToString());   // Passed, NotSupported or Lenient
+}
+
+// Or one test for everything:
+var results = await ConformanceSuite.RunAllAsync(new MyStoreFactory());
+Assert.Null(ConformanceSuite.DescribeFailures(results));   // null when nothing failed
+```
+
+Four outcomes: `Passed`; `Failed`; `NotSupported` (the store does not expose the capability, or the
+factory threw `NotSupportedException` for that kind of store); and `Lenient` (the scenario failed and a
+leniency the factory declared covers it). Leniencies are how a hand-written fake is brought up to the
+contract without a red build: declare what it does not do yet, and
+`ConformanceSuite.UnneededLeniencies(factory, results)` lists the ones to delete as it gets there. The
+xUnit adapter reports `NotSupported` and `Lenient` as skipped tests with the reason.
+
+The package also ships two decorators for your own tests, both over `DelegatingStorage<T>`:
+`CountingStorage<T>` (calls per member) and `FaultInjectingStorage<T>`, which fails the next calls of a
+member either before the inner call or after it. "After" is the lost response:
+`TransientStorageException` with `MayHaveCommitted == true` while the write has landed.
+
+```csharp
+var faulty = new FaultInjectingStorage<Order>(inner).FailNext(StorageMember.Create, FaultTiming.After);
+```
+
+A store over a `TableServiceClient` the factory built itself needs `AddRetryObservation()` on its
+`TableClientOptions` to pass the conditional-delete scenarios (see
+[Failures](#maybeownwrite-and-mayhavecommitted-signals-not-proof)).
 
 ---
 
@@ -1938,9 +2457,23 @@ write is caught too. An update is still a replace, not a merge, so a column set 
 unlocked user's `LockoutEnd`) is cleared.
 
 A delete claims the row first (a conditional write of a fresh stamp) and only then removes claims,
-logins, roles, tokens and the row; `IStorage<T>` has no conditional delete, and the claim is what
-makes a concurrent update fail rather than be lost. A crash between the claim and the last delete
-leaves the row with a new stamp; re-read and delete again.
+logins, roles, tokens and the row; the child rows go before the row itself, so a conditional delete of
+the row would come too late, and the claim is what makes a concurrent update fail rather than be lost.
+A crash between the claim and the last delete leaves the row with a new stamp; re-read and delete again.
+
+Since 0.10.0 an external login is deleted only on the version its ownership was checked on, where the
+store has a [conditional delete](#conditional-delete) (every provider of this library; found through
+the capability probe, so a decorator answers for the store it wraps). A login row's key is the provider
+and the provider key and its owner is in the row, so a login unlinked and linked again by another user
+between the check and the delete used to be removed from that other user, by `RemoveLoginAsync` and by
+the cascade of a user delete. Now the conflict is noticed, the row is read again, and a login that
+changed hands stays with its new owner. Two things to know: when the row is a different version on five
+consecutive reads while still this user's, the `ConcurrencyConflictException` is thrown, from
+`RemoveLoginAsync` and from user `DeleteAsync` alike (as an exception, not as a failed
+`IdentityResult`; no provider of this library rewrites a login row, so it takes another writer that
+does), and the protection is as fine as the provider's ETag: Azure Table Storage and SQLite never reuse
+a version, while Azurite's ETag is a millisecond timestamp. A store without the capability (a
+third-party `IStorage<T>`, a mock) gets the read-then-delete of 0.9.2.
 
 Before 0.9.2 an update was an unconditional upsert, so the last writer won and a security-stamp,
 lockout or password change made by another instance could be silently overwritten.
@@ -1984,6 +2517,130 @@ something this version does partially.
 
 ---
 
+## Upgrading from 0.9.x
+
+0.10.0 is the release that takes the breaks needed before 1.0. Stored rows need no migration, cursors
+issued by 0.9.2 still resume, and `IStorage<T>` has no new member, so implementers, decorators and mocks
+keep compiling. What changes is which exceptions you see and what the in-memory package brings. The
+CHANGELOG has the full list with who is hit; this is the order of work.
+
+**1. Bump every `Unified.Data.Tables.*` package together.** They pin each other exactly, but NuGet
+refuses a mixed set (NU1107) only when the conflict is between transitive constraints. An older sibling
+the project references **directly**, as a per-package bump of a dependency bot or a half-updated
+`Directory.Packages.props` leaves it, restores with warning NU1608 and fails at run time:
+`Unified.Data.Tables` 0.10.0 beside `Unified.Data.Tables.InMemory` 0.9.2 builds, and the first
+`new InMemoryStorage<T>()` throws `MissingMethodException`. Treat the warning as an error while you
+upgrade, and group the packages in your dependency bot:
+
+```xml
+<WarningsAsErrors>$(WarningsAsErrors);NU1608</WarningsAsErrors>
+```
+
+`Unified.Data.Tables.Identity` is not held to the set: it depends on the abstractions with a minimum
+version, so Identity 0.9.2 beside the 0.10.0 providers restores with no diagnostic. Bump it too.
+
+**2. Fix the compile errors. They are all in test and registration code (B4).**
+
+- A test project that reached `TableStorage<T>`, `AddUnifiedTableStorage` or a blob type through
+  `Unified.Data.Tables.InMemory` now references `Unified.Data.Tables` itself. The in-memory package no
+  longer brings `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.Logging.Abstractions` or
+  `Microsoft.Extensions.Hosting.Abstractions` either: a project that used `MemoryCache`, `ILogger`,
+  `NullLogger` or `IHostedService` through it references those packages directly (to stay free of the
+  Azure provider) or references `Unified.Data.Tables`.
+- `AddUnifiedInMemoryStorage(o => o.BlobOffload = ...)` becomes `o.Offload = new OffloadOptions { ... }`.
+- A method or delegate typed `Action<UnifiedTableStorageOptions>` that is passed to an in-memory
+  registration is retyped to `StorageOptions`.
+- `GetRequiredService<UnifiedTableStorageOptions>()` after an in-memory-only registration becomes
+  `GetRequiredService<StorageOptions>()`.
+
+**3. Find every use of the Azure exception types around a storage call (B1). The compiler will not.** A
+`catch (RequestFailedException)` around `IStorage<T>` still compiles and no longer catches anything.
+Start from the superset and look at every hit near a storage call, in production code and in tests:
+
+```bash
+git grep -nE "RequestFailedException|TableTransactionFailedException|TableErrorCode" -- "*.cs"
+git grep -nE "TaskCanceledException|OperationCanceledException" -- "*.cs"
+```
+
+The second finds the handlers of the SDK's timeout, which is a `TransientStorageException` now. These
+narrower searches sort the hits (catches, filters and pattern matches, status checks); they do not
+replace the superset, and the third also finds a status check on a variable whose type is not spelled
+out:
+
+```bash
+git grep -nE "catch *\((Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
+git grep -nE "(is( +not)?|as) +(Azure\.)?(RequestFailedException|TableTransactionFailedException)" -- "*.cs"
+git grep -nE "\.Status *(==|!=|is) *(404|409|412|429|503)|TableErrorCode\.|\.ErrorCode *==" -- "*.cs"
+```
+
+The shapes that keep compiling and fail **silently**, besides the plain catch:
+
+- an exception filter or pattern match: `when (ex is RequestFailedException { Status: 404 })`;
+- a negated test, such as an ASP.NET Core `IExceptionHandler` that starts with
+  `if (exception is not RequestFailedException rfe) return false;`: it now declines every storage failure;
+- a `switch` arm (`RequestFailedException { Status: 404 } => ...`) or a `case RequestFailedException`;
+- a retry policy: Polly's `Handle<RequestFailedException>()`, `.Or<RequestFailedException>()` or
+  `new PredicateBuilder().Handle<RequestFailedException>()` silently stops retrying;
+- an exception-to-status map keyed on `typeof(RequestFailedException)`;
+- a test double of a storage interface that throws the Azure type
+  (`.ThrowsAsync(new RequestFailedException(404, "..."))`): the handler's test stays green while no
+  provider raises that type any more.
+
+Assertions on the Azure type (xUnit, NUnit, MSTest, FluentAssertions) fail loudly in step 4.
+
+Convert each hit that guards a storage call, by the table under [Failures](#failures):
+
+| 0.9.x | 0.10.0 |
+| --- | --- |
+| `catch (RequestFailedException ex) when (ex.Status == 404)` | `catch (EntityNotFoundException)` (or `TableNotFoundException`) |
+| `catch (RequestFailedException ex) when (ex.Status == 409)` | `catch (DuplicateKeyException)` (it was that already for `CreateAsync`) |
+| `catch (RequestFailedException ex) when (ex.Status is 429 or 503)` | `catch (TransientStorageException ex)`, with `ex.RetryAfter` |
+| `catch (RequestFailedException ex) when (ex.Status == 400)`, `catch (TableTransactionFailedException)` | `catch (StorageRequestRejectedException)` |
+| `catch (TaskCanceledException)` for the SDK's timeout | `catch (TransientStorageException)` |
+| `catch (RequestFailedException)`, any status | `catch (StorageException)` |
+| `ex.Status`, `ex.ErrorCode` | `ex.ProviderErrorCode`, or `(ex.InnerException as RequestFailedException)?.Status` |
+
+A catch around a call you make on a `TableClient` or a `BlobContainerClient` of your own is still right:
+leave it. Whenever the provider raised an exception it is the `InnerException` of the neutral one, so a
+handler that needs the status, the headers or the request id still has them. A failure the library
+detects itself has none (a `ConcurrencyConflictException` found by its own read on a type with large
+values, `BatchNotAtomicException`, `BatchPayloadTooLargeException`; see [Failures](#failures)): no request
+was refused there, so null-check the cast, as the last row of the table does.
+
+The optional analyzer package marks such a catch in the IDE (UDT1001). It is severity Info and stays
+Info under `TreatWarningsAsErrors`, so by itself it cannot fail a build, and it says nothing about a try
+block that also calls the Azure SDK directly. (A bulk `.editorconfig` setting such as
+`dotnet_analyzer_diagnostic.severity = warning`, or the same for `category-Upgrade`, raises it like any
+analyzer rule and then it does fail such a build; `dotnet_diagnostic.UDT1001.severity = suggestion`
+keeps it Info.)
+
+```xml
+<PackageReference Include="Unified.Data.Tables.Analyzers" Version="0.10.0" PrivateAssets="all" />
+```
+
+`dotnet build` does not print Info diagnostics. To list them on the command line, raise the rule for one
+run in an `.editorconfig` (`dotnet_diagnostic.UDT1001.severity = warning`), and remove the line and the
+package when the list is empty.
+
+**4. Run the tests.** Tests that asserted the Azure type from the in-memory fake fail on the type (B3):
+assert the neutral one. Code that relied on a 404 escaping `TryMutateAsync`, `TryTransitionAsync` or
+`MutateOrCreateAsync` when the row was deleted mid-mutation gets `NotFound`, or the create branch,
+instead (B2).
+
+**5. Look for the two quiet ones.**
+
+- `ETag = "*"` on an entity passed to `UpdateAsync` throws `ArgumentException` (B5):
+  `git grep -nE "ETag *= *\"\*\"" -- "*.cs"`, and use `ConcurrencyMode.LastWriterWins`.
+- Code that filtered `~` continuation keys out of projected scans (`QueryOptions.Select`) can drop the
+  filter (B6).
+
+**6. If you implement `IStorage<T>` yourself** (a fake, a decorator): nothing to do to compile. But
+your store ignores `QueryOptions.FromRowKey` / `ToRowKey` until you teach it, and returns the whole
+partition for a bounded query. Derive decorators from `DelegatingStorage<T>` so that they pass on the
+wrapped store's capabilities, and run the [conformance kit](#conformance-kit) against a fake.
+
+---
+
 ## Building & testing
 
 ```bash
@@ -2008,12 +2665,15 @@ Three GitHub workflows run the suite with that variable set and a pinned Azurite
   and the scanner's end as separate steps, so a failed build or test fails the job and its analysis is
   not uploaded. It needs a valid `SONAR_TOKEN` and fails at `Begin analysis` without one, whatever the
   tests do.
-- **Publish** (`publish.yml`) runs the tests, packs, and stops before the push unless the packed
-  `Unified.Data.Tables` depends on `Unified.Data.Tables.Abstractions` `[x.y.z]` and
-  `Unified.Data.Tables.InMemory` on `Unified.Data.Tables` `[x.y.z]`, the versions packed in the same run.
+- **Publish** (`publish.yml`) runs the tests, packs, and stops before the push unless every package
+  that shares internals depends on exactly the versions packed in the same run (`[x.y.z]`): the core on
+  the abstractions; `Unified.Data.Tables`, `Unified.Data.Tables.InMemory` and
+  `Unified.Data.Tables.Sqlite` on the abstractions and the core; the conformance kit on the
+  abstractions; its xUnit adapter on the kit.
 
 `TableEntitySerializer.OversizedCellPolicy` is process-wide state, so a test class that sets it, or
-calls `AddUnifiedTableStorage` or `AddUnifiedInMemoryStorage` (which set it), must carry
+calls `AddUnifiedTableStorage`, `AddUnifiedInMemoryStorage` or `AddUnifiedSqliteStorage` (which set
+it), must carry
 `[Collection("OversizedCellPolicy")]`; a test of the main test project fails when one does not.
 
 ---

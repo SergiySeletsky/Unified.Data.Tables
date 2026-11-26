@@ -39,12 +39,20 @@ namespace Unified.Data.Tables.Identity
             {
                 return false;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (EntityNotFoundException)
             {
-                // A conditional replace of a row that was deleted after the read fails with the backend's
-                // own not-found error (a 404 on Azure Tables), which the abstractions do not map. Tell that
-                // case from a real failure by looking again: a row that is gone lost the race like any other
-                // concurrent writer would have made it.
+                // The row was deleted after the read: it lost the race like any other concurrent writer
+                // would have made it.
+                return false;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException and not StorageException)
+            {
+                // A store of this library (Azure, in-memory, SQLite) reports a row deleted after the read
+                // as EntityNotFoundException (above), and every other failure of it as a StorageException,
+                // which is thrown as it is: none of them ever gets here. A third-party IStorage<T> may
+                // still fail a conditional replace of a missing row with an exception of its own, and
+                // before 0.10.0 that was a lost race, not a throw. Kept for such a store: tell that case
+                // from a real failure by looking again; a row that is gone lost the race.
                 bool gone;
                 try
                 {

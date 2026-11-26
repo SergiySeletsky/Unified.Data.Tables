@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Azure;
 using Azure.Data.Tables;
@@ -20,9 +21,15 @@ namespace Unified.Data.Tables;
 /// Rather than mitigate three coupled hazards, this store has none, which also suits the
 /// append-only fact tables it is designed for.
 /// </para>
+/// <para>
+/// Beside <see cref="IPolymorphicStorage{TBase}"/> the store implements the side interfaces
+/// <see cref="IAtomicInsert{TBase}"/> (an all-or-nothing insert) and <see cref="IStorageInfo"/>, and
+/// answers the capability probe (<see cref="IStorageCapabilities"/>); reach them through
+/// <see cref="StorageCapabilityExtensions"/>.
+/// </para>
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
-public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
+public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
     where TBase : class
 {
     private static readonly string[] ReservedCells = ["PartitionKey", "RowKey", "Timestamp", "odata.etag"];
@@ -31,11 +38,13 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     // scan into a keys scan, which matters because Azure Tables has no server-side count.
     private static readonly string[] KeysOnly = ["PartitionKey", "RowKey"];
 
+    private readonly TableServiceClient serviceClient;
     private readonly TableClient client;
     private readonly TableInitializer initializer;
     private readonly ITypeDiscriminator discriminator;
     private readonly ILogger logger;
     private readonly string tableName;
+    private readonly StorageInfo info;
 
     /// <summary>Creates a store over one named table.</summary>
     /// <param name="serviceClient">The Azure Tables service client.</param>
@@ -55,30 +64,101 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
 
         this.tableName = tableName;
         this.logger = logger;
-        discriminator = (options ?? new UnifiedTableStorageOptions()).ResolveTypeDiscriminator();
+        var opts = options ?? new UnifiedTableStorageOptions();
+        discriminator = opts.ResolveTypeDiscriminator();
+        this.serviceClient = serviceClient;
         client = serviceClient.GetTableClient(tableName);
         initializer = new TableInitializer(client);
+        // This store has no read cache: a read never returns a row as it was before another process's write.
+        info = AzureStorageInfo.Describe(serviceClient, tableName, opts, readCacheEnabled: false);
     }
 
+    /// <summary>
+    /// What the store states about itself: the provider (<c>"AzureTables"</c>), its table, the limits the
+    /// library plans and refuses by, that it has no read cache, and how durable an acknowledged write is
+    /// (<see cref="Durability.Replicated"/> on an Azure Storage table host, <see cref="Durability.Unknown"/>
+    /// on any other, or what <see cref="UnifiedTableStorageOptions.DeclaredDurability"/> declares). Calls
+    /// nothing and never throws.
+    /// </summary>
+    /// <returns>The store's info; the same value on every call.</returns>
+    public StorageInfo GetInfo() => info;
+
+#pragma warning disable UDT0001 // the experimental raw-table API is handed out here, not used
+    private AzureRawTable? rawTable;
+    private AzureTableStore? tableStore;
+
+    /// <summary>
+    /// The store's implementation of the side interface <typeparamref name="TCap"/>: the store itself for
+    /// <see cref="IAtomicInsert{TBase}"/> and <see cref="IStorageInfo"/>; the untyped view of its table
+    /// for the experimental <see cref="IRawTable"/> (it shares the store's lazy table creation); the
+    /// tables of its storage account for the experimental <see cref="ITableStore"/>.
+    /// </summary>
+    /// <typeparam name="TCap">The side interface asked for.</typeparam>
+    /// <param name="capability">The implementation to call, or null when the store does not support it.</param>
+    /// <returns>True when the store supports <typeparamref name="TCap"/>.</returns>
+    public bool TryGetCapability<TCap>([NotNullWhen(true)] out TCap? capability) where TCap : class
+    {
+        capability = this as TCap;
+        if (capability is null && typeof(TCap) == typeof(IRawTable))
+            capability = (rawTable ??= new AzureRawTable(client, tableName, initializer.EnsureAsync)) as TCap;
+        if (capability is null && typeof(TCap) == typeof(ITableStore))
+            capability = (tableStore ??= new AzureTableStore(serviceClient)) as TCap;
+        return capability is not null;
+    }
+#pragma warning restore UDT0001
+
     /// <inheritdoc />
-    public Task EnsureCreatedAsync(CancellationToken ct = default) => initializer.EnsureAsync(ct);
+    public async Task EnsureCreatedAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await initializer.EnsureAsync(ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    // The provider-neutral exception for an SDK failure that is leaving a member of this store (see
+    // AzureStorageErrors for what maps to what). write: the member may change stored data, so a transient
+    // failure may have committed and a duplicate may be the call's own retried write, unless the attempts
+    // the call saw of its requests (RequestAttempts) show otherwise.
+    private StorageException Failed(Exception ex, bool write, string? id = null) =>
+        AzureStorageErrors.Map(ex, tableName, tableName, id, write, write ? RequestAttempts.Current : null);
 
     /// <inheritdoc />
     public async Task<PolymorphicEntry<TBase>> InsertAsync(
         PolymorphicWrite<TBase> write, CancellationToken ct = default)
+    {
+        RequestAttempts.Begin();
+        try
+        {
+            return await InsertCoreAsync(write, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, write.Key.ToId());
+        }
+    }
+
+    private async Task<PolymorphicEntry<TBase>> InsertCoreAsync(PolymorphicWrite<TBase> write, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(write);
         var row = ToRow(write);
         await initializer.EnsureAsync(ct);
 
         Response response;
+        var sent = RequestAttempts.MarkCurrent();
         try
         {
             response = await client.AddEntityAsync(row, ct);
         }
         catch (RequestFailedException ex) when (ex.Status == 409)
         {
-            throw new DuplicateKeyException(tableName, write.Key.ToId(), ex);
+            // The SDK may have retried the insert, so the row in the way can be this call's own: it is
+            // reported as one when an earlier attempt was sent, or the attempts could not be observed.
+            throw AzureStorageErrors.Duplicate(tableName, write.Key.ToId(), ex, RequestAttempts.MayBeOwnWriteSince(sent));
         }
 
         row.ETag = ETagOf(response, row);
@@ -89,8 +169,23 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     public async Task<PolymorphicEntry<TBase>> UpsertAsync(
         PolymorphicWrite<TBase> write, CancellationToken ct = default)
     {
+        RequestAttempts.Begin();
+        try
+        {
+            return await UpsertCoreAsync(write, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, write.Key.ToId());
+        }
+    }
+
+    private async Task<PolymorphicEntry<TBase>> UpsertCoreAsync(PolymorphicWrite<TBase> write, CancellationToken ct)
+    {
         ArgumentNullException.ThrowIfNull(write);
         var row = ToRow(write);
+        // The upsert names the key in its URL (RefusedKeyCharacters); an insert or a batch carries it in its body.
+        RefusedKeyCharacters.ThrowIfIn(row.PartitionKey, row.RowKey);
         await initializer.EnsureAsync(ct);
         var response = await client.UpsertEntityAsync(row, TableUpdateMode.Replace, ct);
         row.ETag = ETagOf(response, row);
@@ -100,6 +195,72 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task<int> InsertBatchAsync(
         IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default)
+    {
+        RequestAttempts.Begin();
+        try
+        {
+            return await InsertBatchCoreAsync(writes, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// One entity-group transaction, planned before anything is sent: one partition, at most 100 rows,
+    /// each key once, and the payload budget of <see cref="BatchPlanner"/>. A batch that does not fit is
+    /// refused with <see cref="BatchNotAtomicException"/>; it is never split.
+    /// </remarks>
+    public async Task InsertAtomicAsync(IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct = default)
+    {
+        RequestAttempts.Begin();
+        try
+        {
+            await InsertAtomicCoreAsync(writes, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task InsertAtomicCoreAsync(IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(writes);
+        if (writes.Count == 0)
+            return;
+        ct.ThrowIfCancellationRequested();
+
+        // Every row is built (and validated) first, then the batch is checked as one transaction: both
+        // before the table is touched.
+        var rows = new List<TableEntity>(writes.Count);
+        foreach (var write in writes)
+            rows.Add(ToRow(write ?? throw new ArgumentException("A batch cannot hold a null write.", nameof(writes))));
+        AtomicBatches.RequireOnePartitionEachRowOnce([.. rows.Select(r => (r.PartitionKey, r.RowKey))], "batch", "key");
+        AtomicBatches.RequireOneTransaction([.. rows.Select(TableRowSize.Estimate)], "batch");
+
+        await initializer.EnsureAsync(ct);
+
+        var actions = rows.Select(row => new TableTransactionAction(TableTransactionActionType.Add, row));
+        var sent = RequestAttempts.MarkCurrent();
+        try
+        {
+            await client.SubmitTransactionAsync(actions, ct);
+        }
+        catch (TableTransactionFailedException ex)
+            when (ex.Status == 409 || string.Equals(ex.ErrorCode, "InvalidDuplicateRow", StringComparison.Ordinal))
+        {
+            // A row already exists at one of the keys: nothing of the transaction was applied.
+            var duplicate = ex.FailedTransactionActionIndex is int i && i >= 0 && i < rows.Count
+                ? new TableKey(rows[i].PartitionKey, rows[i].RowKey).ToId()
+                : new TableKey(rows[0].PartitionKey, "?").ToId();
+            throw AzureStorageErrors.Duplicate(tableName, duplicate, ex, RequestAttempts.MayBeOwnWriteSince(sent));
+        }
+    }
+
+    private async Task<int> InsertBatchCoreAsync(IReadOnlyCollection<PolymorphicWrite<TBase>> writes, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(writes);
         if (writes.Count == 0)
@@ -128,6 +289,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
                 for (var i = range.Start; i < range.Start + range.Count; i++)
                     actions.Add(new TableTransactionAction(TableTransactionActionType.Add, groupRows[i]));
 
+                var sent = RequestAttempts.MarkCurrent();
                 try
                 {
                     await client.SubmitTransactionAsync(actions, ct);
@@ -148,7 +310,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
                             groupRows[range.Start + i].RowKey).ToId()
                         : new TableKey(group.Key, "?").ToId();
 
-                    throw new DuplicateKeyException(tableName, duplicate, ex);
+                    throw AzureStorageErrors.Duplicate(tableName, duplicate, ex, RequestAttempts.MayBeOwnWriteSince(sent));
                 }
 
                 written += actions.Count;
@@ -161,6 +323,19 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task MergeColumnsAsync(
         TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct = default)
+    {
+        RequestAttempts.Begin();
+        try
+        {
+            await MergeColumnsCoreAsync(key, columns, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, key.ToId());
+        }
+    }
+
+    private async Task MergeColumnsCoreAsync(TableKey key, IReadOnlyDictionary<string, object> columns, CancellationToken ct)
     {
         ValidateKey(key);
         ArgumentNullException.ThrowIfNull(columns);
@@ -177,6 +352,7 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
             ValidateSystemColumn(column.Key);
             patch[column.Key] = column.Value;
         }
+        RefusedKeyCharacters.ThrowIfIn(key.PartitionKey, key.RowKey);
 
         await initializer.EnsureAsync(ct);
 
@@ -189,11 +365,27 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task<PolymorphicEntry<TBase>?> GetAsync(TableKey key, CancellationToken ct = default)
     {
+        try
+        {
+            return await GetCoreAsync(key, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false, key.ToId());
+        }
+    }
+
+    private async Task<PolymorphicEntry<TBase>?> GetCoreAsync(TableKey key, CancellationToken ct)
+    {
         ValidateKey(key);
         await initializer.EnsureAsync(ct);
+        // No row has a key the service refuses; the request would only change its URL (RefusedKeyCharacters).
+        if (RefusedKeyCharacters.In(key.PartitionKey, key.RowKey))
+            return null;
 
         var response = await client.GetEntityIfExistsAsync<TableEntity>(
             key.PartitionKey, key.RowKey, cancellationToken: ct);
+        AzureStorageErrors.ThrowIfTableMissing(response);
 
         return response.HasValue ? ToEntry(response.Value!) : null;
     }
@@ -210,10 +402,12 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     }
 
     /// <inheritdoc />
-    public async IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
-        string? partition = null,
-        int? take = null,
-        [EnumeratorCancellation] CancellationToken ct = default)
+    public IAsyncEnumerable<PolymorphicEntry<TBase>> QueryStreamAsync(
+        string? partition = null, int? take = null, CancellationToken ct = default) =>
+        AzureStorageErrors.GuardAsync(StreamAsync(partition, take, ct), ex => Failed(ex, write: false), ct);
+
+    private async IAsyncEnumerable<PolymorphicEntry<TBase>> StreamAsync(
+        string? partition, int? take, [EnumeratorCancellation] CancellationToken ct)
     {
         if (take is <= 0)
             yield break;
@@ -228,6 +422,9 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
         await foreach (var row in client.QueryAsync<TableEntity>(
                            PartitionFilter(partition), maxPerPage: null, select: null, ct))
         {
+            // The SDK looks at the token only when it asks for the next page: a token cancelled between two
+            // rows of one page ends the stream at the next row, as it does on every other provider.
+            ct.ThrowIfCancellationRequested();
             yield return ToEntry(row);
 
             if (take is { } limit && ++yielded >= limit)
@@ -238,22 +435,56 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
     /// <inheritdoc />
     public async Task DeleteAsync(TableKey key, CancellationToken ct = default)
     {
-        ValidateKey(key);
-        await initializer.EnsureAsync(ct);
-
+        RequestAttempts.Begin();
         try
         {
-            await client.DeleteEntityAsync(key.PartitionKey, key.RowKey, ETag.All, ct);
+            await DeleteCoreAsync(key, ct);
         }
-        catch (RequestFailedException ex) when (ex.Status == 404)
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true, key.ToId());
+        }
+    }
+
+    private async Task DeleteCoreAsync(TableKey key, CancellationToken ct)
+    {
+        ValidateKey(key);
+        await initializer.EnsureAsync(ct);
+        if (RefusedKeyCharacters.In(key.PartitionKey, key.RowKey))
+            return; // no row has such a key: nothing to delete (see GetAsync)
+
+        Response? response;
+        try
+        {
+            response = await client.DeleteEntityAsync(key.PartitionKey, key.RowKey, ETag.All, ct);
+        }
+        catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
         {
             // Idempotent by contract: deleting what is already gone is the caller's desired state.
             logger.LogDebug("Delete of missing row {Key} in {Table} treated as a no-op.", key, tableName);
+            return;
         }
+        // Only a missing ROW is a no-op. The SDK returns a delete's 404 instead of throwing it, whatever
+        // its code: a 404 that names the table (TableNotFound) is the table's failure and leaves as
+        // TableNotFoundException.
+        AzureStorageErrors.ThrowIfTableMissing(response);
     }
 
     /// <inheritdoc />
     public async Task<int> DeletePartitionAsync(string partition, CancellationToken ct = default)
+    {
+        RequestAttempts.Begin();
+        try
+        {
+            return await DeletePartitionCoreAsync(partition, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: true);
+        }
+    }
+
+    private async Task<int> DeletePartitionCoreAsync(string partition, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(partition);
         await initializer.EnsureAsync(ct);
@@ -277,8 +508,23 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
             for (var i = range.Start; i < range.Start + range.Count; i++)
                 actions.Add(new TableTransactionAction(TableTransactionActionType.Delete, rows[i], ETag.All));
 
-            await client.SubmitTransactionAsync(actions, ct);
-            deleted += actions.Count;
+            var sent = RequestAttempts.MarkCurrent();
+            try
+            {
+                await client.SubmitTransactionAsync(actions, ct);
+                deleted += actions.Count;
+            }
+            catch (RequestFailedException ex) when (AzureStorageErrors.IsMissingRow(ex))
+            {
+                // A delete of a missing row fails its whole transaction, and nothing of it is applied:
+                // another writer deleted one of the listed rows meanwhile, or an earlier attempt of this
+                // very transaction was applied and its response lost. Neither is a failure: the rows of
+                // this transaction are deleted one by one, and only the ones this call removed count.
+                logger.LogDebug(ex, "A row of partition {Partition} in {Table} was deleted after the listing; its transaction's rows are deleted one by one.",
+                    partition, tableName);
+                var chunk = rows.GetRange(range.Start, range.Count);
+                deleted += chunk.Count - await PartitionDeleteLostRace.DeleteOneByOneAsync(client, chunk, sent, ct);
+            }
         }
 
         return deleted;
@@ -286,6 +532,18 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
 
     /// <inheritdoc />
     public async Task<int> CountAsync(string? partition = null, CancellationToken ct = default)
+    {
+        try
+        {
+            return await CountCoreAsync(partition, ct);
+        }
+        catch (Exception ex) when (AzureStorageErrors.IsProviderFailure(ex, ct))
+        {
+            throw Failed(ex, write: false);
+        }
+    }
+
+    private async Task<int> CountCoreAsync(string? partition, CancellationToken ct)
     {
         await initializer.EnsureAsync(ct);
 
@@ -373,6 +631,12 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>
         foreach (var cell in row)
         {
             if (Array.IndexOf(ReservedCells, cell.Key) >= 0)
+                continue;
+
+            // A null system column is not stored (the service drops a null property), so the entry an
+            // insert returns from the row it built leaves it out too, as a later read and the local
+            // providers do.
+            if (cell.Value is null)
                 continue;
 
             columns[cell.Key] = cell.Value;

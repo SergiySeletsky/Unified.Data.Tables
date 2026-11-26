@@ -772,7 +772,9 @@ public class PlainTypeRegressionTests
     // What 0.8.3 sends for an entity whose serialized cells are `cells` and whose builder updates merge `patches`.
     // One line differs from 0.8.3 on purpose: a projected query no longer names odata.etag in $select
     // (0.8.3 sent [PartitionKey,RowKey,Timestamp,odata.etag,_TypeName,Id]). The service returns that
-    // annotation with every entity whatever $select names, so the rows read back are the same.
+    // annotation with every entity whatever $select names, so the rows read back are the same. Since
+    // 0.10.0 it also names _SplitOf, for every type: a continuation row another type stored in the table
+    // is recognised and skipped instead of being returned as an entity (break B6).
     private static string[] SdkCallsOf083(string cells, params string[] patches) =>
     [
         $"CreateAsync: CreateIfNotExistsAsync(ct) ; AddEntityAsync(TableEntity{{{cells}}}, ct)",
@@ -787,7 +789,7 @@ public class PlainTypeRegressionTests
         .. patches.Select(p => $"UpdateAsync(builder): UpdateEntityAsync(TableEntity{{{p}}}, *, Merge, ct)"),
         "QueryAsync(partition): QueryAsync(expr, null, null, ct)",
         "QueryAsync(options): QueryAsync(\"PartitionKey eq 'p' and RowKey ge 'r' and RowKey lt 's'\", 5, null, ct)",
-        "QueryAsync(select): QueryAsync(\"PartitionKey eq 'p'\", null, [PartitionKey,RowKey,Timestamp,_TypeName,Id], ct)",
+        "QueryAsync(select): QueryAsync(\"PartitionKey eq 'p'\", null, [PartitionKey,RowKey,Timestamp,_TypeName,_SplitOf,Id], ct)",
         "QueryPageAsync: QueryAsync(\"PartitionKey eq 'p'\", 5, null, ct)",
         "QueryAsync(predicate): QueryAsync(\"PartitionKey eq 'p' and ((PartitionKey eq 'p' and RowKey eq 'r'))\", null, null, ct)",
         "AnyAsync: QueryAsync(\"PartitionKey eq 'p' and ((PartitionKey eq 'p' and RowKey eq 'r'))\", 1, null, ct)",

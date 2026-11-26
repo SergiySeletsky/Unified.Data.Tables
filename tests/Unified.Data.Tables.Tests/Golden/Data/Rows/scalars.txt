@@ -1,0 +1,27 @@
+# Every scalar type, one property each. Native cells, except the ones with no Edm type of their own.
+row PartitionKey="golden" RowKey="scalars"
+	Access	Edm.String	"Read, Admin"
+	Byte	Edm.Binary	"yA=="
+	Bytes	Edm.Binary	"AAECA3+A/v8="
+	Char__Json	Edm.String	"\u0022\u0416\u0022"
+	Colour	Edm.String	"Green"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	DateTime	Edm.DateTime	"2024-02-29T23:59:58.7654321Z"
+	DateTimeOffset	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	DateTimeOffsetWithOffset	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Decimal	Edm.Double	1234.56
+	Double	Edm.Double	3.141592653589793
+	EmptyText	Edm.String	""
+	Flag	Edm.Boolean	true
+	Guid	Edm.Guid	"0f8fad5b-d9cb-469f-a165-70867728950e"
+	Id	Edm.String	"golden|scalars"
+	Int16__Json	Edm.String	"-12345"
+	Int32	Edm.Int32	-123456789
+	Int64	Edm.Int64	"1234567890123456789"
+	Single__Json	Edm.String	"1.5"
+	Text	Edm.String	"Za\u017C\u00F3\u0142\u0107 \u0022g\u0119\u015Bl\u0105\u0022 ja\u017A\u0144 \u2014 it\u0027s \u003Cb\u003Ebold\u003C/b\u003E \u0026 100% \\ / \uD83D\uDE00"
+	TimeSpan	Edm.String	"1.02:03:04.5670000"
+	UInt32	Edm.Int64	"4000000000"
+	UInt64	Edm.Int64	"9000000000000000000"
+	UpdatedAt	Edm.DateTime	"2025-03-15T16:10:27.1234567Z"
+read	Unified.Data.Tables.Tests.Golden.GoldenScalars	{"Text":"Za\u017C\u00F3\u0142\u0107 \u0022g\u0119\u015Bl\u0105\u0022 ja\u017A\u0144 \u2014 it\u0027s \u003Cb\u003Ebold\u003C/b\u003E \u0026 100% \\ / \uD83D\uDE00","EmptyText":"","Flag":true,"Int32":-123456789,"Int64":1234567890123456789,"Double":3.141592653589793,"Decimal":1234.56,"Guid":"0f8fad5b-d9cb-469f-a165-70867728950e","DateTime":"2024-02-29T23:59:58.7654321","DateTimeOffset":"2025-03-14T15:09:26.5358979\u002B00:00","DateTimeOffsetWithOffset":"2025-03-14T15:09:26.5358979\u002B00:00","TimeSpan":"1.02:03:04.5670000","Bytes":"AAECA3\u002BA/v8=","Colour":5,"Access":5,"UInt32":4000000000,"UInt64":9000000000000000000,"Byte":200,"Int16":-12345,"Single":1.5,"Char":"\u0416","Id":"golden|scalars","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-15T16:10:27.1234567\u002B00:00"}

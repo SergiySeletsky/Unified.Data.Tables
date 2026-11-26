@@ -171,16 +171,21 @@ public class TableStorageSplitTests
     }
 
     [Fact]
-    public async Task Replace_Missing_Throws404()
+    public async Task Replace_Missing_ThrowsEntityNotFound()
     {
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r", null);
 
-        var ex = await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.UpdateAsync(
+        // 0.10.0: until then the store threw an Azure 404 here. Its own read found no row, so nothing was
+        // sent; that 404 is now the inner exception, where every other missing-row path has it.
+        var ex = await Assert.ThrowsAsync<EntityNotFoundException>(() => h.Store.UpdateAsync(
             new SplitTextEntity { Id = "p|r", Body = "x", ETag = "W/\"e\"" }, ConcurrencyMode.Strict, Ct));
 
-        Assert.Equal(404, ex.Status);
-        Assert.Contains("The specified resource does not exist.", ex.Message, StringComparison.Ordinal);
+        Assert.Equal("p|r", ex.Id);
+        Assert.Equal(nameof(SplitTextEntity), ex.EntityType);
+        Assert.Equal("ResourceNotFound", ex.ProviderErrorCode);
+        Assert.Equal(404, Assert.IsType<RequestFailedException>(ex.InnerException).Status);
+        await h.Table.DidNotReceiveWithAnyArgs().UpdateEntityAsync<TableEntity>(default!, default, default, default);
     }
 
     [Fact]
@@ -1055,7 +1060,7 @@ public class TableStorageSplitTests
         Assert.Equal(["PartitionKey"], Assert.Single(selects)!);
         // (0.8.x also sent "odata.etag" here; the row's version is not a column and is no longer selected.)
         Assert.Equal(
-            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "Name"],
+            ["PartitionKey", "RowKey", "Timestamp", "_TypeName", "_SplitOf", "Name"],
             TableStorage<TestEntity>.BuildSelect(new QueryOptions { Select = ["Name"] })!);
     }
 }

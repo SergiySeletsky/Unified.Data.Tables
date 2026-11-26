@@ -26,9 +26,14 @@ public static partial class ServiceCollectionExtensions
 
     /// <summary>
     /// Registers the in-memory cache, the configured <see cref="UnifiedTableStorageOptions"/>, and
-    /// the open-generic <see cref="IStorage{T}"/> → <see cref="TableStorage{T}"/> mapping. The
+    /// the open-generic <see cref="IStorage{T}"/> → <see cref="TableStorage{T}"/> mapping, and the
+    /// experimental <c>ITableStore</c> (the account's tables as untyped rows) over the registered client. The
     /// caller must separately register a <see cref="TableServiceClient"/> (and, if protected
-    /// properties are used, an <see cref="IProtectedPropertyAuthorizer"/>). With
+    /// properties are used, an <see cref="IProtectedPropertyAuthorizer"/>); build it with
+    /// <see cref="TableClientOptionsExtensions.AddRetryObservation"/> on its options so the stores can
+    /// observe the SDK's retries (see <see cref="DuplicateKeyException.MayBeOwnWrite"/>); over a client
+    /// without it, a conditional delete (<see cref="IConditionalDelete{T}"/>) of a row that is not there
+    /// answers <see cref="DeleteStatus.Indeterminate"/>, never <see cref="DeleteStatus.NotFound"/>. With
     /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> set, the blob client is
     /// <see cref="BlobOffloadOptions.ServiceClient"/>, or the host's registered <see cref="BlobServiceClient"/>
     /// when <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/> is true; without one, resolving a
@@ -63,7 +68,9 @@ public static partial class ServiceCollectionExtensions
     /// <summary>
     /// Registers a <see cref="TableServiceClient"/> built from <paramref name="connectionString"/> alongside
     /// the cache, options, and the open-generic <see cref="IStorage{T}"/> mapping. A client already
-    /// registered is kept. When <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set (and names no
+    /// registered is kept. The client is built with the registered options'
+    /// <see cref="UnifiedTableStorageOptions.ConfigureTableClient"/> hook and the library's retry
+    /// observation (<see cref="TableClientOptionsExtensions.AddRetryObservation"/>). When <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set (and names no
     /// <see cref="BlobOffloadOptions.ServiceClient"/> and does not set
     /// <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/>), blob offload uses a
     /// <see cref="BlobServiceClient"/> built from the same string if it has a blob endpoint (a
@@ -87,7 +94,7 @@ public static partial class ServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
 
-        services.TryAddSingleton(_ => new TableServiceClient(connectionString));
+        services.TryAddSingleton(sp => BuildServiceClient(sp, clientOptions => new TableServiceClient(connectionString, clientOptions)));
         return AddCore(services, configure,
             () => HasBlobEndpoint(connectionString) ? BlobClientFrom(connectionString) : null);
     }
@@ -95,7 +102,9 @@ public static partial class ServiceCollectionExtensions
     /// <summary>
     /// Registers a <see cref="TableServiceClient"/> authenticated with a <see cref="TokenCredential"/>
     /// (e.g. a managed identity via <c>DefaultAzureCredential</c>) alongside the cache, options,
-    /// and the open-generic <see cref="IStorage{T}"/> mapping. A client already registered is kept. When
+    /// and the open-generic <see cref="IStorage{T}"/> mapping. A client already registered is kept. The
+    /// client is built with the registered options' <see cref="UnifiedTableStorageOptions.ConfigureTableClient"/>
+    /// hook and the library's retry observation (<see cref="TableClientOptionsExtensions.AddRetryObservation"/>). When
     /// <see cref="UnifiedTableStorageOptions.BlobOffload"/> is set (and names no
     /// <see cref="BlobOffloadOptions.ServiceClient"/> and does not set
     /// <see cref="BlobOffloadOptions.UseRegisteredServiceClient"/>) and the endpoint's host is an Azure
@@ -120,9 +129,20 @@ public static partial class ServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(endpoint);
         ArgumentNullException.ThrowIfNull(credential);
 
-        services.TryAddSingleton(_ => new TableServiceClient(endpoint, credential));
+        services.TryAddSingleton(sp => BuildServiceClient(sp, clientOptions => new TableServiceClient(endpoint, credential, clientOptions)));
         return AddCore(services, configure,
             () => BlobEndpointFor(endpoint) is { } blobEndpoint ? new BlobServiceClient(blobEndpoint, credential) : null);
+    }
+
+    // The TableServiceClient the library builds itself: the registered options' ConfigureTableClient hook
+    // runs on its TableClientOptions first (retry settings, a transport, the host's policies), then the
+    // library adds its retry observation, so the stores over this client can tell a request that was
+    // sent once from one the SDK retried. A client the host registered is never built here.
+    private static TableServiceClient BuildServiceClient(IServiceProvider provider, Func<TableClientOptions, TableServiceClient> build)
+    {
+        var clientOptions = new TableClientOptions();
+        provider.GetService<UnifiedTableStorageOptions>()?.ConfigureTableClient?.Invoke(clientOptions);
+        return build(clientOptions.AddRetryObservation());
     }
 
     private static IServiceCollection AddCore(
@@ -138,7 +158,8 @@ public static partial class ServiceCollectionExtensions
         // register also applies the policy, so a later bare AddUnifiedTableStorage() from another
         // module cannot silently reset an explicitly configured policy. Only an unkeyed registration
         // counts, as for TryAddSingleton: a keyed one of the host is never what a store receives.
-        var optionsAlreadyRegistered = services.Any(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions));
+        // The options another provider registered first (as StorageOptions, the in-memory one) count too.
+        var optionsAlreadyRegistered = RegisteredOptions(services) is not null;
         if (!optionsAlreadyRegistered)
         {
             TableEntitySerializer.OversizedCellPolicy = options.OversizedCells;
@@ -154,13 +175,16 @@ public static partial class ServiceCollectionExtensions
             // blob offload and choose no client does this call supply one, by its own rule (dropping it
             // left every large-value store unresolvable).
             var registered = RegisteredOptions(services);
-            if (registered?.ImplementationInstance is UnifiedTableStorageOptions known)
+            // (The in-memory registration's options are chosen when the container resolves them, so the
+            // host's can still win; until then they are its own instance, read the same way.)
+            if ((registered?.ImplementationInstance as StorageOptions ?? ProviderRegisteredOptions.FallbackOf(registered)) is { } known)
             {
                 // Options registered as an instance can be read now. Their ServiceClient needs no
                 // registration (TableStorage<T> takes it from them); UseRegisteredServiceClient means the
-                // host's client and no other one, so this call derives nothing.
-                if (known.BlobOffload is { ServiceClient: null } offload)
-                    RegisterOffloadClient(services, offload.UseRegisteredServiceClient
+                // host's client and no other one, so this call derives nothing. Offload options without
+                // the Azure part (another provider's) name no client and do not ask for the host's.
+                if (known.Offload is { } asked && asked is not BlobOffloadOptions { ServiceClient: not null })
+                    RegisterOffloadClient(services, asked is BlobOffloadOptions { UseRegisteredServiceClient: true }
                         ? HostsClient
                         : SuppliedClient(options.BlobOffload, derivedBlobClient));
             }
@@ -174,16 +198,30 @@ public static partial class ServiceCollectionExtensions
         }
 
         services.AddMemoryCache();
+        // This call's own options, never the host's: an in-memory registration made before this call does
+        // not take them for options the host registered for every store.
+        ProviderRegisteredOptions.MarkProviderOwned(options);
         services.TryAddSingleton(options);
+        // The same options under their provider-neutral type, which is the one a provider that does not
+        // reference this package (the in-memory one) registers and resolves: registered after this call,
+        // it keeps these options, as it did while both providers shared one options type.
+        services.TryAddSingleton<StorageOptions>(sp => sp.GetRequiredService<UnifiedTableStorageOptions>());
         services.TryAddSingleton(typeof(IStorage<>), typeof(TableStorage<>));
+#pragma warning disable UDT0001 // the experimental table store is registered, not used, here
+        // The account's tables (list, exists, create, delete, raw rows) over the registered client.
+        services.TryAddSingleton<ITableStore>(sp => new AzureTableStore(sp.GetRequiredService<TableServiceClient>()));
+#pragma warning restore UDT0001
         return services;
     }
 
     // The registration of the options TableStorage<T> will be given: the last unkeyed one, as the
     // container resolves it. Its instance is null when the host registered them as a type or a factory,
-    // which cannot be read before the container is built.
+    // which cannot be read before the container is built. Without one, the options a provider that
+    // does not reference this package registered before this call (as StorageOptions): they were the
+    // first registration while the providers shared one options type, and still are.
     private static ServiceDescriptor? RegisteredOptions(IServiceCollection services) =>
-        services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions));
+        services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(UnifiedTableStorageOptions))
+        ?? services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(StorageOptions));
 
     // Whether a call has already registered the offload client (an instance, or the factory that
     // resolves the host's client): that choice is kept, so a later call never replaces it.

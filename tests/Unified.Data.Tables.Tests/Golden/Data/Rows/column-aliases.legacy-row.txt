@@ -1,0 +1,9 @@
+# The row of column-aliases.txt under the old column names, and what a read of it returns.
+row PartitionKey="golden" RowKey="aliases"
+	Caption	Edm.String	"label"
+	Created	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|aliases"
+	Modified	Edm.DateTime	"2025-03-15T16:10:27.1234567Z"
+	OldName	Edm.String	"renamed"
+	OldTags__Json	Edm.String	"[\u0022x\u0022,\u0022y\u0022]"
+read	Unified.Data.Tables.Tests.Golden.GoldenAliased	{"NewName":"renamed","Tags":["x","y"],"Label":"label","Id":"golden|aliases","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-15T16:10:27.1234567\u002B00:00"}

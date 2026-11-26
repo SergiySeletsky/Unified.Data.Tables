@@ -5,18 +5,19 @@
     <PackageId>Unified.Data.Tables</PackageId>
     <RootNamespace>Unified.Data.Tables</RootNamespace>
     <AssemblyName>Unified.Data.Tables</AssemblyName>
-    <Description>Azure Table Storage implementation for Unified.Data.Tables: TableStorage&lt;T&gt; (IStorage&lt;T&gt;) with in-memory caching, ETag optimistic concurrency, builder-driven partial (Merge) updates, role-gated protected properties, and a reflection-based object-graph serializer (nested types, JSON/GZip fallback, an oversized-cell policy), and lossless large values: a [TableValueSplit] string, byte[] or JSON-stored property larger than one 64 KB cell is stored across cells and continuation rows with integrity checks, or offloaded to Azure Blob Storage, and TableBlobContent streams blob-backed content. Builds on Unified.Data.Tables.Abstractions.</Description>
+    <Description>Azure Table Storage implementation for Unified.Data.Tables: TableStorage&lt;T&gt; (IStorage&lt;T&gt;) with in-memory caching, ETag optimistic concurrency, builder-driven partial (Merge) updates, role-gated protected properties, the reflection-based object-graph serializer of Unified.Data.Tables.Core (nested types, JSON/GZip fallback, an oversized-cell policy), and lossless large values: a [TableValueSplit] string, byte[] or JSON-stored property larger than one 64 KB cell is stored across cells and continuation rows with integrity checks, or offloaded to Azure Blob Storage, and TableBlobContent streams blob-backed content. Builds on Unified.Data.Tables.Abstractions and Unified.Data.Tables.Core.</Description>
     <PackageTags>azure;azure-table-storage;table-storage;repository;storage;serialization;nosql;cache</PackageTags>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
-    <!-- The abstractions share internal plumbing with this assembly (InternalsVisibleTo), so the package depends on exactly the same version of them. See Directory.Build.targets. -->
+    <!-- The abstractions and the core share internal plumbing with this assembly (InternalsVisibleTo), so the package depends on exactly the same version of them. See Directory.Build.targets. -->
     <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
+    <ProjectReference Include="..\Unified.Data.Tables.Core\Unified.Data.Tables.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>

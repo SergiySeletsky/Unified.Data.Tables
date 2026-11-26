@@ -25,6 +25,9 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="NSubstitute" Version="5.3.0" />
+    <!-- The compiler as a library: the upgrade analyzer is run over small samples (see Analyzers/). The
+         version the analyzer itself is built against. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" />
     <PackageReference Include="coverlet.collector" Version="10.0.1">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
@@ -34,10 +37,25 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Unified.Data.Tables\Unified.Data.Tables.csproj" />
     <ProjectReference Include="..\..\src\Unified.Data.Tables.InMemory\Unified.Data.Tables.InMemory.csproj" />
+    <ProjectReference Include="..\..\src\Unified.Data.Tables.Sqlite\Unified.Data.Tables.Sqlite.csproj" />
+    <!-- The second process of the SQLite multi-process tests (see Sqlite/SqliteMultiProcessTests.cs): built
+         and copied beside the tests, which start it with the dotnet host. -->
+    <ProjectReference Include="..\Unified.Data.Tables.Sqlite.TestHelper\Unified.Data.Tables.Sqlite.TestHelper.csproj" />
+    <!-- The conformance kit and its xUnit adapter, run here against every provider (see Conformance/). -->
+    <ProjectReference Include="..\..\src\Unified.Data.Tables.Conformance\Unified.Data.Tables.Conformance.csproj" />
+    <ProjectReference Include="..\..\src\Unified.Data.Tables.Conformance.Xunit\Unified.Data.Tables.Conformance.Xunit.csproj" />
+    <!-- The optional upgrade analyzer, referenced as a library so the tests can run it; it is not applied
+         to this project's own code. -->
+    <ProjectReference Include="..\..\src\Unified.Data.Tables.Analyzers\Unified.Data.Tables.Analyzers.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The golden corpus: what 0.9.2 puts on the wire, asserted verbatim (see Golden/GoldenFile.cs). -->
+    <None Include="Golden\Data\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

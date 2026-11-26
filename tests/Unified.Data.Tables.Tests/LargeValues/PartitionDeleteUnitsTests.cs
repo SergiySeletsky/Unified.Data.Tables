@@ -245,7 +245,9 @@ public class PartitionDeleteUnitsTests
         Lists(h, rows);
         var submitted = CaptureTransactions(h, failAt: 1);
 
-        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.DeletePartitionAsync(Pk, Ct));
+        // 0.10.0: the failed transaction leaves as a neutral StorageException, the SDK's failure inside.
+        var failed = await Assert.ThrowsAnyAsync<StorageException>(() => h.Store.DeletePartitionAsync(Pk, Ct));
+        Assert.IsType<RequestFailedException>(failed.InnerException, exactMatch: false);
 
         Assert.Equal(2, submitted.Count);
         var deleted = submitted[0].ToHashSet(StringComparer.Ordinal);
@@ -312,7 +314,9 @@ public class PartitionDeleteUnitsTests
         Lists(h, rows);
         var submitted = CaptureTransactions(h, failAt: 1);
 
-        await Assert.ThrowsAsync<RequestFailedException>(() => h.Store.DeletePartitionAsync(Pk, Ct));
+        // 0.10.0: the failed transaction leaves as a neutral StorageException, the SDK's failure inside.
+        var failed = await Assert.ThrowsAnyAsync<StorageException>(() => h.Store.DeletePartitionAsync(Pk, Ct));
+        Assert.IsType<RequestFailedException>(failed.InnerException, exactMatch: false);
 
         // The first transaction committed: "a000" is gone, and a read must not answer from the cache.
         Assert.Contains("a000", submitted[0]);
@@ -396,7 +400,9 @@ public sealed class AzuritePartitionDeleteUnitsTests : AzuriteCleanupTestBase
 
         var failing = new FailSecondBatch();
         var deleting = SplitOnlyStore<SplitTextEntity>(TableServiceWith(failing));
-        await Assert.ThrowsAnyAsync<RequestFailedException>(() => deleting.DeletePartitionAsync(Pk, Ct));
+        // 0.10.0: the failed transaction leaves as a neutral StorageException, the SDK's failure inside.
+        var failed = await Assert.ThrowsAnyAsync<StorageException>(() => deleting.DeletePartitionAsync(Pk, Ct));
+        Assert.IsType<RequestFailedException>(failed.InnerException, exactMatch: false);
 
         Assert.Equal(2, failing.Batches);
         var left = await RawRowsAsync(TableName);

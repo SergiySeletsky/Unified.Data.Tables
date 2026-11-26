@@ -1,0 +1,8 @@
+# A marker row: system columns only, no item and no _TypeName.
+row PartitionKey="stream-1" RowKey="head"
+	_UpdatedAt	Edm.DateTime	"2025-03-15T16:10:27.1234567Z"
+	_Version	Edm.Int32	2
+read	null
+read-discriminator	null
+read-column	_UpdatedAt	DateTimeOffset	2025-03-15T16:10:27.1234567+00:00
+read-column	_Version	Int32	2

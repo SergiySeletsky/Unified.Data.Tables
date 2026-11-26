@@ -1,0 +1,14 @@
+# InMemoryStorage<T>.QueryPageAsync over nine rows: the first page, its token, and the page the token resumes at.
+# store	query	first page	token	next page
+plain	partition	tenant-a|inv-0001,tenant-a|inv-0002	ODp0ZW5hbnQtYXx+fDI=.dGVuYW50LWEAaW52LTAwMDI=	tenant-a|ord-0001,tenant-a|ord-0002
+plain	partition in natural form	tenant-a|inv-0001,tenant-a|inv-0002	ODp0ZW5hbnQtYXx+fDI=.dGVuYW50LWEAaW52LTAwMDI=	tenant-a|ord-0001,tenant-a|ord-0002
+plain	partition and prefix	tenant-a|ord-0001,tenant-a|ord-0002	ODp0ZW5hbnQtYXw0Om9yZC18Mg==.dGVuYW50LWEAb3JkLTAwMDI=	tenant-a|ord-0003,tenant-a|ord-0004
+plain	partition and prefix in natural form	tenant-a|ord-0001,tenant-a|ord-0002	ODp0ZW5hbnQtYXw0Om9yZC18Mg==.dGVuYW50LWEAb3JkLTAwMDI=	tenant-a|ord-0003,tenant-a|ord-0004
+plain	whole table	tenant-a|inv-0001,tenant-a|inv-0002,tenant-a|ord-0001	fnx+fDM=.dGVuYW50LWEAb3JkLTAwMDE=	tenant-a|ord-0002,tenant-a|ord-0003,tenant-a|ord-0004
+plain	whole table across a partition end	tenant-a|inv-0001,tenant-a|inv-0002,tenant-a|ord-0001,tenant-a|ord-0002,tenant-a|ord-0003,tenant-a|ord-0004,tenant-a|ord-0005	fnx+fDc=.dGVuYW50LWEAb3JkLTAwMDU=	tenant-b|ord-0001,tenant-b|ord-0002
+large-value aware	partition	tenant-a|inv-0001,tenant-a|inv-0002	ODp0ZW5hbnQtYXx+fDI=.dGVuYW50LWEAaW52LTAwMDI=	tenant-a|ord-0001,tenant-a|ord-0002
+large-value aware	partition in natural form	tenant-a|inv-0001,tenant-a|inv-0002	ODp0ZW5hbnQtYXx+fDI=.dGVuYW50LWEAaW52LTAwMDI=	tenant-a|ord-0001,tenant-a|ord-0002
+large-value aware	partition and prefix	tenant-a|ord-0001,tenant-a|ord-0002	ODp0ZW5hbnQtYXw0Om9yZC18Mg==.dGVuYW50LWEAb3JkLTAwMDI=	tenant-a|ord-0003,tenant-a|ord-0004
+large-value aware	partition and prefix in natural form	tenant-a|ord-0001,tenant-a|ord-0002	ODp0ZW5hbnQtYXw0Om9yZC18Mg==.dGVuYW50LWEAb3JkLTAwMDI=	tenant-a|ord-0003,tenant-a|ord-0004
+large-value aware	whole table	tenant-a|inv-0001,tenant-a|inv-0002,tenant-a|ord-0001	fnx+fDM=.dGVuYW50LWEAb3JkLTAwMDE=	tenant-a|ord-0002,tenant-a|ord-0003,tenant-a|ord-0004
+large-value aware	whole table across a partition end	tenant-a|inv-0001,tenant-a|inv-0002,tenant-a|ord-0001,tenant-a|ord-0002,tenant-a|ord-0003,tenant-a|ord-0004,tenant-a|ord-0005	fnx+fDc=.dGVuYW50LWEAb3JkLTAwMDU=	tenant-b|ord-0001,tenant-b|ord-0002

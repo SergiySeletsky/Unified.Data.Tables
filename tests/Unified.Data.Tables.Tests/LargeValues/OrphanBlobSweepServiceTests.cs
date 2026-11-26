@@ -94,7 +94,7 @@ public class OrphanBlobSweepServiceTests
             var services = new ServiceCollection();
             services.AddSingleton<ILogger<OrphanBlobSweepService>>(Logger);
             register(services);
-            services.AddUnifiedInMemoryStorage(o => o.BlobOffload = offload);
+            services.AddUnifiedInMemoryStorage(o => o.Offload = offload);
             Provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true });
             Service = Provider.GetServices<IHostedService>().OfType<OrphanBlobSweepService>().Single();
             Service.Delay = Steps.Delay;

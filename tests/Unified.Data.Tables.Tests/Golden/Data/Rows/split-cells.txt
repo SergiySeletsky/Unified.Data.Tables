@@ -1,0 +1,31 @@
+# [TableValueSplit] values split across cells of the one row: text in 32,000-char chunks (never inside a surrogate pair), binary in 64 KiB chunks, a list as JSON text chunks, and a GZip value.
+row PartitionKey="golden" RowKey="split-cells"
+	Body__c0	Edm.String	sha256=c4c924cd46ca995a299572bb6d18cc482394b91ee036a262e8df7c8a955516a9,utf8-bytes=45171,head="ILt\u044FXNmTP1Xnygm3u0 oQ9ka\u4E2D\u6587R\u658
+	Body__c1	Edm.String	sha256=cea5d9bef2dae089ba2b2fd5d3b51bc06a982eb3449aac5349a38ed9ddd434eb,utf8-bytes=45557,head="\uD83D\uDE002\u044F12aiNDEHP KiduOkQi4TRM MZlBW
+	Body__c2	Edm.String	sha256=5448f32257ebb36eea6a5f5ab5a24ded57bbbc4f462257abed47f0518771f2fc,utf8-bytes=8513,head="3HLTf\u00DFyJYHebIK1JJgwB2eyOg9eP\u65872olAAZPI
+	Body__chunks	Edm.Int32	3
+	Body__enc	Edm.String	"text"
+	Body__len	Edm.Int64	"77827"
+	Body__sha256	Edm.String	"64673e65fbe705eb1b8e41bfb0e0203dc88fe8005739e02177d14a7513569540"
+	CreatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Id	Edm.String	"golden|split-cells"
+	Image__c0	Edm.Binary	sha256=fe453ec7e297d9d223bd4026ba65b94b6706bda6e7370fe785d792c69b49ce88,utf8-bytes=87386,head="m1vuNgNuDPlijuHMluEuB9FPT4u/Xga45kR6nE44e25jCgk
+	Image__c1	Edm.Binary	sha256=54826a5d76e14eb3cd833bca3c02bd4ec238ee59eab8b826e272106f6e73d5ee,utf8-bytes=45954,head="fMh3K3Qrpb5jm4phJz7nbPL8GMBwW9+9J5FjcR/VdBPE9xK
+	Image__chunks	Edm.Int32	2
+	Image__enc	Edm.String	"binary"
+	Image__len	Edm.Int64	"100000"
+	Image__sha256	Edm.String	"8b8ad622268f8a4ed9adb1491b2e19c22c788ef0c14967aad06f5c13aed15fdd"
+	Items__c0	Edm.String	sha256=085141034e228067aeb6638246ef3793295b2e183da1b1dd86e3644a67705d3f,utf8-bytes=45842,head="[\u0022U\u00E9\u4E2D3txEMz3Mmbo4HQBi7d5YX7dxgfh
+	Items__c1	Edm.String	sha256=1b1fe70a7dd493c5bd41d002226e73b7ffb8c7f8e61619ba100ec278ac059909,utf8-bytes=11663,head="5HjPLUWL5\u044FoBsv \u0416rp\u6587\u04161dqOVgO
+	Items__chunks	Edm.Int32	2
+	Items__enc	Edm.String	"text"
+	Items__len	Edm.Int64	"44641"
+	Items__sha256	Edm.String	"fc0cf5e6de3f9dd5f2191aed15c1266718845e022c23d338fd4d99cc60ee17cb"
+	Title	Edm.String	"cells"
+	UpdatedAt	Edm.DateTime	"2025-03-14T15:09:26.5358979Z"
+	Zipped__c0	Edm.Binary	gzip{compressed bytes, pinned by Zipped__sha256}
+	Zipped__chunks	Edm.Int32	1
+	Zipped__enc	Edm.String	"gzip"
+	Zipped__len	Edm.Int64	gzip{the length of the compressed bytes}
+	Zipped__sha256	Edm.String	gzip{inflated-sha256=3053730df04efaa81cd8870ff7b6584ef3b61ff5b6703d815e0d4c421be640b3,inflated-bytes=300000}
+read	Unified.Data.Tables.Tests.Golden.GoldenSplit	{"Title":"cells","Body":"sha256-of-utf16le=5d8f96756ade66c080846f7707a20a42760e4bc49b462b6ed748f0c89d25c9b1,chars=70000","Image":"sha256-of-utf16le=f5df004c8e21804ff4386a77f62ece2f3f9d814946eb44c7ea6eb7e744cd021f,chars=133336","Items":"sha256-of-json=97b927d111dd456f0c4b7206f65f64b9433b45e85bf0a0912890555f5935d4b5,items=40","Zipped":"sha256-of-utf16le=5d2c3c5014bb73d898a2ac084c632035f882fce21ac8cfb817d92914fff64e37,chars=300000","Id":"golden|split-cells","CreatedAt":"2025-03-14T15:09:26.5358979\u002B00:00","UpdatedAt":"2025-03-14T15:09:26.5358979\u002B00:00"}

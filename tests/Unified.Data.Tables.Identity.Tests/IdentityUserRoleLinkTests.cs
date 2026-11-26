@@ -8,7 +8,15 @@ namespace Unified.Data.Tables.Identity.Tests
     /// </summary>
     public class IdentityUserRoleLinkTests : IDisposable
     {
-        private readonly IdentityStoreFixture _fixture = new();
+        private readonly IdentityStoreFixture _fixture;
+
+        public IdentityUserRoleLinkTests()
+            : this(IdentityBackend.InMemory)
+        {
+        }
+
+        /// <summary>The same tests over another storage provider (see SqliteIdentityTests.cs).</summary>
+        protected IdentityUserRoleLinkTests(IdentityBackend backend) => _fixture = new IdentityStoreFixture(backend);
 
         private IUserRoleStore<IdentityUser> Store => _fixture.UserRoleStore;
 
@@ -16,6 +24,7 @@ namespace Unified.Data.Tables.Identity.Tests
         public void Dispose()
         {
             _fixture.UserStore.Dispose();
+            _fixture.Dispose();
             GC.SuppressFinalize(this);
         }
 

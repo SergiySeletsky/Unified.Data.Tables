@@ -12,7 +12,8 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// URL and <c>If-Match</c>) and answers with what a test scripts for it, so a test can assert exactly
 /// what <see cref="TableStorage{T}"/> puts on the wire and how it reads the answer.
 /// </summary>
-internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, ScriptedTableTransport.Answer> respond) : HttpPipelineTransport
+internal sealed class ScriptedTableTransport(
+    Func<ScriptedTableTransport.Sent, ScriptedTableTransport.Answer> respond, bool scriptTableCreation = false) : HttpPipelineTransport
 {
     /// <summary>A request as the SDK sent it.</summary>
     /// <param name="Method">The HTTP method.</param>
@@ -34,7 +35,9 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
     /// <param name="Json">The JSON body, or null for none.</param>
     /// <param name="ETag">The <c>ETag</c> response header, or null for none.</param>
     /// <param name="ErrorCode">The <c>x-ms-error-code</c> response header, or null for none.</param>
-    internal sealed record Answer(int Status, string? Json = null, string? ETag = null, string? ErrorCode = null);
+    /// <param name="Headers">Further response headers (a <c>Retry-After</c>, say), or null for none.</param>
+    internal sealed record Answer(
+        int Status, string? Json = null, string? ETag = null, string? ErrorCode = null, IReadOnlyDictionary<string, string>? Headers = null);
 
     /// <summary>Every request, in the order sent.</summary>
     public List<Sent> Requests { get; } = [];
@@ -53,6 +56,28 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
         new(new Uri("https://acct.table.core.windows.net/"), new TableSharedKeyCredential("acct", Convert.ToBase64String(new byte[32])),
             new TableClientOptions { Transport = this, Retry = { MaxRetries = 0 } });
 
+    /// <summary>
+    /// A table client of the real SDK over this transport whose retry policy sends a request again (at
+    /// once) after a failure without a response, as the SDK does in production: an answer that throws
+    /// <see cref="IOException"/> is a lost response. <paramref name="observe"/> adds the library's retry
+    /// observation, as the clients <c>AddUnifiedTableStorage</c> builds have it.
+    /// </summary>
+    public TableServiceClient RetryingService(bool observe = true, int maxRetries = 3)
+    {
+        var options = new TableClientOptions { Transport = this };
+        options.Retry.MaxRetries = maxRetries;
+        options.Retry.Mode = RetryMode.Fixed;
+        options.Retry.Delay = TimeSpan.FromMilliseconds(1);
+        options.Retry.MaxDelay = TimeSpan.FromMilliseconds(1);
+        if (observe)
+            options.AddRetryObservation();
+        return new TableServiceClient(new Uri("https://acct.table.core.windows.net/"),
+            new TableSharedKeyCredential("acct", Convert.ToBase64String(new byte[32])), options);
+    }
+
+    /// <summary>The answer of a request whose response never arrives (the SDK retries it).</summary>
+    public static Answer Lost() => throw new IOException("Simulated: the connection dropped before the response arrived.");
+
     public override Request CreateRequest() => HttpClientTransport.Shared.CreateRequest();
 
     public override void Process(HttpMessage message)
@@ -65,8 +90,8 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
             Uri.UnescapeDataString(uri.Query.TrimStart('?')),
             message.Request.Headers.TryGetValue("If-Match", out var ifMatch) ? ifMatch : null);
         lock (Requests) Requests.Add(sent);
-        // The lazy table creation is not what a test scripts: it always succeeds.
-        var answer = sent.Method == "POST" && sent.Path.EndsWith("/Tables", StringComparison.Ordinal) ? new Answer(204) : respond(sent);
+        // The lazy table creation is not what a test scripts, unless it asks to: it always succeeds.
+        var answer = !scriptTableCreation && sent.Method == "POST" && sent.Path.EndsWith("/Tables", StringComparison.Ordinal) ? new Answer(204) : respond(sent);
         message.Response = new Canned(answer, message.Request.ClientRequestId);
     }
 
@@ -87,6 +112,8 @@ internal sealed class ScriptedTableTransport(Func<ScriptedTableTransport.Sent, S
             ClientRequestId = clientRequestId;
             if (answer.ETag is not null) headers["ETag"] = answer.ETag;
             if (answer.ErrorCode is not null) headers["x-ms-error-code"] = answer.ErrorCode;
+            foreach (var header in answer.Headers ?? new Dictionary<string, string>())
+                headers[header.Key] = header.Value;
             if (answer.Json is not null)
             {
                 headers["Content-Type"] = "application/json;odata=minimalmetadata;streaming=true;charset=utf-8";

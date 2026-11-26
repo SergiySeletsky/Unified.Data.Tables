@@ -300,8 +300,12 @@ public class InMemoryLargeValueParityTests
         await Assert.ThrowsAsync<DuplicateKeyException>(() => store.CreateAsync(Make("text", 600_000), Ct));
         var missing = Make("text", 600_000);
         missing.Id = "p|other";
-        var notFound = await Assert.ThrowsAsync<RequestFailedException>(() => store.UpdateAsync(missing, ConcurrencyMode.LastWriterWins, Ct));
-        Assert.Equal(404, notFound.Status);
+        // 0.10.0: the neutral type, as TableStorage: the store's own read found no row, and the service's
+        // 404 is the inner exception, as on every other missing-row path.
+        var notFound = await Assert.ThrowsAsync<EntityNotFoundException>(() => store.UpdateAsync(missing, ConcurrencyMode.LastWriterWins, Ct));
+        Assert.Equal("p|other", notFound.Id);
+        Assert.Equal("ResourceNotFound", notFound.ProviderErrorCode);
+        Assert.Equal(404, Assert.IsType<Azure.RequestFailedException>(notFound.InnerException).Status);
 
         var reserved = Make("text", 10);
         reserved.Id = "p|r~0001";

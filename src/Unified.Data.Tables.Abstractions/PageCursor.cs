@@ -19,6 +19,25 @@ internal static class PageCursor
     public static string Fingerprint(string? partition, string? rowKeyPrefix, int pageSize) =>
         $"{LengthPrefixed(partition)}|{LengthPrefixed(rowKeyPrefix)}|{pageSize.ToString(CultureInfo.InvariantCulture)}";
 
+    /// <summary>
+    /// The fingerprint of a query that may carry a RowKey range. With no bound it is, byte for byte, the
+    /// three-part <see cref="Fingerprint(string?, string?, int)"/> every earlier release issued, so a
+    /// cursor from 0.9.2 still decodes; with a bound, four parts follow (lower bound, its inclusivity,
+    /// upper bound, its inclusivity), so a cursor is refused when either bound or either flag changes.
+    /// The flag of a bound that is not set is not part of the query and is written as <c>-</c>.
+    /// </summary>
+    public static string Fingerprint(
+        string? partition, string? rowKeyPrefix, int pageSize,
+        string? fromRowKey, bool fromInclusive, string? toRowKey, bool toInclusive)
+    {
+        var bounds = Fingerprint(partition, rowKeyPrefix, pageSize);
+        if (fromRowKey is null && toRowKey is null)
+            return bounds;
+        return $"{bounds}|{LengthPrefixed(fromRowKey)}|{Flag(fromRowKey, fromInclusive)}|{LengthPrefixed(toRowKey)}|{Flag(toRowKey, toInclusive)}";
+    }
+
+    private static string Flag(string? bound, bool inclusive) => bound is null ? "-" : inclusive ? "1" : "0";
+
     private static string LengthPrefixed(string? s) =>
         s is null ? "~" : s.Length.ToString(CultureInfo.InvariantCulture) + ":" + s;
 
@@ -51,7 +70,7 @@ internal static class PageCursor
 
         if (!string.Equals(encodedFingerprint, fingerprint, StringComparison.Ordinal))
             throw new ArgumentException(
-                "This continuation token was issued for a different query (partition, RowKey prefix, or page " +
+                "This continuation token was issued for a different query (partition, RowKey prefix or range, or page " +
                 "size changed). Restart paging from the first page.", nameof(cursor));
 
         return innerToken;

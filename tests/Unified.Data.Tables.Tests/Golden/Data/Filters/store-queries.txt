@@ -1,0 +1,32 @@
+# The $filter TableStorage<GoldenFilterEntity> puts on the request URL (store is that store).
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a" }, Ct)	PartitionKey eq 'tenant-a'
+() => store.QueryAsync(new QueryOptions { Partition = " Tenant A " }, Ct)	PartitionKey eq 'tenant-a'
+() => store.QueryAsync(new QueryOptions { Partition = "o'brien's" }, Ct)	PartitionKey eq 'o''brien''s'
+() => store.QueryAsync(new QueryOptions { Partition = "100%&a=b+c/d?e#f" }, Ct)	PartitionKey eq '100%&a=b+c/d?e#f'
+() => store.QueryAsync(new QueryOptions { Partition = "юнікод-中文" }, Ct)	"PartitionKey eq '\u044E\u043D\u0456\u043A\u043E\u0434-\u4E2D\u6587'"
+() => store.QueryAsync("tenant-a", Ct)	PartitionKey eq 'tenant-a'
+() => store.CountAsync("tenant-a", Ct)	PartitionKey eq 'tenant-a'
+() => store.QueryStreamAsync(new QueryOptions { Partition = "tenant-a", Take = 5 }, Ct).ToListAsync(Ct).AsTask()	PartitionKey eq 'tenant-a'
+() => store.QueryPageAsync(new QueryOptions { Partition = "tenant-a", Take = 5 }, Ct)	PartitionKey eq 'tenant-a'
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "ord-" }, Ct)	PartitionKey eq 'tenant-a' and RowKey ge 'ord-' and RowKey lt 'ord.'
+() => store.QueryAsync(new QueryOptions { Partition = " Tenant A ", RowKeyPrefix = "Order 1" }, Ct)	PartitionKey eq 'tenant-a' and RowKey ge 'order-1' and RowKey lt 'order-2'
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "a" }, Ct)	PartitionKey eq 'tenant-a' and RowKey ge 'a' and RowKey lt 'b'
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "it's" }, Ct)	PartitionKey eq 'tenant-a' and RowKey ge 'it''s' and RowKey lt 'it''t'
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "ord|2025|" }, Ct)	PartitionKey eq 'tenant-a' and RowKey ge 'ord|2025|' and RowKey lt 'ord|2025}'
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "z~" }, Ct)	"PartitionKey eq 'tenant-a' and RowKey ge 'z~' and RowKey lt 'z\u007F'"
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "é" }, Ct)	"PartitionKey eq 'tenant-a' and RowKey ge '\u00E9' and RowKey lt '\u00EA'"
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "a" + char.MaxValue }, Ct)	"PartitionKey eq 'tenant-a' and RowKey ge 'a\uFFFF' and RowKey lt 'b'"
+() => store.QueryAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = new string(char.MaxValue, 2) }, Ct)	"PartitionKey eq 'tenant-a' and RowKey ge '\uFFFF\uFFFF'"
+() => store.QueryStreamAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "ord-", Take = 5 }, Ct).ToListAsync(Ct).AsTask()	PartitionKey eq 'tenant-a' and RowKey ge 'ord-' and RowKey lt 'ord.'
+() => store.QueryPageAsync(new QueryOptions { Partition = "tenant-a", RowKeyPrefix = "ord-", Take = 5 }, Ct)	PartitionKey eq 'tenant-a' and RowKey ge 'ord-' and RowKey lt 'ord.'
+() => store.QueryAsync(new QueryOptions(), Ct)	(no $filter)
+() => store.QueryAsync(new QueryOptions { Partition = "  " }, Ct)	(no $filter)
+() => store.QueryAsync((string?)null, Ct)	(no $filter)
+() => store.CountAsync(null, Ct)	(no $filter)
+() => store.QueryPageAsync(new QueryOptions { Take = 5 }, Ct)	(no $filter)
+() => store.QueryAsync(x => x.Name == "alice" && x.Count > 1, null, null, Ct)	(Name eq 'alice' and Count gt 1)
+() => store.QueryAsync(x => x.Name == "alice" && x.Count > 1, "tenant-a", null, Ct)	PartitionKey eq 'tenant-a' and ((Name eq 'alice' and Count gt 1))
+() => store.QueryAsync(x => x.Name == "alice" || x.Active, " Tenant A ", 5, Ct)	PartitionKey eq 'tenant-a' and ((Name eq 'alice' or Active eq true))
+() => store.QueryStreamAsync(x => x.Colour == GoldenColour.Green, "tenant-a", null, Ct).ToListAsync(Ct).AsTask()	PartitionKey eq 'tenant-a' and (Colour eq 'Green')
+() => store.AnyAsync(x => x.Price >= 10m, "tenant-a", Ct)	PartitionKey eq 'tenant-a' and (Price ge 10)
+() => store.AnyAsync(x => x.Id == "tenant-a|ord-0001", null, Ct)	(PartitionKey eq 'tenant-a' and RowKey eq 'ord-0001')

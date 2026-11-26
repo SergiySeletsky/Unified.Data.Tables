@@ -4,12 +4,21 @@ namespace Unified.Data.Tables.Identity.Tests
 {
     public class IdentityUserStoreRoleTests : IDisposable
     {
-        private readonly IdentityStoreFixture _fixture = new();
+        private readonly IdentityStoreFixture _fixture;
+
+        public IdentityUserStoreRoleTests()
+            : this(IdentityBackend.InMemory)
+        {
+        }
+
+        /// <summary>The same tests over another storage provider (see SqliteIdentityTests.cs).</summary>
+        protected IdentityUserStoreRoleTests(IdentityBackend backend) => _fixture = new IdentityStoreFixture(backend);
 
         // CA1001 — UserStore implements IUserStore<IdentityUser>, which extends IDisposable.
         public void Dispose()
         {
             _fixture.UserStore.Dispose();
+            _fixture.Dispose();
             GC.SuppressFinalize(this);
         }
 

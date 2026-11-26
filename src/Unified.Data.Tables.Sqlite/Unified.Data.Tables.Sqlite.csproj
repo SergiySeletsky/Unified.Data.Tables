@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <PackageId>Unified.Data.Tables.Sqlite</PackageId>
+    <RootNamespace>Unified.Data.Tables.Sqlite</RootNamespace>
+    <AssemblyName>Unified.Data.Tables.Sqlite</AssemblyName>
+    <Description>SQLite provider for Unified.Data.Tables: IStorage&lt;T&gt; and IPolymorphicStorage&lt;TBase&gt; over one local database file (or :memory:), for development, single-machine deployments and durable tests. The same engine as the in-memory provider, so rows round-trip through the real TableEntitySerializer and the Table service's rules hold (key rules, 100 rows and the payload budget a transaction, 64 KiB a cell, 1 MB a row): a table that works here works on Azure Table Storage. Write-ahead logging with one writer and many readers, several processes on one machine, ETags from a database-wide counter, large values in the same split layout with offloaded blobs in the database, provider-neutral failures, and every 0.10.0 side interface (conditional delete, atomic batches, storage info, raw tables). No Azure provider package, no Azure.Storage.Blobs, no network.</Description>
+    <PackageTags>azure;table-storage;repository;sqlite;local;storage;nosql;testing</PackageTags>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <!-- Binds to the core package's row-store engine and hidden provider SPI (Unified.Data.Tables.Providers), which may change in any minor version: depend on exactly the same version. See Directory.Build.targets. -->
+    <PackExactProjectReferenceVersions>true</PackExactProjectReferenceVersions>
+  </PropertyGroup>
+
+  <!-- The core, not the Azure provider: this package implements the row store under the core's engine
+       and nothing else, with no Azure.Storage.Blobs and no Azure provider package in its closure. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Unified.Data.Tables.Abstractions\Unified.Data.Tables.Abstractions.csproj" />
+    <ProjectReference Include="..\Unified.Data.Tables.Core\Unified.Data.Tables.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The ADO.NET provider with its bundled native SQLite (SQLitePCLRaw.bundle_e_sqlite3). -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
+  </ItemGroup>
+
+  <!-- The tests reach the database below the stores (the row codec, the connections, a raw commit). -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
