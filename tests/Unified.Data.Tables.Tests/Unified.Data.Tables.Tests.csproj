@@ -34,6 +34,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Unified.Data.Tables\Unified.Data.Tables.csproj" />
     <ProjectReference Include="..\..\src\Unified.Data.Tables.InMemory\Unified.Data.Tables.InMemory.csproj" />
+    <ProjectReference Include="..\..\src\Unified.Data.Tables.Sqlite\Unified.Data.Tables.Sqlite.csproj" />
+    <!-- The second process of the SQLite multi-process tests (see Sqlite/SqliteMultiProcessTests.cs): built
+         and copied beside the tests, which start it with the dotnet host. -->
+    <ProjectReference Include="..\Unified.Data.Tables.Sqlite.TestHelper\Unified.Data.Tables.Sqlite.TestHelper.csproj" />
     <!-- The conformance kit and its xUnit adapter, run here against every provider (see Conformance/). -->
     <ProjectReference Include="..\..\src\Unified.Data.Tables.Conformance\Unified.Data.Tables.Conformance.csproj" />
     <ProjectReference Include="..\..\src\Unified.Data.Tables.Conformance.Xunit\Unified.Data.Tables.Conformance.Xunit.csproj" />

@@ -5,7 +5,15 @@ namespace Unified.Data.Tables.Identity.Tests
 {
     public class IdentityClaimStoreTests : IDisposable
     {
-        private readonly IdentityStoreFixture _fixture = new();
+        private readonly IdentityStoreFixture _fixture;
+
+        public IdentityClaimStoreTests()
+            : this(IdentityBackend.InMemory)
+        {
+        }
+
+        /// <summary>The same tests over another storage provider (see SqliteIdentityTests.cs).</summary>
+        protected IdentityClaimStoreTests(IdentityBackend backend) => _fixture = new IdentityStoreFixture(backend);
 
         private IUserClaimStore<IdentityUser> UserClaims => _fixture.UserStore;
 
@@ -16,6 +24,7 @@ namespace Unified.Data.Tables.Identity.Tests
         {
             _fixture.UserStore.Dispose();
             _fixture.RoleStore.Dispose();
+            _fixture.Dispose();
             GC.SuppressFinalize(this);
         }
 

@@ -4,6 +4,7 @@
     <Project Path="src/Unified.Data.Tables.Core/Unified.Data.Tables.Core.csproj" />
     <Project Path="src/Unified.Data.Tables/Unified.Data.Tables.csproj" />
     <Project Path="src/Unified.Data.Tables.InMemory/Unified.Data.Tables.InMemory.csproj" />
+    <Project Path="src/Unified.Data.Tables.Sqlite/Unified.Data.Tables.Sqlite.csproj" />
     <Project Path="src/Unified.Data.Tables.Identity/Unified.Data.Tables.Identity.csproj" />
     <Project Path="src/Unified.Data.Tables.Conformance/Unified.Data.Tables.Conformance.csproj" />
     <Project Path="src/Unified.Data.Tables.Conformance.Xunit/Unified.Data.Tables.Conformance.Xunit.csproj" />
@@ -11,5 +12,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/Unified.Data.Tables.Tests/Unified.Data.Tables.Tests.csproj" />
     <Project Path="tests/Unified.Data.Tables.Identity.Tests/Unified.Data.Tables.Identity.Tests.csproj" />
+    <Project Path="tests/Unified.Data.Tables.Sqlite.TestHelper/Unified.Data.Tables.Sqlite.TestHelper.csproj" />
   </Folder>
 </Solution>

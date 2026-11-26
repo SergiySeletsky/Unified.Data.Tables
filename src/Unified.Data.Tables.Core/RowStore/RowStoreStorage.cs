@@ -636,7 +636,7 @@ internal sealed partial class RowStoreStorage<T> : IStorage<T>, IOrphanBlobSweep
             var sep = inner.IndexOf('\0', StringComparison.Ordinal);
             if (sep < 0)
                 throw new ArgumentException(
-                    "Malformed in-memory continuation token (was it issued by a different backend? " +
+                    "Malformed continuation token (was it issued by a different backend? " +
                     "cursors are backend-specific).", nameof(options));
             after = (inner.Substring(0, sep), inner.Substring(sep + 1));
         }

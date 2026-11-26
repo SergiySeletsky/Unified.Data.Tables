@@ -25,6 +25,7 @@
     <InternalsVisibleTo Include="Unified.Data.Tables.Core" />
     <InternalsVisibleTo Include="Unified.Data.Tables" />
     <InternalsVisibleTo Include="Unified.Data.Tables.InMemory" />
+    <InternalsVisibleTo Include="Unified.Data.Tables.Sqlite" />
     <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
   </ItemGroup>
 

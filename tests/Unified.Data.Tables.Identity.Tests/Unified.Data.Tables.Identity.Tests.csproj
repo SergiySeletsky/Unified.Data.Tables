@@ -28,6 +28,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Unified.Data.Tables.Identity\Unified.Data.Tables.Identity.csproj" />
     <ProjectReference Include="..\..\src\Unified.Data.Tables.InMemory\Unified.Data.Tables.InMemory.csproj" />
+    <!-- The same suite runs on the SQLite provider (see SqliteIdentityTests.cs). -->
+    <ProjectReference Include="..\..\src\Unified.Data.Tables.Sqlite\Unified.Data.Tables.Sqlite.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -9,11 +9,14 @@ namespace Unified.Data.Tables.Identity.Tests;
 [Collection("OversizedCellPolicy")]
 public class UserManagerConcurrencyTests
 {
-    private static ServiceProvider BuildProvider()
+    /// <summary>Registers the storage provider under the stores; the SQLite run of these tests overrides it.</summary>
+    protected virtual void AddStorage(IServiceCollection services) => services.AddUnifiedInMemoryStorage();
+
+    private ServiceProvider BuildProvider()
     {
         var services = new ServiceCollection();
         services.AddLogging();
-        services.AddUnifiedInMemoryStorage();
+        AddStorage(services);
         services.AddIdentityCore<IdentityUser>().AddRoles<IdentityRole>().AddUnifiedIdentityStores();
         return services.BuildServiceProvider();
     }

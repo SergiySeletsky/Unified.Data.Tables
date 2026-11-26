@@ -15,7 +15,15 @@ namespace Unified.Data.Tables.Identity.Tests
     {
         private const string ConcurrencyFailureCode = "ConcurrencyFailure";
 
-        private readonly IdentityStoreFixture _fixture = new();
+        private readonly IdentityStoreFixture _fixture;
+
+        public IdentityConcurrencyTests()
+            : this(IdentityBackend.InMemory)
+        {
+        }
+
+        /// <summary>The same tests over another storage provider (see SqliteIdentityTests.cs).</summary>
+        protected IdentityConcurrencyTests(IdentityBackend backend) => _fixture = new IdentityStoreFixture(backend);
 
         private IUserStore<IdentityUser> Users => _fixture.UserStore;
 
@@ -25,6 +33,7 @@ namespace Unified.Data.Tables.Identity.Tests
         {
             _fixture.UserStore.Dispose();
             _fixture.RoleStore.Dispose();
+            _fixture.Dispose();
             GC.SuppressFinalize(this);
         }
 
