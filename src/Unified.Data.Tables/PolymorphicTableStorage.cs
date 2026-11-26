@@ -633,6 +633,12 @@ public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>,
             if (Array.IndexOf(ReservedCells, cell.Key) >= 0)
                 continue;
 
+            // A null system column is not stored (the service drops a null property), so the entry an
+            // insert returns from the row it built leaves it out too, as a later read and the local
+            // providers do.
+            if (cell.Value is null)
+                continue;
+
             columns[cell.Key] = cell.Value;
         }
 

@@ -201,18 +201,41 @@ public sealed class RawRow
 {
     private static readonly IReadOnlyDictionary<string, RawCell> NoCells = new Dictionary<string, RawCell>();
 
+    /// <summary>
+    /// Refuses a cell named <c>PartitionKey</c>, <c>RowKey</c>, <c>Timestamp</c> or <c>odata.etag</c>: the
+    /// keys are the row's own and the store sets the others, so such a cell would route or stamp the row
+    /// differently on each provider. Called at construction and again by each write, because the cells
+    /// dictionary is not copied.
+    /// </summary>
+    internal static void RequireNoReservedCell(IReadOnlyDictionary<string, RawCell> cells, string paramName)
+    {
+        foreach (var name in cells.Keys)
+        {
+            if (name is "PartitionKey" or "RowKey" or "Timestamp" or "odata.etag")
+                throw new ArgumentException(
+                    $"A raw row cannot hold a cell named '{name}': the keys are given as arguments, and the store sets the timestamp and the ETag.",
+                    paramName);
+        }
+    }
+
     /// <summary>Creates a row.</summary>
     /// <param name="partitionKey">The partition key, exactly as stored (no id normalization is applied).</param>
     /// <param name="rowKey">The row key, exactly as stored.</param>
     /// <param name="cells">
     /// The row's columns by name, without the keys, the timestamp and the ETag; null for none. The
-    /// dictionary is not copied.
+    /// dictionary is not copied, so it must not change afterwards; a write checks the cell names again.
     /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="partitionKey"/> or <paramref name="rowKey"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="cells"/> names a column the store sets itself: <c>PartitionKey</c>, <c>RowKey</c>,
+    /// <c>Timestamp</c> or <c>odata.etag</c>.
+    /// </exception>
     public RawRow(string partitionKey, string rowKey, IReadOnlyDictionary<string, RawCell>? cells = null)
     {
         Guard.NotNull(partitionKey, nameof(partitionKey));
         Guard.NotNull(rowKey, nameof(rowKey));
+        if (cells is not null)
+            RequireNoReservedCell(cells, nameof(cells));
         PartitionKey = partitionKey;
         RowKey = rowKey;
         Cells = cells ?? NoCells;

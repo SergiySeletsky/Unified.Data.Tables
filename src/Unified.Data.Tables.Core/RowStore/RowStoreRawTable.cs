@@ -14,7 +14,7 @@ namespace Unified.Data.Tables.Providers;
 internal sealed partial class RowStoreTableStore(IRowStoreAccount account) : ITableStore
 {
     // What the Table service accepts as a table name: a letter, then 2 to 62 letters and digits.
-    [GeneratedRegex("^[A-Za-z][A-Za-z0-9]{2,62}$")]
+    [GeneratedRegex(@"^[A-Za-z][A-Za-z0-9]{2,62}\z")]
     private static partial Regex TableNameRule();
 
     /// <inheritdoc />
@@ -41,8 +41,9 @@ internal sealed partial class RowStoreTableStore(IRowStoreAccount account) : ITa
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
         ct.ThrowIfCancellationRequested();
         // A name the service refuses is refused here, so a table that can be created locally can be
-        // created on Azure. (A typed store's own table is created under whatever name it resolves.)
-        if (!TableNameRule().IsMatch(tableName))
+        // created on Azure. (A typed store's own table is created under whatever name it resolves.) The
+        // service reserves the name "tables", in any case.
+        if (!TableNameRule().IsMatch(tableName) || string.Equals(tableName, "tables", StringComparison.OrdinalIgnoreCase))
             throw ServiceErrors.Neutral(
                 new Azure.RequestFailedException(400, "The specified resource name contains invalid characters.", "InvalidResourceName", null),
                 tableName, id: null);
@@ -86,6 +87,9 @@ internal sealed class RowStoreRawTable(IRowStore rows, string tableName, Func<Ca
     // A version no row has: the condition of a merge that found no row, so a row that appears before the
     // commit is merged again instead of being replaced by the merge's cells alone.
     private const string NoVersion = "\0";
+
+    // How many times in all a transaction whose unconditional merge lost to another writer is computed and committed.
+    private const int MaxMergeAttempts = 1000;
 
     private ValueTask EnsureAsync(CancellationToken ct) => ensureTable?.Invoke(ct) ?? default;
 
@@ -162,7 +166,7 @@ internal sealed class RowStoreRawTable(IRowStore rows, string tableName, Func<Ca
         try
         {
             await EnsureAsync(ct);
-            while (true)
+            for (var attempt = 1; ; attempt++)
             {
                 // A merge is the stored row with the named cells laid over it, written on condition of
                 // the version it was computed from; a row another writer changed meanwhile is merged again.
@@ -174,7 +178,10 @@ internal sealed class RowStoreRawTable(IRowStore rows, string tableName, Func<Ca
                 if (result.Committed)
                     return result.ETags;
                 var failed = operations[result.FailedIndex];
-                if (result.Failure == RowCommitFailure.VersionMismatch && failed is { Kind: RawOperationKind.Merge, IfMatch: null })
+                // Bounded: a merge only loses to a writer that committed meanwhile, so a store that keeps
+                // refusing it is not making progress, and the caller hears of it instead of a spinning call.
+                if (result.Failure == RowCommitFailure.VersionMismatch && failed is { Kind: RawOperationKind.Merge, IfMatch: null }
+                    && attempt < MaxMergeAttempts)
                     continue;
 
                 // Nothing was applied; the failure is the one of the operation the store names.
@@ -242,6 +249,7 @@ internal sealed class RowStoreRawTable(IRowStore rows, string tableName, Func<Ca
             var row = new TableEntity(operation.Row.PartitionKey, operation.Row.RowKey);
             if (operation.Kind != RawOperationKind.Delete)
             {
+                RawRow.RequireNoReservedCell(operation.Row.Cells, nameof(operations));
                 foreach (var cell in operation.Row.Cells)
                     row[cell.Key] = RowCells.Detached(cell.Value.Value);
             }

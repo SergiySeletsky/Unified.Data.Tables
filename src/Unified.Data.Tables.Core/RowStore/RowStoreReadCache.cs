@@ -21,7 +21,9 @@ namespace Unified.Data.Tables.Providers;
 /// </remarks>
 internal sealed class RowStoreReadCache<T> where T : class, IEntity, new()
 {
-    private const string WholeTable = "*";
+    // The key of a cached list: the whole table's and a partition's never collide, whatever the partition
+    // is called (a partition named "*" is a key the service accepts).
+    private static string ListKey(string? partition) => partition is null ? "all" : "p:" + partition;
 
     private readonly CachePolicy policy;
     private readonly TimeProvider clock;
@@ -73,7 +75,7 @@ internal sealed class RowStoreReadCache<T> where T : class, IEntity, new()
     public bool TryGetList(string? partition, out IEnumerable<T> list)
     {
         list = [];
-        if (!Live(lists, partition ?? WholeTable, out var entry))
+        if (!Live(lists, ListKey(partition), out var entry))
             return false;
         list = entry.Value.Select(Clone).ToList();
         return true;
@@ -128,7 +130,7 @@ internal sealed class RowStoreReadCache<T> where T : class, IEntity, new()
         {
             if (generation != mark)
                 return;
-            lists[partition ?? WholeTable] = new Entry<List<T>>(copies, expires);
+            lists[ListKey(partition)] = new Entry<List<T>>(copies, expires);
             foreach (var copy in copies)
                 entities[EntityId.Canonicalize(copy.Id)] = new Entry<T>(copy, expires);
         }
@@ -143,8 +145,8 @@ internal sealed class RowStoreReadCache<T> where T : class, IEntity, new()
         {
             generation++;
             entities.TryRemove(canonicalId, out _);
-            lists.TryRemove(EntityId.Split(canonicalId).PartitionKey, out _);
-            lists.TryRemove(WholeTable, out _);
+            lists.TryRemove(ListKey(EntityId.Split(canonicalId).PartitionKey), out _);
+            lists.TryRemove(ListKey(null), out _);
         }
     }
 

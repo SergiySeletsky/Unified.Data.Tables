@@ -250,7 +250,11 @@ internal sealed class RowStorePolymorphicStorage<TBase> : IPolymorphicStorage<TB
         }
 
         foreach (var column in columns)
+        {
             ValidateSystemColumn(column.Key);
+            if (column.Value is not null)
+                SystemCell(column.Key, column.Value);
+        }
 
         ct.ThrowIfCancellationRequested();
         ServiceErrors.ThrowIfRefusedKey((key.PartitionKey, key.RowKey), tableName);
@@ -268,7 +272,11 @@ internal sealed class RowStorePolymorphicStorage<TBase> : IPolymorphicStorage<TB
             // meanwhile is merged again.
             var merged = CopyOf(existing.Data);
             foreach (var column in columns)
-                merged[column.Key] = column.Value is byte[] bytes ? bytes.Clone() : column.Value;
+            {
+                // A null value is not sent, as the SDK sends none: the stored cell is left as it is.
+                if (column.Value is not null)
+                    merged[column.Key] = SystemCell(column.Key, column.Value);
+            }
             ServiceErrors.ThrowIfRefusedRow(merged, tableName);
 
             if ((await rows.CommitAsync(key.PartitionKey, [RowWrite.Replace(merged, existing.ETag)], ct)).Committed)
@@ -457,7 +465,11 @@ internal sealed class RowStorePolymorphicStorage<TBase> : IPolymorphicStorage<TB
             foreach (var column in write.SystemColumns)
             {
                 ValidateSystemColumn(column.Key);
-                row[column.Key] = column.Value;
+                // A null value is not stored, as the SDK sends no property for it.
+                if (column.Value is null)
+                    row.Remove(column.Key);
+                else
+                    row[column.Key] = SystemCell(column.Key, column.Value);
             }
         }
 
@@ -515,11 +527,32 @@ internal sealed class RowStorePolymorphicStorage<TBase> : IPolymorphicStorage<TB
             if (Array.IndexOf(ReservedCells, cell.Key) >= 0)
                 continue;
 
-            copy[cell.Key] = cell.Value is byte[] bytes ? bytes.Clone() : cell.Value;
+            // A DateTimeOffset is the instant in UTC, as the service stores an Edm.DateTime and returns it.
+            copy[cell.Key] = RowCells.Detached(cell.Value);
         }
 
         return copy;
     }
+
+    /// <summary>
+    /// A system column's value as the Table service stores and returns it: one of the eight cell types
+    /// (a <see cref="DateTime"/> in UTC becomes the <see cref="DateTimeOffset"/> a read returns, a
+    /// <see cref="BinaryData"/> the <c>byte[]</c>, a <see cref="DateTimeOffset"/> its instant in UTC), a copy
+    /// of an array; any other value is refused with <see cref="NotSupportedException"/>, as the SDK refuses
+    /// what it cannot send, so a value that is stored here can be stored on Azure.
+    /// </summary>
+    private static object SystemCell(string name, object value) => value switch
+    {
+        string or bool or int or long or double or Guid => value,
+        byte[] bytes => bytes.Clone(),
+        BinaryData data => data.ToArray(),
+        DateTimeOffset at => at.ToUniversalTime(),
+        DateTime { Kind: DateTimeKind.Utc } at => new DateTimeOffset(at),
+        DateTime => throw new NotSupportedException(
+            $"The system column '{name}' holds a DateTime whose Kind is not Utc; the Azure SDK requires it to be UTC. Pass a DateTimeOffset or a UTC DateTime."),
+        _ => throw new NotSupportedException(
+            $"The system column '{name}' holds a {value.GetType().Name}, which is not one of the types of a table cell (string, byte[], bool, DateTimeOffset, double, Guid, int, long)."),
+    };
 
     // The same check and message as PolymorphicTableStorage<TBase>.ValidateKey: the two stores throw
     // byte-identical messages (PolymorphicMessages).

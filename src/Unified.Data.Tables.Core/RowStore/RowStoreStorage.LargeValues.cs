@@ -47,6 +47,12 @@ internal sealed partial class RowStoreStorage<T> : IBlobOffloadState
     /// </summary>
     internal Action? BeforeLargeCommit { get; set; }
 
+    /// <summary>
+    /// Runs when a delete of a large-value-aware type found no primary row, before it lists the continuation
+    /// rows that may be left of the entity (for tests that let a create in between the read and the listing).
+    /// </summary>
+    internal Action? BeforeLeftoverListing { get; set; }
+
     /// <summary>The large-value rules this store shares with TableStorage (for tests that replace their retry wait).</summary>
     internal LargeValueTable LargeValueRules => large;
 
@@ -538,10 +544,25 @@ internal sealed partial class RowStoreStorage<T> : IBlobOffloadState
             if (stored is null)
             {
                 // No primary row: all that can be left of the entity are continuation rows nothing declares.
-                var leftovers = await ExistingPartKeysAsync(keys, ct);
+                // They go in one commit on condition that there is still no primary (a create that committed
+                // since the read owns the rows listed) and that each is still the version listed (a writer
+                // that took one back since owns it); a refused commit reads the entity again, as it is now.
+                BeforeLeftoverListing?.Invoke();
+                var leftovers = await PartRowsAsync(keys, ct);
                 if (leftovers.Count == 0)
                     return DeleteStatus.NotFound;
-                await rows.CommitAsync(keys.PartitionKey, [.. leftovers.Select(RowWrite.DeleteIfExists)], ct);
+                var removal = await rows.CommitAsync(keys.PartitionKey,
+                [
+                    new RowWrite(RowWriteKind.Delete, keys.RowKey, null, RowCondition.MustNotExist),
+                    .. leftovers.Select(part => RowWrite.Delete(part.RowKey, part.ETag)),
+                ], ct);
+                if (!removal.Committed)
+                {
+                    if (attempt >= MaxLargeWriteAttempts)
+                        throw ServiceErrors.Coded(new ConcurrencyConflictException(typeName, id,
+                            ServiceErrors.InTransaction(ServiceErrors.ConditionNotSatisfied("The entity was modified by another writer."))));
+                    continue;
+                }
                 AfterLargeCommit?.Invoke();
                 return DeleteStatus.NotFound;
             }

@@ -694,7 +694,7 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
     {
         // Match stored (normalized) PartitionKeys — writes normalize the id, so a natural-form partition
         // ("My Vision") would otherwise silently match nothing. Collapse whitespace to null so a
-        // whole-table query caches under the "*" key that writes actually invalidate (not a raw
+        // whole-table query caches under the whole-table ("all") key that writes invalidate (not a raw
         // whitespace key that InvalidateQueryCache would never evict).
         partition = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition);
 
@@ -1720,7 +1720,9 @@ public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T :
         return EntityKey(id);
     }
 
-    private string QueryCacheKey(string? partition) => $"{cacheKeyPrefix}:query:{partition ?? "*"}";
+    // The whole-table list and a partition's list never share a key, whatever the partition is called ("*" included).
+    private string QueryCacheKey(string? partition) =>
+        partition is null ? $"{cacheKeyPrefix}:query:all" : $"{cacheKeyPrefix}:query:p:{partition}";
 
     // A WRITE's put: the entity a create, update or upsert has just committed, under the version the
     // service returned for it. The write notes itself and puts only if no other write or delete of the

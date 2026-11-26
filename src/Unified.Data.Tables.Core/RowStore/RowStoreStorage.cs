@@ -356,6 +356,17 @@ internal sealed partial class RowStoreStorage<T> : IStorage<T>, IOrphanBlobSweep
         ct.ThrowIfCancellationRequested();
         ServiceErrors.ThrowIfRefusedKey(keys, typeName);
 
+        // The declared members flattened to their columns before anything is read, as TableStorage<T>
+        // flattens them before it sends the merge. The typed flatten refuses a [TableValueSplit] member
+        // exactly as TableStorage<T> does (a merged plain cell beside the old split cells would read back
+        // the OLD value), so that refusal is the same whether the row exists or not.
+        var columns = new List<(string Column, object Cell)>();
+        foreach (var (name, value) in builder.Updates)
+        {
+            foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(typeof(T), name, value))
+                columns.Add((col, cell));
+        }
+
         await EnsureTableAsync(ct);
         while (true)
         {
@@ -373,15 +384,8 @@ internal sealed partial class RowStoreStorage<T> : IStorage<T>, IOrphanBlobSweep
 
             // Server-side Merge: only the declared (flattened) columns change; the rest survive.
             var merged = RowCells.Copy(existing.Data);
-            foreach (var (name, value) in builder.Updates)
-            {
-                // The typed flatten refuses a [TableValueSplit] member exactly as TableStorage<T> does: a
-                // merged plain cell beside the old split cells would read back the OLD value.
-                foreach (var (col, cell) in TableEntitySerializer.FlattenProperty(typeof(T), name, value))
-                {
-                    merged[col] = RowCells.Detached(cell);
-                }
-            }
+            foreach (var (col, cell) in columns)
+                merged[col] = RowCells.Detached(cell);
             merged[nameof(Entity.UpdatedAt)] = clock.GetUtcNow();
             ServiceErrors.ThrowIfRefusedRow(merged, typeName);
 
@@ -517,8 +521,74 @@ internal sealed partial class RowStoreStorage<T> : IStorage<T>, IOrphanBlobSweep
 
         _ = TableFilterTranslator.Translate(predicate);
         var canonical = (Expression<Func<T, bool>>)new IdEqualityCanonicalizer(predicate.Parameters[0]).Visit(predicate);
+        var guarded = Expression.Lambda<Func<T, bool>>(AbsentNestedObjects.Guard(canonical.Body), canonical.Parameters);
         var scope = string.IsNullOrWhiteSpace(partition) ? null : NormalizeId(partition); // match stored (normalized) PartitionKeys
-        return (canonical.Compile(), scope);
+        return (guarded.Compile(), scope);
+    }
+
+    /// <summary>
+    /// The service's answer for a condition on a member of a nested object that is null: the filter names
+    /// the flattened column (<c>Inner_Text</c>), the row has no such cell, and a comparison with an absent
+    /// cell does not match. The compiled predicate would dereference the null object instead, so each
+    /// condition (a comparison, a call, a Boolean member: each operand of <c>&amp;&amp;</c>, <c>||</c> and
+    /// <c>!</c>) is evaluated only when every object on its member paths is there, and is false otherwise.
+    /// </summary>
+    private static class AbsentNestedObjects
+    {
+        public static Expression Guard(Expression condition) => condition switch
+        {
+            BinaryExpression { NodeType: ExpressionType.AndAlso or ExpressionType.OrElse } logical =>
+                Expression.MakeBinary(logical.NodeType, Guard(logical.Left), Guard(logical.Right)),
+            UnaryExpression { NodeType: ExpressionType.Not } not when not.Type == typeof(bool) => Expression.Not(Guard(not.Operand)),
+            _ when condition.Type == typeof(bool) => GuardLeaf(condition),
+            _ => condition,
+        };
+
+        private static Expression GuardLeaf(Expression leaf)
+        {
+            var owners = new OwnerCollector();
+            owners.Visit(leaf);
+            if (owners.Found.Count == 0)
+                return leaf;
+            // Outermost first, so that each check runs only once the object it reads from is known to be there.
+            Expression? present = null;
+            foreach (var owner in owners.Found.OrderBy(o => o.Depth))
+            {
+                var check = owner.Expression.Type.IsValueType
+                    ? Expression.NotEqual(owner.Expression, Expression.Constant(null, owner.Expression.Type))
+                    : (Expression)Expression.ReferenceNotEqual(owner.Expression, Expression.Constant(null, owner.Expression.Type));
+                present = present is null ? check : Expression.AndAlso(present, check);
+            }
+            return Expression.AndAlso(present!, leaf);
+        }
+
+        // The objects a member path reads from below the parameter (x.Inner in x.Inner.Text) that can be null.
+        private sealed class OwnerCollector : ExpressionVisitor
+        {
+            private readonly HashSet<string> seen = new(StringComparer.Ordinal);
+
+            public List<(Expression Expression, int Depth)> Found { get; } = [];
+
+            protected override Expression VisitMember(MemberExpression node)
+            {
+                if (node.Expression is MemberExpression owner && RootedAtParameter(owner, out var depth)
+                    && (!owner.Type.IsValueType || Nullable.GetUnderlyingType(owner.Type) is not null)
+                    && seen.Add(owner.ToString()))
+                    Found.Add((owner, depth));
+                return base.VisitMember(node);
+            }
+
+            private static bool RootedAtParameter(Expression expression, out int depth)
+            {
+                depth = 0;
+                while (expression is MemberExpression member)
+                {
+                    depth++;
+                    expression = member.Expression!;
+                }
+                return expression is ParameterExpression;
+            }
+        }
     }
 
     private async Task<IReadOnlyList<T>> FilteredAsync(Func<T, bool> matches, string? scope, int? take, CancellationToken ct)

@@ -318,6 +318,47 @@ internal static class PolymorphicScenarios
                 Check.Equal(4, (read.Item as ConformanceOrderPlaced)?.Quantity, "Quantity after the refused merges");
                 Check.Equal(1, await store.CountAsync(null, c.Ct), "the row count after the refused writes");
             });
+
+        s.Add("SystemColumns.ANullValue_IsNotStored_AndAMergeOfNullKeepsTheCell",
+            "A system column written with a null value is not stored (the row has no such column), and MergeColumnsAsync with a null value leaves the stored cell as it is, as the service ignores a property with no value.",
+            async c =>
+            {
+                var store = await c.EventsAsync();
+                await store.InsertMarkerAsync(Key(c, "m1"), Columns((Attempts, 1), (Published, null!)), c.Ct);
+
+                var read = Check.NotNull(await store.GetAsync(Key(c, "m1"), c.Ct), "the marker");
+                Check.Equal(1, read.Column<int>(Attempts), "a system column written with a value");
+                Check.True(!read.Columns.ContainsKey(Published), "a system column written with a null value is not stored");
+
+                await store.MergeColumnsAsync(Key(c, "m1"), Columns((Attempts, null!)), c.Ct);
+                var merged = Check.NotNull(await store.GetAsync(Key(c, "m1"), c.Ct), "the marker after a merge of a null value");
+                Check.Equal(1, merged.Column<int>(Attempts), "a system column after a merge of a null value");
+                Check.True(!merged.Columns.ContainsKey(Published), "a column no write gave a value");
+            });
+
+        s.Add("SystemColumns.ReadBackAsTheServiceStoresThem",
+            "A system column is read back as the service stores it: a UTC DateTime as the DateTimeOffset of that instant, a DateTimeOffset as its instant in UTC (offset zero); an item's DateTimeOffset member is read back in UTC too.",
+            async c =>
+            {
+                var store = await c.EventsAsync();
+                var instant = new DateTimeOffset(2024, 1, 2, 1, 4, 5, TimeSpan.Zero);
+                await store.InsertMarkerAsync(Key(c, "m1"), Columns(
+                    ("_Utc", (object)instant.UtcDateTime), ("_Offset", (object)instant.ToOffset(TimeSpan.FromHours(2)))), c.Ct);
+                await store.MergeColumnsAsync(Key(c, "m1"), Columns(("_Merged", (object)instant.ToOffset(TimeSpan.FromHours(-5)))), c.Ct);
+
+                var read = Check.NotNull(await store.GetAsync(Key(c, "m1"), c.Ct), "the marker");
+                Check.Equal(instant, read.Column<DateTimeOffset>("_Utc"), "a UTC DateTime system column, read as a DateTimeOffset");
+                Check.Equal(TimeSpan.Zero, read.Column<DateTimeOffset>("_Offset").Offset, "the offset of a DateTimeOffset system column");
+                Check.Equal(instant, read.Column<DateTimeOffset>("_Offset"), "the instant of a DateTimeOffset system column");
+                Check.Equal(TimeSpan.Zero, read.Column<DateTimeOffset>("_Merged").Offset, "the offset of a merged DateTimeOffset system column");
+
+                await store.InsertAsync(Key(c, "s1"), new ConformanceOrderShipped { Subject = "shipped", ShippedAt = instant.ToOffset(TimeSpan.FromHours(2)) }, c.Ct);
+                var shipped = Check.NotNull(await store.GetAsync(Key(c, "s1"), c.Ct), "the shipped row");
+                var item = Check.NotNull(shipped.Item as ConformanceOrderShipped, "the item, as the type written");
+                Check.Equal(TimeSpan.Zero, item.ShippedAt.Offset, "the offset of an item's DateTimeOffset member");
+                Check.Equal(instant, item.ShippedAt, "the instant of an item's DateTimeOffset member");
+                Check.Equal(TimeSpan.Zero, shipped.Column<DateTimeOffset>("ShippedAt").Offset, "the offset of the item's DateTimeOffset column, read through Columns");
+            });
     }
 
     private static void Deletes(ScenarioBuilder s)

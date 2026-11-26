@@ -283,6 +283,39 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     service holds no earlier date, and a stored 1601-01-01 reads back as the default): it is refused with
     `NotSupportedException` on every provider. *Who is hit:* a filter with such a constant, which
     disagreed between the providers before.
+  - **The local providers refuse a key longer than 512 characters** (`TableKeyRules.MaxKeyLength`) with
+    `StorageRequestRejectedException` (400 `InvalidInput`), on every write of the typed, polymorphic and
+    raw stores, as Azurite refuses it. The in-memory store of 0.9.2 stored it.
+  - **A polymorphic system column is stored as the service stores it, on the local providers.** A null
+    value is not stored, and a `MergeColumnsAsync` with a null value leaves the stored cell as it is (the
+    service ignores a property with no value; 0.9.2's fake stored the null and the merge erased the
+    cell). A UTC `DateTime` reads back as a `DateTimeOffset`, a `BinaryData` as a `byte[]`, and any
+    `DateTimeOffset`, of a system column or of the item, as its instant in UTC (offset zero). A value
+    that is not a table cell (a non-UTC `DateTime`, `decimal`, `float`, `ulong`, `TimeSpan`, an enum, an
+    array, an object) is refused with `NotSupportedException` before anything is written. The README
+    (SQLite provider, known differences) lists the conversions the Azure provider makes instead. On
+    Azure, the entry `InsertAsync` returns no longer lists a null system column either, as a read does.
+  - **Positive and negative infinity are refused on the local providers** with `ArgumentException`, in
+    a typed entity, a polymorphic system column and a raw cell, as the Azure SDK fails to write them.
+    NaN is stored as before.
+  - **`RawRow` refuses a cell named `PartitionKey`, `RowKey`, `Timestamp` or `odata.etag`** with
+    `ArgumentException` (every provider; the raw API is new and experimental), when it is made and again
+    when it is written, since the cells dictionary is not copied. Such a cell routed the
+    row differently on each provider and made a local raw merge retry forever; an unconditional raw
+    merge that keeps losing to other writers now fails with `ConcurrencyConflictException` after 1,000
+    attempts.
+  - **`ITableStore.CreateTableAsync` on the local providers refuses `tables`** (in any case), the name
+    the service reserves, **and a name with a trailing line feed**, which the name rule let through;
+    both are `StorageRequestRejectedException` (400 `InvalidResourceName`).
+  - **A `QueryOptions.Select` entry is read as the service reads the `$select` the Azure provider sends**,
+    on the local providers: white space around a name is dropped, and an entry holding commas names each
+    part (`"Name "` and `"Name,N"` projected nothing locally).
+  - **A LINQ filter on a member of a nested object** (`x.Inner.Text == "a"`) **no longer throws
+    `NullReferenceException` on the local providers** when a row's nested object is null: that row does
+    not match, as the service does not match a row without the flattened cell.
+  - **A partial update (`UpdateAsync(id, builder)`) that names a large value** throws
+    `NotSupportedException` on the local providers whether or not the row exists, as on Azure; a missing
+    row was `EntityNotFoundException` there.
 - **Not broken, with one caveat.** `IStorage<T>` and `IPolymorphicStorage<TBase>` have exactly the
   members of 0.9.2: a hand-written implementer, a decorator or a mock compiled against 0.9.2 loads and
   runs on 0.10.0 (checked by a probe before the release, see Tests and CI). **The caveat: such an
@@ -393,7 +426,7 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   of this process's own: see the README, SQLite provider). It does
   not emulate throttling, latency, SDK retries, short pages or credentials, and network shares are
   unsupported.
-- **`Unified.Data.Tables.Conformance`** (new package, no test framework): 161 named scenarios in five
+- **`Unified.Data.Tables.Conformance`** (new package, no test framework): 164 named scenarios in five
   tiers (logical, failures, capabilities, polymorphic, large values) that hold any `IStorage<T>` or
   `IPolymorphicStorage<TBase>` to the contract the providers keep. Outcomes are `Passed`, `Failed`,
   `NotSupported` and `Lenient`; a fake that is not there yet declares named leniencies and is reported
@@ -459,6 +492,17 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
 - **A projected scan of a plain type returned another type's continuation rows** (B6).
 - **A decorator over a sweeping store was not swept**: the orphan sweep now asks the capability probe.
 - **`"*"` as the ETag of a whole-entity update meant different things on Azure and on the fake** (B5).
+- **A delete on the local providers could destroy an entity created at the same moment.** A delete of a
+  large-value-aware type that found no row removed the continuation rows that named the id without
+  checking that no row had appeared since: a create that committed in between kept its primary row,
+  lost its continuation rows, and every read of it then failed its integrity check. The leftovers now
+  go only while there is still no primary and each is the version listed; otherwise the delete reads the
+  entity again. (`DeleteAsync`, `DeleteIfExistsAsync`, `DeleteIfMatchAsync` and the one-by-one path of
+  `DeletePartitionAsync`. The in-memory store of 0.9.2 did this under one lock; the Azure provider was
+  not affected.)
+- **A partition named `*` shared its cache entry with the whole table** (the Azure provider since before
+  0.9.2, and the new engine's read cache): after one of `QueryAsync("*")` and `QueryAsync()`, the other
+  returned the first one's list. The two are cached apart.
 
 ### Tests and CI
 

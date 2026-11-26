@@ -84,12 +84,18 @@ internal static class ServiceErrors
     }
 
     /// <summary>
-    /// 400 <c>InvalidInput</c> when <paramref name="partitionKey"/> or <paramref name="rowKey"/> holds a
-    /// character the service refuses in a key: <c>/</c>, <c>\</c>, <c>#</c>, <c>?</c>, or a control character
-    /// (U+0000 to U+001F, U+007F to U+009F); null when both keys are accepted.
+    /// 400 <c>InvalidInput</c> when <paramref name="partitionKey"/> or <paramref name="rowKey"/> is longer
+    /// than <see cref="TableKeyRules.MaxKeyLength"/> characters or holds a character the service refuses in a
+    /// key: <c>/</c>, <c>\</c>, <c>#</c>, <c>?</c>, or a control character (U+0000 to U+001F, U+007F to
+    /// U+009F); null when both keys are accepted. These are the rules of <see cref="TableKeyRules"/>.
     /// </summary>
     internal static RequestFailedException? RefusedKey(string partitionKey, string rowKey)
     {
+        var tooLong = partitionKey.Length > TableKeyRules.MaxKeyLength ? "PartitionKey" : rowKey.Length > TableKeyRules.MaxKeyLength ? "RowKey" : null;
+        if (tooLong is not null)
+            return new RequestFailedException(400,
+                $"The '{tooLong}' is longer than the {TableKeyRules.MaxKeyLength.ToString(CultureInfo.InvariantCulture)} characters (1 KiB of UTF-16) a key holds.",
+                "InvalidInput", null);
         var refused = HasRefusedCharacter(partitionKey) ? "PartitionKey" : HasRefusedCharacter(rowKey) ? "RowKey" : null;
         return refused is null
             ? null
@@ -144,8 +150,24 @@ internal static class ServiceErrors
             ? new RequestFailedException(400, "The entity is larger than the maximum allowed size (1MB).", "EntityTooLarge", null)
             : null;
 
-    /// <summary>What the service refuses about a row's content: <see cref="OversizedProperty"/>, then <see cref="OversizedRow"/>, then <see cref="TooManyProperties"/>; null when it accepts the row.</summary>
-    internal static RequestFailedException? RefusedRow(TableEntity row) => OversizedProperty(row) ?? OversizedRow(row) ?? TooManyProperties(row);
+    /// <summary>
+    /// What the service refuses about a row's content: <see cref="OversizedProperty"/>, then
+    /// <see cref="OversizedRow"/>, then <see cref="TooManyProperties"/>; null when it accepts the row. A row that cannot be written at all is
+    /// refused here with the exception the Azure provider meets before it sends anything: a
+    /// <see cref="double"/> cell that is positive or negative infinity throws <see cref="ArgumentException"/>,
+    /// as the SDK's JSON writer does (the service's payload has no form for it).
+    /// </summary>
+    internal static RequestFailedException? RefusedRow(TableEntity row)
+    {
+        foreach (var cell in row)
+        {
+            if (cell.Value is double value && double.IsInfinity(value))
+                throw new ArgumentException(
+                    $"The column '{cell.Key}' holds {(value > 0 ? "positive" : "negative")} infinity, which cannot be written to a table: .NET number values such as positive and negative infinity cannot be written as valid JSON.",
+                    nameof(row));
+        }
+        return OversizedProperty(row) ?? OversizedRow(row) ?? TooManyProperties(row);
+    }
 
     /// <summary>
     /// 400 <c>TooManyProperties</c> when <paramref name="row"/> has more than

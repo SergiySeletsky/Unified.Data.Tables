@@ -54,7 +54,7 @@ internal sealed partial class SqliteDatabase : IRowStoreAccount, IDisposable
     internal const int SqliteError = 1;
 
     // What the Table service accepts as a table name: a letter, then 2 to 62 letters and digits.
-    [GeneratedRegex("^[A-Za-z][A-Za-z0-9]{2,62}$")]
+    [GeneratedRegex(@"^[A-Za-z][A-Za-z0-9]{2,62}\z")]
     private static partial Regex TableNameRule();
 
     private readonly string connectionString;

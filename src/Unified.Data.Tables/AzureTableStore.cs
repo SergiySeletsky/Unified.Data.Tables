@@ -268,6 +268,7 @@ internal sealed class AzureRawTable(TableClient client, string tableName, Func<C
             var row = new TableEntity(operation.Row.PartitionKey, operation.Row.RowKey);
             if (operation.Kind != RawOperationKind.Delete)
             {
+                RawRow.RequireNoReservedCell(operation.Row.Cells, nameof(operations));
                 foreach (var cell in operation.Row.Cells)
                     row[cell.Key] = cell.Value.Value;
             }

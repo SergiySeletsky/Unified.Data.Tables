@@ -71,7 +71,7 @@ copy-pasted into each one.
 - **SQLite provider** — `Unified.Data.Tables.Sqlite` is the same engine over one database file: durable,
   multi-process on one machine, and bound by the Table service's limits, so a table that works locally
   works on Azure.
-- **Conformance kit** — `Unified.Data.Tables.Conformance` runs 161 named scenarios against any
+- **Conformance kit** — `Unified.Data.Tables.Conformance` runs 164 named scenarios against any
   `IStorage<T>` (a provider, a decorator, your own fake) from any test framework, with an xUnit v3
   adapter.
 - **ASP.NET Core Identity stores** — `Unified.Data.Tables.Identity` implements Identity's
@@ -768,7 +768,7 @@ The limits are **what the library plans and refuses by**, not a measurement of t
 may accept more, and so may the service. `MaxRowBytes` is 1,000,000 bytes by the library's estimate, a
 margin below the service's 1 MiB: the providers plan split rows within it and the local providers refuse
 a row above it, but the Azure provider sends a plain row as it is, so a row between the two is stored by
-Azure and refused locally.. Every property is nullable or has an "unknown" value, and the record is sealed with
+Azure and refused locally. Every property is nullable or has an "unknown" value, and the record is sealed with
 `init` properties, so a field added later breaks no implementer; a mock or a third-party store simply
 returns `StorageInfo.Unknown`.
 
@@ -2274,11 +2274,48 @@ Two limits and one cache behaviour differ from Azure on the local providers (SQL
   provider: make the partial update conditional (`WithETag` with the version you read), use the ETag
   string the builder update returns, or retry on the conflict (`MutateAsync` reads again).
 
+### Known differences from Azure (SQLite and in-memory)
+
+The local providers (the SQLite provider and `Unified.Data.Tables.InMemory`, one engine) refuse what the
+service refuses wherever that can be checked before a write. These differences remain, each measured
+against Azurite; keep away from them in code that must behave the same on every provider.
+
+- **Key length.** A key longer than `TableKeyRules.MaxKeyLength` (512 characters) is refused with
+  `StorageRequestRejectedException`. Azurite refuses 513; the service documents 1 KiB without naming the
+  encoding, so it may accept up to 1,024 characters there.
+- **Unpaired UTF-16 surrogates** are kept as written, in keys, string values and query bounds. The
+  Azure path replaces each with U+FFFD, so two keys that differ only in an unpaired surrogate are two
+  rows locally and one row on Azure, and a `RowKeyPrefix` ending in half a surrogate pair matches locally
+  and not on Azure. (A large-value-aware type refuses such a key on every provider.) Keep keys and
+  text well-formed.
+- **ETags are compared, not parsed.** An ETag the store did not issue is a
+  `ConcurrencyConflictException` locally (`NotFound` for a conditional delete of a missing row); the
+  service validates the `If-Match` header first and answers `StorageRequestRejectedException`, and an
+  ETag with non-ASCII characters fails on Azure inside the HTTP client, as a
+  `TransientStorageException` with `MayHaveCommitted == true` although nothing was sent. Local ETags
+  (`W/"<counter>"`) are small numbers, so a guessed one can match. An ETag belongs to the store that
+  issued it and does not move with the data.
+- **Non-finite numbers in a filter.** A write of positive or negative infinity throws
+  `ArgumentException` on every provider (the SDK cannot write it), and NaN is stored on all of them; but
+  a LINQ filter with a NaN or infinite constant (`x.D != double.NaN`, `x.D < double.PositiveInfinity`) is
+  evaluated with .NET semantics locally and matches nothing on Azure.
+- **Polymorphic system column values.** Locally a system column holds one of the eight cell types; a UTC
+  `DateTime` is stored as the `DateTimeOffset` a read returns, a `BinaryData` as a `byte[]`, and any
+  other value (a local or unspecified `DateTime`, `decimal`, `float`, `ulong`, `TimeSpan`, an enum, an
+  array) is refused with `NotSupportedException`. The Azure provider converts some of those instead
+  (`decimal` and `float` to a double, `ulong` to a long, `TimeSpan` to an ISO 8601 string) and reads them
+  back as the converted type.
+- **Which failure is reported first** when a write fails for two reasons: a cell above 64 KiB in a
+  create of a stored key, or in an update or merge of a missing row or of another version, is reported
+  locally as the row's failure (`DuplicateKeyException`, `EntityNotFoundException`,
+  `ConcurrencyConflictException`); Azurite reports the cell (`StorageRequestRejectedException`, 400
+  `PropertyValueTooLarge`). Neither stores anything.
+
 ## Conformance kit
 
-`Unified.Data.Tables.Conformance` is the contract of a store as 161 named scenarios in five tiers:
-**logical** (74: what is read back, counted, ordered, paged), **failures** (15), **capabilities** (27:
-the side interfaces and RowKey ranges), **polymorphic** (22) and **large values** (23). It references the
+`Unified.Data.Tables.Conformance` is the contract of a store as 164 named scenarios in five tiers:
+**logical** (74: what is read back, counted, ordered, paged), **failures** (16), **capabilities** (27:
+the side interfaces and RowKey ranges), **polymorphic** (24) and **large values** (23). It references the
 abstractions only and no test framework. Run it against a provider, a decorator, or the fake a codebase
 wrote for itself; this repository runs it against the in-memory provider, SQLite and Azurite.
 

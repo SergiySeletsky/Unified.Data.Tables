@@ -22,9 +22,19 @@ public static class ProjectedRows
     /// <typeparam name="T">The entity type.</typeparam>
     /// <param name="options">The query options; null reads whole rows.</param>
     /// <returns>The selected columns, or null for whole rows.</returns>
+    /// <remarks>
+    /// The names are those the service projects for the <c>$select</c> <c>TableStorage&lt;T&gt;</c> sends,
+    /// which joins the entries with commas: an entry that holds a comma names each of its parts, and
+    /// the white space around a name is not part of it.
+    /// </remarks>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public static IReadOnlyList<string>? SelectedColumns<T>(QueryOptions? options) where T : class, IEntity, new() =>
-        BuildSelect<T>(options)?.ToList();
+        BuildSelect<T>(options)?
+            .SelectMany(entry => entry.Split(','))
+            .Select(name => name.Trim())
+            .Where(name => name.Length > 0)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
 
     /// <summary>The columns a projected query of <typeparamref name="T"/> selects, or null for every column (<see cref="ProjectionColumns{T}.Build"/>).</summary>
     internal static IEnumerable<string>? BuildSelect<T>(QueryOptions? options) => ProjectionColumns<T>.Build(options);

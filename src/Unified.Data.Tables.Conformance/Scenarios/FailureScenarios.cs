@@ -165,6 +165,26 @@ internal static class FailureScenarios
                 Check.Equal(0, await store.CountAsync(null, c.Ct), "the row count after the refused writes");
             });
 
+        s.Add("Rejected.KeyLongerThanTheServiceHolds_IsAStorageRequestRejectedException",
+            "A write whose partition key or row key is longer than 1 KiB (here 1,025 characters) throws StorageRequestRejectedException and stores nothing, so a key that works locally works on Azure.",
+            [KeyRulesNotEnforced, FailureTypesDiffer],
+            async c =>
+            {
+                var store = await c.ItemsAsync();
+                var longKey = new string('k', 1_025);
+                await Check.NeutralAsync<StorageRequestRejectedException>(
+                    () => store.CreateAsync(Rows.Item(c.Id(longKey)), c.Ct), "a create whose row key is 1,025 characters long");
+                await Check.NeutralAsync<StorageRequestRejectedException>(
+                    () => store.UpsertAsync(Rows.Item(c.Id(longKey)), c.Ct), "an upsert whose row key is 1,025 characters long");
+                await Check.NeutralAsync<StorageRequestRejectedException>(
+                    () => store.CreateAsync(Rows.Item(c.Pk + longKey + "|r"), c.Ct), "a create whose partition key is longer than 1,025 characters");
+                Check.Equal(0, await store.CountAsync(null, c.Ct), "the row count after the refused writes");
+
+                var longest = new string('k', TableKeyRules.MaxKeyLength);
+                await store.CreateAsync(Rows.Item(c.Id(longest)), c.Ct);
+                Check.True(await store.ExistsAsync(c.Id(longest), c.Ct), $"a row whose row key is {TableKeyRules.MaxKeyLength} characters long is stored");
+            });
+
         s.Add("Rejected.BatchThatNamesARowTwice",
             "A plain create batch that names a row twice throws DuplicateKeyException, a plain upsert batch that does throws StorageRequestRejectedException, and neither stores a row of that transaction.",
             [BatchTransactionsDiffer, FailureTypesDiffer],
