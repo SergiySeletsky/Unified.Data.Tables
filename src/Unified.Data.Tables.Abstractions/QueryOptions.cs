@@ -88,16 +88,6 @@ public sealed record QueryOptions
                 "options");
     }
 
-    // Until a provider implements the range (0.10.0 work in progress), it refuses a bounded query instead
-    // of returning the whole partition for it. Removed with the last provider's implementation.
-    internal void ThrowIfRowKeyRangeNotImplemented(string provider)
-    {
-        ValidateRowKeyRange();
-        if (HasRowKeyRange)
-            throw new NotSupportedException(
-                $"{provider} does not implement QueryOptions.FromRowKey/ToRowKey yet; the query was not run.");
-    }
-
     /// <summary>
     /// Stop after this many entities. Bounds data transfer (page-size hinted), but note Azure
     /// Tables has no server-side "top N of the whole set" — results are always in lexical

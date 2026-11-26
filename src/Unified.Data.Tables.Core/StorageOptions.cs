@@ -25,7 +25,8 @@ public class StorageOptions
     /// a value an entity's property initializer assigns when the entity is constructed (the
     /// <see cref="Entity"/> base class initializes <c>CreatedAt</c> and <c>UpdatedAt</c> from the system
     /// clock), and the <c>CreatedAt</c> an upsert keeps because the entity already carries one. Read cache
-    /// expiry is timed by the <c>IMemoryCache</c> the host registers, which has a clock of its own.
+    /// expiry of the Azure provider is timed by the <c>IMemoryCache</c> the host registers, which has a
+    /// clock of its own. The in-memory stores stamp with this clock as the Azure provider does.
     /// </remarks>
     /// <exception cref="ArgumentNullException">The value is null.</exception>
     public TimeProvider TimeProvider
@@ -42,6 +43,11 @@ public class StorageOptions
     /// Default cache policy for all entity types. Defaults to <c>CachePolicy.Sliding(1h)</c> —
     /// the historical 0.2.x behaviour.
     /// </summary>
+    /// <remarks>
+    /// Read by the providers that have a read cache: the Azure provider, and a local provider that shares
+    /// its rows with other writers. The in-memory stores have none (every row of an in-memory table is
+    /// written through its one store) and ignore this.
+    /// </remarks>
     public CachePolicy Cache { get; set; } = CachePolicy.Sliding(TimeSpan.FromHours(1));
 
     /// <summary>

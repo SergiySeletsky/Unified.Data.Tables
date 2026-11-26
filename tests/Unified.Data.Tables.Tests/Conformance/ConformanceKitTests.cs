@@ -78,16 +78,17 @@ public class ConformanceKitTests
     // ── which scenarios each store passes ─────────────────────────────────
 
     [Fact]
-    public async Task TheInMemoryProvider_PassesEveryScenario_ButTheCapabilitiesItDoesNotHaveYet()
+    public async Task TheInMemoryProvider_PassesEveryScenario_TheCapabilitiesIncluded()
     {
         var results = await ConformanceSuite.RunAllAsync(new InMemoryConformanceFactory(), Ct);
 
         Assert.True(ConformanceSuite.DescribeFailures(results) is null, ConformanceSuite.DescribeFailures(results));
         Assert.Equal(ConformanceSuite.All.Count, results.Count);
-        // No side interface is implemented yet (the in-memory package of 0.10.0 adds them all).
-        Assert.Equal(CapabilityScenarios.Except(RunWithoutTheCapability).Order(StringComparer.Ordinal), Names(results, ConformanceOutcome.NotSupported));
-        // No declared difference is left: the wildcard ETag on an update is refused (B5).
-        Assert.Empty(Names(results, ConformanceOutcome.Lenient));
+        // Passed, not "not supported" and not lenient: the in-memory provider is the row-store engine,
+        // which exposes every capability the Azure provider has through the probe (conditional delete,
+        // atomic batch and insert, storage info, the raw table and the table store) and answers a query
+        // with RowKey bounds, so every scenario of the kit runs and passes.
+        Assert.True(results.All(r => r.Outcome == ConformanceOutcome.Passed), Describe(results));
         Assert.Empty(ConformanceSuite.UnneededLeniencies(new InMemoryConformanceFactory(), results));
     }
 

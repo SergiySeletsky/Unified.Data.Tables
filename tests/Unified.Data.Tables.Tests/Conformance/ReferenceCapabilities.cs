@@ -13,7 +13,7 @@ namespace Unified.Data.Tables.Tests.ConformanceKit;
 /// <summary>
 /// A small reference implementation of every 0.10.0 capability, over the current
 /// <see cref="InMemoryStorage{T}"/>: conditional delete, atomic batch, storage info, RowKey range bounds,
-/// the raw table and the table store. No provider implements them yet (the Azure, in-memory and SQLite
+/// the raw table and the table store. It was written before any provider implemented them (the Azure, in-memory and SQLite
 /// packages of 0.10.0 do), so this is what proves the capability tier of the kit can be passed, and that
 /// each of its scenarios fails for the mistake it is about (see <c>ReferenceConformanceTests</c>).
 /// </summary>

@@ -111,15 +111,22 @@ public class ConformanceDecoratorTests
     [Fact]
     public void AnInterceptingDecorator_NeverClaimsACapabilityTheWrappedStoreLacks()
     {
-        IStorage<ConformanceItem> counted = new CountingStorage<ConformanceItem>(new InMemoryStorage<ConformanceItem>());
+        // A store as one was written against 0.9.2 implements no side interface. (InMemoryStorage did not
+        // either, until it became the row-store engine of 0.10.0; it stood here before.)
+        IStorage<ConformanceItem> counted = new CountingStorage<ConformanceItem>(new Capabilities.UneditedImplementer<ConformanceItem>());
 
-        // InMemoryStorage implements neither side interface yet.
         Assert.False(counted.TryGetCapability<ConformanceItem, IConditionalDelete<ConformanceItem>>(out var delete));
         Assert.Null(delete);
         Assert.False(counted.TryGetCapability<ConformanceItem, IAtomicBatch<ConformanceItem>>(out _));
+        Assert.False(counted.TryGetCapability<ConformanceItem, IOrphanBlobSweeper>(out _));
         Assert.Throws<NotSupportedException>(() => { _ = counted.DeleteIfExistsAsync("p|a", Ct); });
-        // The one it has is passed on.
-        Assert.True(counted.TryGetCapability<ConformanceItem, IOrphanBlobSweeper>(out _));
+
+        // The ones a wrapped store has are passed on: every one of them, for the in-memory store.
+        IStorage<ConformanceItem> overMemory = new CountingStorage<ConformanceItem>(new InMemoryStorage<ConformanceItem>());
+        Assert.True(overMemory.TryGetCapability<ConformanceItem, IOrphanBlobSweeper>(out _));
+        Assert.True(overMemory.TryGetCapability<ConformanceItem, IConditionalDelete<ConformanceItem>>(out _));
+        Assert.True(overMemory.TryGetCapability<ConformanceItem, IAtomicBatch<ConformanceItem>>(out _));
+        Assert.True(overMemory.TryGetCapability<ConformanceItem, IStorageInfo>(out _));
     }
 
     // ── FaultInjectingStorage ─────────────────────────────────────────────

@@ -30,11 +30,14 @@
   </ItemGroup>
 
   <!-- The Azure provider is built on this assembly's internals (the split codec and row layout, the value
-       offload coordinator, the serializer's metadata) and the in-memory one on its hidden provider SPI
-       (Unified.Data.Tables.Providers), which is why each of them pins this package to exactly its own
-       version. The test project exercises the same internals directly. -->
+       offload coordinator, the serializer's metadata), and the local providers (in-memory, SQLite) on its
+       row-store engine (RowStore/: a provider implements IRowStore and nothing else), which is why each of
+       them pins this package to exactly its own version. The test project exercises the same internals
+       directly. -->
   <ItemGroup>
     <InternalsVisibleTo Include="Unified.Data.Tables" />
+    <InternalsVisibleTo Include="Unified.Data.Tables.InMemory" />
+    <InternalsVisibleTo Include="Unified.Data.Tables.Sqlite" />
     <InternalsVisibleTo Include="Unified.Data.Tables.Tests" />
   </ItemGroup>
 

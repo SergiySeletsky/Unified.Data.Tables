@@ -16,7 +16,7 @@ internal sealed class InMemoryConformanceFactory : IConformanceStoreFactory
 {
     public string Name => "InMemory";
 
-    // What the in-memory provider does not do yet: nothing the kit has a leniency for. (The wildcard
+    // What the in-memory provider does differently: nothing the kit has a leniency for. (The wildcard
     // ETag on a whole-entity update, B5 of the 0.10.0 plan, is refused since the Azure provider refuses it.)
     public IReadOnlyCollection<string> Leniencies { get; } = [];
 

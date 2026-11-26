@@ -172,9 +172,9 @@ public class QueryRangeDeclarationTests
         Assert.Throws<ArgumentException>(() => PageCursor.Decode(unbounded, issuedFor));
     }
 
-    // ── the providers, until each implements the range ────────────────────
+    // ── the providers ─────────────────────────────────────────────────────
 
-    // A lower bound, an upper bound, both: each alone must be refused.
+    // A lower bound, an upper bound, both (capped by Take): each alone selects its rows.
     private static readonly QueryOptions[] BoundedQueries =
     [
         new() { Partition = "p", FromRowKey = "b" },
@@ -182,37 +182,61 @@ public class QueryRangeDeclarationTests
         new() { Partition = "p", FromRowKey = "a", ToRowKey = "c", Take = 1 },
     ];
 
+    // What each of them selects from the row keys a, b, c: [b, end), [start, b), the first of [a, c).
+    private static readonly string[][] BoundedIds = [["p|b", "p|c"], ["p|a"], ["p|a"]];
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
-    public async Task InMemory_RefusesABoundedQuery_RatherThanReturnTheWholePartition(int query)
+    public async Task InMemory_AnswersABoundedQuery_WithTheRowKeysBetweenTheBounds(int query)
     {
+        // Until the in-memory provider implemented the range it refused these with NotSupportedException
+        // rather than return the whole partition; now each of the three query members honours the bounds.
         var options = BoundedQueries[query];
         var storage = new InMemoryStorage<TestEntity>();
-        await storage.CreateBatchAsync([new() { Id = "p|a" }, new() { Id = "p|b" }, new() { Id = "p|c" }], Ct);
+        await storage.CreateBatchAsync([new() { Id = "p|a" }, new() { Id = "p|b" }, new() { Id = "p|c" }, new() { Id = "q|b" }], Ct);
 
-        await Assert.ThrowsAsync<NotSupportedException>(() => storage.QueryAsync(options, Ct));
-        await Assert.ThrowsAsync<NotSupportedException>(async () => { await foreach (var _ in storage.QueryStreamAsync(options, Ct)) { } });
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => storage.QueryPageAsync(options, Ct));
-        Assert.Contains("FromRowKey/ToRowKey", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(BoundedIds[query], (await storage.QueryAsync(options, Ct)).Select(e => e.Id));
+        var streamed = new List<string>();
+        await foreach (var entity in storage.QueryStreamAsync(options, Ct))
+            streamed.Add(entity.Id);
+        Assert.Equal(BoundedIds[query], streamed);
+        var page = await storage.QueryPageAsync(options, Ct);
+        Assert.Equal(BoundedIds[query], page.Items.Select(e => e.Id));
+        // Take is the page size: the third query has a second page, the unbounded ones do not.
+        Assert.Equal(query == 2, page.ContinuationToken is not null);
     }
 
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
-    public async Task InMemory_LargeValueType_RefusesABoundedQueryToo(int query)
+    public async Task InMemory_LargeValueType_AnswersABoundedQueryToo(int query)
     {
         var options = BoundedQueries[query];
         var storage = new InMemoryStorage<SplitTextEntity>();
-        await storage.CreateAsync(new SplitTextEntity { Id = "p|a", Body = "x" }, Ct);
+        // The middle entity is stored over continuation rows ("b~..."), which a range must not return.
+        await storage.CreateAsync(new SplitTextEntity { Id = "p|a", Body = "x", Title = "A" }, Ct);
+        await storage.CreateAsync(new SplitTextEntity { Id = "p|b", Body = new string((char)0x263A, 600_000), Title = "B" }, Ct);
+        await storage.CreateAsync(new SplitTextEntity { Id = "p|c", Body = "z", Title = "C" }, Ct);
+        Assert.True(storage.PhysicalRowCount > 3);
 
-        await Assert.ThrowsAsync<NotSupportedException>(() => storage.QueryAsync(options, Ct));
-        await Assert.ThrowsAsync<NotSupportedException>(async () => { await foreach (var _ in storage.QueryStreamAsync(options, Ct)) { } });
-        await Assert.ThrowsAsync<NotSupportedException>(() => storage.QueryPageAsync(options, Ct));
-        // A projection takes another path through the store; it is refused as well.
-        await Assert.ThrowsAsync<NotSupportedException>(() => storage.QueryAsync(options with { Select = ["Title"] }, Ct));
+        var all = await storage.QueryAsync(options, Ct);
+        Assert.Equal(BoundedIds[query], all.Select(e => e.Id));
+        Assert.All(all, e => Assert.NotNull(e.Body));
+        var streamed = new List<string>();
+        await foreach (var entity in storage.QueryStreamAsync(options, Ct))
+            streamed.Add(entity.Id);
+        Assert.Equal(BoundedIds[query], streamed);
+        // A page is cut over the stored rows: the continuation rows of "b" take places in it and are skipped.
+        var page = await storage.QueryPageAsync(options, Ct);
+        Assert.Equal(BoundedIds[query], page.Items.Select(e => e.Id));
+        Assert.Equal(query == 2, page.ContinuationToken is not null);
+        // A projection takes another path through the store; it honours the bounds as well.
+        var projected = await storage.QueryAsync(options with { Select = ["Title"] }, Ct);
+        Assert.Equal(BoundedIds[query], projected.Select(e => e.Id));
+        Assert.All(projected, e => Assert.Null(e.Body));
     }
 
     [Theory]

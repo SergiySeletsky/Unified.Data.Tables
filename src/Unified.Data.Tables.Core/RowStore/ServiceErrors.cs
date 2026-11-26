@@ -2,10 +2,10 @@ using System.Globalization;
 using Azure;
 using Azure.Data.Tables;
 
-namespace Unified.Data.Tables.InMemory;
+namespace Unified.Data.Tables.Providers;
 
 /// <summary>
-/// The failures the Table service reports, as the in-memory stores raise them: the same status and
+/// The failures the Table service reports, as the stores over a row store (the in-memory ones) raise them: the same status and
 /// <see cref="RequestFailedException.ErrorCode"/> the SDK surfaces through <c>TableStorage&lt;T&gt;</c>, and a
 /// failure inside an entity-group transaction wrapped in <see cref="TableTransactionFailedException"/> as the
 /// SDK wraps it. None of them leaves a store as it is: like <c>TableStorage&lt;T&gt;</c>, the stores throw the
@@ -134,12 +134,32 @@ internal static class ServiceErrors
         return null;
     }
 
-    /// <summary>Throws <see cref="OversizedProperty"/>, as the neutral exception, for a single-entity write.</summary>
-    internal static void ThrowIfOversizedProperty(TableEntity row, string entityType)
+    /// <summary>
+    /// 400 <c>EntityTooLarge</c> when <paramref name="row"/> is larger than the service stores as one entity
+    /// (1 MB, by the estimate the library plans rows with); null when it fits.
+    /// </summary>
+    internal static RequestFailedException? OversizedRow(TableEntity row) =>
+        TableRowSize.Estimate(row) > TableRequestSize.MaxEntityBytes
+            ? new RequestFailedException(400, "The entity is larger than the maximum allowed size (1MB).", "EntityTooLarge", null)
+            : null;
+
+    /// <summary>What the service refuses about a row's content: <see cref="OversizedProperty"/>, then <see cref="OversizedRow"/>; null when it accepts the row.</summary>
+    internal static RequestFailedException? RefusedRow(TableEntity row) => OversizedProperty(row) ?? OversizedRow(row);
+
+    /// <summary>Throws <see cref="RefusedRow"/>, as the neutral exception, for a single-entity write.</summary>
+    internal static void ThrowIfRefusedRow(TableEntity row, string entityType)
     {
-        if (OversizedProperty(row) is { } refused)
+        if (RefusedRow(row) is { } refused)
             throw Neutral(refused, entityType, id: null);
     }
+
+    /// <summary>
+    /// The neutral exception for a table that does not exist, as <c>TableStorage&lt;T&gt;</c> reports the
+    /// service's 404 <c>TableNotFound</c>: never a missing row.
+    /// </summary>
+    internal static TableNotFoundException TableMissing(string tableName, Exception? cause) =>
+        new($"Table '{tableName}' does not exist.", tableName,
+            new RequestFailedException(404, "The table specified does not exist.", "TableNotFound", cause)) { ProviderErrorCode = "TableNotFound" };
 
     private static bool HasRefusedCharacter(string key)
     {
