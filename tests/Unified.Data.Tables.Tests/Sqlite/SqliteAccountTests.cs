@@ -209,10 +209,21 @@ public sealed class SqliteAccountTests : IDisposable
     public async Task ManyWritersAndReadersOfOneProcess_LoseNoUpdate_AndNoReadFails(bool file)
     {
         const int Writers = 8, Readers = 16, Each = 40;
-        var account = database.Open(file ? database.Path : SqliteStorageOptions.InMemoryDataSource, o => o.Cache = CachePolicy.Disabled);
+        // The writer gate is an in-process lock that reports a timeout as a transient database lock. This test
+        // measures lost updates, not how promptly a loaded runner schedules the writer, so it gives the gate
+        // ample headroom: 24 hot tasks plus the other test assemblies can otherwise starve one holder of the
+        // gate for the default 30 s on a 4-vCPU runner.
+        var account = database.Open(file ? database.Path : SqliteStorageOptions.InMemoryDataSource, o =>
+        {
+            o.Cache = CachePolicy.Disabled;
+            o.BusyTimeout = TimeSpan.FromMinutes(2);
+            // The invariant is lost updates, not fsync durability: 320 commits at Full would spend the test
+            // waiting on the CI disk (and is what a host wanting speed would configure too).
+            o.Synchronous = SqliteSynchronousMode.Normal;
+        });
         // Two stores over the account, as two components of a host have: the writers of both take turns.
         SqliteStorage<Tally>[] stores = [new(account), new(account)];
-        await stores[0].CreateAsync(new Tally { Id = "tally|shared" }, Ct);
+        await RetryingWriteAsync(() => stores[0].CreateAsync(new Tally { Id = "tally|shared" }, Ct), Ct);
         using var done = new CancellationTokenSource();
         long reads = 0, conflicts = 0;
 
@@ -226,19 +237,21 @@ public sealed class SqliteAccountTests : IDisposable
                 last = value;
                 Assert.InRange((await stores[i % 2].QueryAsync(new QueryOptions { Partition = "tally" }, Ct)).Count, 1, 1 + Writers);
                 Interlocked.Increment(ref reads);
+                // One tight loop per reader would leave no core for a writer: yield a millisecond per read.
+                await Task.Delay(1, Ct);
             }
         }, Ct)).ToArray();
         var writers = Enumerable.Range(0, Writers).Select(i => Task.Run(async () =>
         {
             var store = stores[i % 2];
-            await store.CreateAsync(new Tally { Id = $"tally|own-{i}" }, Ct);
+            await RetryingWriteAsync(() => store.CreateAsync(new Tally { Id = $"tally|own-{i}" }, Ct), Ct);
             for (var n = 0; n < Each;)
             {
-                var row = (await store.OneAsync("tally|shared", Ct))!;
+                var row = (await RetryingAsync(() => store.OneAsync("tally|shared", Ct), Ct))!;
                 row.Value++;
                 try
                 {
-                    await store.UpdateAsync(row, ConcurrencyMode.Strict, Ct);
+                    await RetryingWriteAsync(() => store.UpdateAsync(row, ConcurrencyMode.Strict, Ct), Ct);
                     n++;
                 }
                 catch (ConcurrencyConflictException)
@@ -257,6 +270,33 @@ public sealed class SqliteAccountTests : IDisposable
         Assert.True(Interlocked.Read(ref reads) > 0);
         TestContext.Current.TestOutputHelper?.WriteLine($"{reads} reads beside {Writers * Each} increments; {conflicts} lost races, each a ConcurrencyConflictException.");
     }
+
+    // A busy lock is transient by contract: retry until the test's own deadline, so a starved runner is not
+    // reported as a lost update. Any other failure propagates at once, and a genuine deadlock still fails.
+    private static async Task<T> RetryingAsync<T>(Func<Task<T>> operation, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
+        while (true)
+        {
+            try
+            {
+                return await operation();
+            }
+            catch (TransientStorageException) when (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10, ct);
+            }
+        }
+    }
+
+    private static async Task RetryingWriteAsync(Func<Task> operation, CancellationToken ct) =>
+        await RetryingAsync(
+            async () =>
+            {
+                await operation();
+                return true;
+            },
+            ct);
 
     // ── Failures ────────────────────────────────────────────────────────────
 
