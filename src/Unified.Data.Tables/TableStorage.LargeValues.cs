@@ -183,8 +183,13 @@ public partial class TableStorage<T> : IBlobOffloadState
             var prior = kind == LargeWriteKind.Create ? null : await ReadPriorAsync(pk, rk, ct);
             if (kind == LargeWriteKind.Replace)
             {
+                // Found missing by this call's own read, so no request was refused. The 404 the service
+                // answers an update of a missing row with is attached all the same, as a type without
+                // large values carries it (and as 0.9.x threw it here): a handler reads the status and
+                // the code from the same place on every path.
                 if (prior is null)
-                    throw AzureStorageErrors.NotFound(typeName, entity.Id, inner: null);
+                    throw AzureStorageErrors.NotFound(typeName, entity.Id,
+                        new RequestFailedException(404, $"The specified resource does not exist. Id: {entity.Id}", "ResourceNotFound", null));
                 // Found by this call's own read, before it sent a write: no provider exception. Only
                 // after an attempt that failed on a continuation row can the version be this call's own,
                 // and then only when a request of it was sent twice (or its attempts were not observed).

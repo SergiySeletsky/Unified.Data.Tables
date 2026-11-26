@@ -13,6 +13,8 @@ public sealed class AzuriteIdentityClaimStoreTests() : IdentityClaimStoreTests(I
 
 public sealed class AzuriteIdentityConcurrencyTests() : IdentityConcurrencyTests(IdentityBackend.Azurite);
 
+public sealed class AzuriteIdentitySecondHostTests() : IdentitySecondHostTests(IdentityBackend.Azurite);
+
 public sealed class AzuriteIdentityLoginAndTokenStoreTests() : IdentityLoginAndTokenStoreTests(IdentityBackend.Azurite);
 
 public sealed class AzuriteIdentityRoleStoreTests() : IdentityRoleStoreTests(IdentityBackend.Azurite);

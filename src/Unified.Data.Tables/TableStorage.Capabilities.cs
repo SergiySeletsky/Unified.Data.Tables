@@ -182,9 +182,12 @@ public partial class TableStorage<T> : IStorageCapabilities, IConditionalDelete<
             else
                 await WriteAtomicRowsAsync([.. entities], keys, actionType, ct);
         }
-        catch (BatchNotAtomicException)
+        catch (Exception ex) when (ex is BatchNotAtomicException or BatchPayloadTooLargeException
+            or OversizedCellException or OversizedValueException or BlobOffloadNotConfiguredException)
         {
-            // Refused before anything was sent: the caller's entities are as they were.
+            // Refused before anything was sent (a batch that is not one transaction, an entity the
+            // serializer refuses; a plan made again after a lost race follows a transaction that wrote
+            // nothing): the caller's entities are as they were, as on the row-store providers.
             foreach (var (entity, id, createdAt, updatedAt, timestamp, etag) in before)
             {
                 entity.Id = id;

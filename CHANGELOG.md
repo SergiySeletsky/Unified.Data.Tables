@@ -18,10 +18,23 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   member of `TableStorage<T>` and `PolymorphicTableStorage<TBase>`, the extension verbs over them and
   the offload blob store now throw the provider-neutral `StorageException` family (see Added). An
   `Azure.RequestFailedException` or `TableTransactionFailedException` is never thrown by a storage
-  member any more; it is **always the `InnerException`** of the neutral one, on every path, so its
-  `Status`, `ErrorCode` and headers are still there to read. That includes the 404 that
+  member any more; **whenever the provider raised one it is the `InnerException`** of the neutral
+  one, so its `Status`, `ErrorCode` and headers are still there to read. That includes the 404 that
   `IPolymorphicStorage<TBase>.MergeColumnsAsync` documented as its contract: it is
-  `EntityNotFoundException` now.
+  `EntityNotFoundException` now. A missing row (`EntityNotFoundException`) always carries its 404, on
+  every provider: the in-memory and SQLite stores attach the exception the service would have
+  answered with, and so does a whole-entity `UpdateAsync` of a missing row of a type with
+  `[TableValueSplit]`, which the store finds missing by its own read (0.9.x threw that 404 there).
+  - *Without a provider exception:* a failure the library detects itself, with no request refused.
+    That is a `ConcurrencyConflictException` found by the library's own read before it sent a write
+    (a whole-entity update or a conditional delete of a type with large values whose stored version
+    is not the caller's; 0.9.x had no inner exception on that update either),
+    `BatchNotAtomicException` and `BatchPayloadTooLargeException` (refused before a request exists),
+    and what the SQLite provider reports about its own database (a schema version it does not read).
+    A `TransientStorageException` for a timeout or a cancellation
+    that was not the caller's has that exception as `InnerException`, not a
+    `RequestFailedException`. So write `ex.InnerException as RequestFailedException` with a null
+    check, or read `ProviderErrorCode`.
   - *Who is hit:* every `catch (RequestFailedException)` and `catch (TableTransactionFailedException)`
     around a storage call, and every exception filter or middleware that reads `ex.Status` from one.
     Such code still compiles and no longer catches anything: a missing row or a throttled request
@@ -120,7 +133,7 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   - **`GetRequiredService<UnifiedTableStorageOptions>()` throws after an in-memory-only
     registration.** `AddUnifiedInMemoryStorage` registers `StorageOptions`, not the Azure type.
     *Migration:* resolve `StorageOptions`. After `AddUnifiedTableStorage` both types resolve, to the
-    same instance.
+    same instance when it is the first registration (see the next item).
   - **Registration order between the two providers.** "The first registered options win" still
     decides which options the first-registered `IStorage<>` receives and which call sets the
     process-wide oversized-cell policy. What differs is what the container holds afterwards. When
@@ -133,7 +146,7 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
     `GetRequiredService<UnifiedTableStorageOptions>()` returned the first call's options and now
     returns the second call's. A host that registers both and reads the options back should register
     the provider whose settings it means first and resolve `StorageOptions`.
-  - Binary: the four members whose parameter was `UnifiedTableStorageOptions`
+  - Binary: the five members whose parameter was `UnifiedTableStorageOptions`
     (`InMemoryStorage<T>(IProtectedPropertyAuthorizer?, ...)`, the two
     `InMemoryPolymorphicStorage<TBase>` constructors, `AddUnifiedInMemoryStorage`,
     `AddUnifiedInMemoryPolymorphicTable<TBase>`) have a new signature. An assembly compiled against
@@ -247,8 +260,9 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   `IAtomicInsert<TBase>` (`InsertAtomicAsync`). One transaction or nothing: a batch that cannot be one
   transaction (more than 100 rows, more than one partition, a repeated row, over the payload budget, a
   value that would go to blob storage) throws `BatchNotAtomicException` before any write and leaves
-  the caller's entities as they were. The splitting `CreateBatchAsync` / `UpsertBatchAsync` are
-  unchanged and never throw it.
+  the caller's entities as they were, and so does an entity the serializer refuses
+  (`OversizedCellException`, `OversizedValueException`), on every provider. The splitting
+  `CreateBatchAsync` / `UpsertBatchAsync` are unchanged and never throw it.
 - **RowKey range**: `QueryOptions.FromRowKey`, `FromInclusive` (default true), `ToRowKey`, `ToInclusive`
   (default false), on `QueryAsync(QueryOptions)`, `QueryStreamAsync` and `QueryPageAsync`. A range
   needs `Partition` and cannot be combined with `RowKeyPrefix` (`ArgumentException`). Bounds are
@@ -296,8 +310,12 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   scenario. xUnit v2, NUnit and MSTest projects loop over the scenarios of the neutral package.
 - **`Unified.Data.Tables.Analyzers`** (new package, optional): UDT1001, severity Info, marks a
   `catch (RequestFailedException)` (or a derived type) whose try block calls a storage member and no
-  Azure SDK member. It is never a warning, so it cannot fail a build that treats warnings as errors,
-  and no library package depends on it: reference it for the upgrade and remove it afterwards.
+  Azure SDK member. Its default severity is Info, never a warning, so by itself it cannot fail a
+  build that treats warnings as errors, and no library package depends on it: reference it for the
+  upgrade and remove it afterwards. A bulk setting in an `.editorconfig`
+  (`dotnet_analyzer_diagnostic.severity = warning`, or the same for `category-Upgrade`) raises it like
+  any analyzer rule, and with `TreatWarningsAsErrors` it then fails the build; keep it Info there with
+  `dotnet_diagnostic.UDT1001.severity = suggestion`.
 - **Options.** `StorageOptions.TimeProvider` (the clock behind `CreatedAt` and `UpdatedAt`; an entity's
   own field initializers still read the wall clock), `UnifiedTableStorageOptions.ConfigureTableClient`
   (runs on the `TableClientOptions` of the client the library builds),
@@ -318,6 +336,10 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   its own.
 - `IStorage<T>` and `IPolymorphicStorage<TBase>` document the failure model and what a missing row
   does, member by member.
+- Messages name the neutral options beside the Azure ones: the oversized-cell, oversized-value and
+  offload-not-configured messages name `StorageOptions.Offload` / `OffloadOptions`, and the
+  `InvalidOperationException` of an `UpdateAsync` in Auto mode without an ETag names
+  `StorageOptions.ImplicitLastWriterWins`. Code that matches these messages by text must be adjusted.
 
 ### Fixed
 
@@ -356,6 +378,10 @@ rows need no migration, and a cursor issued by 0.9.2 still resumes.
   `Lenient`.
 - SQLite has a two-process test (two processes incrementing one row lose no update) and a
   kill-during-commit test (only whole transactions and every acknowledged one survive).
+- Identity: a login relinked through a second host, while the first host's read cache still holds the
+  old owner's row, is left to its new owner by `RemoveLoginAsync` and by the cascade of a user
+  `DeleteAsync`; run on a SQLite file and on Azurite, the providers with a cache and a store two hosts
+  can share.
 - Before the release, the public API of the four 0.9.2 packages was compared with 0.10.0 by reflection
   (no type removed, no type unbound from its 0.9.2 assembly name, no abstract member added; the only
   removed signatures are the five in-memory members and the two SPI constructors listed under B4), and

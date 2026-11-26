@@ -16,6 +16,9 @@ public sealed class SqliteIdentityClaimStoreTests() : IdentityClaimStoreTests(Id
 
 public sealed class SqliteIdentityConcurrencyTests() : IdentityConcurrencyTests(IdentityBackend.Sqlite);
 
+// Two hosts need a database both can open: the file, not :memory:.
+public sealed class SqliteIdentitySecondHostTests() : IdentitySecondHostTests(IdentityBackend.Sqlite);
+
 public sealed class SqliteIdentityLoginAndTokenStoreTests() : IdentityLoginAndTokenStoreTests(IdentityBackend.Sqlite);
 
 public sealed class SqliteIdentityRoleStoreTests() : IdentityRoleStoreTests(IdentityBackend.Sqlite);

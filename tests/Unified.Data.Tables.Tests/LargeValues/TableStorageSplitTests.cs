@@ -176,14 +176,15 @@ public class TableStorageSplitTests
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet("p", "r", null);
 
-        // 0.10.0: until then the store manufactured an Azure 404 here. Its own read found no row, so
-        // nothing was sent and there is no provider exception to carry.
+        // 0.10.0: until then the store threw an Azure 404 here. Its own read found no row, so nothing was
+        // sent; that 404 is now the inner exception, where every other missing-row path has it.
         var ex = await Assert.ThrowsAsync<EntityNotFoundException>(() => h.Store.UpdateAsync(
             new SplitTextEntity { Id = "p|r", Body = "x", ETag = "W/\"e\"" }, ConcurrencyMode.Strict, Ct));
 
         Assert.Equal("p|r", ex.Id);
         Assert.Equal(nameof(SplitTextEntity), ex.EntityType);
-        Assert.Null(ex.InnerException);
+        Assert.Equal("ResourceNotFound", ex.ProviderErrorCode);
+        Assert.Equal(404, Assert.IsType<RequestFailedException>(ex.InnerException).Status);
         await h.Table.DidNotReceiveWithAnyArgs().UpdateEntityAsync<TableEntity>(default!, default, default, default);
     }
 

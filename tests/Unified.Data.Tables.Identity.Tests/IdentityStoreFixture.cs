@@ -113,6 +113,7 @@ namespace Unified.Data.Tables.Identity.Tests
         private readonly string? _directory;
         private readonly string? _tablePrefix;
         private readonly MemoryCache? _cache;
+        private readonly List<IDisposable> _secondHosts = [];
 
         public IdentityRows<IdentityUserModel> UserRows { get; }
         public IdentityRows<IdentityRoleModel> RoleRows { get; }
@@ -178,11 +179,35 @@ namespace Unified.Data.Tables.Identity.Tests
         }
 
         /// <summary>
+        /// The same table as another host holds it: a storage over the same database file or the same
+        /// Azurite table, with a read cache of its own, so neither host sees what the other has cached or
+        /// evicted. Only the providers that keep rows outside the process have one (a SQLite file, Azurite).
+        /// </summary>
+        public IStorage<T> SecondHostRows<T>() where T : class, IEntity, new()
+        {
+            if (_tablePrefix is { } prefix)
+            {
+                var cache = new MemoryCache(new MemoryCacheOptions());
+                _secondHosts.Add(cache);
+                var options = new UnifiedTableStorageOptions { TableNameResolver = type => IdentityAzurite.TableName(prefix, type) };
+                return new TableStorage<T>(IdentityAzurite.Client, cache, NullLogger<TableStorage<T>>.Instance, authorizer: null, options);
+            }
+
+            if (_directory is null)
+                throw new InvalidOperationException("This provider keeps its rows in the process: there is no second host.");
+            var account = new SqliteStorageAccount(Path.Combine(_directory, "identity.db"));
+            _secondHosts.Add(account);
+            return new SqliteStorage<T>(account);
+        }
+
+        /// <summary>
         /// Closes the SQLite database of the fixture and removes its file, or deletes the fixture's tables
         /// on Azurite; nothing to do for the in-memory one.
         /// </summary>
         public void Dispose()
         {
+            foreach (var host in _secondHosts)
+                host.Dispose();
             _account?.Dispose();
             if (_directory is not null && Directory.Exists(_directory))
                 Directory.Delete(_directory, recursive: true);

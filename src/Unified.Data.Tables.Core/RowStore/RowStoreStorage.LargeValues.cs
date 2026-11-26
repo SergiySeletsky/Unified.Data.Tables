@@ -129,8 +129,10 @@ internal sealed partial class RowStoreStorage<T> : IBlobOffloadState
             var own = takeBack ? await OwnPartsAsync(keys, ct) : null;
             if (kind == LargeWriteKind.Replace)
             {
+                // As TableStorage: the 404 of the service rides along, though this call's own read found
+                // the row missing.
                 if (prior is null)
-                    throw new EntityNotFoundException(typeName, entity.Id, null);
+                    throw ServiceErrors.Neutral(ServiceErrors.NotFound(entity.Id), typeName, entity.Id);
                 // As TableStorage: the version it read is not the caller's, so nothing is sent (no inner failure).
                 if (strict && !string.Equals(prior.ETag, ifMatch, StringComparison.Ordinal))
                     throw new ConcurrencyConflictException(typeName, entity.Id, null);

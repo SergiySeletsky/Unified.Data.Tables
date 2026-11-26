@@ -78,9 +78,10 @@ public class InMemoryNeutralFailureParityTests
     }
 
     [Fact]
-    public async Task Update_OfAMissingRow_OfATypeWithLargeValues_ThrowsEntityNotFound_OnBoth_WithNoProviderException()
+    public async Task Update_OfAMissingRow_OfATypeWithLargeValues_ThrowsEntityNotFound_OnBoth_CarryingThe404()
     {
-        // Such an update reads the row first: both stores find none themselves, so nothing was sent.
+        // Such an update reads the row first: both stores find none themselves, so nothing was sent. The
+        // service's 404 rides along all the same (0.9.x threw it here), as it does for a plain type.
         var memory = new InMemoryStorage<SplitTextEntity>();
         using var h = new StorageHarness<SplitTextEntity>();
         h.SetupGet(null);
@@ -92,8 +93,11 @@ public class InMemoryNeutralFailureParityTests
 
         Assert.Equal(fromAzure.Message, fromMemory.Message);
         Assert.Equal("p|r", fromMemory.Id);
-        Assert.Null(fromMemory.InnerException);
-        Assert.Null(fromAzure.InnerException);
+        Assert.Equal("ResourceNotFound", fromMemory.ProviderErrorCode);
+        Assert.Equal("ResourceNotFound", fromAzure.ProviderErrorCode);
+        Assert.Equal(404, Assert.IsType<RequestFailedException>(fromMemory.InnerException).Status);
+        Assert.Equal(404, Assert.IsType<RequestFailedException>(fromAzure.InnerException).Status);
+        Assert.Equal("ResourceNotFound", ((RequestFailedException)fromAzure.InnerException!).ErrorCode);
     }
 
     [Fact]

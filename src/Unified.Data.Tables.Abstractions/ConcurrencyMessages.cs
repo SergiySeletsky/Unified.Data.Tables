@@ -11,7 +11,8 @@ internal static class ConcurrencyMessages
         $"UpdateAsync in Auto mode requires {typeName}.ETag — read the entity first and round-trip " +
         "its ETag (OneAsync/QueryAsync populate it), use MutateAsync for read-modify-write, or opt " +
         "into an unconditional replace explicitly with ConcurrencyMode.LastWriterWins. " +
-        "(UnifiedTableStorageOptions.ImplicitLastWriterWins = true restores the pre-0.6.0 fallback.)";
+        "(StorageOptions.ImplicitLastWriterWins = true, on the Azure provider UnifiedTableStorageOptions.ImplicitLastWriterWins, " +
+        "restores the pre-0.6.0 fallback.)";
 
     /// <summary>
     /// A whole-entity update whose ETag is the wildcard: <c>"*"</c> is not a version, so the update is

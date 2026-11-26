@@ -61,7 +61,7 @@ copy-pasted into each one.
 - **Provider-neutral failures** — no storage member throws an Azure SDK type. A missing row is
   `EntityNotFoundException`, a throttled or timed-out request `TransientStorageException`, a refused
   one `StorageRequestRejectedException`, all under `StorageException`, on every provider; the
-  provider's own exception is always the `InnerException`. See [Failures](#failures).
+  provider's own exception is the `InnerException` whenever it raised one. See [Failures](#failures).
 - **Conditional delete, all-or-nothing batches, RowKey ranges, store information** — side interfaces
   reached through extension methods (`DeleteIfMatchAsync`, `CreateAtomicAsync`, `GetInfo()`, ...) and
   `QueryOptions.FromRowKey` / `ToRowKey`; `IStorage<T>` itself gained no member.
@@ -607,8 +607,8 @@ bumped by ANY storage write — including migrations — and cannot be set by cl
 
 Since 0.10.0 **no storage member throws a provider type**. Whatever the provider is (Azure Table
 Storage, in-memory, SQLite), a failure the store reports is a `StorageException` or one of its subtypes
-from `Unified.Data.Tables.Abstractions`, and the provider's own exception is always its
-`InnerException`:
+from `Unified.Data.Tables.Abstractions`, and whenever the provider raised an exception of its own, that
+exception is the `InnerException`:
 
 | Exception | Meaning | Azure status |
 | --- | --- | --- |
@@ -624,7 +624,16 @@ from `Unified.Data.Tables.Abstractions`, and the provider's own exception is alw
 
 `StorageException.ProviderErrorCode` carries the backend's code (`"EntityAlreadyExists"`,
 `"TableNotFound"`, `"InvalidDuplicateRow"`, `"SQLITE_BUSY"`), so most handlers never open
-`InnerException`. Not wrapped, on purpose: the caller's own cancellation (`OperationCanceledException`
+`InnerException`. A missing row always has one: the 404, a `RequestFailedException` on Azure and, built
+as the service would answer, on the in-memory and SQLite stores. A failure the library detects itself,
+with no request refused, has **none**: a `ConcurrencyConflictException` found by the library's own read
+before it sent a write (an update or a conditional delete of a type with large values whose stored
+version is not the caller's), `BatchNotAtomicException` and `BatchPayloadTooLargeException`, and what
+SQLite reports about its own database (a schema version it does not read). For a timeout or a
+cancellation that was not the caller's, the inner exception is that one, not a
+`RequestFailedException`. So a handler that opens `InnerException` checks it for null.
+
+Not wrapped, on purpose: the caller's own cancellation (`OperationCanceledException`
 under the caller's token), argument and usage errors (`ArgumentException`, `InvalidOperationException`,
 `NotSupportedException`), and the serializer's and large-value exceptions (`OversizedCellException`,
 `OversizedValueException`, `TableValueIntegrityException`, `BlobOffloadNotConfiguredException`).
@@ -729,6 +738,8 @@ A batch that cannot be one transaction is refused **before anything is sent**, w
 `BatchNotAtomicException`, and the entities are left as you passed them: more than 100 rows, more than
 one partition, a row named twice, a payload over the budget the library plans by, or (for a type with
 large values) a value that would go to blob storage, since a blob is written outside the transaction.
+An entity the serializer refuses (`OversizedCellException`, `OversizedValueException`) fails the batch
+the same way: nothing sent, the entities as you passed them.
 An entity's continuation rows count as rows. A transaction the backend refuses applies nothing and
 throws the failure of the row that caused it (`DuplicateKeyException` for `CreateAtomicAsync`).
 `GetInfo().MaxBatchRows` and `MaxBatchBytes` state the limits.
@@ -2125,7 +2136,8 @@ property, a member marked on an interface).
 `PolymorphicTableStorage<TBase>` do over the service, with the same [neutral exceptions](#failures):
 since 0.10.0 the fake no longer throws `RequestFailedException` (a test that asserted the Azure type
 asserts the neutral one). The exception's `ProviderErrorCode` is the service's code, and its
-`InnerException` carries the service's status as the Azure provider's does. Batches are atomic per
+`InnerException` carries the service's status wherever the Azure provider's does (a conflict the store
+finds by its own read has none on either; see [Failures](#failures)). Batches are atomic per
 transaction only, `QueryOptions.Select` projects the row, a cancelled token commits nothing, a key the
 service refuses is refused, and so is a row above 1 MB. The fake implements every side interface
 (conditional delete, all-or-nothing batches, RowKey ranges, `GetInfo()` with `Durability.Volatile`, raw
@@ -2470,12 +2482,18 @@ Convert each hit that guards a storage call, by the table under [Failures](#fail
 | `ex.Status`, `ex.ErrorCode` | `ex.ProviderErrorCode`, or `(ex.InnerException as RequestFailedException)?.Status` |
 
 A catch around a call you make on a `TableClient` or a `BlobContainerClient` of your own is still right:
-leave it. The provider exception is **always** the `InnerException` of the neutral one, so a handler that
-needs the status, the headers or the request id still has them.
+leave it. Whenever the provider raised an exception it is the `InnerException` of the neutral one, so a
+handler that needs the status, the headers or the request id still has them. A failure the library
+detects itself has none (a `ConcurrencyConflictException` found by its own read on a type with large
+values, `BatchNotAtomicException`, `BatchPayloadTooLargeException`; see [Failures](#failures)): no request
+was refused there, so null-check the cast, as the last row of the table does.
 
 The optional analyzer package marks such a catch in the IDE (UDT1001). It is severity Info and stays
-Info under `TreatWarningsAsErrors`, so it cannot fail a build, and it says nothing about a try block that
-also calls the Azure SDK directly:
+Info under `TreatWarningsAsErrors`, so by itself it cannot fail a build, and it says nothing about a try
+block that also calls the Azure SDK directly. (A bulk `.editorconfig` setting such as
+`dotnet_analyzer_diagnostic.severity = warning`, or the same for `category-Upgrade`, raises it like any
+analyzer rule and then it does fail such a build; `dotnet_diagnostic.UDT1001.severity = suggestion`
+keeps it Info.)
 
 ```xml
 <PackageReference Include="Unified.Data.Tables.Analyzers" Version="0.10.0" PrivateAssets="all" />
