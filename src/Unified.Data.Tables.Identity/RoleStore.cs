@@ -60,11 +60,13 @@ namespace Unified.Data.Tables.Identity
         /// <see cref="IdentityErrorDescriber.ConcurrencyFailure"/>.
         /// </summary>
         /// <remarks>
-        /// As for a user: <see cref="IStorage{T}"/> has no conditional delete, so before the cascade the row
-        /// is rewritten, on condition of the ETag it was read with, with a fresh stamp no caller holds. A
-        /// crash or a cancellation between that claim and the final row delete leaves the role with a new
-        /// stamp (and possibly without some of its claims and links); a delete retried after re-reading the
-        /// role finishes the job.
+        /// As for a user: the child rows go before the role row, so before the cascade the row is
+        /// rewritten, on condition of the ETag it was read with, with a fresh stamp no caller holds, and the
+        /// role row itself is then deleted whatever its version. A crash or a cancellation between that
+        /// claim and the final row delete leaves the role with a new stamp (and possibly without some of
+        /// its claims and links); a delete retried after re-reading the role finishes the job. Every child
+        /// row of a role names the role in its key, so none of them can change hands under the cascade and
+        /// they are deleted by key on every store.
         /// </remarks>
         public async Task<IdentityResult> DeleteAsync(IdentityRole role, CancellationToken cancellationToken)
         {

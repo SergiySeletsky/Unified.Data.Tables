@@ -23,6 +23,11 @@ namespace Unified.Data.Tables.Identity
         private const string AuthenticatorKeyTokenName = "AuthenticatorKey";
         private const string RecoveryCodeTokenName = "RecoveryCodes";
 
+        // How often a login is read again after its conditional delete found another version than the
+        // one read. Nothing in this library rewrites a login row, so one more read settles it; the bound
+        // only keeps a store that reports a conflict every time from looping.
+        private const int LoginDeleteAttempts = 5;
+
         private readonly IStorage<IdentityUserModel> users;
         private readonly IStorage<IdentityUserLoginModel> userLogins;
         private readonly IStorage<IdentityUserClaimModel> userClaims;
@@ -92,12 +97,21 @@ namespace Unified.Data.Tables.Identity
         /// <see cref="IdentityErrorDescriber.ConcurrencyFailure"/>.
         /// </summary>
         /// <remarks>
-        /// <see cref="IStorage{T}"/> has no conditional delete, so the check is made binding another way:
-        /// before the cascade the row is rewritten, on condition of the ETag it was read with, with a fresh
-        /// stamp no caller holds. From then on a concurrent update fails, on that ETag or on the stamp, and
-        /// nothing is deleted until this claim succeeds. What remains is a crash or a cancellation between
-        /// the claim and the final row delete: the user row then survives with a new stamp (and possibly
-        /// without some of its child rows), and a delete retried after re-reading the user finishes the job.
+        /// The child rows go before the user row, so a delete of the user row conditional on its version
+        /// would come too late to protect them. The check is made binding another way: before the cascade
+        /// the row is rewritten, on condition of the ETag it was read with, with a fresh stamp no caller
+        /// holds. From then on a concurrent update fails, on that ETag or on the stamp, and nothing is
+        /// deleted until this claim succeeds. The user row itself is then deleted whatever its version, as
+        /// before 0.10.0 and on every store: the claim decided the delete, and a writer that read the row
+        /// after it changed a user that was already being removed. What remains is a crash or a
+        /// cancellation between the claim and the final row delete: the user row then survives with a new
+        /// stamp (and possibly without some of its child rows), and a delete retried after re-reading the
+        /// user finishes the job.
+        /// <para>
+        /// The user's external logins are the one kind of child row whose key does not name the user, so
+        /// each is deleted as <see cref="RemoveLoginAsync"/> deletes one: only the version found to be this
+        /// user's, where the store has a conditional delete (see <c>RemoveOwnedLoginAsync</c>).
+        /// </para>
         /// </remarks>
         public async Task<IdentityResult> DeleteAsync(IdentityUser user, CancellationToken cancellationToken)
         {
@@ -344,7 +358,9 @@ namespace Unified.Data.Tables.Identity
 
         /// <summary>
         /// The delete behind <see cref="RemoveLoginAsync"/>, surfacing the <see cref="IdentityResult"/>
-        /// that <see cref="IUserLoginStore{TUser}"/>'s <c>Task</c>-returning signature discards.
+        /// that <see cref="IUserLoginStore{TUser}"/>'s <c>Task</c>-returning signature discards. A login
+        /// that is not there, or is another user's, is <c>LoginNotFound</c> and nothing is deleted; see
+        /// <see cref="RemoveOwnedLoginAsync"/> for how the delete is tied to that check.
         /// </summary>
         internal async Task<IdentityResult> RemoveLoginCoreAsync(IdentityUser user, string loginProvider, string providerKey, CancellationToken cancellationToken)
         {
@@ -352,11 +368,74 @@ namespace Unified.Data.Tables.Identity
             // login belongs to the requesting user.
             var id = IdentityKeys.UserLogin(loginProvider, providerKey);
             var existing = await userLogins.OneAsync(id, cancellationToken);
-            if (existing is null || existing.UserId != user.Id)
-                return IdentityResult.Failed(new IdentityError { Code = "LoginNotFound", Description = "Login not found for this user." });
+            return await RemoveOwnedLoginAsync(id, existing, user.Id, cancellationToken)
+                ? IdentityResult.Success
+                : IdentityResult.Failed(new IdentityError { Code = "LoginNotFound", Description = "Login not found for this user." });
+        }
 
-            await userLogins.DeleteAsync(id, cancellationToken);
-            return IdentityResult.Success;
+        /// <summary>
+        /// Deletes the login row <paramref name="id"/> when it is <paramref name="userId"/>'s, starting from
+        /// the row as it was just read (<paramref name="read"/>, null when there was none). Returns false,
+        /// with nothing deleted, when the row is not there or is another user's.
+        /// </summary>
+        /// <remarks>
+        /// The key of a login row is the provider and the provider key; the owner is in the row. So a login
+        /// unlinked and linked again by another user after the read is another user's row under the same
+        /// key, and a delete by key alone would remove it. Where the store has a conditional delete
+        /// (<see cref="IConditionalDelete{T}"/>, found through the capability probe, so a decorator answers
+        /// for the store it wraps), the delete names the version the ownership was checked on:
+        /// <list type="bullet">
+        /// <item><see cref="DeleteStatus.Deleted"/>: this call removed the user's login.</item>
+        /// <item><see cref="DeleteStatus.NotFound"/>: another writer removed it after the read. The login is
+        /// gone, which is what was asked for, and it is reported as removed, as the unconditional delete
+        /// reported it before 0.10.0.</item>
+        /// <item><see cref="DeleteStatus.Indeterminate"/>: the row is gone and the provider cannot tell
+        /// whether an earlier attempt of this request or another writer removed it. Treated as removed as
+        /// well: the row checked was this user's and it no longer exists, and the store runs no side effect
+        /// that depends on who removed it. Asking again could only find no row, or a login linked since,
+        /// which is not the one this call was about.</item>
+        /// <item><see cref="ConcurrencyConflictException"/>: the row is another version than the one read.
+        /// It is read again and judged again: gone or another user's is false, still this user's is
+        /// deleted on its new version. After <see cref="LoginDeleteAttempts"/> reads the conflict is
+        /// thrown rather than swallowed.</item>
+        /// </list>
+        /// A store without the capability (a third-party <see cref="IStorage{T}"/>, an older decorator, a
+        /// mock), or one whose rows carry no ETag, gets exactly the path of 0.9.2: the row is deleted by key
+        /// after the check on the row as read.
+        /// </remarks>
+        private async Task<bool> RemoveOwnedLoginAsync(string id, IdentityUserLoginModel? read, string userId, CancellationToken cancellationToken)
+        {
+            userLogins.TryGetCapability<IdentityUserLoginModel, IConditionalDelete<IdentityUserLoginModel>>(out var conditional);
+
+            for (var attempt = 1; ; attempt++)
+            {
+                if (read is null || read.UserId != userId)
+                    return false;
+
+                if (conditional is null || string.IsNullOrEmpty(read.ETag))
+                {
+                    await userLogins.DeleteAsync(id, cancellationToken);
+                    return true;
+                }
+
+                try
+                {
+                    return await conditional.DeleteIfMatchAsync(id, read.ETag, cancellationToken) switch
+                    {
+                        DeleteStatus.Deleted => true,
+                        DeleteStatus.NotFound => true,
+                        // Gone, possibly by an earlier attempt of this request: see the remarks.
+                        DeleteStatus.Indeterminate => true,
+                        var unknown => throw new InvalidOperationException($"Unknown delete status {unknown}."),
+                    };
+                }
+                catch (ConcurrencyConflictException) when (attempt < LoginDeleteAttempts)
+                {
+                    // Another version than the one read: whose it is now is decided on a fresh read.
+                }
+
+                read = await userLogins.OneAsync(id, cancellationToken);
+            }
         }
 
         public async Task<IList<UserLoginInfo>> GetLoginsAsync(IdentityUser user, CancellationToken cancellationToken)
@@ -379,11 +458,13 @@ namespace Unified.Data.Tables.Identity
             return model?.ToIdentity();
         }
 
+        // The cascade of a user delete. Each row the query found is deleted as a single login is: a
+        // login that changed hands since the query is left to its new owner (see RemoveOwnedLoginAsync).
         private async Task DeleteUserLoginsAsync(string userId, CancellationToken cancellationToken)
         {
             var rows = await userLogins.QueryAsync(l => l.UserId == userId, null, null, cancellationToken);
             foreach (var row in rows)
-                await userLogins.DeleteAsync(row.Id, cancellationToken);
+                await RemoveOwnedLoginAsync(row.Id, row, userId, cancellationToken);
         }
         #endregion
 

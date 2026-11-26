@@ -5,10 +5,12 @@ using Unified.Data.Tables.Sqlite;
 namespace Unified.Data.Tables.Identity.Tests;
 
 // The Identity suite on the SQLite provider: every store test of this assembly once more, over
-// SqliteStorage<T> on a database file with the provider's default read cache (the Azure provider's).
-// Each class below inherits the tests of the class it derives from and only names the provider; a test
-// added to a base class runs on SQLite as well. (ConcurrencyStampsTests, IdentityRowModelTests and the
-// registration rules of AddUnifiedIdentityStoresTests touch no storage and are not repeated.)
+// SqliteStorage<T> on a database file and again on a :memory: database, both with the provider's default
+// read cache (the Azure provider's). Each class below inherits the tests of the class it derives from and
+// only names the provider; a test added to a base class runs on SQLite as well. (ConcurrencyStampsTests,
+// IdentityConditionalDeleteTests, IdentityRowModelTests and the registration rules of
+// AddUnifiedIdentityStoresTests touch no storage and are not repeated.) AzuriteIdentityTests.cs does the
+// same for the Azure provider.
 
 public sealed class SqliteIdentityClaimStoreTests() : IdentityClaimStoreTests(IdentityBackend.Sqlite);
 
@@ -23,6 +25,30 @@ public sealed class SqliteIdentityUserRoleLinkTests() : IdentityUserRoleLinkTest
 public sealed class SqliteIdentityUserStoreRoleTests() : IdentityUserStoreRoleTests(IdentityBackend.Sqlite);
 
 public sealed class SqliteIdentityUserStoreTests() : IdentityUserStoreTests(IdentityBackend.Sqlite);
+
+public sealed class SqliteInMemoryIdentityClaimStoreTests() : IdentityClaimStoreTests(IdentityBackend.SqliteInMemory);
+
+public sealed class SqliteInMemoryIdentityConcurrencyTests() : IdentityConcurrencyTests(IdentityBackend.SqliteInMemory);
+
+public sealed class SqliteInMemoryIdentityLoginAndTokenStoreTests() : IdentityLoginAndTokenStoreTests(IdentityBackend.SqliteInMemory);
+
+public sealed class SqliteInMemoryIdentityRoleStoreTests() : IdentityRoleStoreTests(IdentityBackend.SqliteInMemory);
+
+public sealed class SqliteInMemoryIdentityUserRoleLinkTests() : IdentityUserRoleLinkTests(IdentityBackend.SqliteInMemory);
+
+public sealed class SqliteInMemoryIdentityUserStoreRoleTests() : IdentityUserStoreRoleTests(IdentityBackend.SqliteInMemory);
+
+public sealed class SqliteInMemoryIdentityUserStoreTests() : IdentityUserStoreTests(IdentityBackend.SqliteInMemory);
+
+/// <summary>
+/// UserManager over the stores as a host registers them on a SQLite <c>:memory:</c> database:
+/// <c>AddUnifiedSqliteStorage(":memory:")</c>, then <c>AddUnifiedIdentityStores</c>.
+/// </summary>
+[Collection("OversizedCellPolicy")]
+public sealed class SqliteInMemoryUserManagerConcurrencyTests : UserManagerConcurrencyTests
+{
+    protected override void AddStorage(IServiceCollection services) => services.AddUnifiedSqliteStorage(":memory:");
+}
 
 /// <summary>
 /// UserManager over the stores as a host registers them on SQLite: <c>AddUnifiedSqliteStorage</c>, then

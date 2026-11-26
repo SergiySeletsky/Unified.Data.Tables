@@ -235,6 +235,21 @@ namespace Unified.Data.Tables.Identity.Tests
         }
 
         [Fact]
+        public async Task AConditionalReplaceOfADeletedRow_IsEntityNotFound_OnThisProvider()
+        {
+            // Arrange — what the test above rests on. The stores tell a row deleted after their read from
+            // an outage by the type of the failure, and re-read to find out (ConcurrencyStamps) only over
+            // a store that throws a type of its own. No provider of this library is such a store.
+            await CreateAndReadAsync(NewUser());
+            var row = (await _fixture.UserRows.OneAsync(IdentityKeys.User("u1"), Ct))!;
+            await _fixture.UserRows.DeleteAsync(row.Id, Ct);
+
+            // Act / Assert
+            await Assert.ThrowsAsync<EntityNotFoundException>(
+                () => _fixture.UserRows.UpdateAsync(row, ConcurrencyMode.Strict, Ct));
+        }
+
+        [Fact]
         public async Task UserStore_UsesTheDescriberItIsGiven()
         {
             // Arrange
@@ -363,6 +378,136 @@ namespace Unified.Data.Tables.Identity.Tests
             Assert.True(result.Succeeded);
             Assert.Equal(0, _fixture.UserRows.Count);
             Assert.Equal(0, _fixture.UserClaimRows.Count);
+        }
+
+        // ---- external logins ---------------------------------------------------------------------
+        // The key of a login row is {provider}|{hash(providerKey)}: it does not name the owner. A login
+        // unlinked and linked again by another user between a store's read and its delete is therefore
+        // another user's row under the same key, which only a delete conditional on the version read
+        // leaves alone.
+
+        private const string LoginProvider = "Google";
+        private const string ProviderKey = "k1";
+
+        private static string LoginId => IdentityKeys.UserLogin(LoginProvider, ProviderKey);
+
+        private static IdentityUserLoginModel LoginOf(string userId, string? displayName = null) =>
+            IdentityUserLoginModel.FromIdentity(new IdentityUserLogin<string>
+            {
+                UserId = userId,
+                LoginProvider = LoginProvider,
+                ProviderKey = ProviderKey,
+                ProviderDisplayName = displayName,
+            });
+
+        private UserStore StoreOverLogins(IStorage<IdentityUserLoginModel> logins) =>
+            new(_fixture.UserRows, _fixture.RoleRows, logins, _fixture.UserClaimRows, _fixture.UserRoleRows, _fixture.UserTokenRows);
+
+        /// <summary>The other instance: the first user unlinks the login and <paramref name="userId"/> links it.</summary>
+        private Func<Task> RelinkTo(string userId) => async () =>
+        {
+            await _fixture.UserLoginRows.DeleteAsync(LoginId, CancellationToken.None);
+            // Azurite's ETag is a timestamp in milliseconds: keep the new row out of the old one's.
+            await Task.Delay(20, CancellationToken.None);
+            await _fixture.UserLoginRows.CreateAsync(LoginOf(userId), CancellationToken.None);
+        };
+
+        [Fact]
+        public async Task RemoveLogin_RelinkedToAnotherUserBetweenReadAndDelete_LeavesTheOtherUsersLogin()
+        {
+            // Arrange — the ownership check passes on the row as read, then the login changes hands
+            var user = await CreateAndReadAsync(NewUser());
+            await _fixture.UserLoginRows.CreateAsync(LoginOf("u1"), Ct);
+            var racing = new RacingRows<IdentityUserLoginModel>(_fixture.UserLoginRows, RelinkTo("u2")) { Armed = true };
+
+            // Act — before 0.10.0 the delete was unconditional and removed the other user's login
+            var result = await StoreOverLogins(racing).RemoveLoginCoreAsync(user, LoginProvider, ProviderKey, Ct);
+
+            // Assert
+            Assert.False(result.Succeeded);
+            Assert.Equal("LoginNotFound", Assert.Single(result.Errors).Code);
+            var row = await _fixture.UserLoginRows.OneAsync(LoginId, Ct);
+            Assert.NotNull(row);
+            Assert.Equal("u2", row.UserId);
+        }
+
+        [Fact]
+        public async Task RemoveLogin_RewrittenForTheSameUserBetweenReadAndDelete_IsStillRemoved()
+        {
+            // Arrange — the row is another version but still this user's: the store reads again and deletes
+            var user = await CreateAndReadAsync(NewUser());
+            await _fixture.UserLoginRows.CreateAsync(LoginOf("u1"), Ct);
+            var racing = new RacingRows<IdentityUserLoginModel>(_fixture.UserLoginRows, async () =>
+            {
+                await Task.Delay(20, CancellationToken.None);
+                await _fixture.UserLoginRows.UpsertAsync(LoginOf("u1", "renamed"), CancellationToken.None);
+            })
+            { Armed = true };
+
+            // Act
+            var result = await StoreOverLogins(racing).RemoveLoginCoreAsync(user, LoginProvider, ProviderKey, Ct);
+
+            // Assert
+            Assert.True(result.Succeeded);
+            Assert.Equal(0, _fixture.UserLoginRows.Count);
+        }
+
+        [Fact]
+        public async Task RemoveLogin_RemovedBetweenReadAndDelete_Succeeds()
+        {
+            // Arrange — someone else removed it first: the login is gone, which is what was asked for
+            var user = await CreateAndReadAsync(NewUser());
+            await _fixture.UserLoginRows.CreateAsync(LoginOf("u1"), Ct);
+            var racing = new RacingRows<IdentityUserLoginModel>(_fixture.UserLoginRows,
+                () => _fixture.UserLoginRows.DeleteAsync(LoginId, CancellationToken.None))
+            { Armed = true };
+
+            // Act
+            var result = await StoreOverLogins(racing).RemoveLoginCoreAsync(user, LoginProvider, ProviderKey, Ct);
+
+            // Assert
+            Assert.True(result.Succeeded);
+            Assert.Equal(0, _fixture.UserLoginRows.Count);
+        }
+
+        [Fact]
+        public async Task UserDelete_LoginRelinkedToAnotherUserDuringCascade_LeavesTheOtherUsersLogin()
+        {
+            // Arrange — the cascade finds the user's logins by query, then the login changes hands
+            var user = await CreateAndReadAsync(NewUser());
+            await _fixture.UserLoginRows.CreateAsync(LoginOf("u1"), Ct);
+            var racing = new RacingRows<IdentityUserLoginModel>(_fixture.UserLoginRows, RelinkTo("u2")) { Armed = true };
+
+            // Act — before 0.10.0 the cascade removed whatever row had the key
+            var result = await StoreOverLogins(racing).DeleteAsync(user, Ct);
+
+            // Assert — the user is gone, the other user's login is not
+            Assert.True(result.Succeeded);
+            Assert.Equal(0, _fixture.UserRows.Count);
+            var row = await _fixture.UserLoginRows.OneAsync(LoginId, Ct);
+            Assert.NotNull(row);
+            Assert.Equal("u2", row.UserId);
+        }
+
+        [Fact]
+        public async Task UserDelete_RemovesEveryLoginOfTheUser_AndNoOtherUsers()
+        {
+            // Arrange
+            var user = await CreateAndReadAsync(NewUser());
+            await _fixture.UserStore.AddLoginCoreAsync(
+                new IdentityUserLogin<string> { UserId = "u1", LoginProvider = "Google", ProviderKey = "a" }, Ct);
+            await _fixture.UserStore.AddLoginCoreAsync(
+                new IdentityUserLogin<string> { UserId = "u1", LoginProvider = "GitHub", ProviderKey = "b" }, Ct);
+            await _fixture.UserStore.AddLoginCoreAsync(
+                new IdentityUserLogin<string> { UserId = "u2", LoginProvider = "Google", ProviderKey = "c" }, Ct);
+
+            // Act
+            var result = await Users.DeleteAsync(user, Ct);
+
+            // Assert
+            Assert.True(result.Succeeded);
+            Assert.Equal(1, _fixture.UserLoginRows.Count);
+            Assert.Equal("u2", (await _fixture.UserLoginRows.OneAsync(IdentityKeys.UserLogin("Google", "c"), Ct))!.UserId);
         }
 
         // ---- roles -------------------------------------------------------------------------------
@@ -550,10 +695,45 @@ namespace Unified.Data.Tables.Identity.Tests
         }
 
         /// <summary>
+        /// A decorator that, once armed, runs <c>interleave</c> right after the next point read or predicate
+        /// query returns, i.e. between a store's read and its write. Unlike <see cref="InterleavingStorage{T}"/>
+        /// it forwards the capability probe, so the store above it sees the side interfaces of the provider
+        /// underneath (a conditional delete among them).
+        /// </summary>
+        private sealed class RacingRows<T>(IStorage<T> inner, Func<Task> interleave) : DelegatingStorage<T>(inner)
+            where T : class, IEntity, new()
+        {
+            public bool Armed { get; set; }
+
+            private async Task FireAsync()
+            {
+                if (!Armed) return;
+                Armed = false;
+                await interleave();
+            }
+
+            public override async Task<T?> OneAsync(string id, CancellationToken ct = default)
+            {
+                var read = await base.OneAsync(id, ct);
+                await FireAsync();
+                return read;
+            }
+
+            public override async Task<IReadOnlyList<T>> QueryAsync(
+                Expression<Func<T, bool>> predicate, string? partition = null, int? take = null, CancellationToken ct = default)
+            {
+                var read = await base.QueryAsync(predicate, partition, take, ct);
+                await FireAsync();
+                return read;
+            }
+        }
+
+        /// <summary>
         /// Delegates to an inner storage, and once armed runs <c>interleave</c> right after the next point
         /// read returns, i.e. between a store's read and its write — the window another instance's write
         /// can land in. <c>beforeDeletePartition</c>, when given, runs before every partition delete, i.e.
-        /// inside a user delete's cascade.
+        /// inside a user delete's cascade. A plain <see cref="IStorage{T}"/> with no capability probe: over it
+        /// the stores take the path they take over any third-party implementer.
         /// </summary>
         private sealed class InterleavingStorage<T>(IStorage<T> inner, Func<Task> interleave, Func<Task>? beforeDeletePartition = null) : IStorage<T>
             where T : class, IEntity, new()

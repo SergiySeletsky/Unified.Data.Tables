@@ -28,8 +28,18 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Unified.Data.Tables.Identity\Unified.Data.Tables.Identity.csproj" />
     <ProjectReference Include="..\..\src\Unified.Data.Tables.InMemory\Unified.Data.Tables.InMemory.csproj" />
-    <!-- The same suite runs on the SQLite provider (see SqliteIdentityTests.cs). -->
+    <!-- The same suite runs on the SQLite provider (see SqliteIdentityTests.cs) and on the Azure provider
+         over Azurite (see AzuriteIdentityTests.cs). Only the tests reference the providers: the Identity
+         package itself depends on the abstractions alone. -->
     <ProjectReference Include="..\..\src\Unified.Data.Tables.Sqlite\Unified.Data.Tables.Sqlite.csproj" />
+    <ProjectReference Include="..\..\src\Unified.Data.Tables\Unified.Data.Tables.csproj" />
+  </ItemGroup>
+
+  <!-- The Azurite probe and connection string of the sibling test project, shared rather than copied, so
+       both suites find the emulator, skip and fail by the same rules. -->
+  <ItemGroup>
+    <Compile Include="..\Unified.Data.Tables.Tests\TestSupport\AzuriteConnection.cs" Link="TestSupport\AzuriteConnection.cs" />
+    <Compile Include="..\Unified.Data.Tables.Tests\TestSupport\AzuriteProbe.cs" Link="TestSupport\AzuriteProbe.cs" />
   </ItemGroup>
 
   <ItemGroup>
