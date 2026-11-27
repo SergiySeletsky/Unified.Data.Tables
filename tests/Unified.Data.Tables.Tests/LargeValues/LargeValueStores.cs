@@ -389,15 +389,23 @@ internal abstract class LargeValueStores : IAsyncDisposable
                     var keys = new List<string>();
                     await foreach (var row in client.QueryAsync<TableEntity>(filter, select: ["RowKey"], cancellationToken: CancellationToken.None))
                         keys.Add(row.RowKey);
-                    foreach (var rk in keys)
-                        await client.DeleteEntityAsync(Pk, rk, ETag.All, CancellationToken.None);
+                    // One transaction per 100 rows instead of one request per row: the rows are all in this
+                    // case's partition, so a batch is the same cleanup with a fraction of the round trips.
+                    foreach (var batch in keys.Chunk(100))
+                    {
+                        var actions = batch
+                            .Select(rk => new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(Pk, rk), ETag.All))
+                            .ToList();
+                        await client.SubmitTransactionAsync(actions, CancellationToken.None);
+                    }
                 }
                 catch (RequestFailedException)
                 {
                     // The table was never created, or a row is already gone.
                 }
             }
-            await container.DeleteIfExistsAsync(cancellationToken: CancellationToken.None);
+            if (Offload is not null)
+                await container.DeleteIfExistsAsync(cancellationToken: CancellationToken.None);
         }
 
         /// <summary>Records every request's service, method and path (with its query).</summary>

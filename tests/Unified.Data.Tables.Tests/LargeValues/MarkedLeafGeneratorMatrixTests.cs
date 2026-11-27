@@ -22,9 +22,11 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// a <c>[TableValueSplit]</c> member declared as a type stored as one JSON value holding a subclass stored as columns,
 /// which is never stored.</item>
 /// </list>
-/// Every combination, on both stores, under every <see cref="OversizedCellPolicy"/>, at 10 and 200,000 characters (bytes):
-/// a builder update of <c>Doc_Inner_V</c> by lambda (where the declared types have the member; below a nullable struct the
-/// lambda names <c>Doc_Value_Inner_V</c>) and by a key of <see cref="UpdateBuilder{T}.Updates"/>, and a whole-entity write.
+/// Every combination, on both stores, at 10 and 200,000 characters (bytes): a builder update of
+/// <c>Doc_Inner_V</c> by lambda (where the declared types have the member; below a nullable struct the
+/// lambda names <c>Doc_Value_Inner_V</c>) and by a key of <see cref="UpdateBuilder{T}.Updates"/>, and a
+/// whole-entity write. The trimming <see cref="OversizedCellPolicy"/> values run at 200,000, the only
+/// size at which a cell can overflow; a 10-character value is the default policy's run.
 /// A second dimension (fix wave 9, RV8 SERIALIZER-2): every leaf kind as a top-level property with a legacy name
 /// (<see cref="ColumnAliasAttribute"/> on the property, on the entity class, on a base class, on a property declared by a
 /// base class), in every cell form a read maps onto the property (the whole column, <c>__Json</c>, <c>__GZip</c>, the
@@ -54,10 +56,15 @@ public class MarkedLeafGeneratorMatrixTests
     private const string Column = "Doc_Inner_V";
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
-    private static readonly OversizedCellPolicy[] Policies =
-        [OversizedCellPolicy.Throw, OversizedCellPolicy.TrimSilently, OversizedCellPolicy.TrimWithMarker];
-
-    private static readonly int[] Sizes = [10, 200_000];
+    // A policy only acts on a cell that overflows, and a 10-character value never does: the default policy
+    // covers that size, and the trimming policies run at the size that can overflow a cell.
+    private static readonly (OversizedCellPolicy Policy, int Size)[] Runs =
+    [
+        (OversizedCellPolicy.Throw, 10),
+        (OversizedCellPolicy.Throw, 200_000),
+        (OversizedCellPolicy.TrimSilently, 200_000),
+        (OversizedCellPolicy.TrimWithMarker, 200_000),
+    ];
 
     // ── Leaf kinds ────────────────────────────────────────────────────────────────────────────────────────
 
@@ -513,7 +520,7 @@ public class MarkedLeafGeneratorMatrixTests
             $"{GenericShapes.Length} member shapes over 5 owner kinds; {cases.Count(c => c.Generic)} generic and {cases.Count(c => !c.Generic)} non-generic " +
             $"combinations, {cases.Count} in all ({cases.Count(c => c.RuntimeSubtype)} of the runtime-subtype shape, {cases.Count(c => c.NullableHolder)} " +
             $"below a nullable struct); {cases.Count * 2} theory rows; " +
-            $"{cases.Count * 2 * Policies.Length * Sizes.Length} (combination, store, policy, size) runs." +
+            $"{cases.Count * 2 * Runs.Length} (combination, store, policy, size) runs." +
             "\nExcluded:\n  " + string.Join("\n  ", Excluded) + "\nSubstituted:\n  " + string.Join("\n  ", Substituted));
         Assert.Equal(GenericShapes.Length * (LeafTypes.Length + 1) * HolderKinds.Length * 2
                      + GenericShapes.Count(s => s.Runtime.IsValueType) * (LeafTypes.Length + 1) * 2, cases.Count);
@@ -627,56 +634,54 @@ public class MarkedLeafGeneratorMatrixTests
         await store.CreateAsync(new T { Id = id }, Ct);
         var content = typeof(T).GetProperty("Content")!;
         var seed = 0;
-        foreach (var policy in Policies)
+        // A rule-A refusal is decided before the value's size or a policy is consulted, and the ordinary
+        // control is one 10-character cell: one run covers both. The full policy and size matrix, where a
+        // value can overflow a cell, is exercised by EveryCombination_ below.
+        const OversizedCellPolicy policy = OversizedCellPolicy.Throw;
+        const int size = 10;
+        var label = $"{c.Name}, {kind}, {policy}, {size}";
+        var value = c.Value == typeof(JsonFlatBase)
+            ? new JsonFlatSub { Body = BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(size, ++seed) }
+            : Value(c.Value == typeof(TableBlobContent) ? typeof(LeafBlob) : c.Value == typeof(byte[]) ? typeof(LeafBytes) : c.Value == typeof(JsonBox) ? typeof(LeafJson) : typeof(LeafStr), size, ++seed);
+        var before = TableEntitySerializer.OversizedCellPolicy;
+        TableEntitySerializer.OversizedCellPolicy = policy;
+        try
         {
-            // The control is an ordinary cell: a value of one cell (a trimming policy trims a longer one, as documented).
-            foreach (var size in c.Ordinary ? [10] : Sizes)
+            foreach (var column in c.Ordinary ? [LegacyName + c.Suffix] : new[] { LegacyName + c.Suffix, "Content" + c.Suffix })
             {
-                var label = $"{c.Name}, {kind}, {policy}, {size}";
-                var value = c.Value == typeof(JsonFlatBase)
-                    ? new JsonFlatSub { Body = BuilderUpdateThroughAnInheritedInterfaceMemberTests.Ascii(size, ++seed) }
-                    : Value(c.Value == typeof(TableBlobContent) ? typeof(LeafBlob) : c.Value == typeof(byte[]) ? typeof(LeafBytes) : c.Value == typeof(JsonBox) ? typeof(LeafJson) : typeof(LeafStr), size, ++seed);
-                var before = TableEntitySerializer.OversizedCellPolicy;
-                TableEntitySerializer.OversizedCellPolicy = policy;
-                try
+                Exception? thrown = null;
+                // The JSON cell form of the control holds the value's JSON, which a read maps onto the property.
+                object cell = c.Ordinary && c.Suffix == "__Json" ? System.Text.Json.JsonSerializer.Serialize(value) : value;
+                var requests = await stores.StorageWritesAsync(store, async () =>
+                    thrown = await Record.ExceptionAsync(() => store.UpdateAsync(id, b => b.Updates[column] = cell, Ct)));
+                var row = (await stores.RawRowsAsync<T>(Table)).Single(r => r.RowKey == "legacy");
+                if (c.Ordinary)
                 {
-                    foreach (var column in c.Ordinary ? [LegacyName + c.Suffix] : new[] { LegacyName + c.Suffix, "Content" + c.Suffix })
+                    Assert.True(thrown is null, $"{label}, Updates[{column}]: {thrown?.GetType().Name}: {thrown?.Message}");
+                    Assert.Equal(cell, row[column]);
+                    // The forms a read maps back into a string without more cells: the whole column and its JSON cell.
+                    if (c.Suffix is "" or "__Json")
                     {
-                        Exception? thrown = null;
-                        // The JSON cell form of the control holds the value's JSON, which a read maps onto the property.
-                        object cell = c.Ordinary && c.Suffix == "__Json" ? System.Text.Json.JsonSerializer.Serialize(value) : value;
-                        var requests = await stores.StorageWritesAsync(store, async () =>
-                            thrown = await Record.ExceptionAsync(() => store.UpdateAsync(id, b => b.Updates[column] = cell, Ct)));
-                        var row = (await stores.RawRowsAsync<T>(Table)).Single(r => r.RowKey == "legacy");
-                        if (c.Ordinary)
-                        {
-                            Assert.True(thrown is null, $"{label}, Updates[{column}]: {thrown?.GetType().Name}: {thrown?.Message}");
-                            Assert.Equal(cell, row[column]);
-                            // The forms a read maps back into a string without more cells: the whole column and its JSON cell.
-                            if (c.Suffix is "" or "__Json")
-                            {
-                                Assert.Equal(value, content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
-                                Outcome("builder update of the legacy name of an ordinary property written and read back");
-                            }
-                            else
-                            {
-                                Outcome("builder update of the legacy name of an ordinary property written as before");
-                            }
-                            continue;
-                        }
-                        Assert.True(thrown is NotSupportedException && requests.Count == 0
-                                    && !row.Keys.Any(k => k.StartsWith(LegacyName, StringComparison.Ordinal) || k.StartsWith("Content", StringComparison.Ordinal)),
-                            $"{label}, Updates[{column}]: {thrown?.GetType().Name ?? "accepted"}: {thrown?.Message}; requests [{string.Join(", ", requests)}]; cells [{string.Join(", ", row.Keys)}]");
-                        Assert.Equal(TableEntitySerializer.PartialUpdateRefusal(column), thrown!.Message);
-                        Assert.Null(content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
-                        Outcome(column.StartsWith(LegacyName, StringComparison.Ordinal) ? "builder update of the legacy name refused (rule A)" : "builder update of the property's own name refused (rule A)");
+                        Assert.Equal(value, content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
+                        Outcome("builder update of the legacy name of an ordinary property written and read back");
                     }
+                    else
+                    {
+                        Outcome("builder update of the legacy name of an ordinary property written as before");
+                    }
+                    continue;
                 }
-                finally
-                {
-                    TableEntitySerializer.OversizedCellPolicy = before;
-                }
+                Assert.True(thrown is NotSupportedException && requests.Count == 0
+                            && !row.Keys.Any(k => k.StartsWith(LegacyName, StringComparison.Ordinal) || k.StartsWith("Content", StringComparison.Ordinal)),
+                    $"{label}, Updates[{column}]: {thrown?.GetType().Name ?? "accepted"}: {thrown?.Message}; requests [{string.Join(", ", requests)}]; cells [{string.Join(", ", row.Keys)}]");
+                Assert.Equal(TableEntitySerializer.PartialUpdateRefusal(column), thrown!.Message);
+                Assert.Null(content.GetValue((await stores.Store<T>(Table).OneAsync(id, Ct))!));
+                Outcome(column.StartsWith(LegacyName, StringComparison.Ordinal) ? "builder update of the legacy name refused (rule A)" : "builder update of the property's own name refused (rule A)");
             }
+        }
+        finally
+        {
+            TableEntitySerializer.OversizedCellPolicy = before;
         }
     }
 
@@ -690,9 +695,12 @@ public class MarkedLeafGeneratorMatrixTests
 
     private static async Task RunAsync<T>(Case c, string kind) where T : class, IEntity, new()
     {
-        await using var updates = await LargeValueStores.OpenAsync(kind);
+        // Only a TableBlobContent reaches the blob service at these sizes: no other value passes the
+        // 3 MiB offload threshold.
+        var offload = c.LeafType == typeof(LeafBlob);
+        await using var updates = await LargeValueStores.OpenAsync(kind, offload);
         Assert.SkipWhen(updates is null, LargeValueStores.SkipReason);
-        await using var writes = await LargeValueStores.OpenAsync(kind);
+        await using var writes = await LargeValueStores.OpenAsync(kind, offload);
         Assert.SkipWhen(writes is null, LargeValueStores.SkipReason);
         // The builder updates go to a row of their own, which another type writes: the entity type may be one the
         // serializer cannot write at all (two members of one name).
@@ -702,23 +710,20 @@ public class MarkedLeafGeneratorMatrixTests
         var updateStore = updates.Store<T>(Table);
         var writeStore = writes.Store<T>(Table);
         var seedNumber = 0;
-        foreach (var policy in Policies)
+        foreach (var (policy, size) in Runs)
         {
-            foreach (var size in Sizes)
+            var label = $"{c.Name}, {kind}, {policy}, {size}";
+            var before = TableEntitySerializer.OversizedCellPolicy;
+            TableEntitySerializer.OversizedCellPolicy = policy;
+            try
             {
-                var label = $"{c.Name}, {kind}, {policy}, {size}";
-                var before = TableEntitySerializer.OversizedCellPolicy;
-                TableEntitySerializer.OversizedCellPolicy = policy;
-                try
-                {
-                    foreach (var source in c.RuntimeSubtype ? new[] { "Updates" } : ["lambda", "Updates"])
-                        await BuilderUpdateAsync(c, updates, updateStore, seed, source, Value(c.LeafType, size, ++seedNumber), $"{label}, builder update by {source}");
-                    await WholeEntityWriteAsync(c, writes, writeStore, $"w{(int)policy}-{size}", size, ++seedNumber, $"{label}, whole-entity write");
-                }
-                finally
-                {
-                    TableEntitySerializer.OversizedCellPolicy = before;
-                }
+                foreach (var source in c.RuntimeSubtype ? new[] { "Updates" } : ["lambda", "Updates"])
+                    await BuilderUpdateAsync(c, updates, updateStore, seed, source, Value(c.LeafType, size, ++seedNumber), $"{label}, builder update by {source}");
+                await WholeEntityWriteAsync(c, writes, writeStore, $"w{(int)policy}-{size}", size, ++seedNumber, $"{label}, whole-entity write");
+            }
+            finally
+            {
+                TableEntitySerializer.OversizedCellPolicy = before;
             }
         }
     }
@@ -788,12 +793,13 @@ public class MarkedLeafGeneratorMatrixTests
         SetLeaf(Inner(holder, c), value);
         doc.SetValue(entity, holder);
 
-        var rowsBefore = (await stores.RawRowsAsync<T>(Table)).Select(r => r.RowKey).ToHashSet(StringComparer.Ordinal);
         // Only a TableBlobContent goes to a blob here: no other value reaches the offload threshold (3 MiB).
         var blobLeaf = c.LeafType == typeof(LeafBlob);
         var blobsBefore = blobLeaf ? (await stores.BlobNamesAsync<T>(Table)).ToHashSet(StringComparer.Ordinal) : [];
         var thrown = await Record.ExceptionAsync(() => store.CreateAsync(entity, Ct));
-        var rows = (await stores.RawRowsAsync<T>(Table)).Where(r => !rowsBefore.Contains(r.RowKey)).ToList();
+        // The previous write of this case deleted its entity (below), so every row now in the partition is
+        // this write's: no "before" query is needed to tell them apart.
+        var rows = (await stores.RawRowsAsync<T>(Table)).ToList();
         var blobs = blobLeaf ? (await stores.BlobNamesAsync<T>(Table)).Where(b => !blobsBefore.Contains(b)).ToList() : [];
         var stored = $"rows [{string.Join("; ", rows.Select(r => r.RowKey + ": " + string.Join(",", r.Keys)))}], blobs {blobs.Count}";
         if (thrown is not null)

@@ -10,6 +10,7 @@ jobs:
   build:
     name: Build and analyze
     runs-on: windows-latest
+    timeout-minutes: 35
     steps:
       - name: Set up JDK 17
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
@@ -87,7 +88,9 @@ jobs:
           UNIFIED_TABLES_REQUIRE_AZURITE: "1"
         shell: powershell
         run: |
-          dotnet test --no-build --collect:"XPlat Code Coverage" --settings coverage.runsettings
+          # The report measures source lines, not runtimes: one target framework is enough. ci.yml runs the
+          # whole suite on net10.0 and net11.0 without coverage, so .NET 11 behaviour is still gated there.
+          dotnet test --no-build -f net10.0 --collect:"XPlat Code Coverage" --settings coverage.runsettings
       - name: End analysis
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
