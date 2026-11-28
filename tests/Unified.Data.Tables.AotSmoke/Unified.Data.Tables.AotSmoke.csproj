@@ -9,6 +9,8 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- The smoke app is not a test project: it is published with NativeAOT and run in CI. -->
     <IsTestProject>false</IsTestProject>
+    <!-- It is not a NuGet package either: the publish workflow pushes every package packed from the solution. -->
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
