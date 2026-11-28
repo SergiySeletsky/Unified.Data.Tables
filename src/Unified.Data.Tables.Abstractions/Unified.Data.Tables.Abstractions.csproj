@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <TargetFrameworks>netstandard2.0;net10.0</TargetFrameworks>
+    <!-- AOT and trimming contract: the package is analyzed and packed as AOT-compatible. netstandard2.0 has no analyzer. -->
+    <IsAotCompatible Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net8.0'))">true</IsAotCompatible>
     <PackageId>Unified.Data.Tables.Abstractions</PackageId>
     <RootNamespace>Unified.Data.Tables</RootNamespace>
     <AssemblyName>Unified.Data.Tables.Abstractions</AssemblyName>

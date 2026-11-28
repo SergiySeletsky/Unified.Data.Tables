@@ -36,7 +36,11 @@ namespace Unified.Data.Tables;
 /// </para>
 /// </remarks>
 /// <typeparam name="T">The entity type.</typeparam>
-public abstract class DelegatingStorage<T> : IStorage<T>, IStorageCapabilities where T : class, IEntity, new()
+public abstract class DelegatingStorage<
+#if NET
+    [DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)]
+#endif
+    T> : IStorage<T>, IStorageCapabilities where T : class, IEntity, new()
 {
     /// <summary>Creates a decorator over <paramref name="inner"/>.</summary>
     /// <param name="inner">The store every member forwards to.</param>
