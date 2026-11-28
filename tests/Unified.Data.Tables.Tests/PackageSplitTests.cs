@@ -28,7 +28,7 @@ public class PackageSplitTests
 
     // The public types 0.10.0 adds to the core: 0.9.2 had none of them, so nothing can be bound to them
     // under the Azure assembly's name.
-    private static readonly Type[] NewInCore = [typeof(StorageOptions), typeof(OffloadOptions)];
+    private static readonly Type[] NewInCore = [typeof(StorageOptions), typeof(OffloadOptions), typeof(TableJson)];
 
     // ── the assemblies ────────────────────────────────────────────────────
 

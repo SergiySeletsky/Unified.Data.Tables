@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **NativeAOT and trimming support** for `Unified.Data.Tables.Abstractions`, `.Core`, `.InMemory`,
+  `.Sqlite` and `.Identity`; all five packages are marked `IsAotCompatible`. The Azure provider is
+  not AOT-compatible (the Azure SDK itself fails under NativeAOT).
+- `TableEntityMetadata.Register<T>()` roots an entity graph for the reflection serializer;
+  `TableEntityMetadata.RegisterFilterOperators<T>()` roots the user-defined operators an
+  expression-tree filter on `decimal`, `DateTime`, `DateTimeOffset` or `TimeSpan` needs.
+  In a NativeAOT application an unregistered type fails with a clear message instead of reading
+  partial metadata.
+- `TableJson.UseContext(JsonSerializerContext)` supplies the source-generated JSON contract for
+  collections, parameterized records and JSON-stored `[TableValueSplit]` values.
+- Closed-generic DI registrations `AddUnifiedInMemoryStorage<TEntity>()` and
+  `AddUnifiedSqliteStorage<TEntity>()`; `AddUnifiedIdentityStores()` now registers Identity's seven
+  row models itself.
+- A NativeAOT smoke app (`tests/Unified.Data.Tables.AotSmoke`) published and run in CI; it covers
+  registration, JSON parity, split/offload, polymorphic maps, DI and Identity.
+
+### Changed
+
+- `IStorage<T>` and `IPolymorphicStorage<TBase>` generic parameters carry
+  `DynamicallyAccessedMembers` metadata so a provider registration can preserve the entity graph.
+  This is source-compatible; a custom implementation should mirror the annotation.
+- The serializer now resolves JSON contracts through `JsonTypeInfo`. JIT behavior is unchanged; a
+  NativeAOT app must configure `TableJson.UseContext`. The non-generic enum converter and the
+  parameterized-constructor converter remain JIT-only.
+- NativeAOT polymorphic storage requires an explicit `TypeDiscriminatorMap`; the
+  assembly-qualified default is rejected at store construction instead of resolving types by name.
+
 ## [0.10.0] — 2026-11-26
 
 Provider-neutral failures, a SQLite provider, a conformance kit, and the storage operations four
