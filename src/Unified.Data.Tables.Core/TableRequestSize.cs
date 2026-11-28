@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.Serialization;
 using Azure.Data.Tables;
@@ -128,6 +129,7 @@ public static class TableRequestSize
         ArgumentNullException.ThrowIfNull(entity);
         if (entity is TableEntity row)
             return row;
+        TableEntityMetadata.Require(entity.GetType());
         var model = new TableEntity(entity.PartitionKey, entity.RowKey);
         if (entity.Timestamp is { } timestamp)
             model.Timestamp = timestamp;
@@ -139,6 +141,7 @@ public static class TableRequestSize
         return model;
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
     private static (PropertyInfo Property, string Column)[] ColumnsOf(Type type) =>
         type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(p => p.CanRead && p.GetIndexParameters().Length == 0

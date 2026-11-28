@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using Azure.Data.Tables;
 using Unified.Data.Tables.Providers;
@@ -644,8 +645,10 @@ internal sealed class ValueOffloadCoordinator(IOffloadBlobStore? blobs, OffloadO
 
     // The public property of that name (the most derived declaration, when a subclass hides one of its
     // base) when it is not declared TableBlobContent; null when it is, or when there is none. Never throws.
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
     private static System.Reflection.PropertyInfo? DeclaredAsAnotherType(Type type, string name)
     {
+        TableEntityMetadata.Require(type);
         System.Reflection.PropertyInfo? found = null;
         foreach (var candidate in type.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
         {

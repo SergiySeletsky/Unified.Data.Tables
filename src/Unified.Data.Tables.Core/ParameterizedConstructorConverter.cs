@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -50,8 +51,17 @@ namespace Unified.Data.Tables;
 /// source-generated contracts for other types) is left intact.
 /// </para>
 /// </remarks>
+[UnconditionalSuppressMessage("Trimming", "IL2026", Justification = JitOnlyJustification)]
+[UnconditionalSuppressMessage("AOT", "IL3050", Justification = JitOnlyJustification)]
+[UnconditionalSuppressMessage("Trimming", "IL2070", Justification = JitOnlyJustification)]
+[UnconditionalSuppressMessage("Trimming", "IL2072", Justification = JitOnlyJustification)]
 internal sealed class ParameterizedConstructorConverterFactory : JsonConverterFactory
 {
+    internal const string JitOnlyJustification =
+        "This converter factory is registered only when RuntimeFeature.IsDynamicCodeSupported. NativeAOT " +
+        "uses a source-generated JsonSerializerContext (TableJson.UseContext), and the rows this factory " +
+        "serves are a JIT-only wire-compatibility path.";
+
     private static readonly ConcurrentDictionary<Type, ConstructorInfo?> Constructors = new();
 
     /// <inheritdoc />
@@ -113,6 +123,10 @@ internal sealed class ParameterizedConstructorConverterFactory : JsonConverterFa
 /// <see cref="ParameterizedConstructorConverterFactory"/> for why this exists.
 /// </summary>
 /// <typeparam name="T">The type being constructed.</typeparam>
+[UnconditionalSuppressMessage("Trimming", "IL2026", Justification = ParameterizedConstructorConverterFactory.JitOnlyJustification)]
+[UnconditionalSuppressMessage("AOT", "IL3050", Justification = ParameterizedConstructorConverterFactory.JitOnlyJustification)]
+[UnconditionalSuppressMessage("Trimming", "IL2070", Justification = ParameterizedConstructorConverterFactory.JitOnlyJustification)]
+[UnconditionalSuppressMessage("Trimming", "IL2072", Justification = ParameterizedConstructorConverterFactory.JitOnlyJustification)]
 internal sealed class ParameterizedConstructorConverter<T> : JsonConverter<T>
 {
     private static readonly ConcurrentDictionary<JsonSerializerOptions, JsonSerializerOptions> Delegating = new();

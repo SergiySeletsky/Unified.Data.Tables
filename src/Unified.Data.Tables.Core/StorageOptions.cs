@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace Unified.Data.Tables;
 
 /// <summary>
@@ -137,7 +139,9 @@ public class StorageOptions
     /// How <see cref="IPolymorphicStorage{TBase}"/> maps types to the stored discriminator. Null
     /// selects <see cref="AssemblyQualifiedTypeDiscriminator"/>, which writes exactly what
     /// <c>persistType: true</c> has always written — so an existing table is readable with no
-    /// migration. Prefer a <see cref="TypeDiscriminatorMap"/> for new tables; see
+    /// migration. A NativeAOT application cannot resolve types by name and must set an explicit
+    /// <see cref="TypeDiscriminatorMap"/>; leaving this null there throws at store construction.
+    /// Prefer a <see cref="TypeDiscriminatorMap"/> for new tables; see
     /// <see cref="ITypeDiscriminator"/> for why.
     /// </summary>
     public ITypeDiscriminator? TypeDiscriminator { get; set; }
@@ -145,5 +149,14 @@ public class StorageOptions
     // Null means "the legacy-compatible default", not "no discriminator" — a polymorphic store
     // without one could not read or write a type at all.
     internal ITypeDiscriminator ResolveTypeDiscriminator() =>
-        TypeDiscriminator ?? AssemblyQualifiedTypeDiscriminator.Instance;
+        TypeDiscriminator ?? ThrowIfAotDefault();
+
+    private static ITypeDiscriminator ThrowIfAotDefault()
+    {
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+            throw new InvalidOperationException(
+                "NativeAOT polymorphic storage requires an explicit TypeDiscriminatorMap. " +
+                "Register every stored subtype with Map<T>(token) in StorageOptions.TypeDiscriminator.");
+        return AssemblyQualifiedTypeDiscriminator.Instance;
+    }
 }

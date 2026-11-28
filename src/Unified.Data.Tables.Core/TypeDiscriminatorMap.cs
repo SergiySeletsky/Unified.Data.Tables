@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 
 namespace Unified.Data.Tables;
@@ -47,7 +48,7 @@ public sealed class TypeDiscriminatorMap : ITypeDiscriminator
     /// <param name="token">The stable token to store for it.</param>
     /// <returns>This map, for chaining.</returns>
     /// <exception cref="ArgumentException">The token or the type is already registered.</exception>
-    public TypeDiscriminatorMap Map<T>(string token) => Map(typeof(T), token);
+    public TypeDiscriminatorMap Map<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] T>(string token) => Map(typeof(T), token);
 
     /// <summary>Registers <paramref name="type"/> under <paramref name="token"/>.</summary>
     /// <param name="type">The concrete type to register.</param>
@@ -104,6 +105,7 @@ public sealed class TypeDiscriminatorMap : ITypeDiscriminator
     /// <exception cref="ReflectionTypeLoadException">
     /// <paramref name="assembly"/> contains a type that cannot be loaded.
     /// </exception>
+    [RequiresUnreferencedCode("Assembly.GetTypes is not available in NativeAOT; register each stored subtype explicitly with Map<T>.")]
     public TypeDiscriminatorMap MapAssignableTo<TBase>(Assembly assembly, Func<Type, string>? naming = null)
     {
         ArgumentNullException.ThrowIfNull(assembly);
@@ -126,6 +128,7 @@ public sealed class TypeDiscriminatorMap : ITypeDiscriminator
     /// table converges in place rather than needing a stop-the-world backfill.
     /// </summary>
     /// <returns>This map, for chaining.</returns>
+    [RequiresUnreferencedCode("The fallback resolves assembly-qualified tokens with Type.GetType, which is not guaranteed in NativeAOT.")]
     public TypeDiscriminatorMap WithAssemblyQualifiedFallback()
     {
         assemblyQualifiedFallback = true;
@@ -147,6 +150,7 @@ public sealed class TypeDiscriminatorMap : ITypeDiscriminator
     }
 
     /// <inheritdoc />
+    [UnconditionalSuppressMessage("Trimming", "IL2057", Justification = "The assembly-qualified fallback is the RUC-annotated WithAssemblyQualifiedFallback path; NativeAOT uses explicit Map<T> registrations.")]
     public Type Resolve(string discriminator, Type baseType)
     {
         ArgumentNullException.ThrowIfNull(discriminator);
