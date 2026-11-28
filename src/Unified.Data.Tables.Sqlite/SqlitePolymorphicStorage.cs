@@ -22,7 +22,7 @@ namespace Unified.Data.Tables.Sqlite;
 /// <see cref="SqliteStorage{T}"/>.
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
-public sealed class SqlitePolymorphicStorage<TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
+public sealed class SqlitePolymorphicStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
     where TBase : class
 {
     private readonly SqliteStorageAccount account;

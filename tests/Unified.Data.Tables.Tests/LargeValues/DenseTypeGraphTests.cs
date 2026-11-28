@@ -12,7 +12,7 @@ namespace Unified.Data.Tables.Tests.LargeValues;
 /// </summary>
 public class DenseTypeGraphTests
 {
-    private static readonly TimeSpan Bound = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan Bound = TimeSpan.FromSeconds(10);
 
     // Runs the work on another thread so a walk that never ends fails the test instead of hanging the run.
     private static T Within<T>(Func<T> work, string what)

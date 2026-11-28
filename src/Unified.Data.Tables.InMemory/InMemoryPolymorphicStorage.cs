@@ -23,7 +23,7 @@ namespace Unified.Data.Tables.InMemory;
 /// transaction, 64&#160;KiB a cell, 1&#160;MB a row).
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
-public sealed class InMemoryPolymorphicStorage<TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
+public sealed class InMemoryPolymorphicStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
     where TBase : class
 {
     private readonly InMemoryTable table;

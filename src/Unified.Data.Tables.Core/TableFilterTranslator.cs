@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -308,6 +309,7 @@ public static class TableFilterTranslator
         return string.Join("_", names);
     }
 
+    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Expression.Compile falls back to the interpreter when dynamic code is unavailable; the NativeAOT smoke test exercises a captured-value filter.")]
     private static object Evaluate(Expression valueSide)
     {
         if (valueSide is ConstantExpression c)

@@ -14,5 +14,6 @@
     <Project Path="tests/Unified.Data.Tables.Tests/Unified.Data.Tables.Tests.csproj" />
     <Project Path="tests/Unified.Data.Tables.Identity.Tests/Unified.Data.Tables.Identity.Tests.csproj" />
     <Project Path="tests/Unified.Data.Tables.Sqlite.TestHelper/Unified.Data.Tables.Sqlite.TestHelper.csproj" />
+    <Project Path="tests/Unified.Data.Tables.AotSmoke/Unified.Data.Tables.AotSmoke.csproj" />
   </Folder>
 </Solution>

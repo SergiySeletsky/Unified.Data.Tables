@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -19,14 +20,20 @@ namespace Unified.Data.Tables.Providers;
 /// always false and a delete never answers <see cref="DeleteStatus.Indeterminate"/>.
 /// </summary>
 /// <typeparam name="T">The entity type.</typeparam>
-internal sealed partial class RowStoreStorage<T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
+internal sealed partial class RowStoreStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
 {
-    private static readonly List<(PropertyInfo Prop, ProtectedPropertyAttribute Attr)> ProtectedProps =
-        typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Select(p => (Prop: p, Attr: p.GetCustomAttribute<ProtectedPropertyAttribute>()))
-            .Where(x => x.Attr is not null)
-            .Select(x => (x.Prop, x.Attr!))
-            .ToList();
+    private static readonly List<(PropertyInfo Prop, ProtectedPropertyAttribute Attr)> ProtectedProps;
+
+    static RowStoreStorage()
+    {
+        TableEntityMetadata.Require(typeof(T));
+        ProtectedProps =
+            typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Select(p => (Prop: p, Attr: p.GetCustomAttribute<ProtectedPropertyAttribute>()))
+                .Where(x => x.Attr is not null)
+                .Select(x => (x.Prop, x.Attr!))
+                .ToList();
+    }
 
     // True when T has a member that may be stored as split cells, continuation rows or a blob. Every
     // large-value branch below is reached only for such a T; any other T is one row an entity.

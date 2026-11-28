@@ -2,6 +2,8 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <!-- AOT and trimming contract: the package is analyzed and packed as AOT-compatible. netstandard2.0 has no analyzer. -->
+    <IsAotCompatible Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net8.0'))">true</IsAotCompatible>
     <PackageId>Unified.Data.Tables.InMemory</PackageId>
     <RootNamespace>Unified.Data.Tables.InMemory</RootNamespace>
     <AssemblyName>Unified.Data.Tables.InMemory</AssemblyName>

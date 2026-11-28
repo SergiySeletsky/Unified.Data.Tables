@@ -1,4 +1,8 @@
 
+#if NET
+using System.Diagnostics.CodeAnalysis;
+#endif
+
 namespace Unified.Data.Tables;
 
 /// <summary>
@@ -33,7 +37,11 @@ namespace Unified.Data.Tables;
 /// </para>
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
-public interface IPolymorphicStorage<TBase>
+public interface IPolymorphicStorage<
+#if NET
+    [DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)]
+#endif
+    TBase>
     where TBase : class
 {
     /// <summary>

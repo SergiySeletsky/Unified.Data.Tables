@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -23,18 +24,24 @@ namespace Unified.Data.Tables;
 /// <see cref="ServiceCollectionExtensions.AddUnifiedTableStorage(Microsoft.Extensions.DependencyInjection.IServiceCollection, Action{UnifiedTableStorageOptions})"/>.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public partial class TableStorage<T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
+public partial class TableStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] T> : IStorage<T>, IOrphanBlobSweeper where T : class, IEntity, new()
 {
     private const char Separator = '|';
 
     // Pre-computed list of properties decorated with [ProtectedProperty] for whole-entity
     // UpdateAsync(T) enforcement. Empty for entity types that have no protected fields.
-    private static readonly List<(PropertyInfo Prop, ProtectedPropertyAttribute Attr)> ProtectedProps =
-        typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Select(p => (Prop: p, Attr: p.GetCustomAttribute<ProtectedPropertyAttribute>()))
-            .Where(x => x.Attr is not null)
-            .Select(x => (x.Prop, x.Attr!))
-            .ToList();
+    private static readonly List<(PropertyInfo Prop, ProtectedPropertyAttribute Attr)> ProtectedProps;
+
+    static TableStorage()
+    {
+        TableEntityMetadata.Require(typeof(T));
+        ProtectedProps =
+            typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Select(p => (Prop: p, Attr: p.GetCustomAttribute<ProtectedPropertyAttribute>()))
+                .Where(x => x.Attr is not null)
+                .Select(x => (x.Prop, x.Attr!))
+                .ToList();
+    }
 
     private readonly TableServiceClient serviceClient;
     private readonly TableClient client;

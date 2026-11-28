@@ -1,6 +1,7 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO.Compression;
 using System.Reflection;
@@ -11,6 +12,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using System.Text.Unicode;
 using Azure.Data.Tables;
 
@@ -27,6 +29,23 @@ namespace Unified.Data.Tables;
 /// </summary>
 public static class TableEntitySerializer
 {
+    /// <summary>
+    /// The justification for reflection over a type graph whose metadata is preserved by
+    /// <see cref="TableEntityMetadata.Register{T}"/> and enforced by <see cref="TypeMetadataCache"/>.
+    /// </summary>
+    internal const string AotMetadataJustification =
+        "Every type the serializer reflects over is registered with TableEntityMetadata.Register<T>() " +
+        "before use; TypeMetadataCache.GetMetadata and IsLargeValueAware enforce that registration and " +
+        "throw before partial metadata can be used.";
+
+    /// <summary>
+    /// Configures the JSON contract for values stored in a JSON or GZip cell. See
+    /// <see cref="TableJson.UseContext"/>.
+    /// </summary>
+    /// <param name="context">The source-generated JSON contract.</param>
+    public static void UseJsonContext(JsonSerializerContext context) =>
+        TableEntityValue.UseJsonContext(context);
+
     /// <summary>
     /// Column that stores the type discriminator when <c>persistType</c> is used. An alias for
     /// <see cref="SystemColumnNames.TypeName"/>, which is the single definition — Abstractions
@@ -964,6 +983,9 @@ public static class TableEntitySerializer
     /// callers (e.g. the LINQ filter translator) can tell whether an <c>Owner_Child</c> column exists at
     /// all for a nested member access.
     /// </summary>
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     internal static bool FlattensToColumns(Type type)
     {
         // An IEnumerable (other than string) is ALWAYS stored as a single JSON cell, whatever the
@@ -978,6 +1000,7 @@ public static class TableEntitySerializer
         // runtime type really does flatten to Owner_Child columns must not be rejected. Assume flattenable.
         if (type.IsInterface || type.IsAbstract)
             return true;
+        TableEntityMetadata.Require(type);
         var ctors = type.GetConstructors();
         if (ctors.Length == 0)
             return false;
@@ -1266,48 +1289,146 @@ internal sealed class TableEntityValue
     private static readonly DateTimeOffset MinDto =
         new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    private static readonly object JsonGate = new();
+    private static JsonSerializerContext? jsonContext;
+    private static JsonSerializerOptions? jsonOptions;
+    private static JsonSerializerOptions? wellFormedJsonOptions;
+
+    /// <summary>
+    /// Configures the System.Text.Json contract used for values stored in a JSON or GZip cell.
+    /// NativeAOT and trimmed applications must call this before the first storage operation, with
+    /// a <see cref="JsonSerializerContext"/> that declares every type the store keeps as JSON
+    /// (collections, records with a parameterized constructor, and JSON-stored
+    /// <see cref="TableValueSplitAttribute"/> values). A JIT application can use it too; without
+    /// it the serializer uses the reflection-based contract it always used.
+    /// </summary>
+    /// <param name="context">The source-generated context.</param>
+    /// <exception cref="InvalidOperationException">The serializer already used its JSON contract.</exception>
+    public static void UseJsonContext(JsonSerializerContext context)
     {
-        // camelCase property names; reads stay case-insensitive.
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        // Enum values are written using the declared member name (PascalCase) — the default of
-        // both System.Text.Json and Newtonsoft.Json — so stored tokens stay stable and
-        // byte-compatible with name-as-declared serializers. Reads remain case-insensitive, so
-        // lowercase/camelCase tokens written by <= 0.5.0 still round-trip.
-        // JsonStringEnumConverter: see the comment above. ParameterizedConstructorConverterFactory
-        // restores construction of immutable types whose constructor System.Text.Json would not
-        // select (a private foreign-annotated one) or would bind too strictly (parameters that do
-        // not exactly match property names and types) — both idiomatic historical shapes, and ones
-        // that appear throughout rows written by the serializers this format is compatible with.
-        Converters = { new RefuseBlobContentConverter(), new JsonStringEnumConverter(), new ParameterizedConstructorConverterFactory() },
-        // Allow full Unicode so Cyrillic (and other) characters aren't \uXXXX escaped in stored JSON
-        Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
-    };
+        ArgumentNullException.ThrowIfNull(context);
+        lock (JsonGate)
+        {
+            if (jsonOptions is not null || wellFormedJsonOptions is not null)
+                throw new InvalidOperationException(
+                    "The JSON contract was already used. Call TableJson.UseContext(...) at startup, " +
+                    "before the first storage operation.");
+            jsonContext = context;
+        }
+    }
+
+    private static JsonSerializerOptions JsonOptions
+    {
+        get
+        {
+            lock (JsonGate)
+            {
+                return jsonOptions ??= CreateJsonOptions(wellFormed: false);
+            }
+        }
+    }
+
+    private static JsonSerializerOptions WellFormedJsonOptions
+    {
+        get
+        {
+            lock (JsonGate)
+            {
+                return wellFormedJsonOptions ??= CreateJsonOptions(wellFormed: true);
+            }
+        }
+    }
+
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification =
+        "DefaultJsonTypeInfoResolver is constructed only in the RuntimeFeature.IsDynamicCodeSupported branch; " +
+        "NativeAOT requires TableJson.UseContext with a source-generated context, and TypeInfoFor throws a clear " +
+        "NotSupportedException when it is missing.")]
+    private static JsonSerializerOptions CreateJsonOptions(bool wellFormed)
+    {
+        var options = new JsonSerializerOptions
+        {
+            // camelCase property names; reads stay case-insensitive.
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            // Allow full Unicode so Cyrillic (and other) characters aren't \uXXXX escaped in stored JSON
+            Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
+        };
+        options.Converters.Add(new RefuseBlobContentConverter());
+        if (wellFormed)
+        {
+            // A string (or char) with an unpaired surrogate is refused rather than written as
+            // U+FFFD, which would read back altered with no error.
+            options.Converters.Insert(0, new WellFormedStringConverter());
+            options.Converters.Insert(1, new WellFormedCharConverter());
+        }
+
+        if (RuntimeFeature.IsDynamicCodeSupported)
+        {
+            // Enum values are written using the declared member name (PascalCase) - the default of
+            // both System.Text.Json and Newtonsoft.Json - so stored tokens stay stable and
+            // byte-compatible with name-as-declared serializers. Reads remain case-insensitive, so
+            // lowercase/camelCase tokens written by <= 0.5.0 still round-trip.
+            // ParameterizedConstructorConverterFactory restores construction of immutable types
+            // whose constructor System.Text.Json would not select (a private foreign-annotated one)
+            // or would bind too strictly (parameters that do not exactly match property names and
+            // types) - both idiomatic historical shapes. Both need dynamic code; in NativeAOT the
+            // source-generated context provides the contract instead.
+            options.Converters.Add(new JsonStringEnumConverter());
+            options.Converters.Add(new ParameterizedConstructorConverterFactory());
+        }
+
+        if (jsonContext is not null)
+        {
+            // The library's own context covers the one type the serializer writes outside the
+            // consumer's graph: a string compressed on the oversized-string path. The consumer's
+            // context wins for everything it declares.
+            options.TypeInfoResolver = JsonTypeInfoResolver.Combine(jsonContext, TableInternalJsonContext.Default);
+        }
+        else if (RuntimeFeature.IsDynamicCodeSupported)
+        {
+            // GetTypeInfo does not install the reflection resolver implicitly (JsonSerializer's
+            // serialize/deserialize entry points do), so the JIT path names it explicitly.
+            options.TypeInfoResolver = new DefaultJsonTypeInfoResolver();
+        }
+
+        return options;
+    }
+
+    private static JsonTypeInfo TypeInfoFor(JsonSerializerOptions options, Type type)
+    {
+        try
+        {
+            return options.GetTypeInfo(type);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
+        {
+            if (RuntimeFeature.IsDynamicCodeSupported)
+                throw;
+
+            throw new NotSupportedException(
+                $"NativeAOT cannot store or read a value of type '{type.FullName}' as JSON without a " +
+                "source-generated contract. Call TableJson.UseContext(...) with a JsonSerializerContext " +
+                "that declares [JsonSerializable] for it and for every nested type it holds, before the " +
+                "first storage operation.", ex);
+        }
+    }
 
     /// <summary>The JSON text a value stored as JSON is written as (what a protected-property check compares).</summary>
-    internal static string StoredJson(object value) => JsonSerializer.Serialize(value, JsonOptions);
-
-    // JsonOptions for a value a [TableValueSplit] member stores as JSON: the same bytes, except that a
-    // string (or char, or string dictionary key) with an unpaired surrogate is refused rather than written
-    // as U+FFFD, which would read back altered with no error. A type that opts into nothing never uses it.
-    private static readonly JsonSerializerOptions WellFormedJsonOptions = WellFormed(JsonOptions);
-
-    private static JsonSerializerOptions WellFormed(JsonSerializerOptions options)
+    internal static string StoredJson(object value)
     {
-        var copy = new JsonSerializerOptions(options);
-        copy.Converters.Insert(0, new WellFormedStringConverter());
-        copy.Converters.Insert(1, new WellFormedCharConverter());
-        return copy;
+        ArgumentNullException.ThrowIfNull(value);
+        return JsonSerializer.Serialize(value, TypeInfoFor(JsonOptions, value.GetType()));
     }
 
     // A marked value stored as JSON: refused when it holds text JSON cannot carry (see WellFormedJsonOptions).
     private static string SerializeMarkedJson(object? value, string column)
     {
+        if (value is null)
+            return "null";
         try
         {
-            return JsonSerializer.Serialize(value, WellFormedJsonOptions);
+            return JsonSerializer.Serialize(value, TypeInfoFor(WellFormedJsonOptions, value.GetType()));
         }
         catch (IllFormedTextException)
         {
@@ -1546,7 +1667,7 @@ internal sealed class TableEntityValue
             // the compressed form cannot fit — a capped cell beats a lost entity.
             if (value is string s && Encoding.Unicode.GetByteCount(s) > MaxCellBytes)
             {
-                var compressed = Compress(JsonSerializer.Serialize(s, JsonOptions));
+                var compressed = Compress(JsonSerializer.Serialize(s, TypeInfoFor(JsonOptions, typeof(string))));
                 if (Encoding.Unicode.GetByteCount(compressed) <= MaxCellBytes)
                 {
                     columnName += GZipSuffix;
@@ -1588,7 +1709,7 @@ internal sealed class TableEntityValue
             return false;
 
         // fallback to JSON / GZip
-        var json = JsonSerializer.Serialize(Value, JsonOptions);
+        var json = JsonSerializer.Serialize(Value, TypeInfoFor(JsonOptions, Value.GetType()));
         var size = Encoding.Unicode.GetByteCount(json);
         if (size > MaxCellBytes)
         {
@@ -1856,12 +1977,12 @@ internal sealed class TableEntityValue
 
         if (Format == TableEntityValueFormat.Json)
         {
-            conv = JsonSerializer.Deserialize((string)Value!, prop.PropertyType, JsonOptions);
+            conv = JsonSerializer.Deserialize((string)Value!, TypeInfoFor(JsonOptions, prop.PropertyType));
         }
         else if (Format == TableEntityValueFormat.GZip)
         {
             var txt = Decompress((string)Value!);
-            conv = JsonSerializer.Deserialize(txt, prop.PropertyType, JsonOptions);
+            conv = JsonSerializer.Deserialize(txt, TypeInfoFor(JsonOptions, prop.PropertyType));
         }
         else
         {
@@ -1871,9 +1992,13 @@ internal sealed class TableEntityValue
         prop.SetValue(owner, conv);
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     internal static bool CanSerializeWithoutJson(object val)
     {
         if (val is IEnumerable) return false;
+        TableEntityMetadata.Require(val.GetType());
         var ctors = val.GetType().GetConstructors();
         if (ctors.Length == 0) return false;
         if (ctors.All(c => c.GetParameters().Length > 0)) return false;
@@ -2054,10 +2179,7 @@ internal sealed class TableEntityValue
     {
         for (var n = list.Count / 2; ; n /= 2)
         {
-            var prefix = new List<object?>(n);
-            for (var i = 0; i < n; i++)
-                prefix.Add(list[i]);
-            var candidate = Compress(JsonSerializer.Serialize(prefix, JsonOptions));
+            var candidate = Compress(SerializeJsonArrayPrefix(list, n));
             if (Encoding.Unicode.GetByteCount(candidate) <= MaxCellBytes)
             {
                 keptItems = n;
@@ -2069,6 +2191,31 @@ internal sealed class TableEntityValue
                 return null; // even an empty list doesn't fit — cannot happen in practice
             }
         }
+    }
+
+    // The prefix of a list as a JSON array, one item at a time through the configured contract. This is
+    // the same bytes JsonSerializer writes for List<object?> (an object item is serialized as its runtime
+    // type), without needing a JsonTypeInfo for List<object> in a source-generated context.
+    private static string SerializeJsonArrayPrefix(IList list, int count)
+    {
+        var sb = new StringBuilder();
+        sb.Append('[');
+        for (var i = 0; i < count; i++)
+        {
+            if (i > 0)
+                sb.Append(',');
+            var item = list[i];
+            if (item is null)
+            {
+                sb.Append("null");
+                continue;
+            }
+
+            sb.Append(JsonSerializer.Serialize(item, TypeInfoFor(JsonOptions, item.GetType())));
+        }
+
+        sb.Append(']');
+        return sb.ToString();
     }
 
     private static string Compress(string s)
@@ -2122,7 +2269,10 @@ internal static class TypeMetadataCache
     private static readonly ConditionalWeakTable<Exception, Exception> _misuses = new();
 
     public static TypeMetadata GetMetadata(Type t)
-        => _cache.GetOrAdd(t, CreateMetadata);
+    {
+        TableEntityMetadata.Require(t);
+        return _cache.GetOrAdd(t, CreateMetadata);
+    }
 
     /// <summary>True when flattening metadata was built for <paramref name="t"/> (for tests).</summary>
     internal static bool HasMetadata(Type t) => _cache.ContainsKey(t);
@@ -2161,6 +2311,7 @@ internal static class TypeMetadataCache
     internal static bool IsLargeValueAware(Type t)
     {
         ArgumentNullException.ThrowIfNull(t);
+        TableEntityMetadata.Require(t);
         return _aware.GetOrAdd(t, static type => DeclaredLargeValues(type).Aware || HasClassLevelSplit(type));
     }
 
@@ -2189,6 +2340,7 @@ internal static class TypeMetadataCache
     private static LargeValueInfo LargeValues(Type t, out bool remembered)
     {
         ArgumentNullException.ThrowIfNull(t);
+        TableEntityMetadata.Require(t);
         remembered = true;
         // A type that opts into nothing by its declared types is never constructed to answer this.
         if (!IsLargeValueAware(t))
@@ -2297,6 +2449,9 @@ internal static class TypeMetadataCache
     // entity type that is large-value aware by its declared types is constructed (a store's T: a class
     // with a public parameterless constructor that implements IEntity), and only when it has a property
     // whose declared type flattens into columns; no other type is ever constructed to answer this.
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     private static object? DefaultInstanceOf(Type root)
     {
         if (!root.IsClass || root.IsAbstract || root.ContainsGenericParameters
@@ -2838,6 +2993,9 @@ internal static class TypeMetadataCache
         !IsScalar(type) && TableEntitySerializer.FlattensToColumns(type);
 
     // The public instance properties the serializer stores as columns (the rule of 0.8.3, unchanged).
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     private static IEnumerable<PropertyInfo> SerializedProperties(Type t) =>
         t.GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(IsSerialized);
 
@@ -2866,6 +3024,9 @@ internal static class TypeMetadataCache
     /// types are each listed. Reflection alone, remembered per type; an inherited interface whose members
     /// cannot be read is skipped. Throws what listing the type's own members throws.
     /// </summary>
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     internal static PropertyInfo[] DeclaredProperties(Type t) =>
         _declaredProperties.GetOrAdd(t, static type =>
         {
@@ -2908,6 +3069,9 @@ internal static class TypeMetadataCache
         && p.Name != nameof(TableEntity.ETag)
         && p.Name != nameof(TableEntity.Timestamp);
 
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     private static TypeMetadata CreateMetadata(Type t)
     {
         var props = SerializedProperties(t).ToImmutableList();
@@ -3090,6 +3254,9 @@ internal static class TypeMetadataCache
     // The first member marked [TableValueSplit] of an interface that t implements (or, t an interface, of t
     // or an interface it inherits), remembered per type. Attributes are read by reflection alone; an
     // interface whose members cannot be read is skipped (the serializer never reads its attributes otherwise).
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     private static (Type Contract, PropertyInfo Marked)? InterfaceMemberSplit(Type t) =>
         _interfaceMemberSplits.GetOrAdd(t, static type =>
         {
@@ -3193,6 +3360,9 @@ internal static class TypeMetadataCache
     // inherits it through reflection; a property that hides (new) a base property of the same name and
     // type does not, so the hidden declarations are looked up (by name first: a property that
     // re-declares nothing resolves no type).
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075", Justification = TableEntitySerializer.AotMetadataJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2067", Justification = TableEntitySerializer.AotMetadataJustification)]
     internal static TableValueSplitAttribute? PropertyLevelSplit(PropertyInfo prop)
     {
         if (prop.GetCustomAttribute<TableValueSplitAttribute>(inherit: true) is { } own)

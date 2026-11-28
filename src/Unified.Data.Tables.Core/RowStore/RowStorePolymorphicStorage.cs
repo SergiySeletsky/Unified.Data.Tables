@@ -19,7 +19,7 @@ namespace Unified.Data.Tables.Providers;
 /// messages (which name the table).
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
-internal sealed class RowStorePolymorphicStorage<TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
+internal sealed class RowStorePolymorphicStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
     where TBase : class
 {
     private static readonly string[] ReservedCells = ["PartitionKey", "RowKey", "Timestamp", "odata.etag"];

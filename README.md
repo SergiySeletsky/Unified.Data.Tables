@@ -2517,6 +2517,88 @@ something this version does partially.
 
 ---
 
+## NativeAOT and trimming
+
+`Unified.Data.Tables.Abstractions`, `.Core`, `.InMemory`, `.Sqlite` and `.Identity` are marked
+`IsAotCompatible` and publish with NativeAOT without IL warnings. The Azure provider
+(`Unified.Data.Tables`) is **not** AOT-compatible: `Azure.Data.Tables` serializes its request bodies
+with reflection, and it fails under NativeAOT before the first request reaches the service.
+
+The serializer still reads the object graph by reflection, so an AOT application must tell the
+trimmer which types it will meet. This is a no-op at run time; in a JIT application it changes
+nothing.
+
+```csharp
+// Every reflected type: the entity, its flattened nested types, its runtime polymorphic
+// subtypes, and any type it stores in a JSON cell.
+TableEntityMetadata.Register<StudentModel>();
+TableEntityMetadata.Register<Address>();
+```
+
+Registering an entity type also preserves the members it inherits from `Entity`, but not the
+members of its property types. An unregistered type fails with a message naming
+`TableEntityMetadata.Register<T>()`; it never silently reads partial metadata (which could store a
+nested object as a different column shape).
+
+An expression-tree filter that compares a value type with a user-defined operator — `decimal`,
+`DateTime`, `DateTimeOffset`, `TimeSpan` — also needs those operators preserved:
+
+```csharp
+TableEntityMetadata.RegisterFilterOperators<decimal>();
+```
+
+`TableEntityMetadata.RequireRegistration` is on by default in NativeAOT. A `PublishTrimmed`
+application that still runs on the JIT can set it to `true` to get the same fail-fast check for an
+unregistered type.
+
+Values stored as JSON need a source-generated `JsonSerializerContext` — collections, records with a
+parameterized constructor, and JSON-stored `[TableValueSplit]` values. Configure it once, at startup:
+
+```csharp
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    PropertyNameCaseInsensitive = true,
+    UseStringEnumConverter = true,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+[JsonSerializable(typeof(List<string>))]
+[JsonSerializable(typeof(Address))]
+partial class TablesJsonContext : JsonSerializerContext;
+
+TableJson.UseContext(new TablesJsonContext(new JsonSerializerOptions
+{
+    Encoder = JavaScriptEncoder.Create(UnicodeRanges.All),
+}));
+```
+
+The context must use the same naming, enum and null settings as the reflection contract; the AOT
+smoke test compares the stored JSON byte for byte. A type missing from the context throws a
+`NotSupportedException` naming the type and the required `[JsonSerializable]` declaration.
+
+Polymorphic storage requires an explicit map in AOT; the assembly-qualified default resolves types by
+name and is rejected:
+
+```csharp
+var map = new TypeDiscriminatorMap()
+    .Map<StudentModel>("student")
+    .Map<PaymentModel>("payment");
+
+services.AddUnifiedInMemoryPolymorphicTable<Entity>("rows", o => o.TypeDiscriminator = map);
+```
+
+For DI, prefer the closed-generic registration, which preserves the entity metadata:
+
+```csharp
+services.AddUnifiedInMemoryStorage<StudentModel>();
+services.AddUnifiedSqliteStorage<StudentModel>("app.db");
+```
+
+`AddUnifiedIdentityStores()` registers Identity's seven internal row models itself, so an AOT host
+only needs to register its own entity types. `tests/Unified.Data.Tables.AotSmoke` is a console app
+that is published with NativeAOT and run in CI; it covers registration, the JSON context, split and
+offload values, polymorphic maps, DI and Identity.
+
+---
+
 ## Upgrading from 0.9.x
 
 0.10.0 is the release that takes the breaks needed before 1.0. Stored rows need no migration, cursors

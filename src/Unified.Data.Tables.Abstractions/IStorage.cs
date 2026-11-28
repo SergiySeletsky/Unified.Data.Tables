@@ -1,4 +1,7 @@
-﻿using System.Linq.Expressions;
+using System.Linq.Expressions;
+#if NET
+using System.Diagnostics.CodeAnalysis;
+#endif
 
 namespace Unified.Data.Tables;
 
@@ -37,7 +40,11 @@ namespace Unified.Data.Tables;
 /// <see cref="ConcurrencyMode"/>, also when the row was deleted after the caller read it.
 /// </para>
 /// </remarks>
-public interface IStorage<T> where T : class, IEntity, new()
+public interface IStorage<
+#if NET
+    [DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)]
+#endif
+    T> where T : class, IEntity, new()
 {
     /// <summary>
     /// Delete a single document by its composite id. For a type with large values (a

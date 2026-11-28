@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Unified.Data.Tables;
 
@@ -42,6 +43,7 @@ public sealed class AssemblyQualifiedTypeDiscriminator : ITypeDiscriminator
     }
 
     /// <inheritdoc />
+    [UnconditionalSuppressMessage("Trimming", "IL2057", Justification = "NativeAOT cannot use the assembly-qualified default; StorageOptions.ResolveTypeDiscriminator throws unless an explicit TypeDiscriminatorMap is configured.")]
     public Type Resolve(string discriminator, Type baseType)
     {
         ArgumentNullException.ThrowIfNull(discriminator);
@@ -96,6 +98,7 @@ public sealed class AssemblyQualifiedTypeDiscriminator : ITypeDiscriminator
     /// </summary>
     /// <param name="assemblyQualifiedName">The stored token.</param>
     /// <returns>The resolved type, or null.</returns>
+    [UnconditionalSuppressMessage("Trimming", "IL2057", Justification = "NativeAOT cannot use the assembly-qualified default; StorageOptions.ResolveTypeDiscriminator throws unless an explicit TypeDiscriminatorMap is configured.")]
     internal static Type? ResolveTypeName(string assemblyQualifiedName)
     {
         var direct = Type.GetType(assemblyQualifiedName);
