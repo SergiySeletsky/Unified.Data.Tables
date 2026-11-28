@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-28
+
 ### Added
 
 - **NativeAOT and trimming support** for `Unified.Data.Tables.Abstractions`, `.Core`, `.InMemory`,
