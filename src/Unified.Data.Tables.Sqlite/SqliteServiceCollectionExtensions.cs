@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -92,7 +93,7 @@ public static class SqliteServiceCollectionExtensions
     /// </param>
     /// <returns>The service collection, for chaining.</returns>
     /// <exception cref="ArgumentException"><paramref name="tableName"/> is null, empty or whitespace.</exception>
-    public static IServiceCollection AddUnifiedSqlitePolymorphicTable<TBase>(
+    public static IServiceCollection AddUnifiedSqlitePolymorphicTable<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TBase>(
         this IServiceCollection services,
         string tableName,
         Action<StorageOptions>? configure = null)
@@ -115,6 +116,36 @@ public static class SqliteServiceCollectionExtensions
             new SqlitePolymorphicStorage<TBase>(
                 sp.GetRequiredService<SqliteStorageAccount>(), tableName, local ?? sp.GetService<StorageOptions>()));
 
+        return services;
+    }
+    /// <summary>
+    /// Registers one entity type as a NativeAOT-safe closed <see cref="IStorage{T}"/> registration
+    /// (in addition to the open-generic mapping <see cref="AddUnifiedSqliteStorage(IServiceCollection, string, Action{SqliteStorageOptions})"/>
+    /// installs). The closed registration preserves <typeparamref name="TEntity"/>'s metadata for the
+    /// serializer a NativeAOT application cannot discover by reflection, and is the recommended
+    /// overload when the container is built ahead of time. Register nested and JSON-stored types with
+    /// <see cref="TableEntityMetadata.Register{T}"/> as well, and configure a JSON context with
+    /// <see cref="TableJson.UseContext"/> when the entity stores collections or records as JSON.
+    /// </summary>
+    /// <typeparam name="TEntity">The entity type to register.</typeparam>
+    /// <param name="services">The service collection.</param>
+    /// <param name="dataSource">The path of the database file, or <c>:memory:</c>.</param>
+    /// <param name="configure">The same options the open-generic registration accepts.</param>
+    /// <returns>The service collection, for chaining.</returns>
+    public static IServiceCollection AddUnifiedSqliteStorage<
+        [DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TEntity>(
+        this IServiceCollection services, string dataSource, Action<SqliteStorageOptions>? configure = null)
+        where TEntity : class, IEntity, new()
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentException.ThrowIfNullOrWhiteSpace(dataSource);
+        TableEntityMetadata.Register<TEntity>();
+        AddUnifiedSqliteStorage(services, dataSource, configure);
+        services.TryAddSingleton<IStorage<TEntity>>(sp =>
+            new SqliteStorage<TEntity>(
+                sp.GetRequiredService<SqliteStorageAccount>(),
+                sp.GetService<IProtectedPropertyAuthorizer>(),
+                sp.GetService<StorageOptions>()));
         return services;
     }
 }

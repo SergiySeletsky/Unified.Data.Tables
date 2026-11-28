@@ -1,4 +1,5 @@
-﻿using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Identity;
+using Unified.Data.Tables.Identity.Models;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Unified.Data.Tables.Identity;
@@ -39,6 +40,17 @@ public static class IdentityServiceCollectionExtensions
     public static IdentityBuilder AddUnifiedIdentityStores(this IdentityBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
+
+        // Identity's seven row models are serialized through the same reflection serializer as any entity.
+        // Registering them here means an AOT host does not have to know the internal models; the calls have
+        // no run-time effect and root the metadata the trimmer would otherwise remove.
+        TableEntityMetadata.Register<IdentityUserModel>();
+        TableEntityMetadata.Register<IdentityUserLoginModel>();
+        TableEntityMetadata.Register<IdentityUserClaimModel>();
+        TableEntityMetadata.Register<IdentityUserRoleModel>();
+        TableEntityMetadata.Register<IdentityUserTokenModel>();
+        TableEntityMetadata.Register<IdentityRoleModel>();
+        TableEntityMetadata.Register<IdentityRoleClaimModel>();
 
         if (builder.UserType != typeof(IdentityUser))
             throw new InvalidOperationException(NotIdentityUser);

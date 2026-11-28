@@ -1,4 +1,5 @@
-﻿using Unified.Data.Tables.Identity.Models;
+using Unified.Data.Tables.Identity.Models;
+using System.Diagnostics.CodeAnalysis;
 using Microsoft.AspNetCore.Identity;
 using System.Security.Claims;
 
@@ -34,6 +35,8 @@ namespace Unified.Data.Tables.Identity
 
         #region IQueryableRoleStore
         // Synchronous by force: IQueryableRoleStore exposes a property, not a Task.
+        [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "The source is a materialized List<IdentityRole>; EnumerableQuery only wraps it. The NativeAOT smoke test covers the role query path.")]
+        [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "The source is a materialized List<IdentityRole>; EnumerableQuery only wraps it. The NativeAOT smoke test covers the role query path.")]
         public IQueryable<IdentityRole> Roles =>
             roles.QueryAsync(IdentityKeys.RolePartition).GetAwaiter().GetResult()
                  .Select(r => r.ToIdentity()).ToList().AsQueryable();

@@ -1,4 +1,5 @@
-﻿using Unified.Data.Tables.Identity.Models;
+using Unified.Data.Tables.Identity.Models;
+using System.Diagnostics.CodeAnalysis;
 using Microsoft.AspNetCore.Identity;
 using System.Security.Claims;
 
@@ -61,6 +62,8 @@ namespace Unified.Data.Tables.Identity
         #region IQueryableUserStore
         // Synchronous by force: IQueryableUserStore exposes a property, not a Task. The blocking
         // partition read is the only shape the interface allows.
+        [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "The source is a materialized List<IdentityUser>; EnumerableQuery only wraps it. The NativeAOT smoke test covers Users.Where(...).")]
+        [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "The source is a materialized List<IdentityUser>; EnumerableQuery only wraps it. The NativeAOT smoke test covers Users.Where(...).")]
         public IQueryable<IdentityUser> Users =>
             users.QueryAsync(IdentityKeys.UserPartition).GetAwaiter().GetResult()
                  .Select(u => u.ToIdentity()).ToList().AsQueryable();

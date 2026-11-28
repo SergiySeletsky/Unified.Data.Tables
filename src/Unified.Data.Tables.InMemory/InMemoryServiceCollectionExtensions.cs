@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -69,7 +70,7 @@ public static class InMemoryServiceCollectionExtensions
     /// <see cref="StorageOptions"/>, or the defaults when none is registered.
     /// </param>
     /// <returns>The service collection, for chaining.</returns>
-    public static IServiceCollection AddUnifiedInMemoryPolymorphicTable<TBase>(
+    public static IServiceCollection AddUnifiedInMemoryPolymorphicTable<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TBase>(
         this IServiceCollection services,
         string tableName,
         Action<StorageOptions>? configure = null)
@@ -130,5 +131,33 @@ public static class InMemoryServiceCollectionExtensions
         var options = new StorageOptions();
         configure(options);
         return options;
+    }
+
+    /// <summary>
+    /// Registers one entity type as a NativeAOT-safe closed <see cref="IStorage{T}"/> registration
+    /// (in addition to the open-generic mapping <see cref="AddUnifiedInMemoryStorage(IServiceCollection, Action{StorageOptions})"/>
+    /// installs). The closed registration preserves <typeparamref name="TEntity"/>'s metadata for the
+    /// serializer a NativeAOT application cannot discover by reflection, and is the recommended
+    /// overload when the container is built ahead of time. Register nested and JSON-stored types with
+    /// <see cref="TableEntityMetadata.Register{T}"/> as well, and configure a JSON context with
+    /// <see cref="TableJson.UseContext"/> when the entity stores collections or records as JSON.
+    /// </summary>
+    /// <typeparam name="TEntity">The entity type to register.</typeparam>
+    /// <param name="services">The service collection.</param>
+    /// <param name="configure">The same options the open-generic registration accepts.</param>
+    /// <returns>The service collection, for chaining.</returns>
+    public static IServiceCollection AddUnifiedInMemoryStorage<
+        [DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TEntity>(
+        this IServiceCollection services, Action<StorageOptions>? configure = null)
+        where TEntity : class, IEntity, new()
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        TableEntityMetadata.Register<TEntity>();
+        AddUnifiedInMemoryStorage(services, configure);
+        services.TryAddSingleton<IStorage<TEntity>>(sp =>
+            new InMemoryStorage<TEntity>(
+                sp.GetService<IProtectedPropertyAuthorizer>(),
+                sp.GetService<StorageOptions>()));
+        return services;
     }
 }

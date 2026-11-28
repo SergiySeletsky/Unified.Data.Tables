@@ -29,7 +29,7 @@ namespace Unified.Data.Tables;
 /// </para>
 /// </remarks>
 /// <typeparam name="TBase">The common base type every stored row materializes as.</typeparam>
-public sealed class PolymorphicTableStorage<TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
+public sealed class PolymorphicTableStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] TBase> : IPolymorphicStorage<TBase>, IAtomicInsert<TBase>, IStorageInfo, IStorageCapabilities
     where TBase : class
 {
     private static readonly string[] ReservedCells = ["PartitionKey", "RowKey", "Timestamp", "odata.etag"];

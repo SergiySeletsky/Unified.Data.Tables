@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using Azure.Data.Tables;
 using Unified.Data.Tables.Providers;
@@ -24,7 +24,7 @@ namespace Unified.Data.Tables.InMemory;
 /// sends a request twice, so <see cref="DuplicateKeyException.MayBeOwnWrite"/> is always false here.
 /// </summary>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public sealed class InMemoryStorage<T> : IStorage<T>, IOrphanBlobSweeper, IBlobOffloadState,
+public sealed class InMemoryStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] T> : IStorage<T>, IOrphanBlobSweeper, IBlobOffloadState,
     IStorageCapabilities, IConditionalDelete<T>, IAtomicBatch<T>, IStorageInfo
     where T : class, IEntity, new()
 {

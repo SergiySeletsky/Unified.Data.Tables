@@ -43,7 +43,7 @@ namespace Unified.Data.Tables.Sqlite;
 /// </para>
 /// </remarks>
 /// <typeparam name="T">The entity type; implements <see cref="IEntity"/> (derive from <see cref="Entity"/> for the convenience base) and has a public parameterless constructor.</typeparam>
-public sealed class SqliteStorage<T> : IStorage<T>, IOrphanBlobSweeper, IBlobOffloadState,
+public sealed class SqliteStorage<[DynamicallyAccessedMembers(TableEntityMetadata.SerializerMembers)] T> : IStorage<T>, IOrphanBlobSweeper, IBlobOffloadState,
     IStorageCapabilities, IConditionalDelete<T>, IAtomicBatch<T>, IStorageInfo
     where T : class, IEntity, new()
 {
